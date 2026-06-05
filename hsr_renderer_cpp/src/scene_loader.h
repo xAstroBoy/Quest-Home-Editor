@@ -631,6 +631,11 @@ public:
             md.transform = obj.transform;
             md.overlayKind = overlayKind;
 
+            if (std::getenv("HSR_DUMPMESH") && md.name.find("Sculpture")!=std::string::npos) {
+                FILE* f=fopen("_sculpturea.rendmesh","wb");
+                if(f){ fwrite(meshData.data(),1,meshData.size(),f); fclose(f);
+                       log("  DUMPMESH wrote %zu bytes for %s", meshData.size(), md.name.c_str()); }
+            }
             if (!parseRendMesh(meshData, md.positions, md.uvs, md.indices,
                                &md.boneIndices, &md.boneWeights, md.name.c_str())) {
                 log("  SKIP: RENDMESH parse failed");

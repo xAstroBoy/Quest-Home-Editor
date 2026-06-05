@@ -673,6 +673,24 @@ public:
                     log("  DUMPTEX orm -> %s (%ux%u)", path, md.ormW, md.ormH);
                 }
             }
+            // matParams: shader members (name@offset) + the cooked constant block values
+            if (md.name.find(ds) != std::string::npos) {
+                log("  DUMPMAT '%s' shader matParams members(%zu):", md.name.c_str(), mpmembers.size());
+                for (auto& mm : mpmembers) log("     @%u %s", mm.second, mm.first.c_str());
+                if (!md.matParamsBlob.empty()) {
+                    const float* f=(const float*)md.matParamsBlob.data(); size_t nf=md.matParamsBlob.size()/4;
+                    char b[512]; int p=0; for(size_t k=0;k<nf&&k<16;k++) p+=snprintf(b+p,(size_t)(sizeof(b)-p),"%.4f ",f[k]);
+                    log("  DUMPMAT cooked blob(%zuB): %s", md.matParamsBlob.size(), b);
+                } else log("  DUMPMAT cooked blob: EMPTY");
+                if (!md.uvs.empty()) {
+                    float u0=1e9f,u1=-1e9f,v0=1e9f,v1=-1e9f;
+                    for (size_t k=0;k+1<md.uvs.size();k+=2){ float u=md.uvs[k],v=md.uvs[k+1];
+                        if(u<u0)u0=u; if(u>u1)u1=u; if(v<v0)v0=v; if(v>v1)v1=v; }
+                    char sb[300]; int p=0; size_t nn=md.uvs.size()/2, st=nn/10?nn/10:1;
+                    for (size_t k=0;k<nn && p<260;k+=st) p+=snprintf(sb+p,(size_t)(sizeof(sb)-p),"(%.2f,%.2f) ",md.uvs[k*2],md.uvs[k*2+1]);
+                    log("  DUMPUV uv0 range u[%.3f,%.3f] v[%.3f,%.3f] spread: %s", u0,u1,v0,v1, sb);
+                }
+            }
         }
         // Texture image + view — use GPU-native ASTC if supported and data available
         VkFormat texFmt = VK_FORMAT_R8G8B8A8_SRGB;
@@ -758,7 +776,13 @@ public:
             // otherwise only when the material's shader == the global shader.
             bool blockMatches = (gm.progIdx>=0) ||
                 (!globalShaderPath.empty() && surfaceName(md.shaderPath) == surfaceName(globalShaderPath));
-            if (!std::getenv("HSR_NOMATBLOB") && !md.matParamsBlob.empty() && blockMatches) {
+            // SKIP the cooked block for emissive-ATLAS shaders (isotropictiledemissive / isotropicemissiveusd):
+            // its GlobalTile compresses the per-cube emissive ATLAS uv into one cell-band — that turned
+            // SculptureA's pot pink (its uv0.v 0.44..1.0 got dragged up into the colored cube cells) and
+            // over-saturated the cubes. The atlas needs the RAW uv0. The room's tiled/rgbmasked materials
+            // still get their cooked Tint/Layer colors from the block (without it the floor goes white).
+            bool emissiveAtlas = (gm.progIdx>=0) && programs[gm.progIdx].surface.find("emissive") != std::string::npos;
+            if (!std::getenv("HSR_NOMATBLOB") && !md.matParamsBlob.empty() && blockMatches && !emissiveAtlas) {
                 size_t n = std::min((size_t)MAT_UBO_SIZE, md.matParamsBlob.size());
                 memcpy(fp, md.matParamsBlob.data(), n);
             }

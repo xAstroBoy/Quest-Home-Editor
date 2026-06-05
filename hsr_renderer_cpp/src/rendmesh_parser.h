@@ -122,6 +122,38 @@ inline bool parseRendMesh(const std::vector<u8>& data,
             fprintf(stderr, "[RMSTRUCT] part %u/%u nVerts=%u stride=%u ibCount=%u base=%u\n",
                     pi, partCount, nVerts, stride, ibCount, totalV);
 
+    // ── FAITHFUL vertex format (1:1 with the VS table, NOT auto-detected) ──────────────
+    // VS field[3] = a vector of 4-byte attribute structs {u8 semantic, u8 format, u8 index, u8 _}.
+    // Walk them, summing each format's byte size, to get each attribute's offset. TEXCOORD0
+    // (semantic 5, index 0) is uv0; TEXCOORD1 (sem 5, idx 1) is the lightmap uv1. This is what
+    // the renderer's auto-detect could never get: SculptureA's uv0 is at +18 (after a 6-byte
+    // f16x3 normal), and the 4-byte-aligned scan only tried 12/16/20/24. (semantic: 0=POSITION
+    // 1=NORMAL 5=TEXCOORD; format byte high-nibble≈type 3=f32/2=f16/1=u8, decoded by size below.)
+    u32 fmtUv0 = 0xFFFFFFFF, fmtUv1 = 0xFFFFFFFF;
+    {
+        u32 fb2, fc2;
+        if (followVec(vsTable, 3, fb2, fc2) && fc2 && fc2 < 32 && fb2 + fc2*4 <= data.size()) {
+            auto fmtSize = [](u8 f) -> u32 {
+                switch (f) {
+                    case 0x30: return 4;   case 0x31: return 8;   case 0x32: return 12;  case 0x33: return 16;  // f32 x1..4
+                    case 0x20: return 2;   case 0x21: return 4;   case 0x22: return 6;   case 0x23: return 8;   // f16 x1..4
+                    case 0x27: return 4;                                                                        // u16x2 (lightmap uv)
+                    case 0x10: case 0x11: return 4;                                                             // u8x4 (color/bones)
+                    default:   return 4;
+                }
+            };
+            u32 aoff = 0;
+            for (u32 ai = 0; ai < fc2; ++ai) {
+                const u8* a = data.data() + fb2 + ai*4;
+                u8 sem = a[0], fmt = a[1], idx = a[2];
+                if (sem == 5 && idx == 0 && fmtUv0 == 0xFFFFFFFF) fmtUv0 = aoff;
+                if (sem == 5 && idx == 1 && fmtUv1 == 0xFFFFFFFF) fmtUv1 = aoff;
+                aoff += fmtSize(fmt);
+            }
+            if (std::getenv("HSR_RMSTRUCT")) fprintf(stderr, "[RMFMT] %u attrs uv0@%d uv1@%d\n", fc2, (int)fmtUv0, (int)fmtUv1);
+        }
+    }
+
     // Position is always the first attribute (3x f32 @ +0). UV offset, however,
     // varies by vertex layout: nuxd is stride-20 with UV f16x2 @ +12, but other
     // envs (haven2025) use wider strides (48) with normal/tangent before the UV, so
@@ -135,7 +167,7 @@ inline bool parseRendMesh(const std::vector<u8>& data,
     // A real texcoord set: nearly all samples finite & in a sane range, AND varies
     // across vertices (constant slots are packed color/normal). Pick the EARLIEST
     // qualifying slot (UV precedes normal/tangent), preferring offset 12.
-    u32 uvOff = 12;
+    u32 uvOff = (fmtUv0 != 0xFFFFFFFF) ? fmtUv0 : 12;   // FAITHFUL VS-format value wins
     // Wide layout (haven2025 / V203 USD, stride 48): pos f32x3 @0 + normal f32x3 @12 + uv0 f16x2 @24
     // (matches the V203 shader's vertex stream pos/norm/uv). The generic f16x2 auto-detect below mis-fires
     // here because the f32 NORMAL bytes @12 reinterpret as plausible f16 UVs -> magenta UV scramble.
@@ -154,7 +186,9 @@ inline bool parseRendMesh(const std::vector<u8>& data,
     // Do NOT auto-detect there: a skinned surface with TILED UVs (prism_wave, 32x32) has uv values > the
     // detector's [-4,16] range at off 12, so it rejected the real UV and mis-picked the boneIdx bytes as
     // UVs -> garbled texture. Auto-detect only for the variable non-skinned layouts.
-    if (normAt12) {
+    if (fmtUv0 != 0xFFFFFFFF) {
+        // uvOff already = the faithful TEXCOORD0 offset from the VS attribute table; skip heuristics.
+    } else if (normAt12) {
         uvOff = 24;
     } else if (stride != 28) {
         u32 sampleN = nVerts < 128 ? nVerts : 128;
@@ -177,6 +211,9 @@ inline bool parseRendMesh(const std::vector<u8>& data,
         }
         uvOff = (chosen != 0xFFFFFFFF) ? chosen : 12;
     }
+    // (stride==28 keeps uv0@12 — the verified skinned layout AND haven2025's static props' face uv0.
+    //  SculptureA's emissive "checker" is NOT a uv-offset bug: uv0@12 is the [0,1] face UV; the emissive
+    //  is an ATLAS so each face samples the whole atlas. The real fix is per-cube atlas-cell remapping.)
     if (const char* uo = std::getenv("HSR_UVOFF")) uvOff = (u32)atoi(uo);   // DIAG: force UV offset
 
     if (std::getenv("HSR_RMFMT") && label && strstr(label, "culptur")) {
