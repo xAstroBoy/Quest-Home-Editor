@@ -187,10 +187,13 @@ public:
     // role: 0=pos 1=normal 2=uv 3=lightmapUv/uv1 4=color 5=boneIdx 6=boneWgt 7=tangent 8=other
     std::vector<VIn> vertInputs;                 // sorted by location
     u32 vertStride = 0;
-    // matParams UBO struct members (name, byte offset) from the chosen shader, so the
-    // matParams buffer is filled BY NAME (uvScaleOffset/Tint/GlobalTile/F0/...) instead
-    // of hardcoded per-shader offsets — what corrupts whichever shader you don't match.
-    std::vector<std::pair<std::string,u32>> matParamsMembers;
+    // matParams UBO struct member (name, byte offset, value byte-size from the SPIR-V type) so the
+    // matParams buffer is filled BY NAME (uvScaleOffset/Tint/GlobalTile/F0/...) instead of hardcoded
+    // per-shader offsets. vsize is the TIGHT value size (scalar 4, vec3 12, vec4 16): the cooked block
+    // packs values tightly, so the repack needs the REAL size — a gap heuristic mis-sizes a scalar that
+    // precedes a 16-aligned vec3 (e.g. leaves' lightSSSIntensity before Tint -> washed-white leaves).
+    struct MatMember { std::string name; u32 off = 0; u32 vsize = 4; };
+    std::vector<MatMember> matParamsMembers;
 
     // ── Per-material shader programs (HSR_PERMAT) ───────────────────────────────────────────────
     // The renderer normally draws every mesh with ONE global shader. For faithful v203 we build a
@@ -203,7 +206,7 @@ public:
         std::vector<u32> vert, frag;
         std::vector<VIn> vertInputs; u32 vertStride = 0;
         std::vector<DescBind> set1Binds, set2Binds;
-        std::vector<std::pair<std::string,u32>> matParamsMembers;
+        std::vector<MatMember> matParamsMembers;
         int set2BaseColorBinding = 1; bool hasSet1 = false;
         VkDescriptorSetLayout layout1 = VK_NULL_HANDLE, layout2 = VK_NULL_HANDLE;
         VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
@@ -459,7 +462,7 @@ public:
         const std::vector<VIn>& vins = (gm.progIdx>=0) ? programs[gm.progIdx].vertInputs : vertInputs;
         const u32 stride = (gm.progIdx>=0) ? programs[gm.progIdx].vertStride : (vertStride ? vertStride : 32);
         // per-program (or global) set2 layout + matParams members + base-color binding for this mesh
-        const std::vector<std::pair<std::string,u32>>& mpmembers = (gm.progIdx>=0) ? programs[gm.progIdx].matParamsMembers : matParamsMembers;
+        const std::vector<MatMember>& mpmembers = (gm.progIdx>=0) ? programs[gm.progIdx].matParamsMembers : matParamsMembers;
         const std::vector<DescBind>& s2binds = (gm.progIdx>=0) ? programs[gm.progIdx].set2Binds : set2Binds;
         const int s2base = (gm.progIdx>=0) ? programs[gm.progIdx].set2BaseColorBinding : set2BaseColorBinding;
         VkDescriptorSetLayout s2layout = (gm.progIdx>=0) ? programs[gm.progIdx].layout2 : descSetLayouts[2];
@@ -677,7 +680,7 @@ public:
             // matParams: shader members (name@offset) + the cooked constant block values
             if (md.name.find(ds) != std::string::npos) {
                 log("  DUMPMAT '%s' shader matParams members(%zu):", md.name.c_str(), mpmembers.size());
-                for (auto& mm : mpmembers) log("     @%u %s", mm.second, mm.first.c_str());
+                for (auto& mm : mpmembers) log("     @%u %s (%uB)", mm.off, mm.name.c_str(), mm.vsize);
                 if (!md.matParamsBlob.empty()) {
                     const float* f=(const float*)md.matParamsBlob.data(); size_t nf=md.matParamsBlob.size()/4;
                     char b[512]; int p=0; for(size_t k=0;k<nf&&k<16;k++) p+=snprintf(b+p,(size_t)(sizeof(b)-p),"%.4f ",f[k]);
@@ -750,7 +753,8 @@ public:
             vkMapMemory(device, gm.matUboMem, 0, MAT_UBO_SIZE, 0, &mp);
             float* fp = (float*)mp;
             for (u32 k = 0; k < MAT_UBO_SIZE/4; ++k) fp[k] = 1.0f;  // neutral default
-            for (auto& [rawname, off] : mpmembers) {
+            for (auto& mm : mpmembers) {
+                const std::string& rawname = mm.name; u32 off = mm.off;
                 std::string nm = rawname; for (auto& c : nm) c = (char)tolower((unsigned char)c);
                 u32 fi = off / 4;
                 auto S = [&](u32 idx, float v){ if (fi+idx < MAT_UBO_SIZE/4) fp[fi+idx] = v; };
@@ -799,21 +803,19 @@ public:
                 // constant — Tint, EmissiveTint (the lamp's golden glow), Metallic, Roughness — but FORCE
                 // GlobalTile=1 so the tiling factor can't warp the unwrap (SculptureA's atlas, bowls, lamps).
                 if (!mpmembers.empty() && !std::getenv("HSR_NOREPACK")) {
-                    std::vector<std::pair<std::string,u32>> mem(mpmembers.begin(), mpmembers.end());
+                    std::vector<MatMember> mem(mpmembers.begin(), mpmembers.end());
                     std::sort(mem.begin(), mem.end(),
-                              [](const std::pair<std::string,u32>& a, const std::pair<std::string,u32>& b){ return a.second < b.second; });
+                              [](const MatMember& a, const MatMember& b){ return a.off < b.off; });
                     const u8* src = md.matParamsBlob.data(); size_t srcN = md.matParamsBlob.size(), so = 0;
                     for (size_t i = 0; i < mem.size(); ++i) {
-                        size_t vsz = (i+1 < mem.size())
-                            ? (((mem[i+1].second - mem[i].second) >= 12) ? 12u : 4u)
-                            : (srcN > so ? srcN - so : 4);
+                        size_t vsz = mem[i].vsize ? mem[i].vsize : 4;    // REAL value size from the SPIR-V type
                         if (so + vsz > srcN) break;
-                        if (mem[i].second + vsz <= (u32)MAT_UBO_SIZE) {
-                            std::string mn = mem[i].first; for (char& c : mn) c = (char)tolower((unsigned char)c);
+                        if (mem[i].off + vsz <= (u32)MAT_UBO_SIZE) {
+                            std::string mn = mem[i].name; for (char& c : mn) c = (char)tolower((unsigned char)c);
                             if (propUnwrap && mn.find("tile") != std::string::npos) {
-                                float one = 1.0f; memcpy((u8*)fp + mem[i].second, &one, 4);   // neutralize GlobalTile for unwraps
+                                float one = 1.0f; memcpy((u8*)fp + mem[i].off, &one, 4);   // neutralize GlobalTile for unwraps
                             } else {
-                                memcpy((u8*)fp + mem[i].second, src + so, vsz);
+                                memcpy((u8*)fp + mem[i].off, src + so, vsz);
                             }
                         }
                         so += vsz;
@@ -2189,6 +2191,8 @@ public:
             std::set<u32> bufferBlockTypes;                     // struct ids decorated BufferBlock (SSBO)
             std::map<std::pair<u32,u32>,std::string> memName;   // (struct,member) -> name
             std::map<std::pair<u32,u32>,u32> memOff;            // (struct,member) -> byte offset
+            std::unordered_map<u32,std::vector<u32>> structMems;// OpTypeStruct id -> member type ids (for value sizes)
+            std::unordered_map<u32,u32> vecCount;               // OpTypeVector id -> component count (vec3=3 ...)
             u32 i = 5;
             while (i < n) {
                 u32 word = spv[i], op = word & 0xFFFF, wc = word >> 16;
@@ -2207,6 +2211,11 @@ public:
                     bufferBlockTypes.insert(spv[i+1]);          // OpDecorate <struct> BufferBlock -> SSBO
                 } else if (op == 32 && wc >= 4) {              // OpTypePointer
                     ptr[spv[i+1]] = {spv[i+2], spv[i+3]};
+                } else if (op == 30 && wc >= 2) {              // OpTypeStruct: result, member_type_ids...
+                    std::vector<u32> mt; for (u32 k = 2; k < wc; ++k) mt.push_back(spv[i+k]);
+                    structMems[spv[i+1]] = std::move(mt);
+                } else if (op == 23 && wc >= 4) {              // OpTypeVector: result, component_type, count
+                    vecCount[spv[i+1]] = spv[i+3];
                 } else if ((op == 28 || op == 29) && wc >= 3) { // OpTypeArray / OpTypeRuntimeArray
                     structOfArray[spv[i+1]] = spv[i+2];         // element type
                 } else if (op == 25) typeKind[spv[i+1]] = 2;    // OpTypeImage
@@ -2229,7 +2238,13 @@ public:
                     for (u32 m = 0; m < 64; ++m) {
                         auto nIt = memName.find({structId,m}); if (nIt == memName.end()) break;
                         u32 off = memOff.count({structId,m}) ? memOff[{structId,m}] : 0;
-                        matParamsMembers.push_back({nIt->second, off});
+                        u32 mvsz = 4;                            // value byte-size from the member's SPIR-V type
+                        auto smIt = structMems.find(structId);
+                        if (smIt != structMems.end() && m < smIt->second.size()) {
+                            auto vcIt = vecCount.find(smIt->second[m]);
+                            if (vcIt != vecCount.end()) mvsz = vcIt->second * 4;   // vecN -> N*4 bytes (scalar stays 4)
+                        }
+                        matParamsMembers.push_back({nIt->second, off, mvsz});
                     }
                     break;
                 }
