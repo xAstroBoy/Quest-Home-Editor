@@ -776,13 +776,16 @@ public:
             // otherwise only when the material's shader == the global shader.
             bool blockMatches = (gm.progIdx>=0) ||
                 (!globalShaderPath.empty() && surfaceName(md.shaderPath) == surfaceName(globalShaderPath));
-            // SKIP the cooked block for emissive-ATLAS shaders (isotropictiledemissive / isotropicemissiveusd):
-            // its GlobalTile compresses the per-cube emissive ATLAS uv into one cell-band — that turned
-            // SculptureA's pot pink (its uv0.v 0.44..1.0 got dragged up into the colored cube cells) and
-            // over-saturated the cubes. The atlas needs the RAW uv0. The room's tiled/rgbmasked materials
-            // still get their cooked Tint/Layer colors from the block (without it the floor goes white).
-            bool emissiveAtlas = (gm.progIdx>=0) && programs[gm.progIdx].surface.find("emissive") != std::string::npos;
-            if (!std::getenv("HSR_NOMATBLOB") && !md.matParamsBlob.empty() && blockMatches && !emissiveAtlas) {
+            // SKIP the cooked block for the PROP PBR shaders (isotropictiled / isotropictiledemissive):
+            // its GlobalTile is a TILING factor that compresses the UV, but props use a unique [0,1] UV
+            // UNWRAP (not a tiled texture), so GlobalTile warps them — SculptureA's emissive atlas (pink
+            // pot), the bowls, the vases, every prop. The unwrap needs the RAW uv0. KEEP the block for the
+            // room's genuinely-TILED materials — rgbmasked (needs cooked Tint/Layer; floor goes white
+            // without it) and lightmap — where GlobalTile is the correct repeat count.
+            bool propUnwrap = (gm.progIdx>=0) &&
+                programs[gm.progIdx].surface.find("isotropictiled") != std::string::npos &&
+                programs[gm.progIdx].surface.find("rgbmasked") == std::string::npos;
+            if (!std::getenv("HSR_NOMATBLOB") && !md.matParamsBlob.empty() && blockMatches && !propUnwrap) {
                 size_t n = std::min((size_t)MAT_UBO_SIZE, md.matParamsBlob.size());
                 memcpy(fp, md.matParamsBlob.data(), n);
             }
