@@ -788,13 +788,16 @@ public:
             bool propUnwrap = (gm.progIdx>=0) && !md.tiled &&
                 programs[gm.progIdx].surface.find("isotropictiled") != std::string::npos &&
                 programs[gm.progIdx].surface.find("rgbmasked") == std::string::npos;
-            if (!std::getenv("HSR_NOMATBLOB") && !md.matParamsBlob.empty() && blockMatches && !propUnwrap) {
+            if (!std::getenv("HSR_NOMATBLOB") && !md.matParamsBlob.empty() && blockMatches) {
                 // The cooked block is the per-material constant VALUES, TIGHTLY PACKED in matParams-member
                 // (declaration = offset) order — scalar 4B, vec3 12B — NOT the std140-PADDED UBO layout. A
                 // raw memcpy misaligns everything after the first vec3, so rgbmasked/tiled materials (the
                 // rug, the room floor/walls) rendered magenta/teal instead of their real LayerRed/LayerBlue/
                 // Tint colors. REPACK value-by-value into each member's reflected UBO offset; the value size
                 // is inferred from the gap to the next member (>=12 => vec3, else scalar), last = remainder.
+                // For UNWRAP props (propUnwrap: a unique [0,1] unwrap, not a tiled texture) KEEP every cooked
+                // constant — Tint, EmissiveTint (the lamp's golden glow), Metallic, Roughness — but FORCE
+                // GlobalTile=1 so the tiling factor can't warp the unwrap (SculptureA's atlas, bowls, lamps).
                 if (!mpmembers.empty() && !std::getenv("HSR_NOREPACK")) {
                     std::vector<std::pair<std::string,u32>> mem(mpmembers.begin(), mpmembers.end());
                     std::sort(mem.begin(), mem.end(),
@@ -805,10 +808,17 @@ public:
                             ? (((mem[i+1].second - mem[i].second) >= 12) ? 12u : 4u)
                             : (srcN > so ? srcN - so : 4);
                         if (so + vsz > srcN) break;
-                        if (mem[i].second + vsz <= (u32)MAT_UBO_SIZE) memcpy((u8*)fp + mem[i].second, src + so, vsz);
+                        if (mem[i].second + vsz <= (u32)MAT_UBO_SIZE) {
+                            std::string mn = mem[i].first; for (char& c : mn) c = (char)tolower((unsigned char)c);
+                            if (propUnwrap && mn.find("tile") != std::string::npos) {
+                                float one = 1.0f; memcpy((u8*)fp + mem[i].second, &one, 4);   // neutralize GlobalTile for unwraps
+                            } else {
+                                memcpy((u8*)fp + mem[i].second, src + so, vsz);
+                            }
+                        }
                         so += vsz;
                     }
-                } else {
+                } else if (!propUnwrap) {
                     size_t n = std::min((size_t)MAT_UBO_SIZE, md.matParamsBlob.size());
                     memcpy(fp, md.matParamsBlob.data(), n);
                 }
