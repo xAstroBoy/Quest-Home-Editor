@@ -208,7 +208,8 @@ public:
         VkDescriptorSetLayout layout1 = VK_NULL_HANDLE, layout2 = VK_NULL_HANDLE;
         VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
         VkPipeline pipe = VK_NULL_HANDLE, pipeBlend = VK_NULL_HANDLE, pipeCull = VK_NULL_HANDLE,
-                   pipeBlendCull = VK_NULL_HANDLE, pipeAdditive = VK_NULL_HANDLE, pipeAlphaTest = VK_NULL_HANDLE;
+                   pipeBlendCull = VK_NULL_HANDLE, pipeAdditive = VK_NULL_HANDLE, pipeAlphaTest = VK_NULL_HANDLE,
+                   pipeWire = VK_NULL_HANDLE;   // wireframe variant on THIS program's layout (F + selection highlight)
         VkDescriptorSet set1Desc = VK_NULL_HANDLE;
     };
     bool perMat = false;                          // HSR_PERMAT: route each mesh to its own shader program
@@ -1201,9 +1202,10 @@ public:
                 if (!soloMat.empty() && gm.name.find(soloMat) == std::string::npos) continue;
                 if (gm.useBlend) continue;   // blend handled in pass 2
                 VkPipeline want;
-                if (gm.progIdx >= 0 && !wireframe) {  // per-material program pipeline (skinned now has identity bones bound in set2)
+                if (gm.progIdx >= 0) {  // per-material program pipeline (its OWN layout matches descSet2)
                     auto& p = programs[gm.progIdx];
-                    want = (gm.alphaTest && p.pipeAlphaTest) ? p.pipeAlphaTest
+                    want = wireframe ? (p.pipeWire ? p.pipeWire : p.pipe)
+                         : (gm.alphaTest && p.pipeAlphaTest) ? p.pipeAlphaTest
                          : (gm.cullBack && p.pipeCull) ? p.pipeCull : p.pipe;
                 } else {
                     want = (!wireframe && gm.alphaTest && alphaTestPipeline) ? alphaTestPipeline : opaquePipe;
@@ -1284,25 +1286,30 @@ public:
         }
 
         // Pass 3: selected mesh highlight — wireframe overlay on top
-        if (selectedMesh >= 0 && selectedMesh < (int)gpuMeshes.size()
-            && wireframePipeline != VK_NULL_HANDLE) {
+        if (selectedMesh >= 0 && selectedMesh < (int)gpuMeshes.size()) {
             auto& gm = gpuMeshes[selectedMesh];
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, wireframePipeline);
-            // Override color to bright yellow via push constants: r=1.0, g=0.9, b=0.0, a=1.0
-            VkDeviceSize off = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &gm.vbo, &off);
-            vkCmdBindIndexBuffer(cmd, gm.ibo, 0, VK_INDEX_TYPE_UINT32);
-            float pcData[32] = {};
-            memcpy(pcData, gm.model, 64);
-            pcData[16] = 1.0f; pcData[17] = 0.9f;   // highlight: yellow-ish tint
-            pcData[18] = 0.0f; pcData[19] = 1.0f;
-            vkCmdPushConstants(cmd, pipelineLayout,
-                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80, pcData);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                pipelineLayout, 0, 1, &gm.descSet0, 0, nullptr);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                pipelineLayout, 2, 1, &gm.descSet2, 0, nullptr);
-            vkCmdDrawIndexed(cmd, gm.nIdx, 1, 0, 0, 0);
+            // Draw the highlight with the SELECTED mesh's OWN wireframe pipeline + layout + descriptor sets.
+            // Binding a per-material descSet2 to the global-layout wireframe pipeline is an invalid layout
+            // mismatch that HANGS the GPU on HSL (the click-freeze) — so use the program's own pipeWire.
+            VkPipeline       hlPipe = (gm.progIdx >= 0) ? programs[gm.progIdx].pipeWire : wireframePipeline;
+            VkPipelineLayout pl     = (gm.progIdx >= 0) ? programs[gm.progIdx].pipeLayout : pipelineLayout;
+            bool useS1 = (gm.progIdx >= 0) ? programs[gm.progIdx].hasSet1 : hasSet1;
+            VkDescriptorSet s1 = (gm.progIdx >= 0) ? programs[gm.progIdx].set1Desc : sharedSet1;
+            if (hlPipe != VK_NULL_HANDLE) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, hlPipe);
+                VkDeviceSize off = 0;
+                vkCmdBindVertexBuffers(cmd, 0, 1, &gm.vbo, &off);
+                vkCmdBindIndexBuffer(cmd, gm.ibo, 0, VK_INDEX_TYPE_UINT32);
+                float pcData[32] = {};
+                memcpy(pcData, gm.model, 64);
+                pcData[16] = 1.0f; pcData[17] = 0.9f;   // yellow-ish highlight (the global/unlit shader honors it)
+                pcData[18] = 0.0f; pcData[19] = 1.0f;
+                vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80, pcData);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &gm.descSet0, 0, nullptr);
+                if (useS1 && s1) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 1, 1, &s1, 0, nullptr);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 2, 1, &gm.descSet2, 0, nullptr);
+                vkCmdDrawIndexed(cmd, gm.nIdx, 1, 0, 0, 0);
+            }
         }
 
         if (overlayDraw && !noUI) overlayDraw(cmd);   // ImGui editor UI on top of the scene; HSR_NOUI hides it
@@ -2449,6 +2456,12 @@ public:
         gp.pRasterizationState=&rsCull; gp.pDepthStencilState=&ds;   gp.pColorBlendState=&cbIO; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeCull);
         gp.pRasterizationState=&rsCull; gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIB; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeBlendCull);
         gp.pRasterizationState=&rs;     gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIA; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeAdditive);
+        // Wireframe variant on THIS program's layout — so the editor "vertex structure" (F) + selection
+        // highlight can draw per-material meshes without binding their descSet2 to the global-layout
+        // wireframe pipeline (that mismatch HANGS the GPU on HSL — the click-freeze).
+        { VkPipelineRasterizationStateCreateInfo rsWire=rs; rsWire.polygonMode=VK_POLYGON_MODE_LINE; rsWire.cullMode=VK_CULL_MODE_NONE;
+          gp.pRasterizationState=&rsWire; gp.pDepthStencilState=&ds; gp.pColorBlendState=&cbIO;
+          vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeWire); }
         p.pipeAlphaTest = p.pipe;   // no per-program discard frag; cutouts draw opaque in per-mat path
         vkDestroyShaderModule(device,vm,nullptr); vkDestroyShaderModule(device,fm,nullptr);
     }
