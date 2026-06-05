@@ -631,10 +631,13 @@ public:
             md.transform = obj.transform;
             md.overlayKind = overlayKind;
 
-            if (std::getenv("HSR_DUMPMESH") && md.name.find("Sculpture")!=std::string::npos) {
-                FILE* f=fopen("_sculpturea.rendmesh","wb");
+            if (const char* dm = std::getenv("HSR_DUMPMESH")) {
+              if (md.name.find(dm)!=std::string::npos) {
+                std::string fn = std::string("_")+md.name+".rendmesh";
+                FILE* f=fopen(fn.c_str(),"wb");
                 if(f){ fwrite(meshData.data(),1,meshData.size(),f); fclose(f);
-                       log("  DUMPMESH wrote %zu bytes for %s", meshData.size(), md.name.c_str()); }
+                       log("  DUMPMESH wrote %zu bytes -> %s", meshData.size(), fn.c_str()); }
+              }
             }
             if (!parseRendMesh(meshData, md.positions, md.uvs, md.indices,
                                &md.boneIndices, &md.boneWeights, md.name.c_str())) {
@@ -682,6 +685,12 @@ public:
                 if (!parseMatlmatl(matData, matInfo)) { log("  MATLMATL parse failed"); continue; }
                 log("  Shader: ing=%016llX  Tex: ing=%016llX",
                     (unsigned long long)matInfo.shaderIng, (unsigned long long)matInfo.texIng);
+                if (std::getenv("HSR_DUMPMAT2") &&
+                    (md.name.find("BowlA")!=std::string::npos || md.name.find("SculptureA")!=std::string::npos)) {
+                    std::string fn = std::string("_mat_") + (md.name.find("BowlA")!=std::string::npos?"bowla":"sculpturea") + ".bin";
+                    FILE* f=fopen(fn.c_str(),"wb"); if(f){ fwrite(matData.data(),1,matData.size(),f); fclose(f); }
+                    log("  MATDUMP %s -> %s (%zu bytes) texIngs=%zu", md.name.c_str(), fn.c_str(), matData.size(), matInfo.texIngs.size());
+                }
 
                 if (applyMat(matInfo, md)) { gotTex = true; break; }
             }
