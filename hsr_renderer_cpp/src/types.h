@@ -77,6 +77,9 @@ struct MeshData {
     // Resolved shader asset path (".../NAME.surface/shader...") — used to apply matParamsBlob only
     // when this material's shader matches the renderer's chosen global shader (same UBO layout).
     std::string shaderPath;
+    // Material name carries "pbrlightmap_tiled" -> a genuinely TILED prop material (rugs etc.): unlike the
+    // unwrap props (bowls/vases), it NEEDS its cooked matParams (Tint + GlobalTile) kept, like the room.
+    bool tiled = false;
     // Cooked per-material matParams constant block (real Tint/LayerRed/LayerBlue/Metallic/...), in the
     // material's shader's matParams UBO byte layout. Empty if the material has no constants.
     std::vector<u8> matParamsBlob;
