@@ -262,9 +262,9 @@ public:
 
     std::vector<VkGpuMesh> gpuMeshes;
     // Editor overlay visibility (navmesh / collision-walls). Toggled from the editor panel.
-    bool showNavmesh = true;
+    bool showNavmesh = false;     // navmesh overlay — OFF by default (it's a flat gizmo over the floor); toggle in editor
     bool showCollision = false;   // ~85 wall/collision meshes — off by default, toggle on to wall-map
-    bool showSpawn = true;        // player spawn-point cone markers
+    bool showSpawn = false;       // player spawn-point cone markers — OFF by default; toggle in editor
     // Scene fog — DECODED from the env's SceneSettings (basescene.scene) by the loader, NOT hardcoded.
     // density 0 = no fog (libshell's fallback when an env has no distanceFog). Set via setSceneFog().
     float sceneFogColor[4] = {0,0,0,0};
@@ -452,7 +452,13 @@ public:
         // Editor overlays (navmesh/collision/spawn) MUST draw with the GLOBAL flat-colour shader so their
         // curTint (green/red/cyan) shows. A per-material program would draw the proxy's own material instead
         // (the collision proxy = pink) -> the "wallDecor_COL bleeding pink" + "navmesh not visible" bugs.
-        gm.progIdx = (perMat && !md.overlayKind) ? programForSurface(surfaceName(md.shaderPath)) : -1;
+        // ALSO: a genuinely-TILED architectural material (md.tiled) with a REAL albedo texture (the floor's
+        // megascans parquet, walls/ceiling) must SHOW that albedo. Its rgbmasked per-material shader treats
+        // the albedo as a MASK and, without the baked lightmap (still unsupported), washes it to garbage
+        // purple/yellow -> route it to the GLOBAL albedo shader. The rgbmasked props with a white.png MASK
+        // base (rug/sofaCushions, texW==4) genuinely need the masked path, so they keep their program.
+        bool tiledRealAlbedo = md.tiled && md.texW > 64 && md.texH > 64;
+        gm.progIdx = (perMat && !md.overlayKind && !tiledRealAlbedo) ? programForSurface(surfaceName(md.shaderPath)) : -1;
         // Skinned meshes (prism_wave_a_01) MUST use the "skinned" program variant: it has the boneIdx/boneWgt
         // vertex inputs (vstride 32) + the sbSkinningMatrices buffer. programForSurface can resolve the mesh
         // to the NON-skinned variant (vstride 24, no bones) -> the skinned shader reads garbage bones and
