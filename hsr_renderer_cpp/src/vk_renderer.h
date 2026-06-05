@@ -449,7 +449,10 @@ public:
         memcpy(gm.baseModel, gm.model, sizeof(gm.baseModel)); // edits are a delta applied on top of base
 
         // HSR_PERMAT: route this mesh to its material's OWN shader program (built lazily). -1 => global.
-        gm.progIdx = perMat ? programForSurface(surfaceName(md.shaderPath)) : -1;
+        // Editor overlays (navmesh/collision/spawn) MUST draw with the GLOBAL flat-colour shader so their
+        // curTint (green/red/cyan) shows. A per-material program would draw the proxy's own material instead
+        // (the collision proxy = pink) -> the "wallDecor_COL bleeding pink" + "navmesh not visible" bugs.
+        gm.progIdx = (perMat && !md.overlayKind) ? programForSurface(surfaceName(md.shaderPath)) : -1;
         // Skinned meshes (prism_wave_a_01) MUST use the "skinned" program variant: it has the boneIdx/boneWgt
         // vertex inputs (vstride 32) + the sbSkinningMatrices buffer. programForSurface can resolve the mesh
         // to the NON-skinned variant (vstride 24, no bones) -> the skinned shader reads garbage bones and
