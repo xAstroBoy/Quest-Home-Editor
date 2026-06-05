@@ -782,12 +782,35 @@ public:
             // pot), the bowls, the vases, every prop. The unwrap needs the RAW uv0. KEEP the block for the
             // room's genuinely-TILED materials — rgbmasked (needs cooked Tint/Layer; floor goes white
             // without it) and lightmap — where GlobalTile is the correct repeat count.
-            bool propUnwrap = (gm.progIdx>=0) &&
+            // ... but NOT if the material itself is the TILED variant (md.tiled, e.g. rugA's
+            // pbrlightmap_tiled): those genuinely tile, so they KEEP the block (Tint + GlobalTile).
+            bool propUnwrap = (gm.progIdx>=0) && !md.tiled &&
                 programs[gm.progIdx].surface.find("isotropictiled") != std::string::npos &&
                 programs[gm.progIdx].surface.find("rgbmasked") == std::string::npos;
             if (!std::getenv("HSR_NOMATBLOB") && !md.matParamsBlob.empty() && blockMatches && !propUnwrap) {
-                size_t n = std::min((size_t)MAT_UBO_SIZE, md.matParamsBlob.size());
-                memcpy(fp, md.matParamsBlob.data(), n);
+                // The cooked block is the per-material constant VALUES, TIGHTLY PACKED in matParams-member
+                // (declaration = offset) order — scalar 4B, vec3 12B — NOT the std140-PADDED UBO layout. A
+                // raw memcpy misaligns everything after the first vec3, so rgbmasked/tiled materials (the
+                // rug, the room floor/walls) rendered magenta/teal instead of their real LayerRed/LayerBlue/
+                // Tint colors. REPACK value-by-value into each member's reflected UBO offset; the value size
+                // is inferred from the gap to the next member (>=12 => vec3, else scalar), last = remainder.
+                if (!mpmembers.empty() && !std::getenv("HSR_NOREPACK")) {
+                    std::vector<std::pair<std::string,u32>> mem(mpmembers.begin(), mpmembers.end());
+                    std::sort(mem.begin(), mem.end(),
+                              [](const std::pair<std::string,u32>& a, const std::pair<std::string,u32>& b){ return a.second < b.second; });
+                    const u8* src = md.matParamsBlob.data(); size_t srcN = md.matParamsBlob.size(), so = 0;
+                    for (size_t i = 0; i < mem.size(); ++i) {
+                        size_t vsz = (i+1 < mem.size())
+                            ? (((mem[i+1].second - mem[i].second) >= 12) ? 12u : 4u)
+                            : (srcN > so ? srcN - so : 4);
+                        if (so + vsz > srcN) break;
+                        if (mem[i].second + vsz <= (u32)MAT_UBO_SIZE) memcpy((u8*)fp + mem[i].second, src + so, vsz);
+                        so += vsz;
+                    }
+                } else {
+                    size_t n = std::min((size_t)MAT_UBO_SIZE, md.matParamsBlob.size());
+                    memcpy(fp, md.matParamsBlob.data(), n);
+                }
             }
             vkUnmapMemory(device, gm.matUboMem);
         }

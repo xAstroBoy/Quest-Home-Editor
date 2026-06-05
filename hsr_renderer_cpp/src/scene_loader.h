@@ -678,6 +678,9 @@ public:
                     continue;
                 }
                 log("  Material: %s", matPath->c_str());
+                // A "pbrlightmap_tiled" material (e.g. rugA) is genuinely TILED -> keep its cooked block
+                // (Tint + GlobalTile) like the room; only the plain-unwrap props (bowls/vases) strip it.
+                md.tiled = (matPath->find("_tiled") != std::string::npos);
                 auto matData = readAsset(*matPath);
                 if (matData.empty()) { log("  Material data empty"); continue; }
 
