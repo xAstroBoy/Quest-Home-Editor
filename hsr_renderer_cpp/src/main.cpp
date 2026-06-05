@@ -680,6 +680,7 @@ int main(int argc, char** argv) {
     bool shotQuit = std::getenv("HSR_SHOT_QUIT") != nullptr;
     if (const char* solo = std::getenv("HSR_SOLO")) { vkRenderer.soloMesh = atoi(solo); }
     if (const char* sel = std::getenv("HSR_SELECT")) { vkRenderer.selectedMesh = atoi(sel); }  // headless test of selection-highlight (Pass 3)
+    if (std::getenv("HSR_SHOWOVERLAY")) { vkRenderer.showNavmesh = vkRenderer.showCollision = vkRenderer.showSpawn = true; }  // headless overlay test
     if (const char* hide = std::getenv("HSR_HIDEMESH")) { vkRenderer.hideMesh = atoi(hide); }
     if (const char* hm = std::getenv("HSR_HIDEMAT")) { vkRenderer.hideMat = hm; }
     if (const char* sm = std::getenv("HSR_SOLOMAT")) { vkRenderer.soloMat = sm; }
