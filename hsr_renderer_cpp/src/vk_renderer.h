@@ -506,6 +506,29 @@ public:
         // V79 shader (which multiplies texture·tint·vColor) shows them ENV-LIT instead of the white/dark
         // fallback. diffuseCube(worldN)·ambientIBLTint. Non-specibl meshes keep white (no-op).
         bool meshSpecibl = iblDiffuse.ok() && md.iblLit;
+        // Tiled-real-albedo (floor/walls routed to the global shader): bake the cooked GlobalTile into the
+        // UV so the texture TILES — the global shader doesn't apply GlobalTile, so it showed one ENLARGED
+        // tile (the floor's GlobalTile is 8x8). Read GlobalTileX/Y from the cooked block by name.
+        float gtX = 1.0f, gtY = 1.0f;
+        if (tiledRealAlbedo && !md.matParamsBlob.empty()) {
+            // gm.progIdx is -1 (we route to the global shader), so look up the material's OWN rgbmasked
+            // program for the matParams layout — only IT declares GlobalTileX/Y.
+            int rp = programForSurface(surfaceName(md.shaderPath));
+            if (rp >= 0) {
+                std::vector<MatMember> mem(programs[rp].matParamsMembers.begin(), programs[rp].matParamsMembers.end());
+                std::sort(mem.begin(), mem.end(), [](const MatMember& a, const MatMember& b){ return a.off < b.off; });
+                size_t so = 0;
+                for (auto& m : mem) {
+                    if (so + m.vsize > md.matParamsBlob.size()) break;
+                    std::string mn = m.name; for (char& c : mn) c = (char)tolower((unsigned char)c);
+                    if      (mn == "globaltilex") memcpy(&gtX, md.matParamsBlob.data()+so, 4);
+                    else if (mn == "globaltiley") memcpy(&gtY, md.matParamsBlob.data()+so, 4);
+                    so += m.vsize;
+                }
+                if (gtX <= 0.001f) gtX = 1.0f;
+                if (gtY <= 0.001f) gtY = 1.0f;
+            }
+        }
         std::vector<u8> vbo((size_t)nVerts * stride, 0);
         for (u32 i = 0; i < nVerts; ++i) {
             u8* vp = vbo.data() + (size_t)i * stride;
@@ -514,7 +537,7 @@ public:
                 switch (vin.role) {
                     case 0: { float p[3]={md.positions[i*3],md.positions[i*3+1],md.positions[i*3+2]}; memcpy(dst,p,12);} break;
                     case 1: { float nn[3]={nrm[i*3],nrm[i*3+1],nrm[i*3+2]}; memcpy(dst,nn,12);} break;
-                    case 2: { float uv[2]={(i*2<md.uvs.size())?md.uvs[i*2]:0.f,(i*2+1<md.uvs.size())?md.uvs[i*2+1]:0.f}; memcpy(dst,uv,8);} break;
+                    case 2: { float uv[2]={(i*2<md.uvs.size())?md.uvs[i*2]*gtX:0.f,(i*2+1<md.uvs.size())?md.uvs[i*2+1]*gtY:0.f}; memcpy(dst,uv,8);} break;
                     case 3: { // role 3 = uv1 (lightmap unwrap); fall back to uv0 if absent
                         const std::vector<float>& u1 = !md.uvs2.empty() ? md.uvs2 : md.uvs;
                         float uv[2]={(i*2<u1.size())?u1[i*2]:0.f,(i*2+1<u1.size())?u1[i*2+1]:0.f}; memcpy(dst,uv,8);} break;
