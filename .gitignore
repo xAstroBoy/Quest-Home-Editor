@@ -1,0 +1,46 @@
+# Build artifacts
+build/
+*.exe
+*.obj
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.dll
+*.spv
+__pycache__/
+*.pyc
+
+# Editor / runtime config + scratch
+imgui.ini
+hsr_shot.png
+_*.png
+_*.txt
+_*.log
+_*.astc
+*.jpg
+
+# Large inputs / dumps / vendored deps — not part of the tool source
+Envs To check/
+VRShells/
+Apk Resources/
+AI Junk 2/
+To Compare/
+Tested & Not working/
+V79 Nuxtd/
+Lib/
+apk_compare/
+bindump/
+hsr_apk_tool/
+hsr_renderer_cpp/build/
+Scripts/
+astcenc_bin/
+_astcenc_bin/
+_astcenc_src/
+dobby_src/
+_ripped_shaders/
+ripped_libshell_shaders/
+_lmshader/
+v203_spv/
+v203_shaders/
+.claude/

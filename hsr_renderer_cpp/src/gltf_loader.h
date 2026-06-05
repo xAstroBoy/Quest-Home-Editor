@@ -1,0 +1,705 @@
+#pragma once
+// V79 ".gltf.ovrscene" loader — standard glTF 2.0 (V9.gltf + V9.bin + ASTC8x8 KTX1
+// textures), the raw format old VR-env APKs ship (e.g. The Incredibles). Produces the
+// renderer's MeshData[] (positions/uvs/indices + decoded base-color RGBA), with each
+// node's world transform baked into the positions. This is the source-format side of the
+// V79 -> new-system env editor/porter.
+//
+// Container nesting: APK -> assets/scene.zip -> _WORLD_MODEL.gltf.ovrscene (zip) ->
+//   V9.gltf (JSON), V9.bin (buffer), *.ktx (ASTC 8x8).
+
+#include "types.h"
+#include "tinyjson.h"
+#include "rendtxtr_parser.h"   // astc::decodeASTC
+#include "miniz.h"
+#define STBI_NO_STDIO
+#include "stb_image.h"         // JPEG skybox panoramas (impl in src/stb_image_impl.c)
+#include <vector>
+#include <string>
+#include <cstring>
+#include <cstdio>
+#include <cstdarg>
+#include <cmath>
+#include <functional>
+#include <unordered_map>
+
+class GltfLoader {
+public:
+    std::vector<MeshData> meshes;
+    bool verbose = true;
+
+    // ── glTF skeletal animation (self-contained CPU skinning — our own code, not
+    //    borrowed from libshell). animate(t) streams skinned positions per frame. ──
+    struct GNode { float t[3]={0,0,0}, r[4]={0,0,0,1}, s[3]={1,1,1}; int parent=-1; };
+    struct GSkin { std::vector<int> joints; std::vector<float> ibm; /*joints*16*/ };
+    struct GSampler { std::vector<float> times; std::vector<float> vals; int comps=0; bool step=false; };
+    struct GChannel { int node=-1, path=0, sampler=-1; };  // path: 0=T 1=R 2=S
+    struct SkinnedRec { int meshIdx=-1, skin=-1; u32 nv=0;
+                        std::vector<float> basePos;  // nv*3 (local)
+                        std::vector<u8>  jidx;       // nv*4
+                        std::vector<float> jw; };     // nv*4
+    // A NON-skinned mesh attached to an animated node (or a node with an animated ancestor):
+    // its positions are kept LOCAL and the node's world matrix is applied per-frame (rigid
+    // node animation — e.g. a rotating object, the AmongUs dropship parts). Without this such
+    // envs bake the node transform once at load -> they never move.
+    struct NodeAnimRec { int meshIdx=-1, nodeIdx=-1; std::vector<float> basePos; }; // basePos = local nv*3
+    std::vector<GNode> gnodes;
+    std::vector<GSkin> gskins;
+    std::vector<GChannel> gchannels;
+    std::vector<GSampler> gsamplers;
+    std::vector<SkinnedRec> skinned;
+    std::vector<NodeAnimRec> nodeAnimRecs;
+    // Re-anchor for animated "screen" skins authored away from their target (Rick&Morty TV: the
+    // glTF puts the TV_Anim flipbook node by the WINDOW, libshell repositions it onto the TV at
+    // runtime). HSR_REANCHOR="dx,dy,dz" translates skinned meshes onto the TV. (Off by default.)
+    float reanchor[3] = {0,0,0};
+    float animDuration = 0.0f;
+    bool hasAnimation() const { return animDuration > 0.0f && (!skinned.empty() || !nodeAnimRecs.empty()); }
+
+    void log(const char* fmt, ...) {
+        if (!verbose) return;
+        va_list a; va_start(a, fmt); fprintf(stderr, "[GLTF] "); vfprintf(stderr, fmt, a);
+        fprintf(stderr, "\n"); va_end(a);
+    }
+
+    // ── small zip helper: read one entry from an in-memory zip ──
+    static std::vector<u8> zipRead(const void* zipData, size_t zipSize, const std::string& name) {
+        mz_zip_archive z; memset(&z, 0, sizeof(z));
+        if (!mz_zip_reader_init_mem(&z, zipData, zipSize, 0)) return {};
+        int idx = mz_zip_reader_locate_file(&z, name.c_str(), nullptr, 0);
+        std::vector<u8> out;
+        if (idx >= 0) {
+            size_t sz = 0; void* d = mz_zip_reader_extract_to_heap(&z, idx, &sz, 0);
+            if (d) { out.assign((u8*)d, (u8*)d + sz); mz_free(d); }
+        }
+        mz_zip_reader_end(&z);
+        return out;
+    }
+    // list entries ending with suffix
+    static std::vector<std::string> zipList(const void* zipData, size_t zipSize) {
+        std::vector<std::string> names;
+        mz_zip_archive z; memset(&z, 0, sizeof(z));
+        if (!mz_zip_reader_init_mem(&z, zipData, zipSize, 0)) return names;
+        u32 n = mz_zip_reader_get_num_files(&z);
+        for (u32 i = 0; i < n; ++i) {
+            mz_zip_archive_file_stat st;
+            if (mz_zip_reader_file_stat(&z, i, &st)) names.push_back(st.m_filename);
+        }
+        mz_zip_reader_end(&z);
+        return names;
+    }
+
+    // ── KTX1 (ASTC) → RGBA mip0 ──
+    static bool decodeKtxBaseMip(const std::vector<u8>& ktx, std::vector<u8>& rgba, u32& outW, u32& outH) {
+        if (ktx.size() < 64) return false;
+        static const u8 id[12] = {0xAB,'K','T','X',' ','1','1',0xBB,'\r','\n',0x1A,'\n'};
+        if (memcmp(ktx.data(), id, 12) != 0) return false;
+        auto u32a = [&](size_t o){ return *reinterpret_cast<const u32*>(ktx.data()+o); };
+        u32 glInternalFormat = u32a(28);
+        u32 w = u32a(36), h = u32a(40);
+        u32 bytesOfKeyValueData = u32a(60);
+        size_t off = 64 + bytesOfKeyValueData;        // first mip: [u32 imageSize][data]
+        if (off + 4 > ktx.size()) return false;
+        u32 imageSize = u32a(off); off += 4;
+        if (off + imageSize > ktx.size()) imageSize = (u32)(ktx.size() - off);
+        // ASTC block footprint from glInternalFormat. The GL ASTC enum is a regular
+        // sequence: linear LDR = 0x93B0..0x93BD, sRGB = 0x93D0..0x93DD, both in the
+        // SAME order of 14 footprints. libshell reads the footprint straight from the
+        // KTX glInternalFormat — so we must cover ALL of them, not just the square
+        // ones. The previous switch defaulted every non-square footprint (e.g. the
+        // dome floor atlas, ASTC_8x6 = 0x93B6) to 8x8, which mis-strides the block
+        // grid and scrambles the whole texture (512x683 blocks decoded as 512x512).
+        static const u8 kFootprints[14][2] = {
+            {4,4},{5,4},{5,5},{6,5},{6,6},{8,5},{8,6},{8,8},
+            {10,5},{10,6},{10,8},{10,10},{12,10},{12,12}
+        };
+        u32 bw = 8, bh = 8;
+        int idx = -1;
+        if (glInternalFormat >= 0x93B0 && glInternalFormat <= 0x93BD) idx = (int)(glInternalFormat - 0x93B0);
+        else if (glInternalFormat >= 0x93D0 && glInternalFormat <= 0x93DD) idx = (int)(glInternalFormat - 0x93D0);
+        if (idx >= 0) { bw = kFootprints[idx][0]; bh = kFootprints[idx][1]; }
+        if (!astc::decodeASTC(ktx.data()+off, imageSize, w, h, bw, bh, rgba)) return false;
+        outW = w; outH = h;
+        return true;
+    }
+
+    // ── PNG (8-bit, colortype 0/2/3/4/6, non-interlaced) -> RGBA. Many V79 envs (e.g. Luigi's
+    //    Mansion) reference image/png by uri instead of KTX/ASTC; without this they were all-gray
+    //    (textures never decoded). Uses miniz tinfl for the zlib IDAT inflate. ──
+    static bool decodePNG(const std::vector<u8>& png, std::vector<u8>& rgba, u32& outW, u32& outH) {
+        if (png.size()<8 || png[0]!=0x89 || png[1]!='P' || png[2]!='N' || png[3]!='G') return false;
+        auto rd32=[&](size_t o)->u32{ return ((u32)png[o]<<24)|((u32)png[o+1]<<16)|((u32)png[o+2]<<8)|(u32)png[o+3]; };
+        size_t p=8; u32 w=0,h=0; int bitDepth=0,colorType=0,interlace=0;
+        std::vector<u8> idat, palette, trns;
+        while (p+8 <= png.size()) {
+            u32 len=rd32(p);
+            char t0=(char)png[p+4],t1=(char)png[p+5],t2=(char)png[p+6],t3=(char)png[p+7];
+            size_t d=p+8; if (d+len > png.size()) break;
+            if (t0=='I'&&t1=='H'&&t2=='D'&&t3=='R'){ w=rd32(d); h=rd32(d+4); bitDepth=png[d+8]; colorType=png[d+9]; interlace=png[d+12]; }
+            else if (t0=='P'&&t1=='L'&&t2=='T'&&t3=='E') palette.assign(png.begin()+d, png.begin()+d+len);
+            else if (t0=='t'&&t1=='R'&&t2=='N'&&t3=='S') trns.assign(png.begin()+d, png.begin()+d+len);
+            else if (t0=='I'&&t1=='D'&&t2=='A'&&t3=='T') idat.insert(idat.end(), png.begin()+d, png.begin()+d+len);
+            else if (t0=='I'&&t1=='E'&&t2=='N'&&t3=='D') break;
+            p = d + len + 4;  // + CRC
+        }
+        if (!w||!h||idat.empty()||bitDepth!=8||interlace!=0) return false;
+        int ch = (colorType==2)?3:(colorType==6)?4:(colorType==0)?1:(colorType==4)?2:(colorType==3)?1:0;
+        if (!ch) return false;
+        size_t rawLen=0;
+        void* raw = tinfl_decompress_mem_to_heap(idat.data(), idat.size(), &rawLen, TINFL_FLAG_PARSE_ZLIB_HEADER);
+        if (!raw) return false;
+        const u8* f=(const u8*)raw;
+        size_t stride=(size_t)w*ch;
+        if (rawLen < (stride+1)*h) { mz_free(raw); return false; }
+        std::vector<u8> img((size_t)w*h*ch);
+        auto pae=[](int a,int b,int c)->int{ int pp=a+b-c,pa=pp>a?pp-a:a-pp,pb=pp>b?pp-b:b-pp,pc=pp>c?pp-c:c-pp; return (pa<=pb&&pa<=pc)?a:(pb<=pc?b:c); };
+        for (u32 y=0;y<h;++y){
+            const u8* s=f+(size_t)y*(stride+1); u8 filt=s[0]; s++;
+            u8* dst=img.data()+(size_t)y*stride; const u8* prev=(y>0)?img.data()+(size_t)(y-1)*stride:nullptr;
+            for (size_t x=0;x<stride;++x){
+                int a=(x>=(size_t)ch)?dst[x-ch]:0, b=prev?prev[x]:0, c=(prev&&x>=(size_t)ch)?prev[x-ch]:0, val=s[x];
+                if(filt==1)val+=a; else if(filt==2)val+=b; else if(filt==3)val+=(a+b)/2; else if(filt==4)val+=pae(a,b,c);
+                dst[x]=(u8)val;
+            }
+        }
+        mz_free(raw);
+        rgba.resize((size_t)w*h*4);
+        for (size_t i=0;i<(size_t)w*h;++i){
+            u8 r=200,g=200,bb=200,a=255;
+            if (ch==3){r=img[i*3];g=img[i*3+1];bb=img[i*3+2];}
+            else if (ch==4){r=img[i*4];g=img[i*4+1];bb=img[i*4+2];a=img[i*4+3];}
+            else if (ch==2){r=g=bb=img[i*2];a=img[i*2+1];}
+            else if (colorType==3){int idx=img[i]; if((size_t)idx*3+2<palette.size()){r=palette[idx*3];g=palette[idx*3+1];bb=palette[idx*3+2];} if((size_t)idx<trns.size())a=trns[idx];}
+            else {r=g=bb=img[i];}
+            rgba[i*4]=r; rgba[i*4+1]=g; rgba[i*4+2]=bb; rgba[i*4+3]=a;
+        }
+        outW=w; outH=h; return true;
+    }
+
+    // ── 4x4 matrix helpers (column-major, glTF convention) ──
+    struct Mat4 { float m[16]; };
+    static Mat4 identity() { Mat4 r{}; r.m[0]=r.m[5]=r.m[10]=r.m[15]=1; return r; }
+    static Mat4 mul(const Mat4&a, const Mat4&b){ Mat4 r{}; for(int c=0;c<4;c++)for(int row=0;row<4;row++){float s=0;for(int k=0;k<4;k++)s+=a.m[k*4+row]*b.m[c*4+k]; r.m[c*4+row]=s;} return r; }
+    static Mat4 fromTRS(const float t[3], const float q[4], const float s[3]) {
+        float x=q[0],y=q[1],z=q[2],w=q[3];
+        float r00=1-2*(y*y+z*z), r01=2*(x*y-w*z), r02=2*(x*z+w*y);
+        float r10=2*(x*y+w*z), r11=1-2*(x*x+z*z), r12=2*(y*z-w*x);
+        float r20=2*(x*z-w*y), r21=2*(y*z+w*x), r22=1-2*(x*x+y*y);
+        Mat4 r{};
+        r.m[0]=r00*s[0]; r.m[1]=r10*s[0]; r.m[2]=r20*s[0];  r.m[3]=0;
+        r.m[4]=r01*s[1]; r.m[5]=r11*s[1]; r.m[6]=r21*s[1];  r.m[7]=0;
+        r.m[8]=r02*s[2]; r.m[9]=r12*s[2]; r.m[10]=r22*s[2]; r.m[11]=0;
+        r.m[12]=t[0];    r.m[13]=t[1];    r.m[14]=t[2];     r.m[15]=1;
+        return r;
+    }
+    static void xformPoint(const Mat4& m, float x, float y, float z, float out[3]) {
+        out[0]=m.m[0]*x+m.m[4]*y+m.m[8]*z+m.m[12];
+        out[1]=m.m[1]*x+m.m[5]*y+m.m[9]*z+m.m[13];
+        out[2]=m.m[2]*x+m.m[6]*y+m.m[10]*z+m.m[14];
+    }
+
+    // JPEG -> RGBA via stb_image (skybox panoramas, e.g. hogwarts pano.jpg). A 20 MB equirect
+    // panorama can decode to a very large image; cap the longest side at 4096 (box-downsample) so
+    // the GPU upload stays sane while the sky still looks crisp on a sphere.
+    static bool decodeJPEG(const std::vector<u8>& jpg, std::vector<u8>& rgba, u32& outW, u32& outH) {
+        int w=0,h=0,comp=0;
+        stbi_uc* px = stbi_load_from_memory(jpg.data(), (int)jpg.size(), &w, &h, &comp, 4);
+        if (!px || w<=0 || h<=0) { if (px) stbi_image_free(px); return false; }
+        const int CAP = 4096;
+        int mx = w>h ? w : h;
+        if (mx > CAP) {
+            int nw = (int)((int64_t)w*CAP/mx), nh = (int)((int64_t)h*CAP/mx);
+            if (nw<1) nw=1; if (nh<1) nh=1;
+            rgba.resize((size_t)nw*nh*4);
+            for (int y=0;y<nh;++y){ int sy=(int)((int64_t)y*h/nh);
+                for (int x=0;x<nw;++x){ int sx=(int)((int64_t)x*w/nw);
+                    const stbi_uc* s=px+((size_t)sy*w+sx)*4; u8* d=rgba.data()+((size_t)y*nw+x)*4;
+                    d[0]=s[0];d[1]=s[1];d[2]=s[2];d[3]=s[3]; } }
+            outW=(u32)nw; outH=(u32)nh;
+        } else {
+            rgba.assign(px, px+(size_t)w*h*4); outW=(u32)w; outH=(u32)h;
+        }
+        stbi_image_free(px);
+        return true;
+    }
+
+    // Entry: load from the APK path. Returns true if it IS a V79 gltf.ovrscene scene.
+    bool load(const std::string& apkPath) {
+        mz_zip_archive apk; memset(&apk, 0, sizeof(apk));
+        if (!mz_zip_reader_init_file(&apk, apkPath.c_str(), 0)) return false;
+        int si = mz_zip_reader_locate_file(&apk, "assets/scene.zip", nullptr, 0);
+        if (si < 0) { mz_zip_reader_end(&apk); return false; }
+        size_t scSz=0; void* scD = mz_zip_reader_extract_to_heap(&apk, si, &scSz, 0);
+        mz_zip_reader_end(&apk);
+        if (!scD) return false;
+        std::vector<u8> sceneZip((u8*)scD,(u8*)scD+scSz); mz_free(scD);
+
+        // Find the *.gltf.ovrscene inside scene.zip
+        std::string ovrName;
+        for (auto& n : zipList(sceneZip.data(), sceneZip.size()))
+            if (n.size()>9 && n.substr(n.size()-9)==".ovrscene") { ovrName=n; break; }
+        if (ovrName.empty()) return false;   // not a V79 ovrscene env
+        log("V79 ovrscene: %s", ovrName.c_str());
+        auto ovr = zipRead(sceneZip.data(), sceneZip.size(), ovrName);
+        if (ovr.empty()) return false;
+
+        // Inside the ovrscene zip: V9.gltf + V9.bin + *.ktx
+        std::string gltfName, binName;
+        std::unordered_map<std::string, std::string> ktxByName;  // image uri -> entry name
+        std::vector<std::string> ovrEntries = zipList(ovr.data(), ovr.size());
+        for (auto& n : ovrEntries) {
+            std::string low=n; for(auto&c:low)c=(char)tolower((unsigned char)c);
+            if (low.size()>5 && low.substr(low.size()-5)==".gltf") gltfName=n;
+            else if (low.size()>4 && low.substr(low.size()-4)==".bin") binName=n;
+        }
+        if (gltfName.empty()) { log("no .gltf inside ovrscene"); return false; }
+        auto gltfBytes = zipRead(ovr.data(), ovr.size(), gltfName);
+        std::string gltfJson((char*)gltfBytes.data(), gltfBytes.size());
+        std::vector<u8> bin = binName.empty() ? std::vector<u8>{} : zipRead(ovr.data(), ovr.size(), binName);
+        log("gltf=%s (%zuB) bin=%s (%zuB)", gltfName.c_str(), gltfBytes.size(), binName.c_str(), bin.size());
+
+        tinyjson::Value root;
+        try { root = tinyjson::parse(gltfJson); } catch(...) { log("gltf JSON parse failed"); return false; }
+
+        // Decode all images (KTX) up front -> RGBA cache by image index.
+        struct Img { std::vector<u8> rgba; u32 w=1,h=1; bool ok=false; };
+        std::vector<Img> images;
+        if (root.has("images")) {
+            const auto& imgs = root["images"];
+            for (size_t i=0;i<imgs.size();++i) {
+                Img im;
+                std::string uri = imgs[i].has("uri") ? imgs[i]["uri"].asString() : "";
+                if (!uri.empty()) {
+                    auto kd = zipRead(ovr.data(), ovr.size(), uri);
+                    std::string lu=uri; for(auto&c:lu)c=(char)tolower((unsigned char)c);
+                    auto endsWith=[&](const char* s){ size_t n=strlen(s); return lu.size()>n && lu.compare(lu.size()-n,n,s)==0; };
+                    bool isPng = endsWith(".png");
+                    bool isJpg = endsWith(".jpg") || endsWith(".jpeg");
+                    bool ok=false;
+                    if (!kd.empty()) {
+                        // JPEG (skybox panoramas, e.g. hogwarts pano.jpg) via stb_image; PNG (Luigi's
+                        // etc.) custom decoder; else KTX/ASTC. Try the likely one first, then fall back.
+                        if (isJpg) ok = decodeJPEG(kd, im.rgba, im.w, im.h);
+                        if (!ok) {
+                            if (isPng) ok = decodePNG(kd, im.rgba, im.w, im.h) || decodeKtxBaseMip(kd, im.rgba, im.w, im.h);
+                            else       ok = decodeKtxBaseMip(kd, im.rgba, im.w, im.h) || decodePNG(kd, im.rgba, im.w, im.h)
+                                              || decodeJPEG(kd, im.rgba, im.w, im.h);
+                        }
+                    }
+                    im.ok=ok;
+                    if (ok) log("  image[%zu] %s %ux%u%s", i, uri.c_str(), im.w, im.h, isJpg?" (jpg)":(isPng?" (png)":""));
+                    else    log("  image[%zu] %s decode FAILED", i, uri.c_str());
+                }
+                images.push_back(std::move(im));
+            }
+        }
+        // material -> image index (via baseColorTexture -> textures[].source)
+        auto matBaseImage = [&](int matIdx) -> int {
+            if (matIdx < 0 || !root.has("materials")) return -1;
+            const auto& mats = root["materials"];
+            if ((size_t)matIdx >= mats.size()) return -1;
+            const auto& m = mats[matIdx];
+            int texIdx = -1;
+            if (m.has("pbrMetallicRoughness") && m["pbrMetallicRoughness"].has("baseColorTexture"))
+                texIdx = (int)m["pbrMetallicRoughness"]["baseColorTexture"]["index"].asInt();
+            else if (m.has("emissiveTexture")) texIdx = (int)m["emissiveTexture"]["index"].asInt();
+            if (texIdx < 0 || !root.has("textures")) return -1;
+            const auto& texs = root["textures"];
+            if ((size_t)texIdx >= texs.size()) return -1;
+            if (texs[texIdx].has("source")) return (int)texs[texIdx]["source"].asInt();
+            return -1;
+        };
+        // Solid material color for textureless materials: glTF baseColorFactor (else
+        // emissiveFactor) — LINEAR floats, so convert to sRGB bytes for the sRGB texture.
+        // (The Incredibles "buildings"/logo/cubes are solid emissive-colored materials.)
+        auto lin2srgb = [](float c)->u8 {
+            c = c<0?0:(c>1?1:c);
+            float s = (c<=0.0031308f) ? 12.92f*c : 1.055f*powf(c,1.f/2.4f)-0.055f;
+            int v=(int)(s*255.f+0.5f); return (u8)(v<0?0:v>255?255:v);
+        };
+        auto matSolidColor = [&](int matIdx, u8 out[4]) -> bool {
+            out[0]=out[1]=out[2]=200; out[3]=255;
+            if (matIdx < 0 || !root.has("materials")) return false;
+            const auto& mats = root["materials"];
+            if ((size_t)matIdx >= mats.size()) return false;
+            const auto& m = mats[matIdx];
+            const tinyjson::Value* f = nullptr;
+            if (m.has("pbrMetallicRoughness") && m["pbrMetallicRoughness"].has("baseColorFactor"))
+                f = &m["pbrMetallicRoughness"]["baseColorFactor"];
+            else if (m.has("emissiveFactor")) f = &m["emissiveFactor"];
+            if (!f) return false;
+            for (int i=0;i<3 && i<(int)f->size();++i) out[i]=lin2srgb((float)(*f)[i].asFloat());
+            if (f->size()>=4) out[3]=(u8)((float)(*f)[3].asFloat()*255.f+0.5f);
+            return true;
+        };
+        // Transparency: glTF alphaMode == "BLEND" (or a translucent baseColorFactor alpha)
+        // -> alpha-blend this primitive (e.g. the Incredibles purple environment dome).
+        auto matIsBlend = [&](int matIdx) -> bool {
+            if (matIdx < 0 || !root.has("materials")) return false;
+            const auto& mats = root["materials"];
+            if ((size_t)matIdx >= mats.size()) return false;
+            const auto& m = mats[matIdx];
+            // BLEND = alpha-blend; MASK = alpha cutout (transparent where alpha<cutoff). Both must
+            // honor the texture's alpha so the transparent parts (flame edges, planet/sprite/ship
+            // backgrounds) don't render as opaque squares. (Was only handling BLEND -> the Outer
+            // Wilds fireplace/planets/spaceship "no transparency" bug.) We approximate MASK with
+            // alpha-blend since the shared shader has no discard.
+            if (m.has("alphaMode")) { std::string am = m["alphaMode"].asString(); if (am=="BLEND" || am=="MASK") return true; }
+            if (m.has("pbrMetallicRoughness") && m["pbrMetallicRoughness"].has("baseColorFactor")) {
+                const auto& f = m["pbrMetallicRoughness"]["baseColorFactor"];
+                if (f.size() >= 4 && (float)f[3].asFloat() < 0.99f) return true;
+            }
+            return false;
+        };
+        // glTF face culling: a material is single-sided unless doubleSided==true (spec default false).
+        // Single-sided -> the renderer back-face culls (libshell-faithful). The cel-shading OUTLINE
+        // material (inverted black hull) is single-sided; culling it makes it show as edge rims
+        // instead of a solid blob that blacks out the whole interior.
+        auto matIsDoubleSided = [&](int matIdx) -> bool {
+            if (matIdx < 0 || !root.has("materials")) return true;   // no material -> treat as 2-sided
+            const auto& mats = root["materials"];
+            if ((size_t)matIdx >= mats.size()) return true;
+            const auto& m = mats[matIdx];
+            return m.has("doubleSided") && m["doubleSided"].asBool();
+        };
+
+        const auto& accessors  = root.has("accessors") ? root["accessors"] : tinyjson::Value();
+        const auto& bufferViews= root.has("bufferViews") ? root["bufferViews"] : tinyjson::Value();
+        // read a numeric accessor as floats (handles VEC2/VEC3, float or normalized int)
+        auto readAccessorF = [&](int acc, int comps, std::vector<float>& out) -> u32 {
+            if (acc < 0 || (size_t)acc >= accessors.size()) return 0;
+            const auto& a = accessors[acc];
+            int bv = a.has("bufferView") ? (int)a["bufferView"].asInt() : -1;
+            if (bv < 0) return 0;
+            const auto& v = bufferViews[bv];
+            size_t bvOff = v.has("byteOffset") ? (size_t)v["byteOffset"].asInt() : 0;
+            size_t stride = v.has("byteStride") ? (size_t)v["byteStride"].asInt() : 0;
+            size_t accOff = a.has("byteOffset") ? (size_t)a["byteOffset"].asInt() : 0;
+            int ct = (int)a["componentType"].asInt();   // 5126 float,5123 u16,5125 u32,5121 u8,5122 i16,5120 i8
+            u32 count = (u32)a["count"].asInt();
+            // glTF "normalized": integer accessors map to [0,1] (unsigned) or [-1,1] (signed).
+            // CRITICAL for skinning: WEIGHTS_0 is often normalized u8/u16 — read raw (0..255) it
+            // blows skinned verts to infinity (the "chaos" on rigged characters). Also applies to
+            // normalized UV/COLOR. (JOINTS_0 is never normalized -> raw indices, handled by flag.)
+            bool norm = a.has("normalized") && a["normalized"].asBool();
+            size_t compSize = (ct==5126||ct==5125)?4:(ct==5123||ct==5122)?2:1;
+            if (!stride) stride = compSize*comps;
+            out.resize((size_t)count*comps);
+            const u8* base = bin.data() + bvOff + accOff;
+            for (u32 i=0;i<count;++i) {
+                const u8* p = base + (size_t)i*stride;
+                for (int c=0;c<comps;++c) {
+                    const u8* e = p + c*compSize;
+                    float f=0;
+                    if (ct==5126) f = *reinterpret_cast<const float*>(e);
+                    else if (ct==5123) { f = *reinterpret_cast<const u16*>(e); if (norm) f /= 65535.0f; }
+                    else if (ct==5125) f = (float)*reinterpret_cast<const u32*>(e);
+                    else if (ct==5121) { f = *e; if (norm) f /= 255.0f; }
+                    else if (ct==5122) { f = *reinterpret_cast<const int16_t*>(e); if (norm) { f /= 32767.0f; if (f<-1.f) f=-1.f; } }
+                    else { f = (float)*reinterpret_cast<const int8_t*>(e); if (norm) { f /= 127.0f; if (f<-1.f) f=-1.f; } }
+                    out[(size_t)i*comps+c] = f;
+                }
+            }
+            return count;
+        };
+        auto readIndices = [&](int acc, std::vector<u32>& out) {
+            if (acc < 0 || (size_t)acc >= accessors.size()) return;
+            const auto& a = accessors[acc];
+            int bv = (int)a["bufferView"].asInt();
+            const auto& v = bufferViews[bv];
+            size_t bvOff = v.has("byteOffset") ? (size_t)v["byteOffset"].asInt() : 0;
+            size_t accOff = a.has("byteOffset") ? (size_t)a["byteOffset"].asInt() : 0;
+            int ct = (int)a["componentType"].asInt();
+            u32 count = (u32)a["count"].asInt();
+            const u8* p = bin.data() + bvOff + accOff;
+            out.resize(count);
+            for (u32 i=0;i<count;++i)
+                out[i] = (ct==5125) ? *reinterpret_cast<const u32*>(p+i*4)        // UNSIGNED_INT (no truncation!)
+                       : (ct==5123) ? (u32)*reinterpret_cast<const u16*>(p+i*2)   // UNSIGNED_SHORT
+                                    : (u32)p[i];                                   // UNSIGNED_BYTE
+        };
+
+        const auto& nodes = root.has("nodes") ? root["nodes"] : tinyjson::Value();
+        const auto& gmeshes = root.has("meshes") ? root["meshes"] : tinyjson::Value();
+
+        // ── Parse skeleton/animation state for CPU skinning ──
+        gnodes.assign(nodes.size(), GNode{});
+        for (size_t i=0;i<nodes.size();++i) {
+            const auto& nd = nodes[i];
+            if (nd.has("translation")) for(int k=0;k<3;k++) gnodes[i].t[k]=(float)nd["translation"][k].asFloat();
+            if (nd.has("rotation"))    for(int k=0;k<4;k++) gnodes[i].r[k]=(float)nd["rotation"][k].asFloat();
+            if (nd.has("scale"))       for(int k=0;k<3;k++) gnodes[i].s[k]=(float)nd["scale"][k].asFloat();
+            if (nd.has("children")) for(size_t c=0;c<nd["children"].size();++c) {
+                int ch=(int)nd["children"][c].asInt(); if(ch>=0&&(size_t)ch<gnodes.size()) gnodes[ch].parent=(int)i;
+            }
+        }
+        // TV-animation RE-ANCHOR: the Rick&Morty livingroom glTF authors its animated screen node
+        // (`TV_Anim`, a 100-frame skinned flipbook) over by the WINDOW (~+Z), not on the TV; libshell
+        // repositions it onto the TV at runtime (not in the glTF/markup). Replicate that: when the
+        // `TV_Anim` node is present, shift the skinned screen onto the TV. HSR_REANCHOR overrides.
+        for (size_t i=0;i<root["nodes"].size();++i) {
+            if (root["nodes"][i].has("name") && root["nodes"][i]["name"].asString()=="TV_Anim") {
+                reanchor[0]=-3.2f; reanchor[1]=-0.2f; reanchor[2]=-2.0f;
+                log("glTF: TV_Anim animated screen -> re-anchored onto the TV (%.2f,%.2f,%.2f)", reanchor[0],reanchor[1],reanchor[2]);
+                break;
+            }
+        }
+        if (root.has("skins")) {
+            const auto& sk = root["skins"];
+            for (size_t i=0;i<sk.size();++i) {
+                GSkin g;
+                if (sk[i].has("joints")) for(size_t j=0;j<sk[i]["joints"].size();++j) g.joints.push_back((int)sk[i]["joints"][j].asInt());
+                if (sk[i].has("inverseBindMatrices")) readAccessorF((int)sk[i]["inverseBindMatrices"].asInt(), 16, g.ibm);
+                gskins.push_back(std::move(g));
+            }
+        }
+        // Read ALL animation clips, not just [0]. V79 ambient envs split their motion across
+        // many clips (e.g. AmongUs: clip0=navRing spin, clips1-7=the crewmates) and play them
+        // ALL at once. Merge every clip's samplers+channels onto one timeline (sampler indices
+        // offset per clip); loop at the longest clip duration. (Reading only clip0 = most of an
+        // env's animation silently missing — the AmongUs "no animation" bug.)
+        if (root.has("animations")) {
+            const auto& anims = root["animations"];
+            for (size_t ai=0; ai<anims.size(); ++ai) {
+                const auto& an = anims[ai];
+                int samplerBase = (int)gsamplers.size();
+                if (an.has("samplers")) for (size_t s=0;s<an["samplers"].size();++s) {
+                    const auto& sm = an["samplers"][s];
+                    GSampler gs;
+                    readAccessorF((int)sm["input"].asInt(), 1, gs.times);
+                    const auto& outA = accessors[(int)sm["output"].asInt()];
+                    std::string tp = outA.has("type") ? outA["type"].asString() : "VEC3";
+                    gs.comps = (tp=="VEC4")?4:(tp=="SCALAR")?1:3;
+                    // glTF interpolation: STEP = hold the previous keyframe (no blend). Flipbooks
+                    // (e.g. the Rick&Morty animated-TV: 100 STEP scale tracks toggling frame-quads
+                    // 0<->1) MUST step — LINEAR-blending them fades/ghosts frames into each other
+                    // ("jumping images, not proper animation"). CUBICSPLINE we approximate as LINEAR.
+                    gs.step = sm.has("interpolation") && sm["interpolation"].asString()=="STEP";
+                    readAccessorF((int)sm["output"].asInt(), gs.comps, gs.vals);
+                    for (float tt : gs.times) if (tt>animDuration) animDuration=tt;
+                    gsamplers.push_back(std::move(gs));
+                }
+                if (an.has("channels")) for (size_t c=0;c<an["channels"].size();++c) {
+                    const auto& ch = an["channels"][c];
+                    GChannel gc; gc.sampler = samplerBase + (int)ch["sampler"].asInt();
+                    gc.node=(int)ch["target"]["node"].asInt();
+                    std::string path=ch["target"]["path"].asString();
+                    gc.path = (path=="rotation")?1:(path=="scale")?2:0;
+                    gchannels.push_back(gc);
+                }
+            }
+            log("animation: %zu clips, %zu channels, %zu samplers, duration=%.2fs",
+                anims.size(), gchannels.size(), gsamplers.size(), animDuration);
+        }
+
+        // Which nodes are animated (directly targeted by a channel, OR have an animated
+        // ancestor)? A mesh under such a node must NOT have its transform baked — it gets the
+        // node's world matrix streamed per frame.
+        std::vector<char> nodeDirectAnim(gnodes.size(), 0);
+        for (auto& ch : gchannels) if (ch.node>=0 && (size_t)ch.node<nodeDirectAnim.size()) nodeDirectAnim[ch.node]=1;
+        auto nodeAnimated = [&](int n) -> bool {
+            int guard=0;
+            while (n>=0 && (size_t)n<gnodes.size() && guard++<4096) {
+                if (nodeDirectAnim[n]) return true;
+                n = gnodes[n].parent;
+            }
+            return false;
+        };
+
+        // Emit a MeshData for each primitive of a node's mesh, world transform baked in.
+        std::function<void(int, const Mat4&)> visit = [&](int nodeIdx, const Mat4& parent) {
+            if (nodeIdx < 0 || (size_t)nodeIdx >= nodes.size()) return;
+            const auto& nd = nodes[nodeIdx];
+            Mat4 local = identity();
+            if (nd.has("matrix")) {
+                const auto& mm = nd["matrix"];
+                for (int i=0;i<16 && i<(int)mm.size();++i) local.m[i]=(float)mm[i].asFloat();
+            } else {
+                float t[3]={0,0,0}, q[4]={0,0,0,1}, s[3]={1,1,1};
+                if (nd.has("translation")) for(int i=0;i<3;i++) t[i]=(float)nd["translation"][i].asFloat();
+                if (nd.has("rotation"))    for(int i=0;i<4;i++) q[i]=(float)nd["rotation"][i].asFloat();
+                if (nd.has("scale"))       for(int i=0;i<3;i++) s[i]=(float)nd["scale"][i].asFloat();
+                local = fromTRS(t,q,s);
+            }
+            Mat4 world = mul(parent, local);
+            if (nd.has("mesh")) {
+                int mi = (int)nd["mesh"].asInt();
+                if ((size_t)mi < gmeshes.size()) {
+                    const auto& prims = gmeshes[mi]["primitives"];
+                    std::string nm = nd.has("name") ? nd["name"].asString()
+                                   : (gmeshes[mi].has("name") ? gmeshes[mi]["name"].asString() : "mesh");
+                    for (size_t p=0;p<prims.size();++p) {
+                        const auto& prim = prims[p];
+                        const auto& attr = prim["attributes"];
+                        int posAcc = attr.has("POSITION") ? (int)attr["POSITION"].asInt() : -1;
+                        int uvAcc  = attr.has("TEXCOORD_0") ? (int)attr["TEXCOORD_0"].asInt() : -1;
+                        if (posAcc < 0) continue;
+                        MeshData md; md.name = nm;
+                        std::vector<float> pos; u32 nv = readAccessorF(posAcc, 3, pos);
+                        if (!nv) continue;
+                        bool isSkinned = nd.has("skin") && attr.has("JOINTS_0") && attr.has("WEIGHTS_0");
+                        md.positions.resize((size_t)nv*3);
+                        if (isSkinned) {
+                            // Don't bake: keep LOCAL positions; capture skin data. animate(t)
+                            // streams skinned world positions per frame (bind pose at t=0).
+                            SkinnedRec rec; rec.skin=(int)nd["skin"].asInt(); rec.nv=nv; rec.basePos=pos;
+                            std::vector<float> jf, wf;
+                            readAccessorF((int)attr["JOINTS_0"].asInt(), 4, jf);
+                            readAccessorF((int)attr["WEIGHTS_0"].asInt(), 4, wf);
+                            rec.jidx.resize((size_t)nv*4); rec.jw.resize((size_t)nv*4);
+                            for (u32 i=0;i<nv*4;++i){ rec.jidx[i]=(u8)(jf[i]+0.5f); rec.jw[i]=(i<wf.size())?wf[i]:0.f; }
+                            rec.meshIdx=(int)meshes.size();
+                            md.dynamicVerts=true; md.gltfMeshIndex=(int)skinned.size();
+                            for (u32 i=0;i<nv*3;++i) md.positions[i]=pos[i];   // placeholder; animate fixes
+                            skinned.push_back(std::move(rec));
+                        } else if (nodeAnimated(nodeIdx)) {
+                            // Rigid node animation: keep LOCAL positions, stream node world per frame.
+                            NodeAnimRec nrec; nrec.meshIdx=(int)meshes.size(); nrec.nodeIdx=nodeIdx; nrec.basePos=pos;
+                            md.dynamicVerts=true;
+                            for (u32 i=0;i<nv*3;++i) md.positions[i]=pos[i];   // local placeholder; animate fixes
+                            nodeAnimRecs.push_back(std::move(nrec));
+                        } else {
+                            for (u32 i=0;i<nv;++i) {
+                                float o[3]; xformPoint(world, pos[i*3], pos[i*3+1], pos[i*3+2], o);
+                                md.positions[i*3]=o[0]; md.positions[i*3+1]=o[1]; md.positions[i*3+2]=o[2];
+                            }
+                        }
+                        std::vector<float> uv;
+                        if (uvAcc>=0) readAccessorF(uvAcc, 2, uv);
+                        md.uvs.resize((size_t)nv*2);
+                        // Read UVs exactly as authored — libshell's ModelFile_glTF.cpp does NO
+                        // U/V flip and GlTexture.cpp uploads the KTX as-is. (The dome floor's
+                        // "wrong textures" turned out to be an ASTC-footprint bug in the KTX
+                        // decoder — 8x6 blocks mis-strided as 8x8 — not a UV flip.)
+                        for (u32 i=0;i<nv;++i){
+                            md.uvs[i*2]   = (i*2  <uv.size()) ? uv[i*2]   : 0.f;
+                            md.uvs[i*2+1] = (i*2+1<uv.size()) ? uv[i*2+1] : 0.f; }
+                        if (prim.has("indices")) readIndices((int)prim["indices"].asInt(), md.indices);
+                        else { md.indices.resize(nv); for(u32 i=0;i<nv;++i) md.indices[i]=i; }
+                        md.nVerts=nv; md.nIdx=(u32)md.indices.size();
+                        // base color texture
+                        int matIdx = prim.has("material") ? (int)prim["material"].asInt() : -1;
+                        int imgIdx = matBaseImage(matIdx);
+                        if (imgIdx>=0 && (size_t)imgIdx<images.size() && images[imgIdx].ok) {
+                            md.texRGBA = images[imgIdx].rgba; md.texW=images[imgIdx].w; md.texH=images[imgIdx].h; md.hasTexture=true;
+                        } else {
+                            // No texture: use the material's solid baseColorFactor/emissive color.
+                            u8 c[4]; matSolidColor(matIdx, c);
+                            md.texRGBA={c[0],c[1],c[2],c[3]}; md.texW=md.texH=1; md.hasTexture=true;
+                        }
+                        md.useBlend = matIsBlend(matIdx);  // alpha-blend transparent materials
+                        md.doubleSided = matIsDoubleSided(matIdx);  // single-sided -> back-face cull
+                        md.transform.rot[3]=1.f;  // identity (world already baked in)
+                        meshes.push_back(std::move(md));
+                    }
+                }
+            }
+            if (nd.has("children")) for (size_t c=0;c<nd["children"].size();++c) visit((int)nd["children"][c].asInt(), world);
+        };
+        // Roots: scene.nodes, else all nodes.
+        int sceneIdx = root.has("scene") ? (int)root["scene"].asInt() : 0;
+        if (root.has("scenes") && (size_t)sceneIdx < root["scenes"].size() && root["scenes"][sceneIdx].has("nodes")) {
+            const auto& rn = root["scenes"][sceneIdx]["nodes"];
+            for (size_t i=0;i<rn.size();++i) visit((int)rn[i].asInt(), identity());
+        } else {
+            for (size_t i=0;i<nodes.size();++i) visit((int)i, identity());
+        }
+        if (hasAnimation()) animate(0.0f);   // bind pose for the initial upload
+        log("V79 loaded: %zu mesh primitives (%zu skinned, anim=%.2fs)",
+            meshes.size(), skinned.size(), animDuration);
+        return !meshes.empty();
+    }
+
+    // Sample a sampler at time t (LINEAR; NLERP for vec4 quaternions). Clamps to ends.
+    void sampleSampler(const GSampler& s, float t, float out[4]) const {
+        int n = (int)s.times.size();
+        for (int c=0;c<s.comps;++c) out[c] = s.vals.empty()?0.f:s.vals[c];
+        if (n==0) return;
+        if (t <= s.times[0]) { for(int c=0;c<s.comps;++c) out[c]=s.vals[c]; return; }
+        if (t >= s.times[n-1]) { for(int c=0;c<s.comps;++c) out[c]=s.vals[(size_t)(n-1)*s.comps+c]; return; }
+        int i=0; while (i<n-1 && !(s.times[i]<=t && t<s.times[i+1])) ++i;
+        const float* v0=&s.vals[(size_t)i*s.comps]; const float* v1=&s.vals[(size_t)(i+1)*s.comps];
+        if (s.step) { for(int c=0;c<s.comps;++c) out[c]=v0[c]; return; }   // hold prev keyframe (flipbook)
+        float t0=s.times[i], t1=s.times[i+1];
+        float a = (t1>t0) ? (t-t0)/(t1-t0) : 0.f;
+        for (int c=0;c<s.comps;++c) out[c]=v0[c]+(v1[c]-v0[c])*a;
+        if (s.comps==4) { // normalize quaternion
+            float l=sqrtf(out[0]*out[0]+out[1]*out[1]+out[2]*out[2]+out[3]*out[3]);
+            if (l>1e-8f) for(int c=0;c<4;c++) out[c]/=l;
+        }
+    }
+
+    // CPU skeletal skinning: sample the clip at time t, build joint matrices, skin each
+    // skinned mesh's vertices into meshes[rec.meshIdx].positions (the renderer streams
+    // those into the persistently-mapped VBO each frame). Our own code — no libshell.
+    void animate(float t) {
+        if (!hasAnimation()) return;
+        { static int rd=-1; if(rd<0){ rd=0; if(const char* r=std::getenv("HSR_REANCHOR")) sscanf(r,"%f,%f,%f",&reanchor[0],&reanchor[1],&reanchor[2]); } }
+        if (animDuration > 0.0f) t = fmodf(t, animDuration);
+        std::vector<GNode> cur = gnodes;
+        for (auto& ch : gchannels) {
+            if (ch.node<0 || (size_t)ch.node>=cur.size() || ch.sampler<0 || (size_t)ch.sampler>=gsamplers.size()) continue;
+            float v[4]={0,0,0,1};
+            sampleSampler(gsamplers[ch.sampler], t, v);
+            if (ch.path==0) { cur[ch.node].t[0]=v[0]; cur[ch.node].t[1]=v[1]; cur[ch.node].t[2]=v[2]; }
+            else if (ch.path==1) { cur[ch.node].r[0]=v[0]; cur[ch.node].r[1]=v[1]; cur[ch.node].r[2]=v[2]; cur[ch.node].r[3]=v[3]; }
+            else { cur[ch.node].s[0]=v[0]; cur[ch.node].s[1]=v[1]; cur[ch.node].s[2]=v[2]; }
+        }
+        std::vector<Mat4> world(cur.size()); std::vector<char> done(cur.size(),0);
+        std::function<Mat4(int)> wm = [&](int n)->Mat4 {
+            if (n<0 || (size_t)n>=cur.size()) return identity();
+            if (done[n]) return world[n];
+            done[n]=1;
+            Mat4 local = fromTRS(cur[n].t, cur[n].r, cur[n].s);
+            world[n] = (cur[n].parent>=0) ? mul(wm(cur[n].parent), local) : local;
+            return world[n];
+        };
+        for (size_t n=0;n<cur.size();++n) wm((int)n);
+        for (auto& rec : skinned) {
+            if (rec.skin<0 || (size_t)rec.skin>=gskins.size()) continue;
+            const GSkin& sk = gskins[rec.skin];
+            std::vector<Mat4> jm(sk.joints.size());
+            for (size_t j=0;j<sk.joints.size();++j) {
+                Mat4 ibm; for(int k=0;k<16;k++) ibm.m[k]=((size_t)j*16+k<sk.ibm.size())?sk.ibm[j*16+k]:(k%5==0?1.f:0.f);
+                int jn = sk.joints[j];
+                jm[j] = mul((jn>=0&&(size_t)jn<world.size())?world[jn]:identity(), ibm);
+            }
+            auto& out = meshes[rec.meshIdx].positions;
+            out.resize((size_t)rec.nv*3);
+            for (u32 v=0; v<rec.nv; ++v) {
+                float px=rec.basePos[v*3], py=rec.basePos[v*3+1], pz=rec.basePos[v*3+2];
+                float ox=0,oy=0,oz=0, wsum=0;
+                for (int c=0;c<4;++c) {
+                    float w=rec.jw[v*4+c]; if (w<=0) continue;
+                    int j=rec.jidx[v*4+c]; if ((size_t)j>=jm.size()) continue;
+                    float o[3]; xformPoint(jm[j], px,py,pz, o);
+                    ox+=w*o[0]; oy+=w*o[1]; oz+=w*o[2]; wsum+=w;
+                }
+                // Normalize by the weight sum: glTF doesn't guarantee weights sum to 1 (japan's koi
+                // sum to ~1.1-1.5), and `Σ w·pos` without the divide pushes every vert to 1.5× its
+                // position = stretched-ribbon "broken skeleton". libshell normalizes; pre-normalized
+                // rigs (wsum≈1) are unaffected.
+                if (wsum>1e-5f){ ox/=wsum; oy/=wsum; oz/=wsum; } else { ox=px; oy=py; oz=pz; }
+                out[v*3]=ox+reanchor[0]; out[v*3+1]=oy+reanchor[1]; out[v*3+2]=oz+reanchor[2];
+            }
+            static int sdbg=-1; if(sdbg<0) sdbg=std::getenv("HSR_SKINDBG")?1:0;
+            if (sdbg) {
+                float lo[3]={1e9f,1e9f,1e9f},hi[3]={-1e9f,-1e9f,-1e9f};
+                // bbox of only the VISIBLE verts (skinned to a bone whose scale!=0) vs all
+                for (u32 v=0; v<rec.nv; ++v) for(int c=0;c<3;++c){ float x=out[v*3+c]; if(x<lo[c])lo[c]=x; if(x>hi[c])hi[c]=x; }
+                log("[SKINDBG] mesh#%d nv=%u skinned bbox=[%.2f,%.2f,%.2f]..[%.2f,%.2f,%.2f] (extent %.2f,%.2f,%.2f)",
+                    rec.meshIdx, rec.nv, lo[0],lo[1],lo[2], hi[0],hi[1],hi[2], hi[0]-lo[0],hi[1]-lo[1],hi[2]-lo[2]);
+            }
+        }
+        // Rigid node animation: transform each animated node's mesh by the node's world matrix.
+        for (auto& rec : nodeAnimRecs) {
+            Mat4 m = (rec.nodeIdx>=0 && (size_t)rec.nodeIdx<world.size()) ? world[rec.nodeIdx] : identity();
+            auto& out = meshes[rec.meshIdx].positions;
+            size_t nv = rec.basePos.size()/3; out.resize(nv*3);
+            for (size_t v=0; v<nv; ++v) {
+                float o[3]; xformPoint(m, rec.basePos[v*3], rec.basePos[v*3+1], rec.basePos[v*3+2], o);
+                out[v*3]=o[0]; out[v*3+1]=o[1]; out[v*3+2]=o[2];
+            }
+        }
+    }
+};
