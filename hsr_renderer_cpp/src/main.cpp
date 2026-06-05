@@ -318,6 +318,10 @@ int main(int argc, char** argv) {
     };
 
     loadShadersFromApk(apkPath);
+    // AUTO-DETECT V203/HSL: if the env ships its OWN RENDSHAD (the SHAD per-material shaders), it's a
+    // V203 home -> use the per-material path (perMat) by DEFAULT so the STOCK render (no flags) is
+    // faithful. V79 sources ship no RENDSHAD and keep the built-in shader. (HSR_NOPERMAT forces off.)
+    bool envShippedRendShad = !shaders.empty();
 
     // The v200+ shared shaders (horizon_shared_shaders / renderer_module) are a SYSTEM
     // library — identical across every new env, NOT owned by any one env. When the input
@@ -611,11 +615,15 @@ int main(int argc, char** argv) {
     vkRenderer.globalShaderPath = g_globalShaderPath;               // per-material matParams match gate
     // Per-material shaders (HSR_PERMAT): hand the renderer EVERY loaded shader so it can build a
     // program per distinct material shader and route each mesh to its own (faithful emissive/masked/vege).
-    if (std::getenv("HSR_PERMAT")) {
+    // DEFAULT ON for V203/HSL envs (they ship their own per-material RENDSHAD) so the stock render needs
+    // no flags; HSR_PERMAT forces on for any env; HSR_NOPERMAT forces off.
+    bool usePerMat = !std::getenv("HSR_NOPERMAT") && (std::getenv("HSR_PERMAT") || envShippedRendShad);
+    if (usePerMat) {
         vkRenderer.perMat = true;
         for (auto& p : progs)
             vkRenderer.loadedShaders.push_back({ VkRenderer::surfaceName(p.name), p.vert, p.frag });
-        fprintf(stderr, "[MAIN] HSR_PERMAT: %zu shader programs available\n", progs.size());
+        fprintf(stderr, "[MAIN] per-material shaders ON (%zu programs)%s\n", progs.size(),
+                envShippedRendShad ? " [auto: V203 env ships RENDSHAD]" : " [HSR_PERMAT]");
     }
 
     if (!vkRenderer.init(g_window, vertSpirv, fragSpirv, skinnedVertSpirv, skinnedFragSpirv)) {
