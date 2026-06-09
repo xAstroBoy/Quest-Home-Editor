@@ -702,4 +702,100 @@ public:
             }
         }
     }
+
+    // Bake a VAT (vertex animation texture) for an animated-node mesh. The static export already bakes REST-world
+    // geometry, so these WORLD-space offsets (animatedPos(f) - restPos) add straight on top with an identity entity
+    // transform (vatunlitbasecolor does pos += sample). Returns offsets[(f*nv + v)*3]; nvOut=vertexCount; empty if
+    // meshIdx isn't an animated node mesh. animate() has side effects on meshes[].positions — restored to rest after.
+    std::vector<float> bakeVAT(int meshIdx, int frames, int& nvOut) {
+        nvOut = 0;
+        const NodeAnimRec* rec = nullptr;
+        for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { rec = &r; break; }
+        if (!rec || frames < 2 || animDuration <= 0.0f) return {};
+        size_t nv = rec->basePos.size() / 3; nvOut = (int)nv;
+        animate(0.0f);
+        std::vector<float> rest = meshes[meshIdx].positions;                 // rest world positions
+        if (rest.size() < nv * 3) return {};
+        std::vector<float> off((size_t)frames * nv * 3, 0.0f);
+        for (int f = 0; f < frames; f++) {
+            animate((float)f / (float)frames * animDuration);
+            const auto& p = meshes[meshIdx].positions;
+            size_t n = std::min((size_t)nv * 3, std::min(p.size(), rest.size()));
+            for (size_t i = 0; i < n; i++) off[(size_t)f * nv * 3 + i] = p[i] - rest[i];
+        }
+        animate(0.0f);                                                       // restore rest pose for the static export
+        return off;
+    }
+
+    // ── HZANIM extraction: a skinned glTF mesh -> skeleton (hierarchical bind TRS) + per-vertex bones + the clip
+    //    (per-joint LOCAL TRS sampled at `frames`). Feeds encodeHzSkel + hzAclEncode + the skinned RENDMESH. ──
+    struct HzAnimExport {
+        std::vector<float> jointPos;     // jointCount*3   (bind local translation)
+        std::vector<float> jointQuat;    // jointCount*4   (bind local rotation, W,X,Y,Z for HZAN:SKEL)
+        std::vector<float> jointScale;   // jointCount     (bind local uniform scale)
+        std::vector<int>   parents;      // jointCount     (parent joint index, -1 = root)
+        std::vector<uint8_t> boneIdx, boneWgt;  // nv*4 each (sem7 indices, sem8 u8 weights)
+        std::vector<float> trsLocal;     // frames*jointCount*10 (quat X,Y,Z,W + translation3 + scale3) for ACL
+        std::vector<float> restPos;      // nv*3 REST mesh/model-space positions (NOT world-baked — skinning needs these)
+        int jointCount = 0, frameCount = 0; float fps = 0.f;
+        bool ok() const { return jointCount > 0 && frameCount > 1; }
+    };
+    HzAnimExport extractHzAnim(int meshIdx, int frames) {
+        HzAnimExport e;
+        const SkinnedRec* rec = nullptr;
+        for (auto& r : skinned) if (r.meshIdx == meshIdx) { rec = &r; break; }
+        if (!rec || rec->skin < 0 || (size_t)rec->skin >= gskins.size() || animDuration <= 0.f || frames < 2) return e;
+        const GSkin& sk = gskins[rec->skin];
+        int nj = (int)sk.joints.size(); if (nj < 1) return e;
+        e.restPos = rec->basePos;   // rest mesh-space positions (skinning maps these -> animated world; world-baked positions fling it off-screen)
+        std::vector<int> nodeToJoint(gnodes.size(), -1);
+        for (int j = 0; j < nj; ++j) if ((size_t)sk.joints[j] < gnodes.size()) nodeToJoint[sk.joints[j]] = j;
+        e.jointCount = nj;
+        e.jointPos.resize(nj*3); e.jointQuat.resize(nj*4); e.jointScale.resize(nj); e.parents.resize(nj);
+        for (int j = 0; j < nj; ++j) {
+            int n = sk.joints[j]; const GNode& g = gnodes[n];
+            int pn = g.parent; e.parents[j] = (pn >= 0 && (size_t)pn < gnodes.size() && nodeToJoint[pn] >= 0) ? nodeToJoint[pn] : -1;
+            e.jointPos[j*3]=g.t[0]; e.jointPos[j*3+1]=g.t[1]; e.jointPos[j*3+2]=g.t[2];
+            e.jointQuat[j*4]=g.r[3]; e.jointQuat[j*4+1]=g.r[0]; e.jointQuat[j*4+2]=g.r[1]; e.jointQuat[j*4+3]=g.r[2];   // glTF xyzw -> wxyz
+            e.jointScale[j] = (g.s[0] > 1e-3f || g.s[0] < -1e-3f) ? g.s[0] : 1.0f;   // avoid bind scale 0 (Shield) -> singular inverse-bind -> NaN; clip still drives the 0->1 pop
+        }
+        e.boneIdx.resize((size_t)rec->nv*4); e.boneWgt.resize((size_t)rec->nv*4);
+        for (u32 v = 0; v < rec->nv; ++v) {
+            float wsum=0; for (int c=0;c<4;c++) wsum += rec->jw[v*4+c];
+            for (int c = 0; c < 4; ++c) {
+                e.boneIdx[v*4+c] = rec->jidx[v*4+c];
+                float w = wsum > 1e-6f ? rec->jw[v*4+c]/wsum : (c==0?1.f:0.f);
+                int iw = (int)(w*255.0f + 0.5f); e.boneWgt[v*4+c] = (uint8_t)(iw<0?0:(iw>255?255:iw));
+            }
+        }
+        e.frameCount = frames; e.fps = (float)frames / animDuration;
+        e.trsLocal.resize((size_t)frames*nj*10);
+        for (int f = 0; f < frames; ++f) {
+            float t = (float)f / (float)frames * animDuration;
+            std::vector<GNode> cur = gnodes;
+            for (auto& ch : gchannels) {
+                if (ch.node<0||(size_t)ch.node>=cur.size()||ch.sampler<0||(size_t)ch.sampler>=gsamplers.size()) continue;
+                float val[4]={0,0,0,1}; sampleSampler(gsamplers[ch.sampler], t, val);
+                if (ch.path==0){cur[ch.node].t[0]=val[0];cur[ch.node].t[1]=val[1];cur[ch.node].t[2]=val[2];}
+                else if (ch.path==1){cur[ch.node].r[0]=val[0];cur[ch.node].r[1]=val[1];cur[ch.node].r[2]=val[2];cur[ch.node].r[3]=val[3];}
+                else {cur[ch.node].s[0]=val[0];cur[ch.node].s[1]=val[1];cur[ch.node].s[2]=val[2];}
+            }
+            for (int j = 0; j < nj; ++j) {
+                int n = sk.joints[j]; float* o = &e.trsLocal[((size_t)f*nj+j)*10];
+                o[0]=cur[n].r[0]; o[1]=cur[n].r[1]; o[2]=cur[n].r[2]; o[3]=cur[n].r[3];   // quat xyzw (ACL)
+                o[4]=cur[n].t[0]; o[5]=cur[n].t[1]; o[6]=cur[n].t[2];
+                o[7]=cur[n].s[0]; o[8]=cur[n].s[1]; o[9]=cur[n].s[2];
+            }
+        }
+        if (std::getenv("HSR_HZDBG")) {
+            fprintf(stderr,"[HZDBG] mesh%d skin%d nj=%d frames=%d gchannels=%d animDur=%.2f\n",meshIdx,rec->skin,nj,frames,(int)gchannels.size(),animDuration);
+            for (int j=0;j<nj;++j){ float mn[10],mx[10]; for(int k=0;k<10;k++){mn[k]=1e9f;mx[k]=-1e9f;}
+                for(int f=0;f<frames;++f){float*o=&e.trsLocal[((size_t)f*nj+j)*10];for(int k=0;k<10;k++){if(o[k]<mn[k])mn[k]=o[k];if(o[k]>mx[k])mx[k]=o[k];}}
+                fprintf(stderr,"   j%d node%d dRot=%.3f dTrans=%.3f scale[%.2f..%.2f]\n",j,sk.joints[j],
+                    (mx[0]-mn[0])+(mx[1]-mn[1])+(mx[2]-mn[2])+(mx[3]-mn[3]),(mx[4]-mn[4])+(mx[5]-mn[5])+(mx[6]-mn[6]),mn[7],mx[7]); }
+            int nc=0; for(auto&ch:gchannels) if(nodeToJoint[ch.node<0?0:(ch.node>=(int)nodeToJoint.size()?0:ch.node)]>=0) nc++;
+            fprintf(stderr,"   channels targeting skin joints: %d / %d\n",nc,(int)gchannels.size());
+        }
+        return e;
+    }
 };

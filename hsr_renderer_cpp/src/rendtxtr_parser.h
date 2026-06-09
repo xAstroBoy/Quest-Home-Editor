@@ -3,6 +3,8 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <thread>
+#include <vector>
 #include "astcenc.h"
 
 // RENDTXTR header parser — 1:1 replica of
@@ -142,7 +144,7 @@ inline bool parseRendtxtrHeader(const std::vector<u8>& data, RendtxtrInfo& info)
 namespace astc {
 
 inline bool decodeASTC(const u8* rawMips, u32 rawLen, u32 width, u32 height,
-                       u32 bw, u32 bh, std::vector<u8>& outRGBA) {
+                       u32 bw, u32 bh, std::vector<u8>& outRGBA, bool hdr = false) {
     // Clamp to exactly the first mip's block data — extra mip tails make astcenc reject.
     u32 cols = (width  + bw - 1) / bw;
     u32 rows = (height + bh - 1) / bh;
@@ -151,20 +153,53 @@ inline bool decodeASTC(const u8* rawMips, u32 rawLen, u32 width, u32 height,
     if (rawLen < mip0Size) return false;
 
     astcenc_config cfg = {};
+    // HDR-encoded ASTC (the .hdr baked lightmaps) MUST use the HDR profile. Decoding them as LDR makes
+    // astcenc emit MAGENTA error texels, which the lightmap shader multiplies into the base -> purple ground.
     astcenc_error err = astcenc_config_init(
-        ASTCENC_PRF_LDR, bw, bh, 1,
+        hdr ? ASTCENC_PRF_HDR : ASTCENC_PRF_LDR, bw, bh, 1,
         ASTCENC_PRE_MEDIUM,
         ASTCENC_FLG_DECOMPRESS_ONLY,
         &cfg);
     if (err != ASTCENC_SUCCESS) return false;
 
+    // Decode ACROSS CORES: astcenc cooperatively decompresses one image from N worker threads (each gets a
+    // thread_index 0..N-1 on the same context). The 2048² baked textures dominate load time; this divides the
+    // per-image decode by the core count. The loader allocates a fresh context per call (one image), so no
+    // inter-image reset is needed. HSR_ASTC_THREADS overrides the worker count.
+    unsigned N = std::thread::hardware_concurrency(); if (N < 1) N = 1; if (N > 16) N = 16;
+    if (const char* e = std::getenv("HSR_ASTC_THREADS")) { int v = atoi(e); if (v >= 1) N = (unsigned)v; }
+
     astcenc_context* ctx = nullptr;
-    err = astcenc_context_alloc(&cfg, 1, &ctx);
+    err = astcenc_context_alloc(&cfg, N, &ctx);
     if (err != ASTCENC_SUCCESS) return false;
 
     outRGBA.resize(width * height * 4);
-    u8* slicePtr = outRGBA.data();
+    const astcenc_swizzle swz = {ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A};
 
+    auto runMT = [&](astcenc_image* im) -> astcenc_error {
+        if (N <= 1) return astcenc_decompress_image(ctx, rawMips, rawLen, im, &swz, 0);
+        std::vector<std::thread> th; std::vector<astcenc_error> e(N, ASTCENC_SUCCESS);
+        for (unsigned t = 0; t < N; ++t)
+            th.emplace_back([&, t] { e[t] = astcenc_decompress_image(ctx, rawMips, rawLen, im, &swz, t); });
+        for (auto& x : th) x.join();
+        for (auto ee : e) if (ee != ASTCENC_SUCCESS) return ee;
+        return ASTCENC_SUCCESS;
+    };
+
+    if (hdr) {
+        // Decode HDR ASTC to float, then clamp to [0,1] -> u8 (baked lighting; >1 highlights clamp to white).
+        std::vector<float> fbuf((size_t)width * height * 4);
+        float* fptr = fbuf.data();
+        astcenc_image fimg = {}; fimg.dim_x = width; fimg.dim_y = height; fimg.dim_z = 1;
+        fimg.data_type = ASTCENC_TYPE_F32; fimg.data = reinterpret_cast<void**>(&fptr);
+        err = runMT(&fimg);
+        astcenc_context_free(ctx);
+        if (err != ASTCENC_SUCCESS) return false;
+        for (size_t i = 0; i < fbuf.size(); ++i) { float v = fbuf[i]; v = v < 0 ? 0 : (v > 1 ? 1 : v); outRGBA[i] = (u8)(v * 255.0f + 0.5f); }
+        return true;
+    }
+
+    u8* slicePtr = outRGBA.data();
     astcenc_image img = {};
     img.dim_x = width;
     img.dim_y = height;
@@ -172,9 +207,7 @@ inline bool decodeASTC(const u8* rawMips, u32 rawLen, u32 width, u32 height,
     img.data_type = ASTCENC_TYPE_U8;
     img.data = reinterpret_cast<void**>(&slicePtr);
 
-    const astcenc_swizzle swz = {ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A};
-
-    err = astcenc_decompress_image(ctx, rawMips, rawLen, &img, &swz, 0);
+    err = runMT(&img);
     astcenc_context_free(ctx);
 
     return err == ASTCENC_SUCCESS;

@@ -28,6 +28,10 @@ class SceneLoader {
 public:
     std::vector<MeshData> meshes;
     bool verbose = true;
+    // Skipped / undecoded elements, recorded during load and printed as a summary at the end (always, even
+    // with verbose off) — so missing textures / unparsed meshes / unresolved assets are never silent.
+    std::vector<std::string> skips;
+    void recordSkip(const std::string& s) { skips.push_back(s); }
 
     // ── v203 HzAnim skeletal animation (CPU skin into dynamicVerts, like OPA/glTF) ──
     RendSkel skel; RendClip clip;
@@ -61,6 +65,7 @@ public:
                     wsum += w;
                 }
                 if (wsum < 1e-4f) { ox=bx; oy=by; oz=bz; }
+                else { float inv=1.0f/wsum; ox*=inv; oy*=inv; oz*=inv; }   // normalize (weights may not sum to 1)
                 md.positions[v*3]=ox; md.positions[v*3+1]=oy; md.positions[v*3+2]=oz;
             }
             if (std::getenv("HSR_ANIMDBG") && nv > 1000) {
@@ -282,26 +287,72 @@ public:
         log("Step 3: Loading HSTF hierarchy recursively from: %s", spacePath->c_str());
         std::vector<DrawableEntity> entities;
         {
-            std::set<std::string> visitedHstf;
-            std::function<void(const std::string&, int)> loadHstfRec;
-            loadHstfRec = [&](const std::string& path, int depth) {
-                if (depth <= 0 || visitedHstf.count(path)) return;
-                visitedHstf.insert(path);
+            // stackHstf = recursion-STACK (cycle guard only). The old code used a permanent visited-set,
+            // which silently DROPPED any template reached via a 2nd parent/transform — i.e. legitimately
+            // re-instanced templates (the repeated "pockets", the cave sand/ground clones) → seafloor/cave
+            // GAPS. A stack guard still breaks real cycles (A→…→A) but lets a template instance many times.
+            std::set<std::string> stackHstf;
+            std::set<std::string> everHstf;   // diagnostic: which templates were being re-instanced (previously deduped)
+            std::function<void(const std::string&, int, const Transform&, const float*)> loadHstfRec;
+            loadHstfRec = [&](const std::string& path, int depth, const Transform& parent, const float* parentMat) {
+                if (depth <= 0 || stackHstf.count(path)) return;        // skip only if already on the CURRENT path (a cycle)
+                if (everHstf.count(path)) log("  RE-INSTANCE template (was previously deduped → gap): %s", path.c_str());
+                stackHstf.insert(path); everHstf.insert(path);
                 log("  [d=%d] %s", depth, path.c_str());
 
                 auto hdata = readAsset(path);
-                if (hdata.empty()) return;
+                if (hdata.empty()) { stackHstf.erase(path); return; }
                 std::string hjson((char*)hdata.data(), hdata.size());
 
                 // Collect drawable entities in this HSTF (leaf behavior)
                 std::vector<DrawableEntity> localEnts;
                 parseHstf(hjson, localEnts, false);
-                for (auto& e : localEnts) entities.push_back(e);
+
+                // FAITHFUL empty-transform resolution. The cooker sometimes emits a mesh entity whose
+                // TransformPlatformComponent has NO localPosition (oceanarium Root_sand_SHELL): a flat read
+                // drops it to the origin, leaving a seafloor GAP — but in-headset it sits with the rest of
+                // the level. The cave content (rocks/sand/trim) all share one localPosition (10,0,-5) — a
+                // group offset the cook baked per-mesh — while a few distant rocks sit elsewhere, so it is a
+                // DOMINANT (majority) offset, not unanimous. When the same localPosition is shared by a strict
+                // majority (>50%) of a level's positioned mesh siblings, an empty-transform mesh belongs at
+                // that group offset. Levels whose meshes have VARIED positions (fgpockets — oceanGround
+                // correctly stays at origin; every coral is unique → no majority) leave empty meshes alone.
+                // The level ROOT has no mesh (meshRef.ing==0) so it never participates. Reproduces VR for both
+                // levels; generalizes to any empty-transform mesh ("fix one fixes the rest").
+                {
+                    int nPos = 0, bestCnt = 0; float best[3] = {0,0,0};
+                    for (size_t i = 0; i < localEnts.size(); ++i) {
+                        if (localEnts[i].emptyTransform || localEnts[i].meshRef.ing == 0) continue;
+                        ++nPos; const float* pi = localEnts[i].transform.pos; int cnt = 0;
+                        for (const auto& e : localEnts) {
+                            if (e.emptyTransform || e.meshRef.ing == 0) continue;
+                            const float* pj = e.transform.pos;
+                            if (std::fabs(pj[0]-pi[0])<1e-3f && std::fabs(pj[1]-pi[1])<1e-3f && std::fabs(pj[2]-pi[2])<1e-3f) ++cnt;
+                        }
+                        if (cnt > bestCnt) { bestCnt = cnt; best[0]=pi[0]; best[1]=pi[1]; best[2]=pi[2]; }
+                    }
+                    bool nonZero = std::fabs(best[0])>1e-3f || std::fabs(best[1])>1e-3f || std::fabs(best[2])>1e-3f;
+                    if (bestCnt >= 2 && bestCnt * 2 > nPos && nonZero) {     // a GROUP (≥2) forming a strict majority share one offset
+                        int fixed = 0;
+                        for (auto& e : localEnts)
+                            if (e.emptyTransform && e.meshRef.ing != 0) { e.transform.pos[0]=best[0]; e.transform.pos[1]=best[1]; e.transform.pos[2]=best[2]; ++fixed; }
+                        if (fixed) log("  empty-transform mesh(es) inherited level group offset (%.2f,%.2f,%.2f) [%d/%d siblings]: %d fixed", best[0],best[1],best[2], bestCnt,nPos, fixed);
+                    }
+                }
+                // Compose this level's accumulated world transform onto each local drawable (so template
+                // instances land at their world placement, not template-local — fixes far-flung sunrays2,
+                // seafloor gaps, etc.). Top level passes identity, so direct entities are unchanged.
+                for (auto& e : localEnts) {
+                    float lm[16]; trsToMat4(e.transform, lm);                 // this node's LOCAL T·R·S
+                    mat4mul4(parentMat, lm, e.worldMatrix); e.hasWorldMatrix = true;  // faithful 4×4 world (keeps shear)
+                    e.transform = composeTransform(parent, e.transform);      // composed TRS too (bounds/probe/editor)
+                    entities.push_back(e);
+                }
 
                 // Follow entity type refs (intermediate/recursive behavior)
                 try {
                     auto doc = tinyjson::parse(hjson);
-                    if (!doc.has("entities") || !doc["entities"].isArray()) return;
+                    if (!doc.has("entities") || !doc["entities"].isArray()) { stackHstf.erase(path); return; }
                     const auto& arr = doc["entities"];
                     for (size_t i = 0; i < arr.size(); ++i) {
                         const auto& ent = arr[i];
@@ -320,11 +371,17 @@ public:
                                 (unsigned long long)typeKey.ing, typeKey.tgt);
                             continue;
                         }
-                        loadHstfRec(*typePath, depth - 1);
+                        // Compose the INSTANCE entity's placement onto the parent before descending, so the
+                        // referenced template's geometry inherits where this instance sits in the world.
+                        Transform inst = parseHstfEntityTransform(ent);
+                        float im[16], cm[16]; trsToMat4(inst, im); mat4mul4(parentMat, im, cm); // parent·instance (4×4)
+                        loadHstfRec(*typePath, depth - 1, composeTransform(parent, inst), cm);
                     }
                 } catch (...) {}
+                stackHstf.erase(path);   // pop: allow re-entry of this template via a different parent/transform
             };
-            loadHstfRec(*spacePath, 6);
+            float identMat[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+            loadHstfRec(*spacePath, 6, Transform{}, identMat);
         }
         log("  Total drawable entities from HSTF hierarchy: %zu", entities.size());
         if (entities.empty()) {
@@ -338,20 +395,25 @@ public:
         auto loadTexture = [&](const AssetKey& texKey, MeshData& md) -> bool {
             const std::string* tp = resolve(texKey);
             if (!tp) {
+                char b[64]; snprintf(b,sizeof b,"ing=%016llX tgt=%08X",(unsigned long long)texKey.ing,texKey.tgt);
+                if (texKey.ing != 0)   // ing=0 = material declares no base texture (pos-only/emissive mesh) — not a failure
+                    recordSkip(std::string("texture key not in manifest: ")+b);
                 log("  Texture key not in manifest: ing=%016llX tgt=%08X",
                     (unsigned long long)texKey.ing, texKey.tgt);
                 return false;
             }
             auto texData = readAsset(*tp);
-            if (texData.empty()) { log("  Texture data empty: %s", tp->c_str()); return false; }
+            if (texData.empty()) { recordSkip("texture data empty: "+*tp); log("  Texture data empty: %s", tp->c_str()); return false; }
             RendtxtrInfo ti;
             if (!parseRendtxtrHeader(texData, ti)) {
+                recordSkip("RENDTXTR header parse failed: "+*tp);
                 log("  RENDTXTR header parse failed: %s", tp->c_str());
                 return false;
             }
             u32 rawLen = ti.rawDataLen;
             if (!astc::decodeASTC(texData.data() + ti.rawDataOffset, rawLen,
                                   ti.width, ti.height, ti.blockW, ti.blockH, md.texRGBA)) {
+                recordSkip("ASTC decode failed: "+*tp);
                 log("  ASTC decode failed: %s", tp->c_str());
                 return false;
             }
@@ -364,14 +426,32 @@ public:
         //    (used to load normal/ORM/lightmap maps into their MeshData slots).
         auto decodeTexInto = [&](const AssetKey& texKey, std::vector<u8>& out, u32& ow, u32& oh) -> bool {
             const std::string* tp = resolve(texKey);
+            if (!tp) return false;   // role-specific map simply not present — not an error
+            auto texData = readAsset(*tp);
+            if (texData.empty()) { recordSkip("aux-texture data empty: "+*tp); return false; }
+            RendtxtrInfo ti;
+            if (!parseRendtxtrHeader(texData, ti)) { recordSkip("aux-texture RENDTXTR parse fail: "+*tp); return false; }
+            // .hdr/.exr baked lightmaps are ASTC-HDR — decode with the HDR profile (LDR decode = magenta).
+            bool isHdr = tp->find(".hdr") != std::string::npos || tp->find(".exr") != std::string::npos;
+            if (!astc::decodeASTC(texData.data() + ti.rawDataOffset, ti.rawDataLen,
+                                  ti.width, ti.height, ti.blockW, ti.blockH, out, isHdr)) { recordSkip("aux-texture ASTC decode fail: "+*tp); return false; }
+            ow = ti.width; oh = ti.height;
+            return true;
+        };
+        // ── Helper: VAT offset texture (t_*_vatdata.exr -> tex). It's NOT ASTC — it's an
+        //    R16G16B16A16_SFLOAT (half-float) image (libshell TextureFormat 97; sub_DE8EEC), width=vertexCount,
+        //    height=frameCount, + a mip chain. Grab mip0 (w*h*8 raw half-float bytes) for verbatim upload.
+        auto decodeVatFloat = [&](const AssetKey& texKey, MeshData& md) -> bool {
+            const std::string* tp = resolve(texKey);
             if (!tp) return false;
             auto texData = readAsset(*tp);
             if (texData.empty()) return false;
             RendtxtrInfo ti;
             if (!parseRendtxtrHeader(texData, ti)) return false;
-            if (!astc::decodeASTC(texData.data() + ti.rawDataOffset, ti.rawDataLen,
-                                  ti.width, ti.height, ti.blockW, ti.blockH, out)) return false;
-            ow = ti.width; oh = ti.height;
+            size_t mip0 = (size_t)ti.width * ti.height * 8;   // 4 channels * 2 bytes (half)
+            if (ti.width == 0 || ti.height == 0 || ti.rawDataOffset + mip0 > texData.size()) return false;
+            md.vatRaw.assign(texData.begin() + ti.rawDataOffset, texData.begin() + ti.rawDataOffset + mip0);
+            md.vatW = ti.width; md.vatH = ti.height; md.hasVat = true;
             return true;
         };
         // Classify a texture path into a shader role by its filename suffix — this mirrors
@@ -381,7 +461,11 @@ public:
         auto texRole = [](const std::string& p) -> int {
             std::string s = p; for (auto& c : s) c = (char)tolower((unsigned char)c);
             if (s.find("unsupported") != std::string::npos) return -1;
-            if (s.find("lightmap") != std::string::npos) return 4;
+            // Lightmap: the full word OR the "_lm" suffix (t_sand_lm.png). Without the suffix match the
+            // sand's lightmap (t_sand_lm) was mis-classified as BASE color -> the sand floor rendered its
+            // lightmap as the texture (broken). (loungeSand worked: its lightmap is named "..._lightmap".)
+            if (s.find("lightmap") != std::string::npos ||
+                s.find("_lm.") != std::string::npos || s.find("_lm/") != std::string::npos) return 4;
             if (s.find("emissive") != std::string::npos) return 3;
             if (s.find("onxrny") != std::string::npos || s.find("normal") != std::string::npos ||
                 s.find("_nrm") != std::string::npos) return 1;
@@ -515,6 +599,8 @@ public:
             // shader variants, a follow-up.)
             md.shaderIng = matInfo.shaderIng;   // record which RENDSHAD this material uses
             md.matParamsBlob = matInfo.constBlock;   // real per-material matParams (Tint/Layer*/Metallic…)
+            md.constParams = matInfo.constParams;    // {nameHash,off,size} -> bind by name (MurmurHash3)
+            md.texSlots = matInfo.texSlots;          // sampler-slot name-hashes -> pick matching shader variant
             AssetKey sk = {0, matInfo.shaderIng, matInfo.shaderTgt};
             const std::string* sp = resolve(sk);
             if (!sp) { sk.pkg = matInfo.shaderPkg; sp = resolve(sk); }
@@ -522,17 +608,39 @@ public:
             if (sp && (sp->find("blend") != std::string::npos ||
                        sp->find("Blend") != std::string::npos))
                 md.useBlend = true;
+            // vatlitbubble is a TRANSLUCENT shader (its frag computes alpha/alphaSq/fogAlpha + ACES tonemap)
+            // but its name has no "blend" token, so it was drawn in the OPAQUE pass — the alpha was ignored
+            // and the bubbles rendered as solid GRAY spheres. Mark bubble shaders blend so the alpha shows.
+            if (sp && sp->find("bubble") != std::string::npos) md.useBlend = true;
+            // Foliage/card shaders (unlitfoliage — the vista MERGED_BG rocks/cliffs, cWeed/coral cards) are
+            // alpha CUTOUTS: the texture's alpha=0 border must drop out, not render as solid black. The frag
+            // discards by design but the per-material variant pick doesn't always hit the discard variant, so
+            // mark it alpha-test (and blend as the safety net) to kill the black halo.
+            if (sp && sp->find("foliage") != std::string::npos) { md.alphaTest = true; md.useBlend = true; }
 
             // Load EVERY texture the material references into its role slot, exactly as
             // libshell binds each shader texture resource by name. A HAVEN prop material
             // carries base-color(+metallic), ONxRNy(normal+rough+AO), and sometimes ORM /
             // emissive / lightmap. The base-color is the one bound to BaseColorMetallic_Tx.
-            u64 baseIng = 0;
+            // Base-color selection: a material may list the SYSTEM white.png default FIRST and the REAL
+            // base-colour texture (e.g. t_fabricbeige_fabricteal_basecolormetallic = the blue cushion
+            // fabric) after it. Picking "first base wins" grabbed white -> washed/flat props. PREFER a
+            // texture whose name actually marks it as a base colour ("basecolor"/"albedo"/"diffuse") over
+            // the generic white/renderer_module default.
+            u64 baseIng = 0, defaultBaseIng = 0;
             for (u64 ing : matInfo.texIngs) {
                 AssetKey k = {0, ing, matInfo.texTgt};
                 const std::string* tp = resolve(k);
                 if (!tp) { k.pkg = matInfo.texPkg; tp = resolve(k); }
                 if (!tp) continue;
+                {   // VAT offset texture (half-float) — decode separately, never as ASTC/base.
+                    std::string ln = *tp; for (char& c : ln) c = (char)tolower((unsigned char)c);
+                    if (ln.find("vatdata") != std::string::npos) {
+                        AssetKey tk = {matInfo.texPkg, ing, matInfo.texTgt};
+                        if (decodeVatFloat(tk, md)) log("    [vat]      %s (%ux%u f16)", tp->c_str(), md.vatW, md.vatH);
+                        continue;
+                    }
+                }
                 int role = texRole(*tp);
                 AssetKey tk = {matInfo.texPkg, ing, matInfo.texTgt};
                 switch (role) {
@@ -551,9 +659,20 @@ public:
                                 md.hasLightmap = true; log("    [lightmap] %s", tp->c_str()); } break;
                     case 3: if (decodeTexInto(tk, md.emissiveRGBA, md.emissiveW, md.emissiveH)) {
                                 md.hasEmissive = true; log("    [emissive] %s", tp->c_str()); } break;
-                    case 0: default: if (!baseIng) baseIng = ing; break;  // first base wins
+                    case 0: default: {
+                        std::string ln = *tp; for (char& c : ln) c = (char)tolower((unsigned char)c);
+                        bool isRealBase = ln.find("basecolor") != std::string::npos ||
+                                          ln.find("albedo") != std::string::npos ||
+                                          ln.find("diffuse") != std::string::npos;
+                        bool isDefault  = ln.find("renderer_module") != std::string::npos ||
+                                          ln.find("white.png") != std::string::npos;
+                        if (isRealBase && !isDefault) { if (!baseIng) baseIng = ing; }   // the REAL fabric/albedo
+                        else if (!defaultBaseIng) defaultBaseIng = ing;                  // white / generic fallback
+                        break;
+                    }
                 }
             }
+            if (!baseIng) baseIng = defaultBaseIng;
             if (!baseIng && !matInfo.texIngs.empty()) baseIng = matInfo.texIngs.front();
             AssetKey texKey = {matInfo.texPkg, baseIng, matInfo.texTgt};
             bool ok = loadTexture(texKey, md);
@@ -585,6 +704,8 @@ public:
             // ── Resolve mesh
             const std::string* meshPath = resolve(obj.meshRef);
             if (!meshPath) {
+                char b[64]; snprintf(b,sizeof b,"ing=%016llX tgt=%08X",(unsigned long long)obj.meshRef.ing,obj.meshRef.tgt);
+                recordSkip(std::string("mesh not in manifest: ")+b);
                 log("  SKIP: mesh not in manifest (ing=%016llX tgt=%08X)",
                     (unsigned long long)obj.meshRef.ing, obj.meshRef.tgt);
                 failedCount++;
@@ -609,12 +730,19 @@ public:
                 bool isNav  = low.find("navmesh") != npos || nlow.find("navmesh") != npos;
                 bool isCol  = low.find("_col_mesh") != npos || nlow.find("_col") != npos || nlow.find("collision") != npos;
                 bool isUI   = nlow.find("placement") != npos || nlow.find("hotspot") != npos || nlow.find("icon") != npos;
+                // "blkt" = BLOCKOUT/greybox proxy: every blktGardenWall/blktDeskWall/blktPortalWall/blktBackWall/
+                // blktFloorBlock/blktPlatformBlockB is a flat untextured (stride-12) twin of a DETAILED mesh
+                // (gardenWall, deskWall, ...). Rendering it overlaps & HIDES the real grooved wall ("misplaced,
+                // needs groves"). libshell doesn't show greybox — the detailed twin is the visual. Skip it.
+                bool isBlkt = nlow.find("blkt") != npos;
                 // Editor: load navmesh (1) + collision/walls (2) as editable translucent overlays
                 // instead of dropping them. Still skip physics-duplicate (__phys_) meshes and UI quads.
-                if (isNav && !isPhys) overlayKind = 1;
-                else if (isCol && !isPhys) overlayKind = 2;
-                if (isPhys || isUI) {
-                    log("  SKIP: non-visual (phys-duplicate / UI gizmo)");
+                if (isNav && !isPhys) { overlayKind = 1; recordSkip("NOT RENDERED — classified navmesh overlay: "+obj.name); }
+                else if (isCol && !isPhys) { overlayKind = 2; recordSkip("NOT RENDERED — classified collision overlay: "+obj.name); }
+                if (isPhys || isUI || isBlkt) {
+                    if (isUI) recordSkip("NOT RENDERED — classified UI/gizmo: "+obj.name);
+                    else if (isBlkt) recordSkip("NOT RENDERED — blockout greybox (detailed twin renders instead): "+obj.name);
+                    log("  SKIP: non-visual (phys-duplicate / UI gizmo / blockout greybox)");
                     continue;
                 }
             }
@@ -629,6 +757,9 @@ public:
             MeshData md;
             md.name      = obj.name;
             md.transform = obj.transform;
+            md.atlasCellIndex = obj.atlasCellIndex;                         // per-instance atlas variant (coral colour)
+            md.hasWorldMatrix = obj.hasWorldMatrix;                         // faithful 4×4 world (parent→child)
+            if (obj.hasWorldMatrix) memcpy(md.worldMatrix, obj.worldMatrix, sizeof(md.worldMatrix));
             md.overlayKind = overlayKind;
 
             if (const char* dm = std::getenv("HSR_DUMPMESH")) {
@@ -640,7 +771,8 @@ public:
               }
             }
             if (!parseRendMesh(meshData, md.positions, md.uvs, md.indices,
-                               &md.boneIndices, &md.boneWeights, md.name.c_str())) {
+                               &md.boneIndices, &md.boneWeights, md.name.c_str(), &md.uvs2)) {
+                recordSkip("RENDMESH parse failed: " + (meshPath ? *meshPath : md.name));
                 log("  SKIP: RENDMESH parse failed");
                 failedCount++;
                 continue;
@@ -682,10 +814,10 @@ public:
                 // (Tint + GlobalTile) like the room; only the plain-unwrap props (bowls/vases) strip it.
                 md.tiled = (matPath->find("_tiled") != std::string::npos);
                 auto matData = readAsset(*matPath);
-                if (matData.empty()) { log("  Material data empty"); continue; }
+                if (matData.empty()) { recordSkip("material data empty: "+*matPath); log("  Material data empty"); continue; }
 
                 MatlmatlInfo matInfo;
-                if (!parseMatlmatl(matData, matInfo)) { log("  MATLMATL parse failed"); continue; }
+                if (!parseMatlmatl(matData, matInfo)) { recordSkip("MATLMATL parse failed: "+*matPath); log("  MATLMATL parse failed"); continue; }
                 log("  Shader: ing=%016llX  Tex: ing=%016llX",
                     (unsigned long long)matInfo.shaderIng, (unsigned long long)matInfo.texIng);
                 if (std::getenv("HSR_DUMPMAT2") &&
@@ -727,10 +859,32 @@ public:
                 md.texRGBA = ut.texRGBA;
                 md.texW = ut.texW; md.texH = ut.texH;
                 md.hasTexture = true;
-                md.useBlend = false;
+                // VFX overlays (god rays / sun / surface waves) carry a mostly-TRANSPARENT glow texture and
+                // have no material — drawn OPAQUE they showed as a solid WHITE blob (vfx_surfaceWaves_SUN).
+                // They're ADDITIVE glow (light), so the transparent areas add nothing and the glow blends.
+                // The real skybox dome stays opaque.
+                std::string nm = md.name; for (char& c : nm) c = (char)tolower((unsigned char)c);
+                bool isVfx = nm.find("vfx") != std::string::npos || nm.find("sunray") != std::string::npos ||
+                             nm.find("surfacewave") != std::string::npos || nm.find("_sun") != std::string::npos ||
+                             nm.find("godray") != std::string::npos || nm.find("caustic") != std::string::npos;
+                // VFX (sun/rays/surface waves): ADDITIVE + premultiply, so the transparent surround adds
+                // nothing (no white blob) but the disk/glow adds light. The no-material shader outputs
+                // alpha=1, so plain alpha-blend can't drop the surround — additive on a premultiplied tex is
+                // the only way to get the sun glow visible WITHOUT the full-white quad. Boost so it reads.
+                md.useBlend = isVfx;
+                md.additive = isVfx;
+                if (isVfx) {
+                    for (size_t p = 0; p + 3 < md.texRGBA.size(); p += 4) {
+                        u32 a = md.texRGBA[p+3];
+                        for (int c = 0; c < 3; ++c) {
+                            u32 v = (u32)md.texRGBA[p+c] * a / 255 * 3;   // premult × 3 brightness boost
+                            md.texRGBA[p+c] = (u8)(v > 255 ? 255 : v);
+                        }
+                    }
+                }
                 gotTex = true;
-                log("  UnrefTex[%zu] -> %ux%u (skybox/env opaque)",
-                    unrefTexIdx % n, ut.texW, ut.texH);
+                log("  UnrefTex[%zu] -> %ux%u (%s)",
+                    unrefTexIdx % n, ut.texW, ut.texH, isVfx ? "VFX additive premult x3" : "skybox/env opaque");
                 unrefTexIdx = (unrefTexIdx + 1) % n;
             }
 
@@ -777,6 +931,8 @@ public:
                 if (claimedPaths.count(fname) || claimedPaths.count(normPath)) continue;
 
                 log("  Unclaimed: %s", fname.c_str());
+                { std::string bn=fname; size_t p=bn.rfind('/'); if(p!=std::string::npos) bn=bn.substr(p+1);
+                  recordSkip("UNCLAIMED mesh — loaded at ORIGIN (no entity transform → gap at real spot): "+bn); }
                 size_t msz = 0;
                 void* mdptr = mz_zip_reader_extract_to_heap(&sceneZip, fi, &msz, 0);
                 if (!mdptr) { log("  Extract failed"); continue; }
@@ -837,6 +993,36 @@ public:
                 if (skel.ok() && clip.ok()) for (size_t mi=0; mi<meshes.size(); ++mi) {
                     auto& md = meshes[mi];
                     if (!md.hasBones || md.boneIndices.size() < md.positions.size()/3*4) continue;
+                    // Only genuine SKINNED-shader meshes bind sbSkinningMatrices in libshell. Many static meshes
+                    // carry stray sem7/8 data (false-positive hasBones); skinning those with the whale clip
+                    // explodes them. Gate on the skinned shader (unlitskinneddistancefade / unlitblendskinned).
+                    if (md.shaderPath.find("skinned") == std::string::npos) continue;
+                    // ── Bone-slot -> skel-joint REMAP (libshell fillBoneDataWithRemapping) ──────────────
+                    // The mesh's per-vertex bone indices are PALETTE slots, not skel-joint indices; libshell
+                    // writes skinMatrix[joint] into sbSkinningMatrices[remap[joint]]. The mesh stores no palette
+                    // we could find, but it's RECOVERABLE from the bind: the verts a slot rigidly drives cluster
+                    // at the joint it represents, so match each slot's high-weight centroid to the nearest skel
+                    // joint, then rewrite the vertex indices so skin[idx] addresses the correct joint.
+                    {
+                        int nJ = (int)skel.joints.size();
+                        // The skel file stores joints BREADTH-FIRST, but the mesh's bone SLOTS are in the
+                        // skeleton's DEPTH-FIRST traversal order (the FBX skin-cluster order). slot s addresses
+                        // sbSkinningMatrices[s], which libshell fills as skinMatrix[ dfsOrder[s] ]. So remap each
+                        // vertex slot -> its skel joint: boneIndex = dfsOrder[boneIndex]. (HSR_HZNOREMAP disables.)
+                        std::vector<int> dfs; std::vector<int> stk;
+                        for (int j=nJ-1;j>=0;--j) if (skel.joints[j].parent<0) stk.push_back(j);
+                        while (!stk.empty()) { int j=stk.back(); stk.pop_back(); dfs.push_back(j);
+                            for (int c=nJ-1;c>=0;--c) if (skel.joints[c].parent==j) stk.push_back(c); }
+                        bool ident=true; for(int s=0;s<(int)dfs.size();s++) if(dfs[s]!=s){ident=false;break;}
+                        if ((int)dfs.size()==nJ && !ident && !std::getenv("HSR_HZNOREMAP"))
+                            for (auto& bi : md.boneIndices) if (bi<nJ) bi=(u8)dfs[bi];
+                        if (std::getenv("HSR_HZBONE")) { std::string rs; for(size_t s=0;s<dfs.size();s++){rs+=std::to_string(dfs[s]);rs+=" ";} log("  [HZREMAP] %s ident=%d dfs(slot->joint): %s", md.name.c_str(),(int)ident,rs.c_str()); }
+                    }
+                    if (std::getenv("HSR_HZBONE")) {
+                        int maxIdx=0; float wmin=1e9f,wmax=-1e9f; size_t nv=md.positions.size()/3;
+                        for (size_t v=0; v<nv; ++v){ float ws=0; for(int k=0;k<4;k++){ size_t e=v*4+k; if(e<md.boneIndices.size()){ if(md.boneIndices[e]>maxIdx)maxIdx=md.boneIndices[e]; ws+=md.boneWeights[e]/255.f; } } if(ws<wmin)wmin=ws; if(ws>wmax)wmax=ws; }
+                        log("  [HZBONE] mesh%zu '%s' maxBoneIdx=%d wsum[%.2f,%.2f] (skel=%zu joints)", mi, md.name.c_str(), maxIdx, wmin, wmax, skel.joints.size());
+                    }
                     SkinRec r; r.meshIdx=mi; r.basePos=md.positions; r.bIdx=md.boneIndices; r.bWgt=md.boneWeights;
                     skinRecs.push_back(std::move(r)); md.dynamicVerts = true;
                 }
@@ -879,6 +1065,44 @@ public:
                 }
                 log("  Spawn points: %zu facing-cone markers", spawnPts.size());
             }
+        }
+
+        // ── PROBE: HSR_PROBE="x,z" lists the meshes nearest that world point (find a gap's mesh) ───────
+        if (const char* pe = std::getenv("HSR_PROBE")) {
+            float px = 0, pz = 0; sscanf(pe, "%f,%f", &px, &pz);
+            // Meshes whose WORLD XZ-AABB CONTAINS the point (so big floor meshes centred elsewhere are found),
+            // sorted by min-Y (the floor sits lowest). Transform every vert to world (quat xyzw · scale + pos).
+            std::vector<std::pair<float,size_t>> hit;  // {minY, idx}
+            for (size_t i = 0; i < meshes.size(); ++i) {
+                auto& m = meshes[i]; size_t nv = m.positions.size()/3; if (!nv) continue;
+                const float* q = m.transform.rot; const float* sc = m.transform.scale; const float* tp = m.transform.pos;
+                float mn[3]={1e9f,1e9f,1e9f}, mx[3]={-1e9f,-1e9f,-1e9f};
+                for (size_t v=0; v<nv; ++v) {
+                    float lx=m.positions[v*3]*sc[0], ly=m.positions[v*3+1]*sc[1], lz=m.positions[v*3+2]*sc[2];
+                    float tx=2*(q[1]*lz-q[2]*ly), ty=2*(q[2]*lx-q[0]*lz), tz=2*(q[0]*ly-q[1]*lx);
+                    float wx=lx+q[3]*tx+(q[1]*tz-q[2]*ty)+tp[0], wy=ly+q[3]*ty+(q[2]*tx-q[0]*tz)+tp[1], wz=lz+q[3]*tz+(q[0]*ty-q[1]*tx)+tp[2];
+                    if(wx<mn[0])mn[0]=wx; if(wy<mn[1])mn[1]=wy; if(wz<mn[2])mn[2]=wz;
+                    if(wx>mx[0])mx[0]=wx; if(wy>mx[1])mx[1]=wy; if(wz>mx[2])mx[2]=wz;
+                }
+                if (px>=mn[0]-0.5f && px<=mx[0]+0.5f && pz>=mn[2]-0.5f && pz<=mx[2]+0.5f)
+                    hit.push_back({mn[1], i});
+            }
+            std::sort(hit.begin(), hit.end());
+            fprintf(stderr, "[PROBE] %zu meshes whose world XZ-AABB contains (%.1f,%.1f) [sorted by minY]:\n", hit.size(), px, pz);
+            for (int k=0; k<30 && k<(int)hit.size(); ++k) { size_t i=hit[k].second; auto& m=meshes[i];
+                fprintf(stderr, "  minY=%6.1f blend=%d ovl=%d  %-44.44s  %s\n",
+                    hit[k].first, (int)m.useBlend, m.overlayKind, m.name.c_str(), m.shaderPath.c_str()); }
+        }
+
+        // ── LOAD REPORT: skipped / undecoded elements (ALWAYS printed, even with verbose off) ──────────
+        {
+            std::sort(skips.begin(), skips.end());
+            skips.erase(std::unique(skips.begin(), skips.end()), skips.end());
+            fprintf(stderr, "[LOAD REPORT] %zu meshes loaded; %zu distinct skipped/undecoded element(s)%s\n",
+                    meshes.size(), skips.size(), skips.empty() ? "  (all decoded)" : ":");
+            size_t cap = skips.size() < 50 ? skips.size() : 50;
+            for (size_t i = 0; i < cap; ++i) fprintf(stderr, "   - %s\n", skips[i].c_str());
+            if (skips.size() > cap) fprintf(stderr, "   ... (%zu more)\n", skips.size() - cap);
         }
 
         mz_zip_reader_end(&sceneZip);

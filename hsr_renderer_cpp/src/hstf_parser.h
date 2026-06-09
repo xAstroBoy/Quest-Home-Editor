@@ -10,6 +10,65 @@
 //
 // Parses Horizon Scene Template Format JSON, extracting DrawableEntity list.
 
+// Extract an entity's local TransformPlatformComponent (pos / rot[euler→quat or quat] / scale).
+inline Transform parseHstfEntityTransform(const tinyjson::Value& ent) {
+    Transform t;
+    if (!ent.has("components") || !ent["components"].isArray()) return t;
+    const auto& comps = ent["components"];
+    for (size_t ci = 0; ci < comps.size(); ++ci) {
+        const auto& comp = comps[ci];
+        if (!comp.has("data")) continue;
+        const auto& cd = comp["data"];
+        std::string cls = cd.has("class") ? cd["class"].asString() : "";
+        if (cls.find("TransformPlatformComponent") == std::string::npos) continue;
+        const auto& dat = cd.has("data") ? cd["data"] : tinyjson::Value();
+        if (dat.has("localPosition")) {
+            const auto& p = dat["localPosition"];
+            t.pos[0]=(float)(p.has("x")?p["x"].asFloat():0); t.pos[1]=(float)(p.has("y")?p["y"].asFloat():0); t.pos[2]=(float)(p.has("z")?p["z"].asFloat():0);
+        }
+        if (dat.has("localRotationQuat")) {
+            // AUTHORITATIVE rotation = the cooked quaternion. The sibling localRotation (euler) DISAGREES
+            // (e.g. euler=180°-about-Y while the quat is identity) — euler is a stale/display value whose
+            // axis order doesn't match. Reading euler flipped/tilted every rotated mesh (slanted sand, gaps).
+            const auto& q = dat["localRotationQuat"];
+            float qx=(float)(q.has("x")?q["x"].asFloat():0), qy=(float)(q.has("y")?q["y"].asFloat():0), qz=(float)(q.has("z")?q["z"].asFloat():0), qw=(float)(q.has("w")?q["w"].asFloat():1);
+            float L=std::sqrt(qx*qx+qy*qy+qz*qz+qw*qw); if(L<1e-8f){qx=qy=qz=0;qw=1;L=1;}
+            t.rot[0]=qx/L; t.rot[1]=qy/L; t.rot[2]=qz/L; t.rot[3]=qw/L;
+        }
+        else if (dat.has("localRotation")) {
+            const auto& lr = dat["localRotation"];
+            float rx=(float)(lr.has("x")?lr["x"].asFloat():0), ry=(float)(lr.has("y")?lr["y"].asFloat():0), rz=(float)(lr.has("z")?lr["z"].asFloat():0);
+            // localRotation: WITH w = quaternion; WITHOUT w = EULER RADIANS (libshell sub_C3B280 = half-angle
+            // euler→quat, confirmed in IDA — NOT a quat with derived w).
+            if (lr.has("w")) { float rw=(float)lr["w"].asFloat(); float L=std::sqrt(rx*rx+ry*ry+rz*rz+rw*rw); if(L<1e-8f){rx=ry=rz=0;rw=1;L=1;} t.rot[0]=rx/L;t.rot[1]=ry/L;t.rot[2]=rz/L;t.rot[3]=rw/L; }
+            else { float hx=rx*0.5f,hy=ry*0.5f,hz=rz*0.5f,cx=std::cos(hx),sx=std::sin(hx),cy=std::cos(hy),sy=std::sin(hy),cz=std::cos(hz),sz=std::sin(hz);
+                   // intrinsic ZYX euler→quat (libshell sub_C3B280, IDA-exact). NOT XYZ.
+                   t.rot[0]=sx*cy*cz-cx*sy*sz; t.rot[1]=cx*sy*cz+sx*cy*sz; t.rot[2]=cx*cy*sz-sx*sy*cz; t.rot[3]=cx*cy*cz+sx*sy*sz; }
+        }
+        if (dat.has("localScale")) {
+            const auto& s = dat["localScale"];
+            t.scale[0]=(float)(s.has("x")?s["x"].asFloat():1); t.scale[1]=(float)(s.has("y")?s["y"].asFloat():1); t.scale[2]=(float)(s.has("z")?s["z"].asFloat():1);
+        }
+    }
+    return t;
+}
+
+// World transform of a child under a parent: world = parent ∘ child (scale·rotate·translate).
+inline Transform composeTransform(const Transform& P, const Transform& C) {
+    Transform R;
+    R.scale[0]=P.scale[0]*C.scale[0]; R.scale[1]=P.scale[1]*C.scale[1]; R.scale[2]=P.scale[2]*C.scale[2];
+    float px=P.rot[0],py=P.rot[1],pz=P.rot[2],pw=P.rot[3];
+    float cx=C.rot[0],cy=C.rot[1],cz=C.rot[2],cw=C.rot[3];
+    R.rot[0]=pw*cx+px*cw+py*cz-pz*cy;  R.rot[1]=pw*cy-px*cz+py*cw+pz*cx;
+    R.rot[2]=pw*cz+px*cy-py*cx+pz*cw;  R.rot[3]=pw*cw-px*cx-py*cy-pz*cz;
+    float vx=P.scale[0]*C.pos[0], vy=P.scale[1]*C.pos[1], vz=P.scale[2]*C.pos[2];
+    float tx=2*(py*vz-pz*vy), ty=2*(pz*vx-px*vz), tz=2*(px*vy-py*vx);
+    R.pos[0]=P.pos[0]+vx+pw*tx+(py*tz-pz*ty);
+    R.pos[1]=P.pos[1]+vy+pw*ty+(pz*tx-px*tz);
+    R.pos[2]=P.pos[2]+vz+pw*tz+(px*ty-py*tx);
+    return R;
+}
+
 inline bool parseHstf(const std::string& jsonStr, std::vector<DrawableEntity>& out,
                       bool verbose = true) {
     try {
@@ -49,12 +108,29 @@ inline bool parseHstf(const std::string& jsonStr, std::vector<DrawableEntity>& o
                     const auto& dat = cd.has("data") ? cd["data"] : tinyjson::Value();
 
                     if (cls.find("TransformPlatformComponent") != std::string::npos) {
+                        // A TransformPlatformComponent with NO local pos/rot/scale (data:{}) is the cook
+                        // anomaly (e.g. oceanarium Root_sand_SHELL): a flat read leaves it at the origin.
+                        // Flagged here so the loader can resolve it from the level's group offset.
+                        if (!dat.has("localPosition") && !dat.has("localRotation") &&
+                            !dat.has("localRotationQuat") && !dat.has("localScale"))
+                            draw.emptyTransform = true;
                         if (dat.has("localPosition")) {
                             draw.transform.pos[0] = (float)(dat["localPosition"].has("x") ? dat["localPosition"]["x"].asFloat() : 0);
                             draw.transform.pos[1] = (float)(dat["localPosition"].has("y") ? dat["localPosition"]["y"].asFloat() : 0);
                             draw.transform.pos[2] = (float)(dat["localPosition"].has("z") ? dat["localPosition"]["z"].asFloat() : 0);
                         }
-                        if (dat.has("localRotation")) {
+                        if (dat.has("localRotationQuat")) {
+                            // AUTHORITATIVE rotation = the cooked quaternion. The sibling localRotation (euler)
+                            // DISAGREES with it (e.g. euler says 180°-about-Y while the quat is identity) — the
+                            // euler is a stale/display value whose axis order doesn't match ours. Reading it
+                            // flipped/tilted every rotated mesh (slanted sand, "gaps"). Use the quat directly.
+                            const auto& q = dat["localRotationQuat"];
+                            float qx=(float)(q.has("x")?q["x"].asFloat():0), qy=(float)(q.has("y")?q["y"].asFloat():0);
+                            float qz=(float)(q.has("z")?q["z"].asFloat():0), qw=(float)(q.has("w")?q["w"].asFloat():1);
+                            float L=std::sqrt(qx*qx+qy*qy+qz*qz+qw*qw); if(L<1e-8f){qx=qy=qz=0;qw=1;L=1;}
+                            draw.transform.rot[0]=qx/L; draw.transform.rot[1]=qy/L; draw.transform.rot[2]=qz/L; draw.transform.rot[3]=qw/L;
+                        }
+                        else if (dat.has("localRotation")) {
                             const auto& lr = dat["localRotation"];
                             float rx = (float)(lr.has("x") ? lr["x"].asFloat() : 0);
                             float ry = (float)(lr.has("y") ? lr["y"].asFloat() : 0);
@@ -67,18 +143,19 @@ inline bool parseHstf(const std::string& jsonStr, std::vector<DrawableEntity>& o
                                 draw.transform.rot[0]=rx/L; draw.transform.rot[1]=ry/L;
                                 draw.transform.rot[2]=rz/L; draw.transform.rot[3]=rw/L;
                             } else {
-                                // HSTF TransformPlatformComponent stores localRotation as EULER RADIANS
-                                // (x,y,z, no w). Reading it as a quaternion (w=1) yields a non-unit quat
-                                // that buildModelMatrix turns into a huge scale distortion (items flung
-                                // off the map). Convert euler->quaternion (intrinsic XYZ).
+                                // localRotation WITHOUT a w = EULER RADIANS → quaternion, EXACTLY as libshell.
+                                // From IDA disasm of TransformPlatformComponent.cpp's reader (sub_C99330 →
+                                // sub_C3B280, then sub_C3B228 normalises): half-angle euler in **intrinsic ZYX**
+                                // order (validated: identity→(0,0,0,1)). The old code used intrinsic XYZ — every
+                                // cross-term sign was FLIPPED, which spun the turtles' swim into the home/floor.
                                 float hx=rx*0.5f, hy=ry*0.5f, hz=rz*0.5f;
                                 float cx=std::cos(hx), sx=std::sin(hx);
                                 float cy=std::cos(hy), sy=std::sin(hy);
                                 float cz=std::cos(hz), sz=std::sin(hz);
-                                draw.transform.rot[0] = sx*cy*cz + cx*sy*sz;
-                                draw.transform.rot[1] = cx*sy*cz - sx*cy*sz;
-                                draw.transform.rot[2] = cx*cy*sz + sx*sy*cz;
-                                draw.transform.rot[3] = cx*cy*cz - sx*sy*sz;
+                                draw.transform.rot[0] = sx*cy*cz - cx*sy*sz;
+                                draw.transform.rot[1] = cx*sy*cz + sx*cy*sz;
+                                draw.transform.rot[2] = cx*cy*sz - sx*sy*cz;
+                                draw.transform.rot[3] = cx*cy*cz + sx*sy*sz;
                             }
                         }
                         if (dat.has("localScale")) {
@@ -121,6 +198,21 @@ inline bool parseHstf(const std::string& jsonStr, std::vector<DrawableEntity>& o
                                 if (verbose) fprintf(stderr, "[HSTF]     material[%zu]: pkg=%016llX ing=%016llX tgt=%08X\n",
                                     mi, (unsigned long long)matRef.pkg,
                                     (unsigned long long)matRef.ing, matRef.tgt);
+                            }
+                        }
+                    }
+                    else if (cls.find("MaterialPropertyOverrides") != std::string::npos) {
+                        // Per-instance material overrides. The unlitatlasinstance coral carry
+                        // "instance.atlasCellIndex" (value.x = which atlas cell = which colour variant). Without
+                        // it every coral sampled cell 0 (one colour: coral_22 was blue, should be pink=cell 21).
+                        if (dat.has("constantParameters") && dat["constantParameters"].isArray()) {
+                            const auto& cps = dat["constantParameters"];
+                            for (size_t ci = 0; ci < cps.size(); ++ci) {
+                                const auto& cp = cps[ci].has("data") ? cps[ci]["data"] : tinyjson::Value();
+                                if (cp.has("parameterName") &&
+                                    cp["parameterName"].asString().find("atlasCellIndex") != std::string::npos &&
+                                    cp.has("value") && cp["value"].has("x"))
+                                    draw.atlasCellIndex = (float)cp["value"]["x"].asFloat();
                             }
                         }
                     }

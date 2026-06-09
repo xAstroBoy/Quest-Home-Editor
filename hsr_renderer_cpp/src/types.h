@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -11,6 +12,41 @@ using u16 = uint16_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
 using i32 = int32_t;
+
+// MurmurHash3 x86 32-bit (canonical, seed-parameterised). libshell hashes cooked material constant
+// names with this (seed 0) over the fully-qualified uniform name "matParams.<member>" — confirmed by
+// reversing setUniformByHash call sites (compile-time hash + literal name) and reproducing every env
+// material's constantParameter nameHashes. This is the KEY that binds cooked constants to shader UBO slots.
+inline u32 murmur3_x86_32(const void* key, size_t len, u32 seed = 0) {
+    const u8* data = static_cast<const u8*>(key);
+    const size_t nblocks = len / 4;
+    u32 h1 = seed;
+    const u32 c1 = 0xcc9e2d51u, c2 = 0x1b873593u;
+    auto rotl = [](u32 x, int r) -> u32 { return (x << r) | (x >> (32 - r)); };
+    for (size_t i = 0; i < nblocks; ++i) {
+        u32 k1;
+        std::memcpy(&k1, data + i * 4, 4);          // little-endian host (Windows x64)
+        k1 *= c1; k1 = rotl(k1, 15); k1 *= c2;
+        h1 ^= k1; h1 = rotl(h1, 13); h1 = h1 * 5 + 0xe6546b64u;
+    }
+    const u8* tail = data + nblocks * 4;
+    u32 k1 = 0;
+    switch (len & 3) {
+        case 3: k1 ^= (u32)tail[2] << 16; [[fallthrough]];
+        case 2: k1 ^= (u32)tail[1] << 8;  [[fallthrough]];
+        case 1: k1 ^= (u32)tail[0];
+                k1 *= c1; k1 = rotl(k1, 15); k1 *= c2; h1 ^= k1;
+    }
+    h1 ^= (u32)len;
+    h1 ^= h1 >> 16; h1 *= 0x85ebca6bu; h1 ^= h1 >> 13; h1 *= 0xc2b2ae35u; h1 ^= h1 >> 16;
+    return h1;
+}
+
+// Hash of "matParams.<member>" — the cooked constantParameter nameHash for a shader UBO member.
+inline u32 matParamNameHash(const std::string& memberName) {
+    std::string full = "matParams." + memberName;
+    return murmur3_x86_32(full.data(), full.size(), 0);
+}
 
 struct AssetKey {
     u64 pkg = 0;
@@ -33,17 +69,54 @@ struct AssetKeyHash {
 
 using AssetMap = std::unordered_map<AssetKey, std::string, AssetKeyHash>;
 
+// One cooked material constant (MATLMATL `constantParameters` entry =
+// horizon::renderer::ConstantMaterialParameter). The shader UBO member it targets is found
+// by MurmurHash3_x86_32("matParams."+memberName, 0) == nameHash (reversed from libshell
+// setUniformByHash). value = matParamsBlob[blobOffset .. +byteSize], tight-packed (scalar 4B, vec3 12B).
+struct ConstParam {
+    u32 nameHash = 0;
+    u32 blobOffset = 0;
+    u32 byteSize = 0;
+};
+
 struct Transform {
     float pos[3] = {0, 0, 0};
     float rot[4] = {0, 0, 0, 1}; // xyzw quaternion
     float scale[3] = {1, 1, 1};
 };
 
+// Column-major T·R·S local matrix (scale in local space, THEN rotate, THEN translate — libshell's per-node
+// local matrix). Rotation columns are scaled => M = T·R·S, never T·S·R.
+inline void trsToMat4(const Transform& t, float out[16]) {
+    float x=t.rot[0], y=t.rot[1], z=t.rot[2], w=t.rot[3];
+    float sx=t.scale[0], sy=t.scale[1], sz=t.scale[2];
+    float r00=1-2*(y*y+z*z), r01=2*(x*y-w*z), r02=2*(x*z+w*y);
+    float r10=2*(x*y+w*z), r11=1-2*(x*x+z*z), r12=2*(y*z-w*x);
+    float r20=2*(x*z-w*y), r21=2*(y*z+w*x), r22=1-2*(x*x+y*y);
+    out[0]=r00*sx; out[4]=r01*sy; out[8]=r02*sz; out[12]=t.pos[0];
+    out[1]=r10*sx; out[5]=r11*sy; out[9]=r12*sz; out[13]=t.pos[1];
+    out[2]=r20*sx; out[6]=r21*sy; out[10]=r22*sz; out[14]=t.pos[2];
+    out[3]=0;      out[7]=0;      out[11]=0;      out[15]=1;
+}
+// out = a · b (column-major). Composing parent·child as 4×4 matrices preserves the SHEAR a non-uniform-scale
+// parent × rotated child produces — which a TRS-only recompose silently drops (the "stretching/slanting").
+inline void mat4mul4(const float a[16], const float b[16], float out[16]) {
+    for (int col=0; col<4; ++col)
+        for (int row=0; row<4; ++row) {
+            float s=0; for (int k=0;k<4;++k) s += a[k*4+row]*b[col*4+k];
+            out[col*4+row]=s;
+        }
+}
+
 struct DrawableEntity {
     std::string name;
     Transform   transform;
     AssetKey    meshRef;
     std::vector<AssetKey> matRefs;
+    float worldMatrix[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}; // faithful 4×4 parent→child world matrix
+    bool  hasWorldMatrix = false;
+    bool  emptyTransform = false;   // had a TransformPlatformComponent but NO local pos/rot/scale (cook anomaly — resolve via level group offset)
+    float atlasCellIndex = -1.0f;   // MaterialPropertyOverrides "instance.atlasCellIndex" (per-instance atlas variant; -1 = none)
 };
 
 struct MeshData {
@@ -69,8 +142,15 @@ struct MeshData {
     std::vector<u8> ormRGBA;     u32 ormW = 1, ormH = 1;       bool hasOrm = false;
     std::vector<u8> emissiveRGBA; u32 emissiveW = 1, emissiveH = 1; bool hasEmissive = false;
     std::vector<u8> lmRGBA;      u32 lmW = 1, lmH = 1;         bool hasLightmap = false;
+    // VAT (Vertex Animation Texture) offset texture: R16G16B16A16_SFLOAT, width=vertexCount, height=frameCount.
+    // The vatunlit vertex shader does worldPosition = inPos + texelFetch(vatAnimTex, (vertexCol, frameRow)).
+    // vatRaw holds mip0 as raw half-float bytes (vatW*vatH*8), uploaded verbatim as R16G16B16A16_SFLOAT.
+    std::vector<u8> vatRaw;      u32 vatW = 0, vatH = 0;       bool hasVat = false;
     // matParams.Tint (per-material RGB color multiplier; default white).
     float tint[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    // Per-instance atlas variant (unlitatlasinstance shader's instanceTag.atlasCellIndex) from the entity's
+    // MaterialPropertyOverrides "instance.atlasCellIndex". -1 = none (all coral were sampling cell 0 -> one colour).
+    float atlasCellIndex = -1.0f;
     // Ingestion id of the RENDSHAD this material references — the renderer picks the
     // matching shader pipeline per mesh (masked->discard, emissive->glow, etc.), as libshell does.
     u64 shaderIng = 0;
@@ -80,9 +160,17 @@ struct MeshData {
     // Material name carries "pbrlightmap_tiled" -> a genuinely TILED prop material (rugs etc.): unlike the
     // unwrap props (bowls/vases), it NEEDS its cooked matParams (Tint + GlobalTile) kept, like the room.
     bool tiled = false;
-    // Cooked per-material matParams constant block (real Tint/LayerRed/LayerBlue/Metallic/...), in the
-    // material's shader's matParams UBO byte layout. Empty if the material has no constants.
+    // Cooked per-material matParams VALUE blob (real Tint/LayerRed/LayerBlue/Metallic/... values),
+    // tight-packed (scalar 4B, vec3 12B) in the material's .surface param-declaration order — NOT the
+    // SPIR-V std140 UBO order. Empty if the material has no constants.
     std::vector<u8> matParamsBlob;
+    // The cooked `constantParameters` entries {nameHash, blobOffset, byteSize}. Each slices matParamsBlob
+    // and binds BY NAME (MurmurHash3 of "matParams."+member) to the shader UBO offset — the faithful path
+    // (the blob order ≠ UBO order, so positional binding swaps e.g. Tint/AOfloor → wrong colours).
+    std::vector<ConstParam> constParams;
+    // Candidate sampler-slot name-hashes (MurmurHash3 of the sampler name, e.g. "BaseColor_Tx"/"RBAoDir_Tx")
+    // from the material's textureParameters — used to pick the shader VARIANT whose samplers match.
+    std::vector<u32> texSlots;
 
     // Raw ASTC data for GPU-native upload (preferred when GPU supports ASTC_LDR)
     std::vector<u8> astcRaw;
@@ -90,6 +178,11 @@ struct MeshData {
 
     // Transform
     Transform transform;
+    // Faithful 4×4 world matrix (parent→child composed via mat4mul4). When set, the renderer uses this
+    // verbatim instead of rebuilding T·R·S from `transform` — so hierarchy shear (non-uniform parent scale
+    // × rotated child) is preserved, not dropped by a TRS recompose.
+    float worldMatrix[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    bool  hasWorldMatrix = false;
 
     // Bone skinning data (for unlitblendskinned meshes, stride=28)
     std::vector<u8> boneIndices;  // 4 u8 per vertex (bone indices)

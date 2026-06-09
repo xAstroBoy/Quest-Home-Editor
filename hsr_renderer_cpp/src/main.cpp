@@ -18,7 +18,110 @@
 #include <string>
 #include <unordered_map>
 #include <cctype>
+#include <cstring>
 #include <iostream>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <dbghelp.h>
+// Symbolized crash handler: on a segfault, walk the faulting thread's stack and print
+// function + file:line for each frame (needs the PDB from /Zi /DEBUG). Writes to stderr
+// (→ _live.log) AND _crash.txt so a background/headless crash is never silent.
+static LONG WINAPI hsrCrashHandler(EXCEPTION_POINTERS* ep) {
+    HANDLE proc = GetCurrentProcess();
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+    SymInitialize(proc, nullptr, TRUE);
+    FILE* cf = fopen("_crash.txt", "w");
+    auto emit = [&](const char* fmt, auto... a) {
+        fprintf(stderr, fmt, a...); if (cf) fprintf(cf, fmt, a...);
+    };
+    emit("\n[CRASH] code=0x%08lx addr=%p\n",
+         (unsigned long)ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        ep->ExceptionRecord->NumberParameters >= 2)
+        emit("[CRASH] access violation %s address %p\n",
+             ep->ExceptionRecord->ExceptionInformation[0] ? "WRITING" : "READING",
+             (void*)ep->ExceptionRecord->ExceptionInformation[1]);
+    CONTEXT ctx = *ep->ContextRecord;
+    STACKFRAME64 sf = {};
+    sf.AddrPC.Offset = ctx.Rip; sf.AddrPC.Mode = AddrModeFlat;
+    sf.AddrFrame.Offset = ctx.Rbp; sf.AddrFrame.Mode = AddrModeFlat;
+    sf.AddrStack.Offset = ctx.Rsp; sf.AddrStack.Mode = AddrModeFlat;
+    char symbuf[sizeof(SYMBOL_INFO) + 512];
+    SYMBOL_INFO* sym = (SYMBOL_INFO*)symbuf;
+    for (int i = 0; i < 48; ++i) {
+        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, GetCurrentThread(), &sf, &ctx,
+                         nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr)) break;
+        if (!sf.AddrPC.Offset) break;
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO); sym->MaxNameLen = 511;
+        DWORD64 disp = 0; const char* name = "(?)";
+        if (SymFromAddr(proc, sf.AddrPC.Offset, &disp, sym)) name = sym->Name;
+        IMAGEHLP_LINE64 ln; ln.SizeOfStruct = sizeof(ln); DWORD ld = 0;
+        if (SymGetLineFromAddr64(proc, sf.AddrPC.Offset, &ld, &ln)) {
+            const char* fn = strrchr(ln.FileName, '\\'); fn = fn ? fn + 1 : ln.FileName;
+            emit("  #%-2d %s  (%s:%lu)\n", i, name, fn, (unsigned long)ln.LineNumber);
+        } else {
+            emit("  #%-2d %s +0x%llx\n", i, name, (unsigned long long)disp);
+        }
+    }
+    if (cf) fclose(cf);
+    fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;  // terminate after reporting
+}
+
+// ── HSR_LIVE HTTP control server ───────────────────────────────────────────────────────────────
+// A tiny localhost HTTP server so the renderer loads ONCE and is driven live (no relaunch, no files).
+// POST the command block (newline-separated, same syntax as the comments in the render loop) in the
+// request body; the response body carries the result (farscan/listmesh dumps, or "ok"/"shot <path>").
+// The socket thread only enqueues raw text under a mutex; ALL renderer/Vulkan state is touched solely
+// by the main thread, which drains the queue each frame — so this never races the GPU.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <atomic>
+struct LiveCmd { std::string text, result; std::atomic<bool> done{false}; };
+static std::mutex          g_liveMx;
+static std::deque<LiveCmd*> g_liveQ;
+static void hsrHttpServer(int port) {
+    WSADATA w; if (WSAStartup(MAKEWORD(2,2), &w) != 0) { fprintf(stderr, "[HTTP] WSAStartup failed\n"); return; }
+    SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    int yes = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (char*)&yes, sizeof yes);
+    sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons((u_short)port);
+    inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+    if (bind(ls, (sockaddr*)&a, sizeof a) != 0 || listen(ls, 8) != 0) {
+        fprintf(stderr, "[HTTP] bind/listen failed on port %d (err %d)\n", port, WSAGetLastError()); return;
+    }
+    fprintf(stderr, "[HTTP] live control on http://127.0.0.1:%d  (POST commands in body)\n", port);
+    for (;;) {
+        SOCKET c = accept(ls, nullptr, nullptr);
+        if (c == INVALID_SOCKET) continue;
+        std::string req; char rb[4096]; int n;
+        while ((n = recv(c, rb, sizeof rb, 0)) > 0) {
+            req.append(rb, n);
+            size_t hp = req.find("\r\n\r\n");
+            if (hp != std::string::npos) {
+                size_t clp = req.find("Content-Length:");
+                int cl = (clp != std::string::npos) ? atoi(req.c_str() + clp + 15) : 0;
+                size_t have = req.size() - (hp + 4);
+                while ((int)have < cl) { n = recv(c, rb, sizeof rb, 0); if (n <= 0) break; req.append(rb, n); have += n; }
+                break;
+            }
+        }
+        std::string cmds; size_t hp = req.find("\r\n\r\n");
+        if (hp != std::string::npos && hp + 4 < req.size()) cmds = req.substr(hp + 4);
+        LiveCmd lc; lc.text = cmds;
+        { std::lock_guard<std::mutex> g(g_liveMx); g_liveQ.push_back(&lc); }
+        while (!lc.done.load(std::memory_order_acquire)) Sleep(1);
+        std::string body = lc.result.empty() ? "ok\n" : lc.result;
+        char hdr[160]; int hl = snprintf(hdr, sizeof hdr,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", body.size());
+        send(c, hdr, hl, 0); send(c, body.data(), (int)body.size(), 0);
+        closesocket(c);
+    }
+}
+#endif
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -199,6 +302,9 @@ static void errorCb(int err, const char* desc) {
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(hsrCrashHandler);   // segfault → symbolized stack in stderr + _crash.txt
+#endif
     fprintf(stderr, "========================================================\n");
     fprintf(stderr, " HSR Renderer / Editor — libshell.so Vulkan replica\n");
     fprintf(stderr, " Drag an .apk onto the window to load it\n");
@@ -244,10 +350,22 @@ int main(int argc, char** argv) {
     // Detect format: a raw V79 env ships a *.gltf.ovrscene (glTF 2.0 + ASTC KTX); the new
     // HSR/Haven format ships RENDMESH/MATLMATL/RENDSHAD. Try V79 (glTF) first, else HSR.
     SceneLoader loader;
-    loader.verbose = true;
+    // Per-asset logging floods stderr (hundreds of lines) — and stderr is slow on Windows, so it noticeably
+    // drags out load time. Default OFF; set HSR_VERBOSE=1 to re-enable the full asset trace for debugging.
+    loader.verbose = (std::getenv("HSR_VERBOSE") != nullptr);
     GltfLoader gltf;
     OpaLoader opa;
     std::vector<MeshData>* sceneMeshes = nullptr;
+    // Companion env to render alongside (merged at the shared origin). Explicit via HSR_BACKDROP, or AUTO:
+    // a "vista_" env is a BACKGROUND scenery for the haven2025 home, so auto-load haven2025 from the same
+    // folder and render the home inside the vista (one command: just open the vista APK).
+    std::string companionPath;
+    if (const char* bd = std::getenv("HSR_BACKDROP")) companionPath = bd;
+    else if (apkPath.find("vista_") != std::string::npos) {
+        size_t sl = apkPath.find_last_of("/\\");
+        companionPath = (sl == std::string::npos ? std::string() : apkPath.substr(0, sl + 1)) + "haven2025.apk";
+        fprintf(stderr, "[MAIN] vista_ env -> auto-companion home: %s\n", companionPath.c_str());
+    }
     bool isV79 = gltf.load(apkPath);
     bool isOpa = false;
     if (isV79) {
@@ -261,6 +379,18 @@ int main(int argc, char** argv) {
         if (!loader.load(apkPath)) {
             fprintf(stderr, "\n[MAIN] FATAL: Scene load failed\n");
             return 1;
+        }
+        // RENDER BOTH: merge the companion env (vista backdrop + haven2025 home) at the shared origin.
+        if (!companionPath.empty()) {
+            static SceneLoader companion;
+            companion.verbose = loader.verbose;
+            fprintf(stderr, "[MAIN] Loading companion env: %s\n", companionPath.c_str());
+            if (companion.load(companionPath)) {
+                size_t before = loader.meshes.size();
+                for (auto& m : companion.meshes) loader.meshes.push_back(std::move(m));
+                fprintf(stderr, "[MAIN] Companion merged: +%zu meshes (total %zu)\n",
+                        loader.meshes.size() - before, loader.meshes.size());
+            } else fprintf(stderr, "[MAIN] Companion load FAILED: %s\n", companionPath.c_str());
         }
         sceneMeshes = &loader.meshes;
     }
@@ -318,6 +448,7 @@ int main(int argc, char** argv) {
     };
 
     loadShadersFromApk(apkPath);
+    if (!companionPath.empty()) loadShadersFromApk(companionPath);  // companion's shaders too (both envs render)
     // AUTO-DETECT V203/HSL: if the env ships its OWN RENDSHAD (the SHAD per-material shaders), it's a
     // V203 home -> use the per-material path (perMat) by DEFAULT so the STOCK render (no flags) is
     // faithful. V79 sources ship no RENDSHAD and keep the built-in shader. (HSR_NOPERMAT forces off.)
@@ -442,6 +573,7 @@ int main(int argc, char** argv) {
     // (the tiny fragments are depth/shadow prepass variants that output no color).
     struct Prog { std::vector<u32> vert, frag; std::string name; bool fragTex=false; };
     std::vector<Prog> progs;
+    std::vector<Prog> allVariants;   // EVERY (vert,frag) pair per surface — per-material picks the right one
     {
         struct FileBlobs { std::vector<std::vector<u32>> verts, frags; };
         std::unordered_map<std::string, FileBlobs> byFile;
@@ -459,19 +591,28 @@ int main(int argc, char** argv) {
             // Choose the pair (i-th vert, i-th frag) whose fragment is largest among the
             // pairs that have both stages.
             size_t nPair = std::min(fb.verts.size(), fb.frags.size());
+            auto fragSamplesTex = [](const std::vector<u32>& frag) -> bool {
+                for (size_t i = 5; i + 1 < frag.size(); ) {
+                    u32 op = frag[i] & 0xFFFF, wc = frag[i] >> 16; if (!wc) break;
+                    if (op == 25 || op == 27) return true;
+                    i += wc;
+                }
+                return false;
+            };
             size_t best = 0; size_t bestSz = 0;
-            for (size_t i = 0; i < nPair; ++i)
+            for (size_t i = 0; i < nPair; ++i) {
                 if (fb.frags[i].size() > bestSz) { bestSz = fb.frags[i].size(); best = i; }
+                // keep EVERY variant for the per-material path (so it can pick the one whose samplers
+                // match the material's textureParameters slots — the builder otherwise grabs the largest
+                // übershader variant, which uses samplers/inputs we don't feed -> washed/flat).
+                Prog pv; pv.name = name; pv.vert = fb.verts[i]; pv.frag = fb.frags[i];
+                pv.fragTex = fragSamplesTex(fb.frags[i]); allVariants.push_back(std::move(pv));
+            }
             Prog p;
             p.name = name;
             p.vert = fb.verts[best];
             p.frag = fb.frags[best];
-            // does the chosen fragment sample a texture?
-            for (size_t i = 5; i + 1 < p.frag.size(); ) {
-                u32 op = p.frag[i] & 0xFFFF, wc = p.frag[i] >> 16; if (!wc) break;
-                if (op == 25 || op == 27) { p.fragTex = true; break; }
-                i += wc;
-            }
+            p.fragTex = fragSamplesTex(p.frag);
             progs.push_back(std::move(p));
         }
     }
@@ -594,9 +735,12 @@ int main(int argc, char** argv) {
     if (!glfwInit()) { fprintf(stderr, "GLFW init failed\n"); return 1; }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);  // always-on-top so external screenshot capture is reliable
-    g_window = glfwCreateWindow(g_winW, g_winH,
-        "HSR Renderer [Vulkan] — WASD=move drag=look  Tab/N=next mesh B=prev  F=wire  Esc=quit",
-        nullptr, nullptr);
+    // Title shows WHICH loader/format is active (V79 glTF / V79 OPA / HSL) + the env file name.
+    std::string g_fmtName = isV79 ? "V79 glTF" : (isOpa ? "V79 OPA" : "HSL");
+    std::string g_baseName = apkPath; { size_t sl = g_baseName.find_last_of("/\\"); if (sl != std::string::npos) g_baseName = g_baseName.substr(sl + 1); }
+    std::string g_title = "HSR Renderer [Vulkan]  —  " + g_fmtName + "  —  " + g_baseName +
+                          "   |   WASD=move drag=look  Tab/N=next mesh B=prev  F=wire  Esc=quit";
+    g_window = glfwCreateWindow(g_winW, g_winH, g_title.c_str(), nullptr, nullptr);
     if (!g_window) { fprintf(stderr, "Window creation failed\n"); glfwTerminate(); return 1; }
 
     glfwSetKeyCallback(g_window, keyCb);
@@ -620,9 +764,9 @@ int main(int argc, char** argv) {
     bool usePerMat = !std::getenv("HSR_NOPERMAT") && (std::getenv("HSR_PERMAT") || envShippedRendShad);
     if (usePerMat) {
         vkRenderer.perMat = true;
-        for (auto& p : progs)
+        for (auto& p : allVariants)
             vkRenderer.loadedShaders.push_back({ VkRenderer::surfaceName(p.name), p.vert, p.frag });
-        fprintf(stderr, "[MAIN] per-material shaders ON (%zu programs)%s\n", progs.size(),
+        fprintf(stderr, "[MAIN] per-material shaders ON (%zu variants)%s\n", allVariants.size(),
                 envShippedRendShad ? " [auto: V203 env ships RENDSHAD]" : " [HSR_PERMAT]");
     }
 
@@ -726,6 +870,26 @@ int main(int argc, char** argv) {
     }
     long totalFrames = 0;
     bool shotDone = false;
+    // ── Live control mode (HSR_LIVE): load the scene ONCE, then drive camera / visibility /
+    // screenshots by writing lines to a control file (no relaunch, no mesh reload). One persistent
+    // instance serves every camera angle + shot. Commands (one per line in the control file):
+    //   cam=x,y,z,yawDeg,pitchDeg | shot=path.png | hidemesh=<idx> | solomesh=<idx>
+    //   hidemat=<substr> | solomat=<substr> | wire=0/1 | clear | quit
+    // After each shot the renderer writes _live_ack.txt so the driver knows the PNG is ready.
+    const char* liveEnv  = std::getenv("HSR_LIVE");
+    bool        liveMode = liveEnv != nullptr;
+    std::string pendingShot, pendingShotOut;
+#ifdef _WIN32
+    LiveCmd*    pendingShotCmd = nullptr;   // the command whose shot completes after the next render
+#endif
+    if (liveMode) {
+        shotQuit = false; shotPath = nullptr;   // never auto-quit / one-shot in live mode
+#ifdef _WIN32
+        int port = atoi(liveEnv); if (port <= 1) port = 8777;
+        std::thread(hsrHttpServer, port).detach();
+        fprintf(stderr, "[LIVE] ready — HTTP control on :%d (curl --data 'cam=..\\nshot=path' 127.0.0.1:%d)\n", port, port);
+#endif
+    }
     auto animStart = std::chrono::high_resolution_clock::now();
     // HSR_ANIMTIME=<sec> forces a fixed animation pose (deterministic capture / debugging).
     const char* animTimeEnv = std::getenv("HSR_ANIMTIME");
@@ -766,14 +930,119 @@ int main(int argc, char** argv) {
     // ── Editor UI (Dear ImGui): outliner, move, focus, anim/audio control, save ──
     float animDur = isOpa ? opa.animDuration() : (isV79 ? gltf.animDuration : 0.0f);
     Editor editor;
+    editor.r = &vkRenderer;             // bind the renderer up-front so Export works even when the UI is skipped (HSR_NOUI)
+    editor.sceneMeshes = sceneMeshes;   // CPU geometry/textures for the "Export APK" cooker (parallel to gpuMeshes)
+    // VAT (vertex-animation) is for ORGANIC deformation (fish/foliage) — it morphs vertices + lerps frames, which is
+    // WRONG for rigid spins (warps the geometry instead of rotating). Off by default; HSR_VAT=1 to experiment.
+    if (isV79 && std::getenv("HSR_VAT")) editor.vatBaker = [&gltf](int meshIdx, int frames, int& nv){ return gltf.bakeVAT(meshIdx, frames, nv); };
+    if (isV79) editor.hzAnimExtractor = [&gltf](int meshIdx, int frames, hslcook::ExportMesh& em){   // HZANIM skeletal port
+        auto e = gltf.extractHzAnim(meshIdx, frames);
+        if (e.ok()) { em.hzJointPos=std::move(e.jointPos); em.hzJointQuat=std::move(e.jointQuat); em.hzJointScale=std::move(e.jointScale);
+                      em.hzParents=std::move(e.parents); em.hzBoneIdx=std::move(e.boneIdx); em.hzBoneWgt=std::move(e.boneWgt);
+                      em.hzTrsLocal=std::move(e.trsLocal); em.hzRestPos=std::move(e.restPos); em.hzJointCount=e.jointCount; em.hzFrames=e.frameCount; em.hzFps=e.fps; }
+    };
     if (!std::getenv("HSR_NOUI"))   // HSR_NOUI = clean capture without the editor overlay
         editor.init(&vkRenderer, g_window, &g_audio, &g_animOverride, &g_animScrub, animDur);
+
+    // One-shot headless re-cook: HSR_EXPORT exports the loaded (optionally edited) scene to an APK then,
+    // with HSR_EXPORT_QUIT, exits — lets the editor's Export path run batch / from the command line.
+    if (std::getenv("HSR_EXPORT")) {
+        editor.exportAPK();
+        fprintf(stderr, "[MAIN] HSR_EXPORT -> %s\n", editor.exportStatus.c_str());
+        if (std::getenv("HSR_EXPORT_QUIT")) return 0;
+    }
 
     while (!glfwWindowShouldClose(g_window)) {
         auto now = std::chrono::high_resolution_clock::now();
         float dt = std::chrono::duration<float>(now - lastTime).count();
         lastTime = now;
         if (dt > 0.1f) dt = 0.1f;
+
+        // ── Live control: drain HTTP-queued command batches. Camera/visibility apply immediately;
+        // a shot is deferred to AFTER this frame renders (so it reflects the new camera) and then the
+        // command's HTTP response is completed. farscan/listmesh write their dump into the response.
+        // Commands (one per body line): cam=x,y,z,yaw,pitch | move=dx,dy,dz | fov=deg | far=val
+        //   bg=r,g,b (clear colour; bg=1,1,1 = WHITE sky to expose ground HOLES) | wire=0/1
+        //   hidemesh=i | solomesh=i | hidemat=sub | solomat=sub | clear | shot=path.png
+        //   listmesh=sub | farscan[=thr] (meshes with a vertex |world coord|>thr — finds mis-decoded
+        //   geometry flung far away that tears holes) | quit
+#ifdef _WIN32
+        if (liveMode) {
+            std::vector<LiveCmd*> batch;
+            { std::lock_guard<std::mutex> g(g_liveMx); while (!g_liveQ.empty()) { batch.push_back(g_liveQ.front()); g_liveQ.pop_front(); } }
+            for (LiveCmd* lc : batch) {
+                std::vector<char> mb(lc->text.begin(), lc->text.end()); mb.push_back(0);
+                std::string out; std::string shotThis;
+                auto& C = vkRenderer.cam;
+                for (char* ln = strtok(mb.data(), "\r\n"); ln; ln = strtok(nullptr, "\r\n")) {
+                    while (*ln == ' ' || *ln == '\t') ++ln;
+                    if (!*ln || *ln == '#') continue;
+                    float x, y, z, yd, pd, r, g, b; char tmp[256];
+                    if (sscanf(ln, "cam=%f,%f,%f,%f,%f", &x, &y, &z, &yd, &pd) == 5) {
+                        C.pos[0] = x; C.pos[1] = y; C.pos[2] = z;
+                        C.yaw = yd * 3.14159265f / 180.0f; C.pitch = pd * 3.14159265f / 180.0f;
+                    } else if (sscanf(ln, "move=%f,%f,%f", &x, &y, &z) == 3) { C.pos[0]+=x; C.pos[1]+=y; C.pos[2]+=z; }
+                    else if (sscanf(ln, "bg=%f,%f,%f", &r, &g, &b) == 3) { vkRenderer.clearRGB[0]=r; vkRenderer.clearRGB[1]=g; vkRenderer.clearRGB[2]=b; }
+                    else if (strncmp(ln, "fov=", 4) == 0)         C.fovDeg = (float)atof(ln + 4);
+                    else if (strncmp(ln, "far=", 4) == 0)         C.farZ = (float)atof(ln + 4);
+                    else if (strncmp(ln, "shot=", 5) == 0)        shotThis = ln + 5;
+                    else if (strncmp(ln, "hidemesh=", 9) == 0)    vkRenderer.hideMesh = atoi(ln + 9);
+                    else if (strncmp(ln, "solomesh=", 9) == 0)    vkRenderer.soloMesh = atoi(ln + 9);
+                    else if (strncmp(ln, "movemesh=", 9) == 0) {   // live-edit: world-translate ONE mesh (test placement fixes without recompiling)
+                        int mi; float dx, dy, dz;
+                        if (sscanf(ln + 9, "%d,%f,%f,%f", &mi, &dx, &dy, &dz) == 4 && mi >= 0 && mi < (int)vkRenderer.gpuMeshes.size()) {
+                            vkRenderer.gpuMeshes[mi].model[12] += dx; vkRenderer.gpuMeshes[mi].model[13] += dy; vkRenderer.gpuMeshes[mi].model[14] += dz;
+                            snprintf(tmp, sizeof tmp, "moved mesh %d by (%.2f,%.2f,%.2f)\n", mi, dx, dy, dz); out += tmp;
+                        }
+                    }
+                    else if (strncmp(ln, "hidemat=", 8) == 0)     vkRenderer.hideMat = ln + 8;   // std::string; empty = none (checked via .empty())
+                    else if (strncmp(ln, "solomat=", 8) == 0)     vkRenderer.soloMat = ln + 8;
+                    else if (strncmp(ln, "wire=", 5) == 0)        vkRenderer.wireframe = atoi(ln + 5) != 0;
+                    else if (strncmp(ln, "clear", 5) == 0)      { vkRenderer.hideMesh = -1; vkRenderer.soloMesh = -1; vkRenderer.hideMat.clear(); vkRenderer.soloMat.clear(); vkRenderer.wireframe = false; }
+                    else if (strncmp(ln, "listmesh=", 9) == 0) {
+                        const char* sub = ln + 9; size_t N = sceneMeshes->size();
+                        snprintf(tmp,sizeof tmp,"[LISTMESH] '%s':\n",sub); out += tmp;
+                        for (size_t mi = 0; mi < N && mi < vkRenderer.gpuMeshes.size(); ++mi) {
+                            const auto& md = (*sceneMeshes)[mi];
+                            if (md.name.find(sub) == std::string::npos) continue;
+                            const float* M = vkRenderer.gpuMeshes[mi].model;
+                            snprintf(tmp,sizeof tmp,"  [%zu] %s  nV=%zu  modelPos=(%.2f,%.2f,%.2f)\n",
+                                    mi, md.name.c_str(), md.positions.size()/3, M[12], M[13], M[14]); out += tmp;
+                        }
+                    }
+                    else if (strncmp(ln, "farscan", 7) == 0) {
+                        float thr = 1000.0f; sscanf(ln + 7, "=%f", &thr);
+                        size_t N = std::min(sceneMeshes->size(), vkRenderer.gpuMeshes.size());
+                        snprintf(tmp,sizeof tmp,"[FARSCAN] meshes with a vertex |world coord| > %.0f (of %zu):\n", thr, N); out += tmp;
+                        for (size_t mi = 0; mi < N; ++mi) {
+                            const auto& md = (*sceneMeshes)[mi]; const float* M = vkRenderer.gpuMeshes[mi].model;
+                            size_t nv = md.positions.size()/3; if (!nv) continue;
+                            float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f}, maxabs=0; size_t farv=0;
+                            for (size_t i=0;i<nv;i++){
+                                float lx=md.positions[i*3],ly=md.positions[i*3+1],lz=md.positions[i*3+2];
+                                float wx=M[0]*lx+M[4]*ly+M[8]*lz+M[12];
+                                float wy=M[1]*lx+M[5]*ly+M[9]*lz+M[13];
+                                float wz=M[2]*lx+M[6]*ly+M[10]*lz+M[14];
+                                mn[0]=std::min(mn[0],wx);mx[0]=std::max(mx[0],wx);
+                                mn[1]=std::min(mn[1],wy);mx[1]=std::max(mx[1],wy);
+                                mn[2]=std::min(mn[2],wz);mx[2]=std::max(mx[2],wz);
+                                float aa=fabsf(wx); aa=std::max(aa,fabsf(wy)); aa=std::max(aa,fabsf(wz));
+                                if(aa>maxabs)maxabs=aa; if(aa>thr)farv++;
+                            }
+                            if (maxabs > thr) {
+                                snprintf(tmp,sizeof tmp,"  [%zu] %s  maxabs=%.0f farV=%zu/%zu  wAABB X[%.0f,%.0f] Y[%.0f,%.0f] Z[%.0f,%.0f]\n",
+                                        mi, md.name.c_str(), maxabs, farv, nv, mn[0],mx[0],mn[1],mx[1],mn[2],mx[2]); out += tmp;
+                            }
+                        }
+                        out += "[FARSCAN] done\n";
+                    }
+                    else if (strncmp(ln, "quit", 4) == 0)         glfwSetWindowShouldClose(g_window, GLFW_TRUE);
+                }
+                if (shotThis.empty()) { lc->result = out.empty() ? "ok\n" : out; lc->done.store(true, std::memory_order_release); }
+                else { pendingShot = shotThis; pendingShotOut = out; pendingShotCmd = lc; }  // finished after render (below)
+            }
+        }
+#endif
 
         // V79 glTF skeletal animation: sample the clip and stream skinned positions into
         // each dynamic mesh's persistently-mapped VBO (vertex position is at offset 0).
@@ -917,6 +1186,20 @@ int main(int argc, char** argv) {
             { FILE* tf=fopen("_main_trace.txt","a"); if(tf){fprintf(tf,"screenshot returned\n");fclose(tf);} }
             shotDone = true;
             if (shotQuit) glfwSetWindowShouldClose(g_window, GLFW_TRUE);
+        }
+        // Live-mode capture: the camera was applied at the top of THIS frame, so the just-rendered
+        // image reflects it. Write the PNG, then complete the HTTP response for that command.
+        if (liveMode && !pendingShot.empty()) {
+            vkRenderer.screenshot(pendingShot.c_str());
+            fprintf(stderr, "[LIVE] shot -> %s\n", pendingShot.c_str());
+#ifdef _WIN32
+            if (pendingShotCmd) {
+                pendingShotCmd->result = pendingShotOut + "shot " + pendingShot + "\n";
+                pendingShotCmd->done.store(true, std::memory_order_release);
+                pendingShotCmd = nullptr;
+            }
+#endif
+            pendingShot.clear(); pendingShotOut.clear();
         }
 
         frames++;
