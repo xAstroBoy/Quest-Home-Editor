@@ -16,6 +16,7 @@
 #include "astcenc.h"   // ASTC ENCODE (full astcenc build) — RGBA8 -> ASTC blocks for RENDTXTR
 #include "miniz.h"     // ZIP read/write — scene.zip assembly + APK splice (already linked by the project)
 #include "hzanim_acl.h"  // hzAclEncode (HZANIM ACL clip) — only the declaration; ACL lives in hzanim_acl.cpp
+#include "cook_verify.h"  // cook-time FlatBuffer verifier (device's stock-flatbuffers structural check, schema from Meta assets)
 
 namespace hslcook {
 
@@ -383,21 +384,28 @@ inline std::string entityJson(const std::string& id, const std::string& name,
                               const float pos[3], const float rotEuler[3], const float scale[3],
                               const AssetKey3& meshRef, const std::vector<AssetKey3>& matRefs,
                               const AssetKey3& colliderRef = AssetKey3{0,0,0}, const std::string& extraComp = std::string(),
-                              int meshVer = 5) {   // meshVer=9 for SKINNED meshes (v5 renders static bind-pose; v9 = animator-driven skinning)
+                              int meshVer = 5, bool animated = false) {
+    // GROUND TRUTH — extracted from the WORKING calming_butterflies.hstf (a skinned+animated entity that renders AND
+    // animates on device). Its component layout is EXACTLY: Transform **v1** -> Mesh **v5** -> Material v1
+    // {materials,constantParameters:[],textureParameters:[]} -> AnimatorPlatformComponent v4 {skeleton,animations,
+    // sockets:[]} (animator is LAST). Earlier guesses (Transform v2, Mesh v6, Animator-before-Material) all CONTRADICT
+    // this reference and are removed. Static entities = the same minus the animator.
     char tb[256]; snprintf(tb,sizeof tb,
         "{\"localPosition\":{\"x\":%g,\"y\":%g,\"z\":%g},\"localRotation\":{\"x\":%g,\"y\":%g,\"z\":%g},\"localScale\":{\"x\":%g,\"y\":%g,\"z\":%g}}",
         pos[0],pos[1],pos[2], rotEuler[0],rotEuler[1],rotEuler[2], scale[0],scale[1],scale[2]);
     std::string mats; for (size_t i=0;i<matRefs.size();++i){ if(i)mats+=","; mats+=refJson(matRefs[i]); }
+    (void)animated;
+    bool skinned = !extraComp.empty();
     std::string comps =
         comp("TransformPlatformComponent", 1, tb) + "," +
         comp("MeshPlatformComponent", meshVer, std::string("{\"mesh\":") + refJson(meshRef) + "}") + "," +
-        comp("MaterialPlatformComponent", 1, std::string("{\"materials\":[") + mats + "]}");
+        comp("MaterialPlatformComponent", 1, std::string("{\"materials\":[") + mats + "],\"constantParameters\":[],\"textureParameters\":[]}");
+    if (skinned) comps += "," + extraComp;   // AnimatorPlatformComponent LAST (exact calming butterfly order)
     // walkable: collision mesh + static physics body (so locomotion/teleport land on it)
     if (colliderRef.pkg || colliderRef.ing || colliderRef.tgt) {
         comps += "," + comp("ColliderMeshPlatformComponent", 1, std::string("{\"meshAsset\":") + refJson(colliderRef) + "}");
         comps += "," + comp("PhysicsBodyPlatformComponent", 1, "{\"type\":\"StaticCollision\"}");
     }
-    if (!extraComp.empty()) comps += "," + extraComp;   // e.g. AnimatorPlatformComponent (HZANIM)
     return std::string("{\"id\":\"") + id + "\",\"name\":\"" + name + "\",\"components\":[" + comps + "],\"attributes\":[]}";
 }
 // AnimatorPlatformComponent v4 (HZANIM): binds a skeleton (HZAN:SKEL) + an animation (HZAN:ANIM/ACL clip). Drives the
@@ -405,7 +413,7 @@ inline std::string entityJson(const std::string& id, const std::string& name,
 inline std::string animatorComponentJson(const AssetKey3& skel, const AssetKey3& anim) {
     return comp("AnimatorPlatformComponent", 4,
         std::string("{\"skeleton\":") + refJson(skel) +
-        ",\"animations\":[{\"class\":\"horizon::animation::Animation\",\"data\":{\"animation\":" + refJson(anim) + "}}],\"remapPages\":[]}");
+        ",\"animations\":[{\"class\":\"horizon::animation::Animation\",\"data\":{\"animation\":" + refJson(anim) + "}}],\"sockets\":[]}");   // "sockets" (calming butterflies = WORKING skinned) NOT "remapPages" (nuxd prism_wave = invisible, same bug)
 }
 // Spawn point: where the player starts (just above the floor). Without one the shell uses a fallback that can
 // leave you off the floor. Transform + SpawnPointPlatformComponent{stateEnabled,allowStart}.
@@ -605,12 +613,26 @@ inline std::vector<uint8_t> assembleSceneZip(std::vector<CookAsset>& assets,
 inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, const std::vector<float>& uv,
                                                 const std::vector<uint32_t>& idx, const std::vector<uint8_t>& embeddedMatl = {},
                                                 int vatVertexCount = 0,
-                                                const std::vector<uint8_t>& boneIdx = {}, const std::vector<uint8_t>& boneWgt = {}) {
+                                                const std::vector<uint8_t>& boneIdx = {}, const std::vector<uint8_t>& boneWgt = {},
+                                                const std::vector<uint32_t>& jointIds = {}) {   // jointIds = murmur3(joint name) per skeleton joint
     struct Part { std::vector<uint8_t> vb, ib; uint32_t nv = 0; };
     std::vector<Part> parts;
     bool haveUv = uv.size() >= (pos.size() / 3) * 2;
     size_t nvTotal = pos.size() / 3;
     bool skinned = boneIdx.size() >= nvTotal * 4 && boneWgt.size() >= nvTotal * 4;   // stride-24 SKINNED mesh (sem7 idx, sem8 wgt)
+    // DENSE JOINT PALETTE: ROOT.f2 must list ONLY the skeleton joints this mesh's vertices actually reference, and each
+    // vertex bone index is remapped into that palette (local slot). The device's skin build REJECTS a palette that
+    // contains joints no vertex uses (MeshDefinition::fix() "flatbuffer verification failed" -> std::length_error abort).
+    // A 0..maxBoneIdx palette only works when the references are contiguous (m001 droid body uses {0,1,2,3}); the omnidroid
+    // SHIELD weights only joints {0,4}, so a 0..4 palette would include unused 1,2,3 and crash the device. This is the
+    // standard glTF skin-palette remap. [[project_hsr_skinned_rendmesh_skinblock]]
+    std::vector<uint8_t> palette;       // local slot -> skeleton joint index (sorted, unique, only referenced)
+    uint8_t boneRemap[256]; memset(boneRemap, 0, sizeof boneRemap);
+    if (skinned) {
+        bool seen[256] = { false };
+        for (size_t i = 0; i < nvTotal * 4 && i < boneIdx.size(); i++) seen[boneIdx[i]] = true;
+        for (int j = 0; j < 256; j++) if (seen[j]) { boneRemap[j] = (uint8_t)palette.size(); palette.push_back((uint8_t)j); }
+    }
     float mn[3] = { 1e30f,1e30f,1e30f }, mx[3] = { -1e30f,-1e30f,-1e30f };
     for (size_t i = 0; i + 2 < pos.size(); i += 3) for (int k = 0; k < 3; k++) { float p = pos[i + k]; if (p < mn[k]) mn[k] = p; if (p > mx[k]) mx[k] = p; }
     size_t ntri = idx.size() / 3;
@@ -633,8 +655,15 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
                     memcpy(b,&z,4); pr.vb.insert(pr.vb.end(),b,b+4);
                     uint16_t u = f32_to_f16(haveUv ? uv[(size_t)g*2] : 0.f), v = f32_to_f16(haveUv ? uv[(size_t)g*2+1] : 0.f);
                     uint8_t bb[4] = { (uint8_t)u,(uint8_t)(u>>8),(uint8_t)v,(uint8_t)(v>>8) }; pr.vb.insert(pr.vb.end(),bb,bb+4);
-                    if (skinned) {   // SKINNED stride-24: boneIndices u8x4 (sem7) + weights u8x4-UNORM (sem8)
-                        pr.vb.insert(pr.vb.end(), &boneIdx[(size_t)g*4], &boneIdx[(size_t)g*4]+4);
+                    if (skinned) {   // SKINNED stride-28 (match butterflies/unlitdoublesidedskinned): COLOR0(sem4) + boneIdx(sem7) + weights(sem8 u8x4-UNORM). Was stride-24 (no sem4) -> shader read bone idx/weight at wrong offsets -> mesh collapsed.
+                        // sem4 = vertexColor0 (COLOR_0), u8x4 RGBA — NOT a normal. GROUND TRUTH: the working butterfly mesh
+                        // stores (255,255,255,255) here, and the source omnidroid's COLOR_0 is (1,1,1,1). The shader does
+                        // baseColor * vertexColor0, so the old (0,0,127,0) "normal placeholder" multiplied the droid down to
+                        // near-black (THE "full dark" bug). White = neutral = the texture (incl. the red strip) shows fully.
+                        uint8_t col0[4] = { 0xFF,0xFF,0xFF,0xFF }; pr.vb.insert(pr.vb.end(), col0, col0+4);   // vertexColor0 sem4 = white (source COLOR_0)
+                        uint8_t bidx[4] = { boneRemap[boneIdx[(size_t)g*4]], boneRemap[boneIdx[(size_t)g*4+1]],
+                                            boneRemap[boneIdx[(size_t)g*4+2]], boneRemap[boneIdx[(size_t)g*4+3]] };  // remap to dense palette slot
+                        pr.vb.insert(pr.vb.end(), bidx, bidx+4);
                         pr.vb.insert(pr.vb.end(), &boneWgt[(size_t)g*4], &boneWgt[(size_t)g*4]+4);
                     } else if (vatVertexCount > 0) {   // VAT column: uv1.x = (vertexIndex+0.5)/count (u16 UNORM), replaces the normal slot
                         float col = ((float)g + 0.5f) / (float)vatVertexCount; col = col < 0 ? 0 : (col > 1 ? 1 : col);
@@ -657,12 +686,12 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
     // from real meshes: oceanarium VAT-format VS.f0 = {0x4157E789,0x79BF0758,0}).
     static const uint8_t VSF0_N[12] = { 0x23,0xa5,0xe0,0xdb, 0x22,0x95,0x8f,0xf3, 0,0,0,0 };
     static const uint8_t VSF0_V[12] = { 0x89,0xe7,0x56,0x41, 0x58,0x07,0xbf,0x79, 0,0,0,0 };
-    static const uint8_t VSF0_S[12] = { 0xe6,0x08,0x94,0xe5, 0x75,0xde,0x33,0x4a, 0x04,0,0,0 };   // SKINNED format hash
+    static const uint8_t VSF0_S[12] = { 0x92,0xb6,0x7a,0xd8, 0x01,0x13,0x34,0x77, 0,0,0,0 };   // SKINNED format hash — unlitdoublesidedskinned stride-28 (POS+UV+NORMAL+boneIdx+weight), matched byte-for-byte to the calming butterflies' working skinned mesh
     const uint8_t* VSF0 = skinned ? VSF0_S : (vatVertexCount > 0 ? VSF0_V : VSF0_N);
     float ones[2] = { 1.f,1.f }; uint8_t rf8[8]; memcpy(rf8, ones, 8);
-    uint8_t attr[16] = { 0,0x32,0,0, 5,0x21,0,0, 4,0x13,0,0, 0,0,0,0 };  // POS f32x3@0, UV f16x2@12, NORMAL fmt0x13@16 (stride20)
+    uint8_t attr[24] = { 0,0x32,0,0, 5,0x21,0,0, 4,0x13,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0 };  // POS f32x3@0, UV f16x2@12, NORMAL(sem4) fmt0x13@16
     int nattr = 3;
-    if (skinned) { attr[8]=7; attr[9]=0x13; attr[10]=0; attr[11]=0; attr[12]=8; attr[13]=0x13; attr[14]=0; attr[15]=0; nattr=4; }  // sem7 boneIdx + sem8 weights (stride24)
+    if (skinned) { attr[12]=7; attr[13]=0x13; attr[14]=0; attr[15]=0; attr[16]=8; attr[17]=0x13; attr[18]=0; attr[19]=0; nattr=5; }  // POS,UV,NORMAL(sem4),boneIdx(sem7),weight(sem8) stride28 — exact butterflies layout
     else if (vatVertexCount > 0) { attr[8]=5; attr[9]=0x27; attr[10]=1; attr[11]=0; }   // 3rd attr -> UV1 u16x2 (VAT column)
     size_t cap = 2048 + embeddedMatl.size() * (parts.size() + 1); for (auto& p : parts) cap += p.vb.size() + p.ib.size() + 256;
     FB b(cap);
@@ -683,10 +712,12 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
     // SKINNED meshes need the device's "has skin weights" markers (shipped whale mesh has them; static meshes don't):
     // LOD.f2 = u16 max bone index, LOD.f4 = u16 0, ROOT.f0 = empty vector. Without them the device logs
     // "Mesh ... has no skin weights and will not follow skeleton animation" and renders the frozen bind pose.
-    uint16_t maxBoneIdx = 0; if (skinned) for (uint8_t bv : boneIdx) if (bv > maxBoneIdx) maxBoneIdx = bv;
+    bool markers = skinned && !std::getenv("HSR_HZNOMARK");   // diag: isolate skin markers from the stride-24 format
+    // LOD.f2 = max LOCAL (remapped) bone index = palette.size()-1 — the highest slot any vertex now uses (dense).
+    uint16_t maxBoneIdx = (skinned && !palette.empty()) ? (uint16_t)(palette.size() - 1) : 0;
     uint16_t zero16 = 0;
     int lod;
-    if (skinned) {
+    if (markers) {
         b.startObject(5); b.addOffset(0, pv); b.addScalar<float>(1, 0.2f);
         b.addStructSlot(2, (const uint8_t*)&maxBoneIdx, 2, 2);
         b.addStructSlot(3, (const uint8_t*)aabb, 24, 4);
@@ -696,10 +727,27 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
         b.startObject(4); b.addOffset(0, pv); b.addScalar<float>(1, 0.2f); b.addStructSlot(3, (const uint8_t*)aabb, 24, 4); lod = b.endObject();
     }
     int lv = b.createOffsetVector({ lod });
-    int matVec = b.createOffsetVector({});   // empty materials (materials come from part.field3 embedded MATL)
-    int rootF0 = skinned ? b.createOffsetVector({}) : 0;   // ROOT.f0 = empty vector (skinned marker)
+    // ROOT.f2: static meshes leave this EMPTY. SKINNED meshes populate it with ONE element whose field0 is an OFFSET to a
+    // vector<u32> of JOINT-ID HASHES = MurmurHash3_x86_32(joint name, seed 0), one per PALETTE slot (the joints the mesh
+    // actually references, dense). The device maps each vertex's (remapped) local bone index -> f2[localIdx] -> StringId ->
+    // skeleton joint. f2 MUST contain only referenced joints: an unreferenced palette entry makes the device's skin build
+    // reject the mesh (MeshDefinition::fix verification fail -> crash). f2[local] = murmur3(joint name of palette[local]).
+    // VERIFIED: butterfly f2 ids == murmur3 of the joints its verts use. Static meshes keep f2 EMPTY (mat via part.f3).
+    int matVec;
+    if (skinned && !jointIds.empty() && !palette.empty()) {
+        std::vector<uint32_t> paletteIds; paletteIds.reserve(palette.size());
+        for (uint8_t sk : palette) paletteIds.push_back(sk < jointIds.size() ? jointIds[sk] : 0u);
+        int jidVec = b.createStructVector((const uint8_t*)paletteIds.data(), 4, (int)paletteIds.size(), 4);  // vector<u32> palette joint ids
+        b.startObject(1); b.addOffset(0, jidVec); int skinDesc = b.endObject();
+        matVec = b.createOffsetVector({ skinDesc });
+    } else {
+        matVec = b.createOffsetVector({});
+    }
+    uint16_t rootF0val = 2;   // ROOT.f0 = u16 2 (the whale's skinned marker). I'd wrongly made it a 4-byte EMPTY
+                              // VECTOR (offset) -> the strict device Verifier rejected the buffer ("MeshDefinition::fix").
+    int badF0 = (markers && std::getenv("HSR_HZBADF0")) ? b.createOffsetVector({}) : 0;   // demo: reproduce the old bug
     b.startObject(9);
-    if (skinned) b.addOffset(0, rootF0);
+    if (markers) { if (badF0) b.addOffset(0, badF0); else b.addStructSlot(0, (const uint8_t*)&rootF0val, 2, 2); }
     b.addOffset(1, lv); b.addOffset(2, matVec); b.addStructSlot(3, (const uint8_t*)aabb, 24, 4); b.addScalar<float>(4, radius); b.addStructSlot(8, rf8, 8, 4); int root = b.endObject();
     b.finish(root, "MESH"); return b.output();
 }
@@ -738,6 +786,7 @@ struct ExportMesh {
     std::vector<uint8_t> rgba;      // decoded base-color RGBA8 (optional)
     uint32_t w = 0, h = 0;
     bool blend = false;             // alpha-blended (transparent) -> route to unlitblend.surface
+    float matTint[4] = {1,1,1,1};   // the mesh's OWN base-color tint (glTF baseColorFactor) for its material params
     std::vector<float> vatOffsets;  // VAT vertex offsets, frames*vertexCount*3 (WORLD space) -> animated via VAT (non-skeletal)
     int vatFrames = 0;
     // HZANIM (skeletal): hzFrames>1 -> skinned RENDMESH + HZAN:SKEL + ACL HZAN:ANIM + AnimatorPlatformComponent
@@ -773,8 +822,20 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     auto matBlend  = readFileBytes("cooker/realdome_mat.bin");    // unlitblend.surface MATL template
     auto shadVat   = readFileBytes("cooker/vat_shader.bin");      // vatunlitbasecolor (vertex-animation) shader
     auto matVat    = readFileBytes("cooker/vat_mat.bin");         // VAT MATL template (416B, base@152/160 + VAT@192/200)
-    auto shadSkin  = readFileBytes("cooker/skinned_shader.bin");  // unlitblendskinned.surface (HZANIM skeletal)
-    auto matSkin   = readFileBytes("cooker/skinned_mat.bin");     // skinned MATL template (motes, 176B)
+    auto shadSkin  = readFileBytes("cooker/unlitdoublesidedskinned.bin");  // OPAQUE skinned (butterflies) — for opaque skinned meshes (droid body). matParams = uvScaleOffset.
+    auto shadSkinB = readFileBytes("cooker/unlitblendskinned.bin");        // BLEND skinned (Nuxd renderer_module) — alpha-blends transparent skinned meshes (the omnidroid SHIELD force-field). SAME matParams layout (uvScaleOffset) as unlitdoublesidedskinned, so the SAME field-7 material template works; only the shader ref differs.
+    auto matSkin   = readFileBytes("cooker/skinned_mat.bin");     // OLD motes MATL template (176B, NO field7 — fails device skinned path)
+    auto matSkin2  = readFileBytes("cooker/skinned_mat_v2.bin");  // CURRENT-format skinned MATL (butterflies: field7=shader ref @48, tex ing@128). The device's skinned render path reads the shader from MATL FIELD 7; the old motes material has only 6 fields (no field7) so it read garbage -> ShaderAsset/TextureAsset MISSING -> ErrorNotReady -> invisible droid.
+    // BLEND skinned material = skinned_mat_v2 + a PROPER field2=2 (transparent-pass flag), generated in code so no extra
+    // asset file is needed. The butterflies template (root@32, vtable@10) has a 24-byte shader-ref struct @48..72 and
+    // field0 (u16=2) @74, leaving 2 free padding bytes @72-73: write u16=2 there (table voffset 40) and point field2's
+    // vtable slot (@18) at voffset 40 -> a non-overlapping field2=2. This makes BLEND skinned meshes (the omnidroid
+    // SHIELD) sort into the device's ALPHA-BLEND transparent pass with proper depth (was opaque-pass -> "no depth, the
+    // rest overlays it, only visible against black"). Ref offsets (@48/56 shader, @120/128 tex) are unchanged. Official
+    // transparent skinned mats (central donut_shield, calming waterfalls) confirm the field set [0,2,3,5,7,8].
+    std::vector<uint8_t> matSkinB = matSkin2;
+    if (matSkinB.size() >= 76) { matSkinB[72] = 2; matSkinB[73] = 0; matSkinB[18] = 40; matSkinB[19] = 0; }
+    auto refSkinMesh = readFileBytes("cooker/ref_skinned_mesh.bin"); // Meta-shipped skinned RENDMESH = cook-verify schema oracle
     if (shad.empty() || matTpl.size() < 176) return {};
     AssetKey3 shaderK = { 0x608B25CE5424598Dull, 0x78686234E7611EFCull, 0xA1767FE9u };
     assets.push_back({ "meta/renderer_module/shaders/unlit.surface/shader", shaderK.tgt, shad, shaderK });
@@ -788,13 +849,25 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         AssetKey3 shaderVatK = { 0x91897C97D84A4317ull, 0xFB22F5F00E5164C0ull, 0xA1767FE9u };
         assets.push_back({ "meta/horizon_shared_shaders/shaders/vat/vatunlitbasecolor.surface/shader", shaderVatK.tgt, shadVat, shaderVatK });
     }
-    bool haveSkin = !shadSkin.empty() && matSkin.size() >= 176;
-    if (haveSkin) {   // ship unlitblendskinned for HZANIM skinned meshes
-        AssetKey3 shaderSkinK = { 0x608B25CE5424598Dull, 0xFCF6A70495BF7B47ull, 0xA1767FE9u };
-        assets.push_back({ "meta/renderer_module/shaders/unlitblendskinned.surface/shader", shaderSkinK.tgt, shadSkin, shaderSkinK });
+    bool haveSkin = !shadSkin.empty() && matSkin2.size() >= 176;   // require the CURRENT-format skinned material
+    AssetKey3 shaderSkinK{}, shaderSkinBK{};
+    if (haveSkin) {   // ship our skinned shaders ENV-LOCAL (the device resolves the env's own package; renderer_module copies
+                      // are shadowed by the system module). The material's field7 ref is patched (below) to the exact key,
+                      // so it resolves to our shipped shader. Ship BOTH the opaque (unlitdoublesidedskinned) and the BLEND
+                      // (unlitblendskinned) skinned shaders; blend skinned meshes (the shield) route to the blend one.
+        std::string pSkinShader = "meta/myhome/shaders/unlitdoublesidedskinned.surface/shader";
+        shaderSkinK = keyForPath(pSkinShader);
+        assets.push_back({ pSkinShader, shaderSkinK.tgt, shadSkin, shaderSkinK });
+        if (!shadSkinB.empty()) {
+            std::string pSkinShaderB = "meta/myhome/shaders/unlitblendskinned.surface/shader";
+            shaderSkinBK = keyForPath(pSkinShaderB);
+            assets.push_back({ pSkinShaderB, shaderSkinBK.tgt, shadSkinB, shaderSkinBK });
+        }
     }
     std::vector<uint8_t> whiteTex; { std::vector<uint8_t> w4((size_t)4*4*4, 255); whiteTex = encodeRendTxtr(w4.data(), 4, 4, 8, 8); }
     std::string pWhite = "meta/myhome/white.tex/tex"; AssetKey3 whiteK = keyForPath(pWhite); bool whiteUsed = false;
+    struct SharedRig { std::vector<uint8_t> skel, anim; AssetKey3 skelK, animK; };  // dedup skel+anim across meshes sharing one armature (like nuxd)
+    std::vector<SharedRig> rigs;
     std::string rootId = makeUuid(rng);
     std::string entities = rootEntityJson(rootId), rels;
     float pos0[3]={0,0,0}, rot0[3]={0,0,0}, scl1[3]={1,1,1};
@@ -803,6 +876,15 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     for (size_t i = 0; i < meshes.size(); ++i) {
         const ExportMesh& m = meshes[i];
         if (m.positions.size() < 9 || m.indices.size() < 3) continue;   // skip empty
+        { // skip DEGENERATE meshes: all verts at one point (0-area). For a SKINNED mesh (e.g. the omnidroid's Shield) the
+          // bind/rest pose is real geometry and only the ANIMATED rest collapses (Shield joint scale 0->1 pop); the cooked
+          // skinned mesh uses hzRestPos (un-collapsed bind), so test THAT, not m.positions. Only a truly 0-area mesh
+          // (even at rest) is dropped. (The old check dropped the Shield purely because its m.positions = animated bind.)
+          bool willSkin = std::getenv("HSR_HZANIM") && m.hzFrames > 1 && m.hzRestPos.size() == m.positions.size();
+          const std::vector<float>& dp = willSkin ? m.hzRestPos : m.positions;
+          float dmn[3]={1e30f,1e30f,1e30f}, dmx[3]={-1e30f,-1e30f,-1e30f};
+          for (size_t v=0; v+2<dp.size(); v+=3) for(int k=0;k<3;k++){ float p=dp[v+k]; if(p<dmn[k])dmn[k]=p; if(p>dmx[k])dmx[k]=p; }
+          if (dmx[0]-dmn[0]<1e-3f && dmx[1]-dmn[1]<1e-3f && dmx[2]-dmn[2]<1e-3f) { fprintf(stderr,"[COOK] skip degenerate mesh m%03zu '%s' (0-area)\n", i, m.name.c_str()); continue; } }
         // navmesh bounds: explicit mesh (HSR_NAVMESH), else substantial GROUND geometry only — skip the skybox and
         // the billboard-planets (few verts, far away) so the ground sits ON the terrain, not hundreds of m below it.
         size_t mnv = m.positions.size() / 3;
@@ -814,21 +896,53 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     pTex = std::string(base) + ".tex/tex";
         AssetKey3 meshK = keyForPath(pMesh), matK = keyForPath(pMat);
         AssetKey3 texK; std::vector<uint8_t> tex;
-        if (m.rgba.size() >= (size_t)m.w * m.h * 4 && m.w && m.h) { texK = keyForPath(pTex); tex = encodeRendTxtr(m.rgba.data(), (int)m.w, (int)m.h, 8, 8); }
+        // An OPAQUE skinned mesh (e.g. the Incredibles droid: source alphaMode=OPAQUE) is drawn through the
+        // unlitblendskinned BLEND shader, so its texture's UV-atlas-mask alpha (alpha 0 outside the islands) would
+        // make it transparent. The source ignores that alpha (opaque); cook the texture OPAQUE to match.
+        // The droid's texture is a UV-ATLAS MASK: alpha=0 outside the UV islands. An opaque-source skinned mesh that
+        // ends up on an alpha-respecting material then renders TRANSPARENT (invisible) wherever alpha=0. Force the texture
+        // OPAQUE for ANY opaque skinned-source mesh — NOT gated behind HSR_HZANIM (the static cook needs it too; that gate
+        // was THE bug that made the static droid invisible on-device while the sim's alpha-ignoring fallback still showed it).
+        bool skinnedOpaque = haveSkin && m.hzJointCount > 0 && !m.blend;
+        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' skinnedOpaque=%d blend=%d hzJoints=%d haveSkin=%d w=%d h=%d rgba=%zu\n", i, m.name.c_str(), skinnedOpaque, (int)m.blend, m.hzJointCount, (int)haveSkin, m.w, m.h, m.rgba.size());
+        std::vector<uint8_t> texOpaque; const uint8_t* texSrc = m.rgba.data();
+        if (skinnedOpaque && m.rgba.size() >= (size_t)m.w * m.h * 4) {
+            texOpaque = m.rgba; for (size_t k = 3; k < texOpaque.size(); k += 4) texOpaque[k] = 255; texSrc = texOpaque.data();
+        }
+        bool droidWhite = std::getenv("HSR_DROIDWHITE") && m.hzJointCount > 0;   // diag: force the droid to the white fallback tex (isolate texture vs mesh)
+        if (m.rgba.size() >= (size_t)m.w * m.h * 4 && m.w && m.h && !droidWhite) { texK = keyForPath(pTex); tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, 8, 8); }
         if (tex.empty()) { texK = whiteK; whiteUsed = true; }     // share the white fallback
         // ANIMATED (VAT) mesh -> bake the offset texture + the vatunlitbasecolor MATL (base tex + VAT tex); else
         // transparent -> unlitblend MATL, opaque -> floor MATL. Patch each to THIS mesh's texture(s).
         int vc = (int)(m.positions.size() / 3);
-        bool useHz  = haveSkin && m.hzFrames > 1 && m.hzJointCount > 0
+        // HZANIM (skinned animation) gated behind HSR_HZANIM: the skin-marker fields trigger a device skinned-verify
+        // that rejects the mesh (WIP). Default OFF -> skinned meshes export as STATIC (visible, like the static port).
+        bool useHz  = std::getenv("HSR_HZANIM") && haveSkin && m.hzFrames > 1 && m.hzJointCount > 0
                     && m.hzBoneIdx.size() >= (size_t)vc*4 && m.hzBoneWgt.size() >= (size_t)vc*4
-                    && m.hzTrsLocal.size() >= (size_t)m.hzFrames*m.hzJointCount*10;
+                    && m.hzTrsLocal.size() >= (size_t)m.hzFrames*m.hzJointCount*10
+                    && m.hzRestPos.size() == m.positions.size();   // centered rest positions present
         bool useVat = !useHz && !m.vatOffsets.empty() && m.vatFrames > 1 && haveVat && m.vatOffsets.size() >= (size_t)vc * m.vatFrames * 3;
         std::vector<uint8_t> vatTex; AssetKey3 vatTexK;
         if (useVat) { vatTex = encodeVatTexture(m.vatOffsets, vc, m.vatFrames); if (vatTex.empty()) useVat = false; }
         std::vector<uint8_t> matl; std::string animatorComp;
-        if (useHz) {   // HZANIM: skinned MATL + HZAN:SKEL + ACL HZAN:ANIM + AnimatorPlatformComponent
-            matl = matSkin;
-            memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);
+        if (useHz) {   // HZANIM: CURRENT-format skinned MATL (field7=shader) + HZAN:SKEL + ACL HZAN:ANIM + AnimatorPlatformComponent
+            // BLEND skinned (the SHIELD) -> the transparent-flagged material (field2=2) so it alpha-blends in the
+            // transparent pass; OPAQUE skinned (body) -> the plain butterflies template.
+            matl = std::getenv("HSR_HZMATTPL") ? matTpl : (m.blend && matSkinB.size() >= 176 ? matSkinB : matSkin2);
+            if (!std::getenv("HSR_HZMATTPL") && matl.size() >= 140) {
+                // field7 shader ref @48(pkg)/@56(ing)/@64(tgt) -> our env-local skinned shader; tgt @64 stays 0xA1767FE9 (murmur3"shader").
+                // BLEND skinned meshes (the omnidroid SHIELD = alphaMode BLEND) use unlitBLENDskinned so the device alpha-blends
+                // them (transparent force-field); OPAQUE skinned (droid body) use unlitdoublesidedskinned. Same matParams layout.
+                const AssetKey3& sk = (m.blend && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
+                memcpy(matl.data() + 48, &sk.pkg, 8); memcpy(matl.data() + 56, &sk.ing, 8);
+                // texture ref pkg @120 / ing @128 -> THIS mesh's texture; tgt @136 stays 0x6E4CC522 (murmur3"tex").
+                // pkg is NOT implicit: the butterflies template's @120 holds the CALMING package, so leaving it makes the
+                // texture resolve to {calming_pkg, our_ing} = MISSING TextureAsset -> ErrorNotReady -> INVISIBLE DROID.
+                // (The shader ref above patches pkg+ing; the texture was only half-patched. THIS was the real blocker.)
+                memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);
+            } else if (matl.size() >= 96) {
+                memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);  // legacy (HSR_HZMATTPL) path
+            }
             std::vector<HzJoint> joints; joints.reserve(m.hzJointCount);
             for (int j = 0; j < m.hzJointCount; ++j) {
                 HzJoint jt; jt.parent = m.hzParents[j];
@@ -838,13 +952,34 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 jt.scale = m.hzJointScale[j];
                 joints.push_back(jt);
             }
-            std::string pSkel = std::string(base) + ".skel/skeleton"; AssetKey3 skelK = keyForPath(pSkel);
-            assets.push_back({ pSkel, skelK.tgt, encodeHzSkel(joints), skelK, TYPE_HZAN, TYPE_SKEL });
+            // SHARE one skeleton + one anim across all meshes that use the SAME armature (the omnidroid body + shield are
+            // the same skin[0] -> identical encoded skel+anim). GROUND TRUTH: nuxd's prism_wave + motes both reference the
+            // SAME skeleton/anim asset (one skeleton_0 + one take_001 in its scene). Shipping a DUPLICATE per-mesh skel/anim
+            // made the device's async asset loader race -> std::length_error crash-loop (5-6x then loaded). Dedup by bytes:
+            // ship a shared armatureN.skel/anim once; later meshes with identical bytes reference it.
+            auto skelBytes = encodeHzSkel(joints);
             auto anim = hzAclEncode(m.hzTrsLocal.data(), m.hzParents.data(), m.hzJointCount, m.hzFrames, m.hzFps);
             if (!anim.empty()) {
-                std::string pAnim = std::string(base) + ".anim/anim"; AssetKey3 animK = keyForPath(pAnim);
-                assets.push_back({ pAnim, animK.tgt, anim, animK, TYPE_HZAN, TYPE_ANIM });
-                animatorComp = animatorComponentJson(skelK, animK);
+                int rigIdx = -1;
+                for (size_t r = 0; r < rigs.size(); ++r) if (rigs[r].skel == skelBytes && rigs[r].anim == anim) { rigIdx = (int)r; break; }
+                if (rigIdx < 0) {
+                    char rb[48]; snprintf(rb, sizeof rb, "meta/myhome/armature%zu", rigs.size());
+                    std::string pSkel = std::string(rb) + ".skel/skeleton", pAnim = std::string(rb) + ".anim/anim";
+                    AssetKey3 skK = keyForPath(pSkel), anK = keyForPath(pAnim);
+                    // HZAN:SKEL / HZAN:ANIM use a FIXED type targetId across ALL official envs (nuxd/calming/horror all
+                    // ship skel tgt=2292226755, anim tgt=1496459219 — NOT murmur3(subName)). The device animation system
+                    // keys on these; my murmur3 tgts (513515675/1177748882) left an inconsistent anim record that the
+                    // environment-unload/memory-compaction path choked on -> std::length_error crash-loop (stock envs on
+                    // the SAME compaction path don't crash). The loose loader still resolves by (pkg,ing,tgt) since the
+                    // manifest maps the overridden tgt -> subName, so it both animates AND matches the device's type id.
+                    skK.tgt = 2292226755u;  // HZAN:SKEL fixed type targetId
+                    anK.tgt = 1496459219u;  // HZAN:ANIM fixed type targetId
+                    assets.push_back({ pSkel, skK.tgt, skelBytes, skK, TYPE_HZAN, TYPE_SKEL });
+                    assets.push_back({ pAnim, anK.tgt, anim,      anK, TYPE_HZAN, TYPE_ANIM });
+                    rigs.push_back({ skelBytes, anim, skK, anK });
+                    rigIdx = (int)rigs.size() - 1;
+                }
+                animatorComp = animatorComponentJson(rigs[rigIdx].skelK, rigs[rigIdx].animK);
             }
         } else if (useVat) {
             std::string pVatTex = std::string(base) + ".vat.tex/tex"; vatTexK = keyForPath(pVatTex);
@@ -856,17 +991,63 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             matl = (m.blend && haveBlend) ? matBlend : matTpl;
             memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);
         }
-        // NOTE: skinned meshes still export world-baked positions for now. The "correct" path is rest/model-space
-        // positions (m.hzRestPos) + a skeleton in the same space + an entity transform for placement, but that hit a
-        // MeshDefinition::fix() verifier rejection (WIP). Baked positions pass the verifier and load.
-        auto mesh = useHz ? encodeRendMeshParts(m.positions, m.uvs, m.indices, matl, 0, m.hzBoneIdx, m.hzBoneWgt)
-                          : encodeRendMeshParts(m.positions, m.uvs, m.indices, matl, useVat ? vc : 0);
+        // Skinned: use the CENTERED rest positions (extractHzAnim centered mesh+skeleton+clip near origin so the
+        // verifier accepts them); place the rig via the entity transform at the baked mesh's center (skinPos below).
+        // Diagnostic: HSR_HZWORLD=1 -> skinned mesh uses the EXACT world-baked positions that pass as static (isolates
+        // whether the skin markers/skeleton/animator break the verifier vs. the rest-position coordinate change).
+        const std::vector<float>& hzMeshPos = std::getenv("HSR_HZWORLD") ? m.positions : m.hzRestPos;
+        if (useHz && std::getenv("HSR_VERBOSE")) {
+            int maxIdx = 0; for (auto b : m.hzBoneIdx) if ((int)b > maxIdx) maxIdx = (int)b;
+            float rmn[3]={1e30f,1e30f,1e30f}, rmx[3]={-1e30f,-1e30f,-1e30f};
+            for (size_t v=0; v+2<hzMeshPos.size(); v+=3) for(int k=0;k<3;k++){ float p=hzMeshPos[v+k]; if(p<rmn[k])rmn[k]=p; if(p>rmx[k])rmx[k]=p; }
+            float wsum = 0; for (size_t k=0; k<4 && k<m.hzBoneWgt.size(); k++) wsum += m.hzBoneWgt[k];
+            float wmn[3]={1e30f,1e30f,1e30f}, wmx[3]={-1e30f,-1e30f,-1e30f};
+            for (size_t v=0; v+2<m.positions.size(); v+=3) for(int k=0;k<3;k++){ float p=m.positions[v+k]; if(p<wmn[k])wmn[k]=p; if(p>wmx[k])wmx[k]=p; }
+            fprintf(stderr, "[HZDIAG] m%03zu joints=%d maxBoneIdx=%d v0wgtSum=%.3f restB=(%.2f,%.2f,%.2f)..(%.2f,%.2f,%.2f) worldB=(%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f)\n",
+                    i, m.hzJointCount, maxIdx, wsum, rmn[0],rmn[1],rmn[2], rmx[0],rmx[1],rmx[2], wmn[0],wmn[1],wmn[2], wmx[0],wmx[1],wmx[2]);
+            for (int j=0; j<m.hzJointCount && j<8 && (int)m.hzJointPos.size()>=(j+1)*3; j++)
+                fprintf(stderr, "  [HZJOINT] m%03zu j%d parent=%d localPos=(%.2f,%.2f,%.2f) scl=%.3f\n", i, j,
+                        j<(int)m.hzParents.size()?m.hzParents[j]:-9, m.hzJointPos[j*3],m.hzJointPos[j*3+1],m.hzJointPos[j*3+2],
+                        j<(int)m.hzJointScale.size()?m.hzJointScale[j]:0.f);
+        }
+        std::vector<uint32_t> jointIds;   // ROOT.f2 joint-binding table = murmur3(joint name) per skeleton joint (m###.skel order)
+        if (useHz) for (int j = 0; j < m.hzJointCount; ++j) { char jn[24]; snprintf(jn, sizeof jn, "joint_%d", j); jointIds.push_back(murmur3_x86_32(jn, strlen(jn), 0)); }
+        std::vector<float> dbgPos; const std::vector<float>* staticPos = &m.positions;
+        if (std::getenv("HSR_DROIDFRONT") && m.hzJointCount > 0) {   // diag: shrink+move the droid right in front of spawn (isolate position/cull vs mesh-reject)
+            float c[3]={0,0,0}; size_t np=m.positions.size()/3;
+            for (size_t v=0;v+2<m.positions.size();v+=3) for(int k=0;k<3;k++) c[k]+=m.positions[v+k];
+            for(int k=0;k<3;k++) c[k]/= (np?(float)np:1.f);
+            dbgPos.resize(m.positions.size()); float tgt[3]={0,1.5f,-3.f}, sc=0.08f;
+            for (size_t v=0;v+2<m.positions.size();v+=3) for(int k=0;k<3;k++) dbgPos[v+k]=(m.positions[v+k]-c[k])*sc+tgt[k];
+            staticPos = &dbgPos;
+        }
+        auto mesh = useHz ? encodeRendMeshParts(hzMeshPos, m.uvs, m.indices, matl, 0, m.hzBoneIdx, m.hzBoneWgt, jointIds)
+                          : encodeRendMeshParts(*staticPos, m.uvs, m.indices, matl, useVat ? vc : 0);
+        // COOK-TIME VERIFY: check the just-cooked skinned RENDMESH against the Meta-shipped reference schema (the
+        // device runs the stock flatbuffers verifier; this catches structural divergence — e.g. a field emitted as
+        // an offset where the schema wants an inline scalar — BEFORE the asset ever ships to the headset).
+        if (useHz && refSkinMesh.size() >= 8) {
+            auto probs = fbVerifyAgainst(mesh, refSkinMesh);
+            if (probs.empty()) fprintf(stderr, "[COOK-VERIFY] %s : OK (matches Meta skinned-mesh schema)\n", pMesh.c_str());
+            else { fprintf(stderr, "[COOK-VERIFY] %s : %zu PROBLEM(S) vs device schema:\n", pMesh.c_str(), probs.size());
+                   for (auto& s : probs) fprintf(stderr, "    !! %s\n", s.c_str()); }
+        }
         assets.push_back({ pMesh, meshK.tgt, mesh, meshK });
         if (!tex.empty()) assets.push_back({ pTex, texK.tgt, tex, texK });
         assets.push_back({ pMat, matK.tgt, matl, matK });
         std::string nm = m.name.empty() ? ("mesh" + std::to_string(i)) : m.name;
         std::string mid = makeUuid(rng);
-        entities += "," + entityJson(mid, nm, pos0, rot0, scl1, meshK, { matK }, AssetKey3{0,0,0}, animatorComp, useHz ? 9 : 5);
+        // SKINNED: the mesh+rig are centered at origin; place them at the baked mesh's center (= the scene position) via the entity transform.
+        float skinPos[3] = {0,0,0};
+        if (useHz) { float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f};
+            for (size_t v=0; v+2<m.positions.size(); v+=3) for(int k=0;k<3;k++){ float p=m.positions[v+k]; if(p<mn[k])mn[k]=p; if(p>mx[k])mx[k]=p; }
+            for(int k=0;k<3;k++) skinPos[k]=0.5f*(mn[k]+mx[k]); }
+        static const float fixedPos[3] = {0.f, 1.4f, 0.f}; static const float fixedScl[3] = {0.03f, 0.03f, 0.03f};  // HSR_HZFIXED: can't-miss visibility test (tiny droid at spawn)
+        const float* hzPos = (useHz && std::getenv("HSR_HZFIXED")) ? fixedPos : (useHz && std::getenv("HSR_HZCENTER")) ? skinPos : pos0;
+        const float* hzScl = (useHz && std::getenv("HSR_HZFIXED")) ? fixedScl : scl1;
+        // MeshPlatformComponent **v5** for ALL meshes (static AND skinned). GROUND TRUTH: the working calming butterfly
+        // skinned entity uses Mesh v5 (extracted from calming_butterflies.hstf). v6 was a guess that contradicts it.
+        entities += "," + entityJson(mid, nm, hzPos, rot0, hzScl, meshK, { matK }, AssetKey3{0,0,0}, animatorComp, 5, false);
         rels += (rels.empty() ? std::string() : std::string(",")) + relChildOf(mid, rootId);
     }
     if (rels.empty()) return {};

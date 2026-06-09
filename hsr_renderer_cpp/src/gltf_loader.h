@@ -537,15 +537,26 @@ public:
                         MeshData md; md.name = nm;
                         std::vector<float> pos; u32 nv = readAccessorF(posAcc, 3, pos);
                         if (!nv) continue;
-                        bool isSkinned = nd.has("skin") && attr.has("JOINTS_0") && attr.has("WEIGHTS_0");
+                        // A mesh is SKINNED only if it has JOINTS_0/WEIGHTS_0 with ACTUAL non-zero weights. A mesh can carry
+                        // empty JOINTS_0/WEIGHTS_0 (all-zero weights) that the exporter auto-added — that is NOT a real skin
+                        // and must render STATIC. The incredibles "Logo" (Circle.007) is exactly this: node.skin=None AND every
+                        // weight is 0.0 (verified) -> static. (The old "inflates via a scaling joint" note was a misdiagnosis;
+                        // zero weights can't deform.) Cooking a zero-weight mesh as skinned makes the device reject it
+                        // (MeshDefinition::fix verification fail). When node.skin is absent but real weights exist, fall back to
+                        // skin[0]. [[project_hsl_v203_animation_format]]
+                        int skinIdx = nd.has("skin") ? (int)nd["skin"].asInt() : (gskins.empty() ? -1 : 0);
+                        std::vector<float> jf, wf;
+                        bool isSkinned = false;
+                        if (skinIdx >= 0 && attr.has("JOINTS_0") && attr.has("WEIGHTS_0")) {
+                            readAccessorF((int)attr["WEIGHTS_0"].asInt(), 4, wf);
+                            for (float w : wf) if (w > 1e-4f) { isSkinned = true; break; }   // any real weight -> skinned
+                        }
                         md.positions.resize((size_t)nv*3);
                         if (isSkinned) {
                             // Don't bake: keep LOCAL positions; capture skin data. animate(t)
                             // streams skinned world positions per frame (bind pose at t=0).
-                            SkinnedRec rec; rec.skin=(int)nd["skin"].asInt(); rec.nv=nv; rec.basePos=pos;
-                            std::vector<float> jf, wf;
+                            SkinnedRec rec; rec.skin=skinIdx; rec.nv=nv; rec.basePos=pos;
                             readAccessorF((int)attr["JOINTS_0"].asInt(), 4, jf);
-                            readAccessorF((int)attr["WEIGHTS_0"].asInt(), 4, wf);
                             rec.jidx.resize((size_t)nv*4); rec.jw.resize((size_t)nv*4);
                             for (u32 i=0;i<nv*4;++i){ rec.jidx[i]=(u8)(jf[i]+0.5f); rec.jw[i]=(i<wf.size())?wf[i]:0.f; }
                             rec.meshIdx=(int)meshes.size();
@@ -582,6 +593,32 @@ public:
                         int imgIdx = matBaseImage(matIdx);
                         if (imgIdx>=0 && (size_t)imgIdx<images.size() && images[imgIdx].ok) {
                             md.texRGBA = images[imgIdx].rgba; md.texW=images[imgIdx].w; md.texH=images[imgIdx].h; md.hasTexture=true;
+                            // FORCE-FIELD GLOW: an UNLIT shader shows only base color, so a material whose emissive is a flat
+                            // CONSTANT (emissiveFactor, NO emissiveTexture) loses its glow. The omnidroid SHIELD = a faint
+                            // Shield texture + a purple emissive [0.74,0.20,1.0]; baked as base+emissive it becomes a visible
+                            // glowing translucent force-field. SKIP when emissive is a texture (the body: emissive=base,
+                            // already shown) or there's no base texture (solid-color Logo keeps its factor color).
+                            if (matIdx>=0 && root.has("materials") && (size_t)matIdx<root["materials"].size()) {
+                                const auto& mm = root["materials"][matIdx];
+                                if (mm.has("emissiveFactor") && !mm.has("emissiveTexture")) {
+                                    const auto& ef = mm["emissiveFactor"];
+                                    float e[3]={ ef.size()>0?(float)ef[0].asFloat():0.f, ef.size()>1?(float)ef[1].asFloat():0.f, ef.size()>2?(float)ef[2].asFloat():0.f };
+                                    if (e[0]>0.004f||e[1]>0.004f||e[2]>0.004f) {
+                                        // glow luminance — drives both the baked color AND, for BLEND meshes, the OPACITY:
+                                        // a glowing surface should stay VISIBLE through alpha-blend, so lift alpha toward
+                                        // opaque proportional to the glow (the omnidroid SHIELD's texture alpha ~25% made it
+                                        // semi-invisible). GENERAL: applies to ANY constant-emissive blend mesh in any env.
+                                        float lum = 0.299f*e[0]+0.587f*e[1]+0.114f*e[2]; if (lum>1.f) lum=1.f; if (lum<0.f) lum=0.f;
+                                        bool blendMat = mm.has("alphaMode") && mm["alphaMode"].asString()=="BLEND";
+                                        const float GLOW = 0.4f;   // gentle glow — full-strength emissive baked into base was TOO BRIGHT (user). HSR_GLOW overrides.
+                                        float gk = std::getenv("HSR_GLOW") ? (float)atof(std::getenv("HSR_GLOW")) : GLOW;
+                                        for (size_t p=0;p+3<md.texRGBA.size();p+=4) {
+                                            for (int k=0;k<3;k++){ int vv=md.texRGBA[p+k]+(int)(e[k]*255.f*gk+0.5f); md.texRGBA[p+k]=(u8)(vv>255?255:vv); }
+                                            if (blendMat){ int a=md.texRGBA[p+3]; md.texRGBA[p+3]=(u8)(a+(int)((255-a)*lum*gk+0.5f)); }  // lift opacity by glow
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             // No texture: use the material's solid baseColorFactor/emissive color.
                             u8 c[4]; matSolidColor(matIdx, c);
@@ -589,6 +626,17 @@ public:
                         }
                         md.useBlend = matIsBlend(matIdx);  // alpha-blend transparent materials
                         md.doubleSided = matIsDoubleSided(matIdx);  // single-sided -> back-face cull
+                        // This mesh's OWN base-color tint (glTF baseColorFactor; identity-white for a plain textured
+                        // mesh). The cooker uses it for the skinned material instead of borrowing nuxd's "motes"
+                        // particle tint (1,1,0,0 alpha-0) which zeroed the droid/shield on-device.
+                        md.tint[0]=md.tint[1]=md.tint[2]=md.tint[3]=1.0f;
+                        if (matIdx>=0 && root.has("materials") && (size_t)matIdx<root["materials"].size()) {
+                            const auto& mm = root["materials"][matIdx];
+                            if (mm.has("pbrMetallicRoughness") && mm["pbrMetallicRoughness"].has("baseColorFactor")) {
+                                const auto& bcf = mm["pbrMetallicRoughness"]["baseColorFactor"];
+                                for (int i=0;i<4 && i<(int)bcf.size();++i) md.tint[i]=(float)bcf[i].asFloat();
+                            }
+                        }
                         md.transform.rot[3]=1.f;  // identity (world already baked in)
                         meshes.push_back(std::move(md));
                     }
@@ -752,12 +800,67 @@ public:
         for (int j = 0; j < nj; ++j) if ((size_t)sk.joints[j] < gnodes.size()) nodeToJoint[sk.joints[j]] = j;
         e.jointCount = nj;
         e.jointPos.resize(nj*3); e.jointQuat.resize(nj*4); e.jointScale.resize(nj); e.parents.resize(nj);
+        // Joints can be parented through INTERMEDIATE non-joint nodes (rig groups): the glTF node's LOCAL transform is
+        // then NOT relative to the parent JOINT, so storing it directly + dropping the broken parent link gives false
+        // roots + a wrong bind -> CURSED skinning (wrong joints, garbage deform). Fix: bake each joint's full WORLD
+        // transform (compose the whole node hierarchy) for both bind AND clip, emit as ROOTS -> the renderer/device
+        // compute worldAnim·inverse(worldBind) = correct standard glTF skinning regardless of intermediate nodes.
+        auto trsM = [](const float* t, const float* r, const float* s, float* m){   // r=quat xyzw -> column-major mat4
+            float x=r[0],y=r[1],z=r[2],w=r[3];
+            m[0]=(1-2*(y*y+z*z))*s[0]; m[1]=(2*(x*y+w*z))*s[0];   m[2]=(2*(x*z-w*y))*s[0];   m[3]=0;
+            m[4]=(2*(x*y-w*z))*s[1];   m[5]=(1-2*(x*x+z*z))*s[1]; m[6]=(2*(y*z+w*x))*s[1];   m[7]=0;
+            m[8]=(2*(x*z+w*y))*s[2];   m[9]=(2*(y*z-w*x))*s[2];   m[10]=(1-2*(x*x+y*y))*s[2];m[11]=0;
+            m[12]=t[0]; m[13]=t[1]; m[14]=t[2]; m[15]=1; };
+        auto mulM = [](const float* a, const float* b, float* o){
+            for (int c=0;c<4;c++) for (int rr=0;rr<4;rr++) o[c*4+rr]=a[rr]*b[c*4]+a[4+rr]*b[c*4+1]+a[8+rr]*b[c*4+2]+a[12+rr]*b[c*4+3]; };
+        std::function<void(const std::vector<GNode>&,int,float*)> worldM = [&](const std::vector<GNode>& nd,int n,float* out){
+            float loc[16]; trsM(nd[n].t, nd[n].r, nd[n].s, loc);
+            if (nd[n].parent>=0 && (size_t)nd[n].parent<nd.size()){ float pw[16]; worldM(nd,nd[n].parent,pw); mulM(pw,loc,out); }
+            else memcpy(out,loc,64); };
+        // HZHIER (default): build a proper MODEL-SPACE joint hierarchy like every working skinned env (calming
+        // butterflies: root->body->wings, LOCAL transforms near origin). The device skins skinMatrix = animPose *
+        // inverseBind, building the bind by COMPOSING the hierarchy; a flat all-roots skeleton with WORLD transforms
+        // (the old world-bake) gives no hierarchy to compose -> inverseBind can't cancel the huge world translation ->
+        // mesh double-transforms OFF-SCREEN. Fix: each joint's transform = LOCAL relative to its nearest JOINT ancestor
+        // (compose the intermediate non-joint nodes into it), emit the real parent index. Mesh restPos stays model-space.
+        bool hzHier = !std::getenv("HSR_HZWORLDBAKE");   // default ON; HSR_HZWORLDBAKE = old flat world-bake (PC-sim-only)
+        // nearest JOINT ancestor of node n (-1 = root); composes the local transform relative to it (no inverse needed).
+        auto parentJointOf = [&](const std::vector<GNode>& nd, int n)->int {
+            for (int p = nd[n].parent; p>=0 && (size_t)p<nd.size(); p = nd[p].parent) if (nodeToJoint[p]>=0) return nodeToJoint[p];
+            return -1; };
+        auto localRelToParentJoint = [&](const std::vector<GNode>& nd, int n, int pn, float* out){
+            std::vector<int> path; for (int p=n; p!=pn && p>=0; p=nd[p].parent) path.push_back(p);
+            float acc[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+            for (int k=(int)path.size()-1; k>=0; --k){ float loc[16]; trsM(nd[path[k]].t,nd[path[k]].r,nd[path[k]].s,loc); float tmp[16]; mulM(acc,loc,tmp); memcpy(acc,tmp,64); }
+            memcpy(out,acc,64); };
+        auto matTrs = [](const float* m, float* q /*xyzw*/, float* t, float* s){
+            t[0]=m[12]; t[1]=m[13]; t[2]=m[14];
+            s[0]=sqrtf(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]); s[1]=sqrtf(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]); s[2]=sqrtf(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]);
+            float ix=s[0]>1e-8f?1/s[0]:0, iy=s[1]>1e-8f?1/s[1]:0, iz=s[2]>1e-8f?1/s[2]:0;
+            float r0=m[0]*ix,r1=m[1]*ix,r2=m[2]*ix, r3=m[4]*iy,r4=m[5]*iy,r5=m[6]*iy, r6=m[8]*iz,r7=m[9]*iz,r8=m[10]*iz;
+            float tr=r0+r4+r8;
+            if (tr>0){ float S=sqrtf(tr+1)*2; q[3]=0.25f*S; q[0]=(r5-r7)/S; q[1]=(r6-r2)/S; q[2]=(r1-r3)/S; }
+            else if (r0>r4&&r0>r8){ float S=sqrtf(1+r0-r4-r8)*2; q[3]=(r5-r7)/S; q[0]=0.25f*S; q[1]=(r3+r1)/S; q[2]=(r6+r2)/S; }
+            else if (r4>r8){ float S=sqrtf(1+r4-r0-r8)*2; q[3]=(r6-r2)/S; q[0]=(r3+r1)/S; q[1]=0.25f*S; q[2]=(r7+r5)/S; }
+            else { float S=sqrtf(1+r8-r0-r4)*2; q[3]=(r1-r3)/S; q[0]=(r6+r2)/S; q[1]=(r7+r5)/S; q[2]=0.25f*S; } };
+        // For the BIND reference, treat scale-0 nodes (e.g. the Shield assembly, collapsed at rest) as scale-1 so the
+        // joint's world POSITION propagates correctly instead of collapsing to its parent's origin — otherwise the
+        // Shield's bind lands at ~(0,0,0) and skins OFF the droid. The clip keeps the real 0->1 scale (drives the pop).
+        std::vector<GNode> bindNodes = gnodes;
+        for (auto& g : bindNodes) for (int k=0;k<3;k++) if (g.s[k]<1e-3f && g.s[k]>-1e-3f) g.s[k]=1.0f;
         for (int j = 0; j < nj; ++j) {
-            int n = sk.joints[j]; const GNode& g = gnodes[n];
-            int pn = g.parent; e.parents[j] = (pn >= 0 && (size_t)pn < gnodes.size() && nodeToJoint[pn] >= 0) ? nodeToJoint[pn] : -1;
-            e.jointPos[j*3]=g.t[0]; e.jointPos[j*3+1]=g.t[1]; e.jointPos[j*3+2]=g.t[2];
-            e.jointQuat[j*4]=g.r[3]; e.jointQuat[j*4+1]=g.r[0]; e.jointQuat[j*4+2]=g.r[1]; e.jointQuat[j*4+3]=g.r[2];   // glTF xyzw -> wxyz
-            e.jointScale[j] = (g.s[0] > 1e-3f || g.s[0] < -1e-3f) ? g.s[0] : 1.0f;   // avoid bind scale 0 (Shield) -> singular inverse-bind -> NaN; clip still drives the 0->1 pop
+            int n = sk.joints[j];
+            int pj = hzHier ? parentJointOf(bindNodes, n) : -1;
+            float lm[16];
+            if (hzHier && pj >= 0) localRelToParentJoint(bindNodes, n, sk.joints[pj], lm);   // LOCAL bind relative to parent JOINT
+            else worldM(bindNodes, n, lm);                                                   // root: full world transform
+            float q[4], t[3], s[3]; matTrs(lm, q, t, s);
+            e.parents[j] = pj;
+            if (hzHier && pj > j && std::getenv("HSR_VERBOSE")) fprintf(stderr, "[HZHIER] WARN joint %d parent %d (parent after child — needs reorder)\n", j, pj);
+            e.jointPos[j*3]=t[0]; e.jointPos[j*3+1]=t[1]; e.jointPos[j*3+2]=t[2];
+            e.jointQuat[j*4]=q[3]; e.jointQuat[j*4+1]=q[0]; e.jointQuat[j*4+2]=q[1]; e.jointQuat[j*4+3]=q[2];   // xyzw -> wxyz
+            float us=s[0];   // uniform scale; bind 0 (Shield) -> 1 to avoid singular inverse-bind; the clip still drives the 0->1 pop
+            e.jointScale[j] = (us > 1e-3f || us < -1e-3f) ? us : 1.0f;
         }
         e.boneIdx.resize((size_t)rec->nv*4); e.boneWgt.resize((size_t)rec->nv*4);
         for (u32 v = 0; v < rec->nv; ++v) {
@@ -782,11 +885,79 @@ public:
             }
             for (int j = 0; j < nj; ++j) {
                 int n = sk.joints[j]; float* o = &e.trsLocal[((size_t)f*nj+j)*10];
-                o[0]=cur[n].r[0]; o[1]=cur[n].r[1]; o[2]=cur[n].r[2]; o[3]=cur[n].r[3];   // quat xyzw (ACL)
-                o[4]=cur[n].t[0]; o[5]=cur[n].t[1]; o[6]=cur[n].t[2];
-                o[7]=cur[n].s[0]; o[8]=cur[n].s[1]; o[9]=cur[n].s[2];
+                float lm[16];
+                if (hzHier && e.parents[j] >= 0) localRelToParentJoint(cur, n, sk.joints[e.parents[j]], lm);  // LOCAL per-frame rel parent joint
+                else worldM(cur, n, lm);                                                                      // root: world transform
+                float q[4], t[3], s[3]; matTrs(lm, q, t, s);
+                o[0]=q[0]; o[1]=q[1]; o[2]=q[2]; o[3]=q[3];             // quat xyzw (ACL)
+                o[4]=t[0]; o[5]=t[1]; o[6]=t[2];
+                o[7]=s[0]; o[8]=s[1]; o[9]=s[2];
             }
         }
+        // ── SINGLE-ROOT PORT: the device's SkinnedMesh build requires the skeleton to have EXACTLY ONE root joint
+        //    (avatar BodyTrackingHierarchy literally errors "multiple or no root joints ... must have exactly one"; the
+        //    env's Clay SkinnedMesh rejects a multi-root forest -> asset null -> invisible droid). The glTF often has
+        //    several disconnected root joints (the Incredibles droid: 3-4 — its rig parents them through non-joint nodes,
+        //    so they read as roots). Re-parent every EXTRA root under the FIRST root, recomputing its LOCAL transform for
+        //    BOTH bind and every clip frame as inverse(root.world)*joint.world -> the WORLD pose stays byte-identical.
+        //    Not a rig change: same joints, same poses, same motion, just the single tree the device demands.
+        if (hzHier && nj > 1) {
+            int rootJ = -1; std::vector<int> orphans;
+            for (int j = 0; j < nj; ++j) if (e.parents[j] < 0) { if (rootJ < 0) rootJ = j; else orphans.push_back(j); }
+            if (rootJ >= 0 && !orphans.empty()) {
+                auto invAffine = [](const float* m, float* o){   // inverse of an affine TRS mat4 (column-major)
+                    float a00=m[0],a01=m[4],a02=m[8], a10=m[1],a11=m[5],a12=m[9], a20=m[2],a21=m[6],a22=m[10];
+                    float det=a00*(a11*a22-a12*a21)-a01*(a10*a22-a12*a20)+a02*(a10*a21-a11*a20);
+                    float id=(det>1e-12f||det<-1e-12f)?1.f/det:0.f;
+                    float i00=(a11*a22-a12*a21)*id,i01=(a02*a21-a01*a22)*id,i02=(a01*a12-a02*a11)*id;
+                    float i10=(a12*a20-a10*a22)*id,i11=(a00*a22-a02*a20)*id,i12=(a02*a10-a00*a12)*id;
+                    float i20=(a10*a21-a11*a20)*id,i21=(a01*a20-a00*a21)*id,i22=(a00*a11-a01*a10)*id;
+                    o[0]=i00;o[1]=i10;o[2]=i20;o[3]=0; o[4]=i01;o[5]=i11;o[6]=i21;o[7]=0; o[8]=i02;o[9]=i12;o[10]=i22;o[11]=0;
+                    float tx=m[12],ty=m[13],tz=m[14];
+                    o[12]=-(i00*tx+i01*ty+i02*tz); o[13]=-(i10*tx+i11*ty+i12*tz); o[14]=-(i20*tx+i21*ty+i22*tz); o[15]=1; };
+                auto bindM = [&](int j, float* m){ float q[4]={e.jointQuat[j*4+1],e.jointQuat[j*4+2],e.jointQuat[j*4+3],e.jointQuat[j*4]}; float s3[3]={e.jointScale[j],e.jointScale[j],e.jointScale[j]}; trsM(&e.jointPos[j*3], q, s3, m); };
+                float Rw[16], Rwi[16]; bindM(rootJ, Rw); invAffine(Rw, Rwi);
+                for (int j : orphans) {   // BIND: re-express orphan relative to the single root
+                    float Jw[16]; bindM(j, Jw); float L[16]; mulM(Rwi, Jw, L);
+                    float q[4], t[3], s[3]; matTrs(L, q, t, s);
+                    e.jointPos[j*3]=t[0]; e.jointPos[j*3+1]=t[1]; e.jointPos[j*3+2]=t[2];
+                    e.jointQuat[j*4]=q[3]; e.jointQuat[j*4+1]=q[0]; e.jointQuat[j*4+2]=q[1]; e.jointQuat[j*4+3]=q[2];   // xyzw->wxyz
+                    float us=s[0]; e.jointScale[j]=(us>1e-3f||us<-1e-3f)?us:1.0f;
+                }
+                for (int f = 0; f < frames; ++f) {   // CLIP: same re-parent per frame (trsLocal quat = xyzw)
+                    auto clipM = [&](int j, float* m){ float* o=&e.trsLocal[((size_t)f*nj+j)*10]; float q[4]={o[0],o[1],o[2],o[3]}; float s3[3]={o[7],o[8],o[9]}; float tt[3]={o[4],o[5],o[6]}; trsM(tt, q, s3, m); };
+                    float Rwf[16], Rwfi[16]; clipM(rootJ, Rwf); invAffine(Rwf, Rwfi);
+                    for (int j : orphans) {
+                        float Jwf[16]; clipM(j, Jwf); float L[16]; mulM(Rwfi, Jwf, L);
+                        float q[4], t[3], s[3]; matTrs(L, q, t, s);
+                        float* o=&e.trsLocal[((size_t)f*nj+j)*10];
+                        o[0]=q[0]; o[1]=q[1]; o[2]=q[2]; o[3]=q[3]; o[4]=t[0]; o[5]=t[1]; o[6]=t[2]; o[7]=s[0]; o[8]=s[1]; o[9]=s[2];
+                    }
+                }
+                for (int j : orphans) e.parents[j] = rootJ;
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[HZ1ROOT] mesh%d: reparented %d orphan root(s) under joint %d -> single-root tree\n", meshIdx, (int)orphans.size(), rootJ);
+            }
+        }
+        if (std::getenv("HSR_HZDUMP")) for (int f=0; f<frames; f += (frames>10?frames/10:1)) {
+            const float* o=&e.trsLocal[((size_t)f*nj+(nj-1))*10];
+            fprintf(stderr,"[HZDUMP] f%d shieldJ%d worldT=(%.2f,%.2f,%.2f) S=(%.3f,%.3f,%.3f)\n", f, nj-1, o[4],o[5],o[6], o[7],o[8],o[9]);
+        }
+        // NO CENTERING by default. The verifier reject was NEVER the far-from-origin bounds — it was the ROOT.f0
+        // marker type (now fixed). restPos + the skeleton are already in the droid's WORLD space (exactly what the
+        // renderer skins correctly); the device drives the skinned mesh from the skeleton and ignores the entity
+        // transform, so centering to origin + re-placing via the entity transform DROPS the placement -> droid
+        // off-screen. Feed the renderer's exact uncentered rig + identity entity = droid at its world position.
+        // (HSR_HZCENTER re-enables the old centering for comparison.)
+        if (std::getenv("HSR_HZCENTER")) {
+            float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f};
+            for (size_t v=0; v+2<e.restPos.size(); v+=3) for(int k=0;k<3;k++){ float p=e.restPos[v+k]; if(p<mn[k])mn[k]=p; if(p>mx[k])mx[k]=p; }
+            float cen[3]; for(int k=0;k<3;k++) cen[k]=0.5f*(mn[k]+mx[k]);
+            for (size_t v=0; v+2<e.restPos.size(); v+=3){ e.restPos[v]-=cen[0]; e.restPos[v+1]-=cen[1]; e.restPos[v+2]-=cen[2]; }
+            for (int j=0;j<nj;++j) if (e.parents[j]<0){ e.jointPos[j*3]-=cen[0]; e.jointPos[j*3+1]-=cen[1]; e.jointPos[j*3+2]-=cen[2]; }
+            for (int f=0;f<frames;++f) for (int j=0;j<nj;++j) if (e.parents[j]<0){ float* o=&e.trsLocal[((size_t)f*nj+j)*10]; o[4]-=cen[0]; o[5]-=cen[1]; o[6]-=cen[2]; }
+        }
+        // (No geometry perturbation: the verifier reject was the ROOT.f0 marker encoding — an empty vector where the
+        // device wants a u16 scalar — NOT the geometry. Positions are free; use the exact centered rest pose.)
         if (std::getenv("HSR_HZDBG")) {
             fprintf(stderr,"[HZDBG] mesh%d skin%d nj=%d frames=%d gchannels=%d animDur=%.2f\n",meshIdx,rec->skin,nj,frames,(int)gchannels.size(),animDuration);
             for (int j=0;j<nj;++j){ float mn[10],mx[10]; for(int k=0;k<10;k++){mn[k]=1e9f;mx[k]=-1e9f;}

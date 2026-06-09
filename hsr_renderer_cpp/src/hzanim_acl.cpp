@@ -59,6 +59,8 @@ float hzAclSampleRate(const HzAclClip* c) { return c && c->tracks ? c->tracks->g
 int hzAclSampleLocal(HzAclClip* c, float t, float* out, int maxJoints)
 {
     if (!c || !c->tracks || !out) return 0;
+    float dur = c->tracks->get_duration();          // ACL seek CLAMPS t to [0,dur] (no wrap) -> wrap here so the clip LOOPS
+    if (dur > 1e-6f) { t = std::fmod(t, dur); if (t < 0.f) t += dur; }
     c->ctx.seek(t, sample_rounding_policy::none);   // interpolate between the two bracketing samples
     LocalWriter w;
     c->ctx.decompress_tracks(w);
@@ -131,7 +133,7 @@ std::vector<uint8_t> hzAclEncode(const float* trs, const int* parents, int joint
     uint32_t blockSize = s1a + S2;                         // @0x14 = align16(jointClipSize) + floatClipSize
     std::vector<uint8_t> b((size_t)aclOff + blockSize, 0);
     auto w32 = [&](uint32_t o, uint32_t v){ std::memcpy(b.data() + o, &v, 4); };
-    w32(0, 0xA34912B6u); w32(4, 3u); w32(8, (uint32_t)jointCount); w32(12, channelMapOff);
+    w32(0, 0xA34912B6u); w32(4, 6u); w32(8, (uint32_t)jointCount); w32(12, channelMapOff);   // version 6 (current device HzAnim format; was 3 -> device parsed/rejected the clip -> garbage poses -> mesh collapsed). Header layout is identical, byte-for-byte matched to the calming butterflies' working clip.
     w32(16, aclOff); w32(20, blockSize); w32(24, nameLen);
     b[28] = 0;                                             // @0x1C flag byte (0 in real clips)
     std::memcpy(b.data() + 32, nm, nameLen);               // name @0x20 (device reads the name from +0x20, NOT +0x1C)

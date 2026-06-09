@@ -523,8 +523,9 @@ struct Editor {
         std::string out   = envOr("HSR_COOK_OUT",     "cooker/out/edited_export_unsigned.apk");
         auto rd = [](const std::string& p){ std::vector<uint8_t> b; FILE* f=fopen(p.c_str(),"rb"); if(!f) return b;
             fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ b.resize(n); size_t r=fread(b.data(),1,n,f); b.resize(r);} fclose(f); return b; };
+        // myunlit.*.spv are UNUSED by exportSceneAPK (it bundles the real V203 unlit/unlitblend/skinned shaders). Don't
+        // fail the GUI "repack APK" when they're absent (they only exist relative to a specific CWD).
         auto vspv = rd(shdir + "/myunlit.vert.spv"), fspv = rd(shdir + "/myunlit.frag.spv");
-        if (vspv.empty() || fspv.empty()) { exportStatus = "ERROR: shaders missing in " + shdir; return; }
         if (!r || !sceneMeshes) { exportStatus = "ERROR: renderer/scene not bound"; return; }
         std::vector<ExportMesh> ems;
         size_t n = std::min(sceneMeshes->size(), r->gpuMeshes.size());
@@ -542,6 +543,7 @@ struct Editor {
             }
             em.uvs = md.uvs; em.indices = md.indices;
             em.blend = gm.useBlend || gm.additive;     // transparent -> unlitblend.surface (fixes black-where-see-through)
+            for (int k=0;k<4;k++) em.matTint[k] = md.tint[k];   // carry the mesh's own base-color tint to the cooker
             if (vatBaker) {                            // animated node -> bake a VAT (non-skeletal); 64-frame loop
                 int bnv = 0; auto off = vatBaker((int)i, 64, bnv);
                 if (!off.empty() && bnv == (int)nv) { em.vatOffsets = std::move(off); em.vatFrames = 64; }

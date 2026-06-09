@@ -164,7 +164,8 @@ public:
             for (int i = 0; i < nf; ++i) {
                 if (!mz_zip_reader_file_stat(&sceneZip, i, &st)) continue;
                 std::string n(st.m_filename);
-                if (n.find("hzanim_skel") != std::string::npos || n.find("__skel") != std::string::npos) {
+                if (n.find("hzanim_skel") != std::string::npos || n.find("__skel") != std::string::npos
+                    || n.find(".skel/skeleton") != std::string::npos) {   // OUR cooker's naming
                     envHasSkeleton = true; break;
                 }
             }
@@ -985,9 +986,15 @@ public:
                         if (p){ out.assign((u8*)p,(u8*)p+sz); mz_free(p); return true; } } }
                 return false; };
             std::vector<u8> sb, ab;
-            if (extractBy("__hzanim_skel_sub_targets__", sb) && parseRendSkel(sb, skel)) {
+            // nuxd names these "__hzanim_*_sub_targets__"; OUR cooker names them "mNNN.skel/skeleton" + ".anim/anim".
+            // For OUR cooked envs the per-vertex bone indices are ALREADY direct skel-joint indices (the glTF skin's
+            // JOINTS_0 palette == our skeleton order) — so the nuxd palette-slot->joint DFS remap must be SKIPPED.
+            bool cookedNaming = false;
+            bool foundSkel = extractBy("__hzanim_skel_sub_targets__", sb);
+            if (!foundSkel) { foundSkel = extractBy(".skel/skeleton", sb); cookedNaming = foundSkel; }
+            if (foundSkel && parseRendSkel(sb, skel)) {
                 log("  HzAnim skeleton: %zu joints (first '%s')", skel.joints.size(), skel.joints.empty()?"":skel.joints[0].name.c_str());
-                if (extractBy("__hzanim_anim_sub_targets__", ab) && parseRendClip(ab, (int)skel.joints.size(), clip))
+                if ((extractBy("__hzanim_anim_sub_targets__", ab) || extractBy(".anim/anim", ab)) && parseRendClip(ab, (int)skel.joints.size(), clip))
                     log("  HzAnim clip: %d frames x %d joints @ %.0f fps", clip.nFrames, clip.nJoints, clip.fps);
                 else log("  HzAnim clip: parse FAILED (clip format unresolved)");
                 if (skel.ok() && clip.ok()) for (size_t mi=0; mi<meshes.size(); ++mi) {
@@ -1014,7 +1021,7 @@ public:
                         while (!stk.empty()) { int j=stk.back(); stk.pop_back(); dfs.push_back(j);
                             for (int c=nJ-1;c>=0;--c) if (skel.joints[c].parent==j) stk.push_back(c); }
                         bool ident=true; for(int s=0;s<(int)dfs.size();s++) if(dfs[s]!=s){ident=false;break;}
-                        if ((int)dfs.size()==nJ && !ident && !std::getenv("HSR_HZNOREMAP"))
+                        if ((int)dfs.size()==nJ && !ident && !std::getenv("HSR_HZNOREMAP") && !cookedNaming)
                             for (auto& bi : md.boneIndices) if (bi<nJ) bi=(u8)dfs[bi];
                         if (std::getenv("HSR_HZBONE")) { std::string rs; for(size_t s=0;s<dfs.size();s++){rs+=std::to_string(dfs[s]);rs+=" ";} log("  [HZREMAP] %s ident=%d dfs(slot->joint): %s", md.name.c_str(),(int)ident,rs.c_str()); }
                     }
