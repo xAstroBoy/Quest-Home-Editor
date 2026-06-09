@@ -607,7 +607,7 @@ inline std::vector<uint8_t> assembleSceneZip(std::vector<CookAsset>& assets,
     return buildStoredZip(files);
 }
 
-// ── multi-part RENDMESH: split arbitrary (u32-indexed) geometry into parts of <=65535 unique verts, each with
+// ── multi-part RENDMESH: split arbitrary (u32-indexed) geometry into u16 parts of <=60000 unique verts, each with
 //    its own VB + LOCAL u16 IB. parseRendMesh concatenates parts' VBs and offsets each part's indices by the
 //    running vertex base, so per-part local 0-based indices are correct. Handles meshes of any size. ──────────
 inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, const std::vector<float>& uv,
@@ -638,12 +638,15 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
     size_t ntri = idx.size() / 3;
     size_t t = 0;
     if (ntri == 0) { Part p; parts.push_back(p); }  // degenerate guard
-    while (t < ntri) {
+    while (t < ntri) {   // split into parts of <=60000 unique verts. RENDMESH indices are u16 + MULTI-PART (the device &
+        // renderer offset each part by its running vertex base). Cap < 65535 (0xFFFF): the device verifier REJECTS a part
+        // of exactly 65535 verts (the erebor statues/halls + moria pillar vanished). Multi-MATERIAL meshes are already
+        // separate ExportMeshes, so this is purely a u16-index size split.
         Part pr; std::unordered_map<uint32_t, uint16_t> remap; remap.reserve(70000);
         while (t < ntri) {
             uint32_t tri[3] = { idx[t*3], idx[t*3+1], idx[t*3+2] };
             int newv = 0; for (uint32_t g : tri) if (!remap.count(g)) newv++;
-            if (!remap.empty() && remap.size() + (size_t)newv > 65535) break;   // flush this part
+            if (!remap.empty() && remap.size() + (size_t)newv > 60000) break;   // flush this part
             for (uint32_t g : tri) {
                 auto it = remap.find(g); uint16_t l;
                 if (it == remap.end()) {
@@ -674,7 +677,7 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
                     }
                     pr.nv++;
                 } else l = it->second;
-                pr.ib.push_back((uint8_t)l); pr.ib.push_back((uint8_t)(l>>8));
+                pr.ib.push_back((uint8_t)l); pr.ib.push_back((uint8_t)(l >> 8));
             }
             t++;
         }
@@ -802,6 +805,43 @@ inline std::vector<uint8_t> readFileBytes(const std::string& p) {
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     if (n > 0) { b.resize((size_t)n); size_t r = fread(b.data(), 1, (size_t)n, f); b.resize(r); } fclose(f); return b;
 }
+// Split a LARGE static mesh (>cap unique verts) into SEPARATE single-part meshes (each its own entity). MULTI-PART
+// static RENDMESHes pass the device verifier but DON'T RENDER (no official env ships a size-split static mesh; the
+// device only draws multi-part for skinned/multi-material). u32 single-part renders as GARBAGE (the device reads the
+// RENDMESH index buffer as u16). So the only faithful path for a >65535-vert static mesh (erebor Statues 91306 / Halls
+// 87956, moria Pillar 235183) is many SINGLE-PART (u16) meshes. Chunks share the source texture (dedup'd in the cook).
+inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMesh>& in, size_t cap = 60000) {
+    std::vector<ExportMesh> out;
+    for (const auto& m : in) {
+        size_t nv = m.positions.size() / 3;
+        bool skinnedOrVat = m.hzJointCount > 0 || m.vatFrames > 0 || !m.hzBoneIdx.empty();
+        if (nv <= cap || skinnedOrVat || m.indices.size() < 3) { out.push_back(m); continue; }
+        bool haveUv = m.uvs.size() >= nv * 2;
+        size_t ntri = m.indices.size() / 3, t = 0;
+        while (t < ntri) {
+            ExportMesh c; c.name = m.name; c.blend = m.blend; c.w = m.w; c.h = m.h; c.rgba = m.rgba;
+            for (int k = 0; k < 4; k++) c.matTint[k] = m.matTint[k];
+            std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(cap + 16);
+            while (t < ntri) {
+                uint32_t tri[3] = { m.indices[t*3], m.indices[t*3+1], m.indices[t*3+2] };
+                int newv = 0; for (uint32_t g : tri) if (!remap.count(g)) newv++;
+                if (!remap.empty() && remap.size() + (size_t)newv > cap) break;
+                for (uint32_t g : tri) {
+                    auto it = remap.find(g); uint32_t l;
+                    if (it == remap.end()) {
+                        l = (uint32_t)remap.size(); remap.emplace(g, l);
+                        c.positions.push_back(m.positions[g*3]); c.positions.push_back(m.positions[g*3+1]); c.positions.push_back(m.positions[g*3+2]);
+                        c.uvs.push_back(haveUv ? m.uvs[g*2] : 0.f); c.uvs.push_back(haveUv ? m.uvs[g*2+1] : 0.f);
+                    } else l = it->second;
+                    c.indices.push_back(l);
+                }
+                t++;
+            }
+            out.push_back(std::move(c));
+        }
+    }
+    return out;
+}
 // Port ANY decoded scene (e.g. a V79 .ovrscene loaded by the renderer) to a bootable V203 APK: per-mesh RENDMESH
 // (struct-bounds, embedded material) + RENDTXTR + the floor MATL template patched to that mesh's texture, all bound
 // to the real renderer_module unlit.surface shader; Root entity + child relationships + spawn point.
@@ -873,8 +913,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     float pos0[3]={0,0,0}, rot0[3]={0,0,0}, scl1[3]={1,1,1};
     const char* navE = getenv("HSR_NAVMESH"); int navIdx = navE ? atoi(navE) : -1;   // base navmesh on one mesh, else whole scene
     float smn[3]={1e30f,1e30f,1e30f}, smx[3]={-1e30f,-1e30f,-1e30f};
-    for (size_t i = 0; i < meshes.size(); ++i) {
-        const ExportMesh& m = meshes[i];
+    // Split >60000-vert STATIC meshes into separate single-part meshes (multi-part static doesn't render on device).
+    std::vector<ExportMesh> meshesV = splitLargeStaticMeshes(meshes);
+    std::unordered_map<uint64_t, std::pair<AssetKey3, std::string>> texCache;  // rgba hash -> shared texture (split chunks share one)
+    for (size_t i = 0; i < meshesV.size(); ++i) {
+        const ExportMesh& m = meshesV[i];
         if (m.positions.size() < 9 || m.indices.size() < 3) continue;   // skip empty
         { // skip DEGENERATE meshes: all verts at one point (0-area). For a SKINNED mesh (e.g. the omnidroid's Shield) the
           // bind/rest pose is real geometry and only the ANIMATED rest collapses (Shield joint scale 0->1 pop); the cooked
@@ -895,7 +938,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         std::string pMesh = std::string(base) + ".rendmesh/mesh", pMat = std::string(base) + ".material/material",
                     pTex = std::string(base) + ".tex/tex";
         AssetKey3 meshK = keyForPath(pMesh), matK = keyForPath(pMat);
-        AssetKey3 texK; std::vector<uint8_t> tex;
+        AssetKey3 texK{}; std::vector<uint8_t> tex;   // value-init -> tgt==0 means "no texture yet" (used by the white-fallback check)
         // An OPAQUE skinned mesh (e.g. the Incredibles droid: source alphaMode=OPAQUE) is drawn through the
         // unlitblendskinned BLEND shader, so its texture's UV-atlas-mask alpha (alpha 0 outside the islands) would
         // make it transparent. The source ignores that alpha (opaque); cook the texture OPAQUE to match.
@@ -910,8 +953,13 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             texOpaque = m.rgba; for (size_t k = 3; k < texOpaque.size(); k += 4) texOpaque[k] = 255; texSrc = texOpaque.data();
         }
         bool droidWhite = std::getenv("HSR_DROIDWHITE") && m.hzJointCount > 0;   // diag: force the droid to the white fallback tex (isolate texture vs mesh)
-        if (m.rgba.size() >= (size_t)m.w * m.h * 4 && m.w && m.h && !droidWhite) { texK = keyForPath(pTex); tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, 8, 8); }
-        if (tex.empty()) { texK = whiteK; whiteUsed = true; }     // share the white fallback
+        if (m.rgba.size() >= (size_t)m.w * m.h * 4 && m.w && m.h && !droidWhite) {
+            uint64_t rh = murmur64A(texSrc, (size_t)m.w * m.h * 4);   // dedup identical textures (esp. the chunks a big mesh was split into)
+            auto cit = texCache.find(rh);
+            if (cit != texCache.end()) { texK = cit->second.first; pTex = cit->second.second; }  // reuse the shared texture; leave `tex` empty so it isn't re-encoded/re-pushed
+            else { texK = keyForPath(pTex); tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, 8, 8); texCache[rh] = { texK, pTex }; }
+        }
+        if (tex.empty() && texK.tgt == 0) { texK = whiteK; whiteUsed = true; }     // share the white fallback (only when there was NO texture at all, not for a dedup hit)
         // ANIMATED (VAT) mesh -> bake the offset texture + the vatunlitbasecolor MATL (base tex + VAT tex); else
         // transparent -> unlitblend MATL, opaque -> floor MATL. Patch each to THIS mesh's texture(s).
         int vc = (int)(m.positions.size() / 3);
