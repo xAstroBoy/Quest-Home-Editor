@@ -1,6 +1,7 @@
 #pragma once
 #include "types.h"
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 #include <string>
 
@@ -65,11 +66,86 @@ inline bool scanSpirvModules(const std::vector<u8>& data, std::vector<SpirvBlob>
     return !out.empty();
 }
 
+// FAITHFUL variant selection (reversed from the RENDSHAD format, NOT heuristics): the SHAD FlatBuffer
+// holds a `passes` vector [ "forward", "forward_debug", ... ] and a `stages` vector (each stage = a
+// SPIR-V byte blob). For COLOUR rendering libshell uses the **forward** pass; "forward_debug" is the
+// in-engine texture-visualiser variant (its frag is the LARGEST, which a "pick largest" heuristic wrongly
+// grabbed -> wrong/dark output). Stages are laid out 2-per-pass in pass order (vert, frag), so the
+// forward pass's modules are stages[2*fwdIdx] (vert) + stages[2*fwdIdx+1] (frag). Extract ONLY those.
+inline bool parseRendShadForward(const std::vector<u8>& data, std::vector<SpirvBlob>& out) {
+    const u8* d = data.data(); const size_t N = data.size();
+    auto rd16 = [&](size_t o)->u16{ return (o+2<=N)? *reinterpret_cast<const u16*>(d+o):0; };
+    auto rdi32= [&](size_t o)->i32{ return (o+4<=N)? *reinterpret_cast<const i32*>(d+o):0; };
+    auto rd32 = [&](size_t o)->u32{ return (o+4<=N)? *reinterpret_cast<const u32*>(d+o):0; };
+    auto vtField = [&](size_t tbl, u32 fi)->size_t{
+        if (tbl+4>N) return 0; i32 so=rdi32(tbl); long long vt=(long long)tbl-so;
+        if (vt<0||(size_t)vt+4>N) return 0; u16 vs=rd16((size_t)vt); size_t sl=(size_t)vt+4+fi*2;
+        if (sl+2>(size_t)vt+vs||sl+2>N) return 0; u16 fo=rd16(sl); return fo? tbl+fo:0; };
+    auto vtNFields = [&](size_t tbl)->u32{
+        if (tbl+4>N) return 0; i32 so=rdi32(tbl); long long vt=(long long)tbl-so;
+        if (vt<0||(size_t)vt+4>N) return 0; u16 vs=rd16((size_t)vt); return vs>=4?(vs-4)/2:0; };
+    auto strAt = [&](size_t p)->std::string{
+        if (!p||p+4>N) return ""; size_t s=p+rd32(p); u32 ln=rd32(s);
+        if (ln==0||ln>256||s+4+ln>N) return ""; return std::string((const char*)(d+s+4), ln); };
+    size_t root = rd32(0); if (root+4>N) return false;
+    u32 nRoot = vtNFields(root);
+    // Find the passes vector (vector-of-tables whose element[0] has a string field "forward"...) and the
+    // stages vector (vector-of-tables whose element has a >500-byte byte-vector = SPIR-V).
+    size_t passesBase=0; u32 nPasses=0; int fwdIdx=-1;
+    size_t stagesBase=0; u32 nStages=0;
+    for (u32 fi=0; fi<nRoot; ++fi) {
+        size_t fp=vtField(root,fi); if(!fp) continue; u32 uoff=rd32(fp); if(!uoff) continue;
+        size_t vec=fp+uoff; if(vec+4>N) continue; u32 cnt=rd32(vec); if(cnt==0||cnt>64) continue;
+        size_t base=vec+4; if(base+(size_t)cnt*4>N) continue;
+        // element 0
+        size_t e0=base+rd32(base);
+        // passes? element has a string field naming a pass
+        for (u32 ef=0; ef<vtNFields(e0) && ef<4; ++ef) {
+            std::string s=strAt(vtField(e0,ef));
+            if (s=="forward"||s=="forward_debug"||s.rfind("forward",0)==0) {
+                passesBase=base; nPasses=cnt;
+                for (u32 pi=0; pi<cnt; ++pi){ size_t pe=base+pi*4; size_t pt=pe+rd32(pe);
+                    for (u32 pf=0; pf<vtNFields(pt)&&pf<4; ++pf) if (strAt(vtField(pt,pf))=="forward"){ fwdIdx=(int)pi; break; } }
+                break;
+            }
+        }
+        // stages? element has a large byte vector
+        for (u32 ef=0; ef<vtNFields(e0) && ef<4; ++ef) {
+            size_t sp=vtField(e0,ef); if(!sp) continue; u32 so=rd32(sp); size_t sv=sp+so;
+            if (sv+4<=N){ u32 bc=rd32(sv); if (bc>500 && sv+4+bc<=N && bc<2000000){ stagesBase=base; nStages=cnt; break; } }
+        }
+    }
+    if (fwdIdx<0 || nStages==0 || nPasses==0 || nStages != 2*nPasses) return false;
+    auto stageSpirv = [&](u32 si, SpirvBlob& blob)->bool{
+        if (si>=nStages) return false; size_t se=stagesBase+si*4; size_t st=se+rd32(se);
+        for (u32 ef=0; ef<vtNFields(st)&&ef<6; ++ef){ size_t sp=vtField(st,ef); if(!sp) continue;
+            u32 so=rd32(sp); size_t sv=sp+so; if(sv+4>N) continue; u32 bc=rd32(sv);
+            if (bc>500 && sv+4+bc<=N && (bc%4)==0){ size_t start=sv+4;
+                if (rd32(start)!=0x07230203u) continue;            // SPIR-V magic
+                blob.code.resize(bc/4); memcpy(blob.code.data(), d+start, bc);
+                blob.stageType=0xFFFFFFFFu;
+                for (size_t wi=5; wi+1<blob.code.size() && wi<60;){ u32 w=blob.code[wi],op=w&0xFFFF,wc=w>>16;
+                    if(wc==0)break; if(op==15){blob.stageType=blob.code[wi+1];break;} wi+=wc; }
+                return true; }
+        }
+        return false;
+    };
+    SpirvBlob v,f;
+    if (!stageSpirv((u32)(2*fwdIdx), v) || !stageSpirv((u32)(2*fwdIdx+1), f)) return false;
+    // order may be (vert,frag) or (frag,vert) — keep both, tagged by their own exec model
+    out.push_back(std::move(v)); out.push_back(std::move(f));
+    return out.size()==2;
+}
+
 inline bool parseRendShad(const std::vector<u8>& data, std::vector<SpirvBlob>& out) {
     if (data.size() < 48) return false;
     if (memcmp(data.data() + 4, "SHAD", 4) != 0) return false;
 
-    // Primary path: scan for all SPIR-V modules (handles multi-variant surface shaders).
+    // FAITHFUL: select the `forward` (colour) pass variant from the RENDSHAD passes table.
+    if (!std::getenv("HSR_ALLVARIANTS") && parseRendShadForward(data, out)) return true;
+    out.clear();
+
+    // Fallback: scan for all SPIR-V modules (handles multi-variant surface shaders).
     if (scanSpirvModules(data, out)) return true;
 
     u32 rootOff = *reinterpret_cast<const u32*>(data.data());

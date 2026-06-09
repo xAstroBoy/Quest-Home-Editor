@@ -16,7 +16,8 @@ inline bool parseRendMesh(const std::vector<u8>& data,
                           std::vector<u32>& indices,
                           std::vector<u8>* boneIndices = nullptr,
                           std::vector<u8>* boneWeights = nullptr,
-                          const char* label = nullptr) {
+                          const char* label = nullptr,
+                          std::vector<float>* uvs2 = nullptr) {   // uvs2 = TEXCOORD1 (lightmap unwrap) — the rgmask/AO UV
     if (data.size() < 14 || memcmp(data.data() + 4, "MESH", 4) != 0)
         return false;
 
@@ -99,25 +100,37 @@ inline bool parseRendMesh(const std::vector<u8>& data,
     };
 
     u32 totalV = 0;
+    // Flag EVERY dropped part (a part that fails a check is silently lost geometry = a gap/hole). Printed
+    // always so nothing is skipped silently. (A mesh can still load OTHER parts and "succeed" overall.)
+    auto drop = [&](u32 p, const char* why) {
+        fprintf(stderr, "[MESHDROP] %s : part %u/%u DROPPED — %s\n", label ? label : "?", p, partCount, why);
+    };
     for (u32 pi = 0; pi < partCount; ++pi) {
         u32 partTable;
-        if (!followElem(partBase, pi, partTable)) continue;
+        if (!followElem(partBase, pi, partTable)) { drop(pi, "part table uoffset invalid"); continue; }
         // Part -> VS[0] (field[0]=vs_uoff) + IB bytes (field[1]=idx_uoff)
         u32 vsBase, vsCount;
-        if (!followVec(partTable, 0, vsBase, vsCount) || !vsCount) continue;
+        if (!followVec(partTable, 0, vsBase, vsCount) || !vsCount) { drop(pi, "no vertex-stream vector (field 0)"); continue; }
         u32 vsTable;
-        if (!followElem(vsBase, 0, vsTable)) continue;
+        if (!followElem(vsBase, 0, vsTable)) { drop(pi, "VS[0] uoffset invalid"); continue; }
         u32 ibStart, ibCount;
-        if (!followByteVec(partTable, 1, ibStart, ibCount) || !ibCount) continue;
+        if (!followByteVec(partTable, 1, ibStart, ibCount) || !ibCount) { drop(pi, "no index buffer (field 1)"); continue; }
         // VS -> vertex_count (field[1]) + VB bytes (field[2])
         u16 vcFo = fieldFo(vsTable, 1);
-        if (!vcFo) continue;
+        if (!vcFo) { drop(pi, "no vertex_count field"); continue; }
         u32 nVerts = *reinterpret_cast<const u32*>(data.data() + vsTable + vcFo);
         u32 vbStart, vbCount;
-        if (!followByteVec(vsTable, 2, vbStart, vbCount) || !nVerts) continue;
-        if (vbCount % nVerts != 0) continue;
+        if (!followByteVec(vsTable, 2, vbStart, vbCount) || !nVerts) { drop(pi, "no vertex buffer / 0 verts"); continue; }
+        if (vbCount % nVerts != 0) { char b[80]; snprintf(b,sizeof b,"vbCount %u not divisible by nVerts %u", vbCount, nVerts); drop(pi, b); continue; }
         u32 stride = vbCount / nVerts;
-        if (stride < 20 || vbStart + (size_t)nVerts * stride > data.size()) continue;
+        // Minimum valid vertex = pos f32x3 (12) + uv f16x2 (4) = 16 bytes. The old `< 20` threshold
+        // SKIPPED every stride-16 mesh — that's the rocks/cliffs/heroRock/vistaSand (the vista MOUNTAINS
+        // & terrain), which are pos+uv only (no normal). They were dropped entirely ("where are the
+        // mountains?"). Accept stride >= 16.
+        // Accept stride>=12 (POSITION-ONLY f32x3 meshes: haven2025 blockout walls + emissive fixtures —
+        // emissCabinet/Chairs/Shelves/Lights, blktWalls — have NO uv/normal; they were dropped at <16,
+        // leaving the home half-built). uv defaults to (0,0) below when there's no room for it.
+        if (stride < 12 || vbStart + (size_t)nVerts * stride > data.size()) { char b[96]; snprintf(b,sizeof b,"stride=%u (<12 min) or vbuf OOB (nVerts=%u)", stride, nVerts); drop(pi, b); continue; }
         if (std::getenv("HSR_RMSTRUCT"))
             fprintf(stderr, "[RMSTRUCT] part %u/%u nVerts=%u stride=%u ibCount=%u base=%u\n",
                     pi, partCount, nVerts, stride, ibCount, totalV);
@@ -129,7 +142,8 @@ inline bool parseRendMesh(const std::vector<u8>& data,
     // the renderer's auto-detect could never get: SculptureA's uv0 is at +18 (after a 6-byte
     // f16x3 normal), and the 4-byte-aligned scan only tried 12/16/20/24. (semantic: 0=POSITION
     // 1=NORMAL 5=TEXCOORD; format byte high-nibble≈type 3=f32/2=f16/1=u8, decoded by size below.)
-    u32 fmtUv0 = 0xFFFFFFFF, fmtUv1 = 0xFFFFFFFF;
+    u32 fmtUv0 = 0xFFFFFFFF, fmtUv1 = 0xFFFFFFFF; u8 uv1FmtByte = 0;
+    u32 fmtBoneIdx = 0xFFFFFFFF, fmtBoneWgt = 0xFFFFFFFF;   // VS-attr-table bone offsets (sem 8=indices, 7=weights)
     {
         u32 fb2, fc2;
         if (followVec(vsTable, 3, fb2, fc2) && fc2 && fc2 < 32 && fb2 + fc2*4 <= data.size()) {
@@ -147,10 +161,20 @@ inline bool parseRendMesh(const std::vector<u8>& data,
                 const u8* a = data.data() + fb2 + ai*4;
                 u8 sem = a[0], fmt = a[1], idx = a[2];
                 if (sem == 5 && idx == 0 && fmtUv0 == 0xFFFFFFFF) fmtUv0 = aoff;
-                if (sem == 5 && idx == 1 && fmtUv1 == 0xFFFFFFFF) fmtUv1 = aoff;
+                if (sem == 5 && idx == 1 && fmtUv1 == 0xFFFFFFFF) { fmtUv1 = aoff; uv1FmtByte = fmt; }
+                // Skinning bones by SEMANTIC (the whale: sem 7 = weights @16, sem 8 = indices @20, stride 24).
+                // The fixed stride-28 layout (idx@20/wgt@24, stride>=28) misses these -> skinned=0. (sem 6 is
+                // also seen as indices in some streams.)
+                if ((sem == 8 || sem == 6) && fmtBoneIdx == 0xFFFFFFFF) fmtBoneIdx = aoff;
+                if (sem == 7 && fmtBoneWgt == 0xFFFFFFFF) fmtBoneWgt = aoff;
                 aoff += fmtSize(fmt);
             }
-            if (std::getenv("HSR_RMSTRUCT")) fprintf(stderr, "[RMFMT] %u attrs uv0@%d uv1@%d\n", fc2, (int)fmtUv0, (int)fmtUv1);
+            if (std::getenv("HSR_RMSTRUCT") && (fmtBoneIdx != 0xFFFFFFFF || fmtBoneWgt != 0xFFFFFFFF)) {
+                fprintf(stderr, "[RMFMT] %u attrs:", fc2); u32 ao=0;
+                for (u32 ai=0; ai<fc2; ++ai){ const u8* a=data.data()+fb2+ai*4; fprintf(stderr," [sem%u fmt0x%02x idx%u @%u]", a[0],a[1],a[2],ao); ao+=fmtSize(a[1]); }
+                fprintf(stderr, "  boneIdx@%d boneWgt@%d\n", (int)fmtBoneIdx, (int)fmtBoneWgt);
+            }
+            else if (std::getenv("HSR_RMSTRUCT")) fprintf(stderr, "[RMFMT] %u attrs uv0@%d uv1@%d\n", fc2, (int)fmtUv0, (int)fmtUv1);
         }
     }
 
@@ -238,8 +262,34 @@ inline bool parseRendMesh(const std::vector<u8>& data,
             positions[(base+i)*3+0] = *reinterpret_cast<const float*>(v + 0);
             positions[(base+i)*3+1] = *reinterpret_cast<const float*>(v + 4);
             positions[(base+i)*3+2] = *reinterpret_cast<const float*>(v + 8);
-            uvs[(base+i)*2+0] = f16tof32(*reinterpret_cast<const u16*>(v + uvOff));
-            uvs[(base+i)*2+1] = f16tof32(*reinterpret_cast<const u16*>(v + uvOff + 2));
+            if (uvOff + 4 <= stride) {   // pos-only (stride-12) meshes have no uv -> (0,0), avoids reading the next vertex
+                uvs[(base+i)*2+0] = f16tof32(*reinterpret_cast<const u16*>(v + uvOff));
+                uvs[(base+i)*2+1] = f16tof32(*reinterpret_cast<const u16*>(v + uvOff + 2));
+            } else { uvs[(base+i)*2+0] = 0.0f; uvs[(base+i)*2+1] = 0.0f; }
+        }
+
+        // TEXCOORD1 (uv1 = lightmap unwrap): the rgmask/lit shaders sample the ONxRNy/RBAoDir mask AND
+        // the lightmap at uv1, NOT uv0. Without it the mask was sampled at uv0 (the material unwrap) ->
+        // the carpet's design tiled into "multiple circles", the ceiling got white spots, the couch
+        // looked dusty. Decode at the FAITHFUL VS-table offset, honouring its format (lightmap uv1 is
+        // commonly u16x2 UNORM (fmt 0x27), else f16x2 (0x2x) / f32x2 (0x31)).
+        if (uvs2 && fmtUv1 != 0xFFFFFFFF && fmtUv1 + 4 <= stride) {
+            uvs2->resize((base + nVerts) * 2);
+            for (u32 i = 0; i < nVerts; ++i) {
+                const u8* v = data.data() + vbStart + i * stride + fmtUv1;
+                float u, w;
+                if (uv1FmtByte == 0x27) {        // u16x2 UNORM
+                    u = *reinterpret_cast<const u16*>(v)     / 65535.0f;
+                    w = *reinterpret_cast<const u16*>(v + 2) / 65535.0f;
+                } else if (uv1FmtByte == 0x31) { // f32x2
+                    u = *reinterpret_cast<const float*>(v);
+                    w = *reinterpret_cast<const float*>(v + 4);
+                } else {                          // f16x2 (default)
+                    u = f16tof32(*reinterpret_cast<const u16*>(v));
+                    w = f16tof32(*reinterpret_cast<const u16*>(v + 2));
+                }
+                (*uvs2)[(base+i)*2+0] = u; (*uvs2)[(base+i)*2+1] = w;
+            }
         }
 
         // Bone indices + weights. VERIFIED stride==28 layout: pos@0(12) + uv@12(4 f16x2) +
@@ -247,12 +297,30 @@ inline bool parseRendMesh(const std::vector<u8>& data,
         // bind to bone 0 at full weight so they ride the node transform.
         // Only a skinned mesh (some part has the stride>=28 bone layout) gets bones; a purely static
         // mesh keeps boneIndices empty -> static pipeline. A static part inside a skinned mesh binds bone 0.
-        if (boneIndices && boneWeights && (stride >= 28 || !boneIndices->empty())) {
+        // Bones present if the VS attr table declared them (sem 7/8 — whale, stride 24) OR the stride-28 layout.
+        bool attrBones = (fmtBoneIdx != 0xFFFFFFFF && fmtBoneWgt != 0xFFFFFFFF &&
+                          fmtBoneIdx + 4 <= stride && fmtBoneWgt + 4 <= stride);
+        // The sem7/sem8 -> WEIGHTS/INDICES assignment differs by env: nuxd has sem7=weights/sem8=indices,
+        // but the V203 whale is the OPPOSITE (sem7=indices @16, sem8=weights @20). Detect from the data —
+        // skin weights are u8-normalized (sum ~255 per vertex), indices are small (< joint count). Swap if
+        // the offset we tagged "indices" actually holds the ~255-summing weights.
+        if (attrBones) {
+            double sIdx = 0, sWgt = 0; u32 ns = 0;
+            for (u32 i = 0; i < nVerts && ns < 64; ++i, ++ns) {
+                const u8* v = data.data() + vbStart + i * stride;
+                sIdx += v[fmtBoneIdx]+v[fmtBoneIdx+1]+v[fmtBoneIdx+2]+v[fmtBoneIdx+3];
+                sWgt += v[fmtBoneWgt]+v[fmtBoneWgt+1]+v[fmtBoneWgt+2]+v[fmtBoneWgt+3];
+            }
+            if (ns) { sIdx /= ns; sWgt /= ns; if (sIdx > 128.0 && sWgt < 128.0) std::swap(fmtBoneIdx, fmtBoneWgt); }
+        }
+        if (boneIndices && boneWeights && (attrBones || stride >= 28 || !boneIndices->empty())) {
             boneIndices->resize((base + nVerts) * 4, 0);
             boneWeights->resize((base + nVerts) * 4, 0);
             for (u32 i = 0; i < nVerts; ++i) {
                 const u8* v = data.data() + vbStart + i * stride;
-                if (stride >= 28) {
+                if (attrBones) {       // FAITHFUL: bone idx/wgt at their VS-attr-table offsets (any stride)
+                    for (int k = 0; k < 4; ++k) { (*boneIndices)[(base+i)*4+k] = v[fmtBoneIdx+k]; (*boneWeights)[(base+i)*4+k] = v[fmtBoneWgt+k]; }
+                } else if (stride >= 28) {
                     for (int k = 0; k < 4; ++k) { (*boneIndices)[(base+i)*4+k] = v[20+k]; (*boneWeights)[(base+i)*4+k] = v[24+k]; }
                 } else {
                     (*boneWeights)[(base+i)*4+0] = 255;  // bind to bone 0

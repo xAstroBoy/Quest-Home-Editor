@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <string>
 #include "types.h"
+#include "hzanim_acl.h"   // ACL bridge (the real libshell decode; ACL types stay in hzanim_acl.cpp)
 
 struct RendJoint { float pos[3]; float quat[4]; float scale; int parent; std::string name; };
 struct RendSkel {
@@ -21,7 +22,9 @@ struct RendClip {
     // per (frame*nJoints) a quaternion (w,x,y,z) + a translation (x,y,z) [translation optional / from bind].
     std::vector<float> quats;   // nFrames*nJoints*4
     std::vector<float> trans;   // nFrames*nJoints*3 (may be empty -> use bind pos)
-    bool ok() const { return nFrames > 0 && nJoints > 0 && !quats.empty(); }
+    HzAclClip* acl = nullptr;   // V203: the real ACL clip (preferred over the legacy quats path)
+    int aclJoints = 0;
+    bool ok() const { return acl != nullptr || (nFrames > 0 && nJoints > 0 && !quats.empty()); }
 };
 
 // quat (w,x,y,z) -> column-major 4x4 with translation t and uniform scale s.
@@ -61,10 +64,61 @@ inline bool rs_invert(const float* m, float* inv) {
     for(int i=0;i<16;i++) inv[i]*=det; return true;
 }
 
+// Compose each joint's world bind matrix (chaining parents, which precede children) + its inverse-bind.
+inline void rs_buildBind(RendSkel& s) {
+    int n = (int)s.joints.size();
+    s.bind.resize(16*n); s.invBind.resize(16*n);
+    for (int i=0;i<n;i++) {
+        float local[16]; rs_trs(s.joints[i].quat, s.joints[i].pos, s.joints[i].scale, local);
+        float world[16]; memcpy(world, local, 64);
+        if (s.joints[i].parent >= 0 && s.joints[i].parent < n)
+            rs_mul(&s.bind[16*s.joints[i].parent], local, world);
+        memcpy(&s.bind[16*i], world, 64);
+        if (!rs_invert(world, &s.invBind[16*i])) { memset(&s.invBind[16*i],0,64); s.invBind[16*i]=s.invBind[16*i+5]=s.invBind[16*i+10]=s.invBind[16*i+15]=1; }
+    }
+}
+
+// V203 vista skeleton ("lekS"): magic(4) ver u32 nameLen u32 name | u16 jointCount | per joint:
+//   i16 parent, u32 nameLen, name, T f32x3, Q(w,x,y,z) f32x4, S f32x1. HIERARCHICAL (parents precede children),
+//   e.g. whale01: global_jnt(-1)->root->chest->{head, l/r_shoulder->elbow->wrist} + tailStart->tail1->tail2->tailEnd.
+inline bool parseRendSkelV203(const std::vector<u8>& d, RendSkel& s) {
+    auto rd32=[&](size_t o)->u32{ return o+4<=d.size()? *(const u32*)(d.data()+o):0u; };
+    auto rd16=[&](size_t o)->u16{ return o+2<=d.size()? *(const u16*)(d.data()+o):(u16)0; };
+    auto rdf =[&](size_t o){ float f=0; if(o+4<=d.size()) memcpy(&f,d.data()+o,4); return f; };
+    size_t o = 8;                              // after magic + version
+    u32 nameLen = rd32(o); o += 4 + nameLen;   // skeleton name ("Skeleton_0")
+    if (o + 2 > d.size()) return false;
+    u32 jc = rd16(o); o += 2;                  // u16 joint count
+    if (jc == 0 || jc > 1024) return false;
+    std::vector<RendJoint> js;
+    for (u32 i = 0; i < jc; ++i) {
+        if (o + 6 > d.size()) return false;
+        int parent = (short)rd16(o);
+        u32 nl = rd32(o + 2);
+        if (nl == 0 || nl > 128 || o + 6 + nl + 32 > d.size()) return false;
+        RendJoint j;
+        j.name.assign((const char*)d.data() + o + 6, nl);
+        for (char ch : j.name) if (ch < 32 || ch > 126) return false;   // sanity: printable joint names
+        size_t p = o + 6 + nl;
+        j.pos[0]=rdf(p); j.pos[1]=rdf(p+4); j.pos[2]=rdf(p+8);
+        j.quat[0]=rdf(p+12); j.quat[1]=rdf(p+16); j.quat[2]=rdf(p+20); j.quat[3]=rdf(p+24);   // w,x,y,z
+        j.scale = rdf(p+28); if (j.scale < 1e-4f || j.scale > 1e4f) j.scale = 1.0f;
+        j.parent = parent;
+        o = p + 32;
+        js.push_back(std::move(j));
+    }
+    s.joints = std::move(js);
+    rs_buildBind(s);
+    return true;
+}
+
 // "Skel" custom binary: magic"Skel"(4) ver u32 nameLen u32 name | then a 4B field | per joint:
 //   nameLen u32, name, pos f32x3, quat(w,x,y,z) f32x4, scale f32, parent u16. FLAT (parent usually 0xffff).
 inline bool parseRendSkel(const std::vector<u8>& d, RendSkel& s) {
     if (d.size() < 26 || (memcmp(d.data(), "Skel", 4) != 0 && memcmp(d.data(), "lekS", 4) != 0)) return false;
+    // V203 vista format (parent-first, u16 jointCount) — the whale/turtle skeletons. Try it first; it
+    // returns false cleanly if the bytes are the older nuxd layout, which the code below then handles.
+    { RendSkel v; if (parseRendSkelV203(d, v) && v.joints.size() >= 2) { s = std::move(v); return true; } }
     auto rd32=[&](size_t o)->u32{ return o+4<=d.size()? *(const u32*)(d.data()+o):0u; };
     auto rd16=[&](size_t o)->u16{ return o+2<=d.size()? *(const u16*)(d.data()+o):(u16)0; };
     auto rdf=[&](size_t o){ float f=0; if(o+4<=d.size()) memcpy(&f,d.data()+o,4); return f; };
@@ -113,7 +167,14 @@ inline bool parseRendSkel(const std::vector<u8>& d, RendSkel& s) {
 //   all 107 joints decode |xyz|^2<=1. (Per-frame motion lives in the segmented variable-bitrate bitstream
 //   at the segment byte offsets; decoded incrementally — see HSR_HZBITS. This always yields the reference pose.)
 inline bool parseRendClip(const std::vector<u8>& d, int nJoints, RendClip& c) {
-    if (d.size() < 200 || nJoints <= 0) return false;
+    if (d.size() < 80 || nJoints <= 0) return false;
+    // V203: the HzAnim clip wraps a stock ACL `compressed_tracks` — decode it with the real ACL library
+    // (byte-exact with libshell's inlined ACL decompressor sub_175F004). Preferred over the legacy path below.
+    if (HzAclClip* a = hzAclCreate(d.data(), d.size())) {
+        c.acl = a; c.aclJoints = hzAclJointCount(a); c.fps = hzAclSampleRate(a);
+        return true;
+    }
+    if (d.size() < 200) return false;
     auto rd32=[&](size_t o)->u32{ return o+4<=d.size()? *(const u32*)(d.data()+o):0u; };
     auto rdf=[&](size_t o){ float f=0; if(o+4<=d.size()) memcpy(&f,d.data()+o,4); return f; };
     if (rd32(0) != 0xA34912B6u) return false;                 // hzanim clip magic
@@ -198,6 +259,27 @@ inline bool parseRendClip(const std::vector<u8>& d, int nJoints, RendClip& c) {
 inline void sampleRendClip(const RendSkel& s, const RendClip& c, float t, std::vector<float>& outSkin) {
     int n = (int)s.joints.size(); outSkin.resize(16*n);
     if (!c.ok() || std::getenv("HSR_SKINID")) { for(int i=0;i<n;i++){ float* m=&outSkin[16*i]; memset(m,0,64); m[0]=m[5]=m[10]=m[15]=1; } return; }
+    // V203 ACL path: decode each joint's LOCAL transform (rotation + translation + scale) at time t,
+    // compose the hierarchy to animated world, then skin[j] = animWorld[j] * invBind[j]. The ACL clip
+    // carries the FULL local transform incl. the swimming root translation — use it directly (the legacy
+    // path below assumed rotation-only + bind translation, which froze the whale's swim path).
+    if (c.acl) {
+        std::vector<float> loc((size_t)n*8, 0.f);
+        int nj = hzAclSampleLocal(c.acl, t, loc.data(), n);
+        std::vector<float> animWorld(16*n);
+        for (int i=0;i<n;i++) {
+            float q[4], tr[3], sc;
+            if (i < nj) { const float* L=&loc[i*8]; q[0]=L[0];q[1]=L[1];q[2]=L[2];q[3]=L[3]; tr[0]=L[4];tr[1]=L[5];tr[2]=L[6]; sc=L[7]; }
+            else { q[0]=1;q[1]=q[2]=q[3]=0; tr[0]=s.joints[i].pos[0];tr[1]=s.joints[i].pos[1];tr[2]=s.joints[i].pos[2]; sc=1.f; }
+            if (sc<1e-4f||sc>1e4f) sc=1.0f;
+            float localM[16]; rs_trs(q, tr, sc, localM);
+            int par = s.joints[i].parent;
+            if (par>=0 && par<n) rs_mul(&animWorld[16*par], localM, &animWorld[16*i]);   // parents precede children
+            else                 memcpy(&animWorld[16*i], localM, 64);
+            rs_mul(&animWorld[16*i], &s.invBind[16*i], &outSkin[16*i]);
+        }
+        return;
+    }
     float frame = t * c.fps; int f0 = (int)frame % c.nFrames; if(f0<0)f0+=c.nFrames; int f1=(f0+1)%c.nFrames; float a=frame-(float)((int)frame);
     int nj = c.nJoints;
     for (int i=0;i<n;i++) {

@@ -79,6 +79,9 @@ struct VkGpuMesh {
     VkImage lmImage = VK_NULL_HANDLE;          // baked lightmap (if material provides one)
     VkDeviceMemory lmMem = VK_NULL_HANDLE;
     VkImageView lmView = VK_NULL_HANDLE;
+    VkImage vatImage = VK_NULL_HANDLE;         // VAT offset texture (R16G16B16A16_SFLOAT: verts x frames)
+    VkDeviceMemory vatMem = VK_NULL_HANDLE;
+    VkImageView vatView = VK_NULL_HANDLE;      // VAT offset texture (decoded .exr vatdata); null => zero-offset rest pose
     VkDescriptorSet descSet0 = VK_NULL_HANDLE; // set 0: globalUniforms + linearWrapSampler
     VkDescriptorSet descSet2 = VK_NULL_HANDLE; // set 2: matParams + baseColorTex (unlit)
     // Skinned pipeline extras (set when isSkinned=true)
@@ -230,6 +233,12 @@ public:
     VkImage flatNormalImage = VK_NULL_HANDLE;
     VkDeviceMemory flatNormalMem = VK_NULL_HANDLE;
     VkImageView flatNormalView = VK_NULL_HANDLE;
+    // 1x1 BLACK (0,0,0,0): zero-offset fallback for the VAT offset texture (vatAnimTex). The VAT vertex
+    // shader does worldPosition = inPos + offset, offset = sample(vatAnimTex); a black sample => offset 0
+    // => the mesh renders at its rest pose. (White made offset=(1,1,1) -> huge displacement -> stretched.)
+    VkImage blackImage = VK_NULL_HANDLE;
+    VkDeviceMemory blackMem = VK_NULL_HANDLE;
+    VkImageView blackView = VK_NULL_HANDLE;
 
     // ── Synthesized lighting for the real PBR shaders (set 1) ───────────────
     // Haven2025 is a "footprint" env: its IBL cubemaps / lightprobe volume / lights are
@@ -315,6 +324,7 @@ public:
     int selectedMesh = -1;                     // Tab to cycle, -1=none
     int soloMesh = -1;                          // if >=0, draw ONLY this mesh index (debug, env HSR_SOLO)
     int hideMesh = -1;                          // if >=0, SKIP this mesh index (debug, env HSR_HIDEMESH)
+    float clearRGB[3] = {0.05f, 0.05f, 0.08f};  // render-pass clear colour; set bright (e.g. magenta) to expose see-through HOLES
     // Diffuse IBL irradiance cubemap (V79 SpecIbl). When loaded, *_specibl* meshes get their per-vertex
     // color = diffuseCube(worldN)·ambientIBLTint baked in (the dominant lift off the white/dark fallback).
     ibl::Cubemap iblDiffuse;
@@ -428,6 +438,10 @@ public:
             u8 flatN[4] = {128,128,255,255};
             createTextureImage(flatN, 1, 1, flatNormalImage, flatNormalMem);
             flatNormalView = createImageView(flatNormalImage, VK_FORMAT_R8G8B8A8_UNORM);
+            // 1x1 black for the VAT zero-offset fallback (UNORM so sampling returns 0.0, not sRGB-decoded).
+            u8 blackPixel[4] = {0,0,0,0};
+            createTextureImage(blackPixel, 1, 1, blackImage, blackMem);
+            blackView = createImageView(blackImage, VK_FORMAT_R8G8B8A8_UNORM);
         }
 
         // Synthesized lighting (set1) for the real PBR shaders. No-op for unlit shaders.
@@ -444,7 +458,10 @@ public:
     void uploadMesh(const MeshData& md) {
         VkGpuMesh gm;
         gm.nIdx = md.nIdx;
-        buildModelMatrix(md.transform, gm.model);
+        // Use the faithful 4×4 parent→child world matrix when the loader composed one (preserves hierarchy
+        // shear from non-uniform-scale × rotation that a TRS recompose drops). Else rebuild T·R·S locally.
+        if (md.hasWorldMatrix) memcpy(gm.model, md.worldMatrix, sizeof(gm.model));
+        else                   buildModelMatrix(md.transform, gm.model);
         gm.local = md.transform;                           // authored TRS (editor outliner reads this)
         memcpy(gm.baseModel, gm.model, sizeof(gm.baseModel)); // edits are a delta applied on top of base
 
@@ -457,13 +474,25 @@ public:
         // the albedo as a MASK and, without the baked lightmap (still unsupported), washes it to garbage
         // purple/yellow -> route it to the GLOBAL albedo shader. The rgbmasked props with a white.png MASK
         // base (rug/sofaCushions, texW==4) genuinely need the masked path, so they keep their program.
-        bool tiledRealAlbedo = md.tiled && md.texW > 64 && md.texH > 64;
-        gm.progIdx = (perMat && !md.overlayKind && !tiledRealAlbedo) ? programForSurface(surfaceName(md.shaderPath)) : -1;
+        // Routing: an UNLIT per-material forward shader (set1=0, e.g. unlittiledlightmaprgmasked — the
+        // couch/carpet/cushions) now renders faithfully (samples BaseColor_Tx as the real albedo + binds
+        // matParams by name), so use it. But a LIT isotropic PBR shader (e.g. unpackedisotropictiledrgbmasked
+        // — the floor/walls) multiplies by scene lighting we can't fully feed, so per-material renders it
+        // pink/wrong; for those tiled-real-albedo surfaces fall back to the GLOBAL shader, which shows the
+        // base albedo (parquet). Distinguish by the surface name: "unlit*" = self-lit -> per-material.
+        std::string surfLower = surfaceName(md.shaderPath); for (char& c : surfLower) c = (char)tolower((unsigned char)c);
+        bool unlitSurface = surfLower.find("unlit") != std::string::npos;
+        bool tiledRealAlbedo = md.tiled && md.texW > 64 && md.texH > 64 && !unlitSurface;
+        gm.progIdx = (perMat && !md.overlayKind && !tiledRealAlbedo) ? programForSurface(surfaceName(md.shaderPath), &md.texSlots) : -1;
+        if (std::getenv("HSR_MATDBG")) log("  ROUTE '%s' progIdx=%d tiled=%d texW=%u unlit=%d", md.name.c_str(), gm.progIdx, (int)md.tiled, md.texW, (int)unlitSurface);
         // Skinned meshes (prism_wave_a_01) MUST use the "skinned" program variant: it has the boneIdx/boneWgt
         // vertex inputs (vstride 32) + the sbSkinningMatrices buffer. programForSurface can resolve the mesh
         // to the NON-skinned variant (vstride 24, no bones) -> the skinned shader reads garbage bones and
         // collapses every vertex to the origin (prism invisible). Force the skinned program for bone meshes.
-        if (perMat && md.hasBones) { int sp = programForSkinned(); if (sp >= 0) gm.progIdx = sp; }
+        // BUT a VAT mesh (md.hasVat) is NOT skinned — its stride-28/44 vertex stream has the VAT vertexCol,
+        // not boneIdx/boneWgt. parseRendMesh's stride>=28 bone heuristic mis-flags it as skinned; forcing it
+        // to the skinned program here overrode its vatlitbubble/vatunlit program -> the bubbles stayed broken.
+        if (perMat && md.hasBones && !md.hasVat) { int sp = programForSkinned(); if (sp >= 0) gm.progIdx = sp; }
 
         // Build the VBO to MATCH the (per-mesh or global) shader's introspected vertex inputs: each
         // attribute is written at its role-derived offset (pos/normal/uv/lightmapUv/color/bone…).
@@ -616,7 +645,7 @@ public:
         // pos offset within a vertex (for CPU animation writes) — role 0.
         u32 posOff = 0; for (auto& vin : vins) if (vin.role==0) posOff = vin.offset;
         // CPU vertex animation (nuxd motes/prism): keep VBO mapped + remember bind pose.
-        if (md.hasBones && !md.boneIndices.empty() && md.dynamicVerts) {
+        if (md.hasBones && !md.boneIndices.empty() && md.dynamicVerts && !md.hasVat) {
             // v203 HzAnim: the CPU skinner (loader.animate -> sampleRendClip) streams real skinned
             // world positions into the position attribute each frame. Use the dynamicVerts path (NOT
             // the gm.animated procedural-drift placeholder) so the decoded clip actually drives verts.
@@ -633,7 +662,9 @@ public:
                 gm.basePos[i*3+2] = md.positions[i*3+2];
                 gm.vBone[i] = (i*4 < bIdx.size()) ? bIdx[i*4] : 0;
             }
-        } else if (md.hasBones && !md.boneIndices.empty()) {
+        } else if (md.hasBones && !md.boneIndices.empty() && !md.hasVat) {
+            // NOT for VAT meshes: gm.animated drives a procedural CPU drift that fights the VAT vertex
+            // shader's per-frame offset -> the bubbles shot off into spikes. VAT is GPU-driven; leave verts.
             gm.vboMapped = vdata; gm.vboStride = stride; gm.animated = true;
             gm.basePos.resize(nVerts * 3); gm.vBone.resize(nVerts);
             for (u32 i = 0; i < nVerts; ++i) {
@@ -726,6 +757,17 @@ public:
                     for (size_t k=0;k<nn && p<260;k+=st) p+=snprintf(sb+p,(size_t)(sizeof(sb)-p),"(%.2f,%.2f) ",md.uvs[k*2],md.uvs[k*2+1]);
                     log("  DUMPUV uv0 range u[%.3f,%.3f] v[%.3f,%.3f] spread: %s", u0,u1,v0,v1, sb);
                 }
+                if (!md.uvs2.empty()) {
+                    float u0=1e9f,u1=-1e9f,v0=1e9f,v1=-1e9f;
+                    for (size_t k=0;k+1<md.uvs2.size();k+=2){ float u=md.uvs2[k],v=md.uvs2[k+1];
+                        if(u<u0)u0=u; if(u>u1)u1=u; if(v<v0)v0=v; if(v>v1)v1=v; }
+                    log("  DUMPUV uv1 range u[%.3f,%.3f] v[%.3f,%.3f] (VAT column)", u0,u1,v0,v1);
+                } else log("  DUMPUV uv1 EMPTY (VAT column falls back to uv0!)");
+                auto col=[&](int c){ return std::sqrt(gm.model[c]*gm.model[c]+gm.model[c+1]*gm.model[c+1]+gm.model[c+2]*gm.model[c+2]); };
+                float pmn[3]={1e9f,1e9f,1e9f},pmx[3]={-1e9f,-1e9f,-1e9f};
+                for(size_t k=0;k+2<md.positions.size();k+=3) for(int c=0;c<3;c++){ float p=md.positions[k+c]; if(p<pmn[c])pmn[c]=p; if(p>pmx[c])pmx[c]=p; }
+                log("  MODEL scale=(%.3f,%.3f,%.3f) inPos AABB x[%.2f,%.2f] y[%.2f,%.2f] z[%.2f,%.2f]",
+                    col(0),col(4),col(8), pmn[0],pmx[0],pmn[1],pmx[1],pmn[2],pmx[2]);
             }
         }
         // Texture image + view — use GPU-native ASTC if supported and data available
@@ -751,7 +793,14 @@ public:
             gm.normalView = createImageView(gm.normalImage, VK_FORMAT_R8G8B8A8_UNORM);
         }
         if (md.hasOrm && !md.ormRGBA.empty()) {
-            createTextureImage(md.ormRGBA.data(), md.ormW, md.ormH, gm.ormImage, gm.ormMem, VK_FORMAT_R8G8B8A8_UNORM);
+            std::vector<u8> ormData = md.ormRGBA;
+            if (const char* sw = std::getenv("HSR_MASKSWIZ")) {   // diagnostic channel remap: new RGBA = old[s0],old[s1],...
+                auto ci=[&](char c)->int{ c=(char)tolower((unsigned char)c); return c=='r'?0:c=='g'?1:c=='b'?2:c=='a'?3:0; };
+                std::string s = sw; while (s.size()<4) s+="rgba"[s.size()];
+                for (size_t i=0;i+3<ormData.size();i+=4) { u8 o[4]={md.ormRGBA[i],md.ormRGBA[i+1],md.ormRGBA[i+2],md.ormRGBA[i+3]};
+                    ormData[i]=o[ci(s[0])]; ormData[i+1]=o[ci(s[1])]; ormData[i+2]=o[ci(s[2])]; ormData[i+3]=o[ci(s[3])]; }
+            }
+            createTextureImage(ormData.data(), md.ormW, md.ormH, gm.ormImage, gm.ormMem, VK_FORMAT_R8G8B8A8_UNORM);
             gm.ormView = createImageView(gm.ormImage, VK_FORMAT_R8G8B8A8_UNORM);
         }
         if (md.hasEmissive && !md.emissiveRGBA.empty()) {
@@ -761,6 +810,14 @@ public:
         if (md.hasLightmap && !md.lmRGBA.empty()) {
             createTextureImage(md.lmRGBA.data(), md.lmW, md.lmH, gm.lmImage, gm.lmMem, VK_FORMAT_R8G8B8A8_SRGB);
             gm.lmView = createImageView(gm.lmImage, VK_FORMAT_R8G8B8A8_SRGB);
+        }
+        if (md.hasVat && !md.vatRaw.empty()) {
+            // Upload the half-float offset texture verbatim as R16G16B16A16_SFLOAT (verts x frames). The
+            // vatunlit vertex shader texelFetches it: worldPosition = inPos + offset[vertexCol][frameRow].
+            createTextureImageRaw(md.vatRaw.data(), (u32)md.vatRaw.size(), md.vatW, md.vatH,
+                                  VK_FORMAT_R16G16B16A16_SFLOAT, gm.vatImage, gm.vatMem);
+            gm.vatView = createImageView(gm.vatImage, VK_FORMAT_R16G16B16A16_SFLOAT);
+            if (std::getenv("HSR_VATDBG")) log("  VAT '%s' offsetTex %ux%u f16 bound", md.name.c_str(), md.vatW, md.vatH);
         }
         // lightmappower applied IN-SHADER (tint*lmPow), faithful HDR order (not pre-baked+clamped) — for
         // BOTH the lightmap-sampler path (concrete shells) and the lightmap-as-base fallback (helmet/gem/loft_lamp).
@@ -834,7 +891,42 @@ public:
                 // For UNWRAP props (propUnwrap: a unique [0,1] unwrap, not a tiled texture) KEEP every cooked
                 // constant — Tint, EmissiveTint (the lamp's golden glow), Metallic, Roughness — but FORCE
                 // GlobalTile=1 so the tiling factor can't warp the unwrap (SculptureA's atlas, bowls, lamps).
-                if (!mpmembers.empty() && !std::getenv("HSR_NOREPACK")) {
+                // FAITHFUL by-NAME binding (libshell): each cooked `constantParameter` carries
+                // {nameHash, blobOffset, byteSize}; the shader UBO member it targets is the one whose
+                // MurmurHash3_x86_32("matParams."+memberName,0) == nameHash. The cooked value blob is
+                // tight-packed in .surface param-declaration order, which DIFFERS from the SPIR-V std140
+                // member order (the compiler slots a scalar into a vec3's padding gap, e.g. AOfloor@44
+                // before Tint@48), so positional binding swapped Tint↔AOfloor → sofaCushions rendered flat
+                // yellow (read Tint=(1,1,0.1)). Map each introspected member to its entry BY HASH.
+                if (!md.constParams.empty() && !mpmembers.empty() && !std::getenv("HSR_NOREPACK") &&
+                    !std::getenv("HSR_NOHASHBIND")) {
+                    int bound = 0;
+                    for (auto& m : mpmembers) {
+                        u32 want = matParamNameHash(m.name);
+                        for (auto& cp : md.constParams) {
+                            if (cp.nameHash != want) continue;
+                            if ((size_t)cp.blobOffset + cp.byteSize > md.matParamsBlob.size()) break;
+                            if (m.off + cp.byteSize > (u32)MAT_UBO_SIZE) break;
+                            std::string mn = m.name; for (char& c : mn) c = (char)tolower((unsigned char)c);
+                            if (propUnwrap && mn.find("tile") != std::string::npos) {
+                                float one = 1.0f; memcpy((u8*)fp + m.off, &one, 4);   // neutralize GlobalTile for unwraps
+                            } else {
+                                memcpy((u8*)fp + m.off, md.matParamsBlob.data() + cp.blobOffset, cp.byteSize);
+                            }
+                            ++bound; break;
+                        }
+                    }
+                    if (std::getenv("HSR_MATDBG")) {
+                        log("  MATHASHBIND '%s' bound %d/%zu members from %zu constParams",
+                            md.name.c_str(), bound, mpmembers.size(), md.constParams.size());
+                        char vb[400]; int vp=0;
+                        for (auto& m : mpmembers) { float val; memcpy(&val,(u8*)fp+m.off,4);
+                            vp+=snprintf(vb+vp,(size_t)(sizeof(vb)-vp),"%s=%.3g ",m.name.c_str(),val); if(vp>360)break; }
+                        log("    MATVALS %s", vb);
+                    }
+                } else if (!mpmembers.empty() && !std::getenv("HSR_NOREPACK")) {
+                    // Fallback (no parsed constantParameters — older schema): positional repack by offset
+                    // order. Tight-packed value-by-value into each member's reflected UBO offset.
                     std::vector<MatMember> mem(mpmembers.begin(), mpmembers.end());
                     std::sort(mem.begin(), mem.end(),
                               [](const MatMember& a, const MatMember& b){ return a.off < b.off; });
@@ -953,10 +1045,15 @@ public:
                     } else if (n.find("lightbaker") != std::string::npos) {
                         f[0]=1.0f; f[1]=1.0f;   // uvScale
                         f[2]=0.0f; f[3]=0.0f;   // uvOffset
+                    } else if (n.find("instance") != std::string::npos && md.atlasCellIndex >= 0.0f) {
+                        // unlitatlasinstance "instanceTag" UBO = { float atlasCellIndex @offset 0 } (verified in
+                        // the shader's member layout). It selects WHICH atlas cell (col=cell%subDivX,
+                        // row=cell/subDivX) = which baked colour variant for THIS instance. Was zeroed → every
+                        // coral sampled cell 0 (one colour: coral_22 rendered blue; its real cell 21 = pink).
+                        memset(f, 0, USZ);
+                        f[0] = md.atlasCellIndex;
                     } else {
-                        // Unknown per-material UBO (e.g. instanced "instanceTag": atlasCellIndex +
-                        // hue/bright/saturate variation). Zero = no per-instance variation, which is
-                        // the neutral that keeps the base albedo intact (1.0f washed colors to gray).
+                        // Unknown per-material UBO: zero = neutral (keeps base albedo; 1.0f washed to gray).
                         memset(f, 0, USZ);
                     }
                     vkUnmapMemory(device, m);
@@ -978,19 +1075,31 @@ public:
                 bool isCube = n.find("cube") != std::string::npos || n.find("specularibl") != std::string::npos;
                 bool isBase = n.find("basecolor") != std::string::npos || n.find("albedo") != std::string::npos ||
                               n.find("diffuse") != std::string::npos;
+                // ONxRNy_Tx / RBAoDir_Tx is the merged R(rough)/BentNormal/AO/Direction map. For the
+                // rgbmasked shaders its .rg channels ARE the layer mask (the carpet/fabric/wood pattern):
+                //   baseColor = mix(mix(baseTex, LayerRed, RBAoDir.r·RedLayerMult·grunge), LayerBlue, RBAoDir.g·…)
+                // so it MUST reach this sampler — a flat fallback gives a constant mask -> flat beige.
                 bool isNorm = n.find("onxrny") != std::string::npos || n.find("normal") != std::string::npos ||
-                              n.find("_nx") != std::string::npos;
+                              n.find("_nx") != std::string::npos || n.find("rbaodir") != std::string::npos ||
+                              n.find("rbao") != std::string::npos;
                 bool isLm   = n.find("lightmap") != std::string::npos || n.find("lightbaker") != std::string::npos;
                 bool isOrm  = n.find("orm") != std::string::npos || n.find("rough") != std::string::npos ||
                               n.find("metal") != std::string::npos || n.find("_ao") != std::string::npos ||
-                              n.find("occl") != std::string::npos;
+                              n.find("occl") != std::string::npos || n.find("rbaodir") != std::string::npos ||
+                              n.find("rbao") != std::string::npos;
                 bool isEmissive = n.find("emissive") != std::string::npos;
-                if (isCube)          v = (iblSpecView ? iblSpecView : whiteView);   // specular reflection cube
+                // The merged map is loaded into EITHER the normal OR the orm slot depending on its filename
+                // (a "_rbaodir" classifies as orm); bind whichever is present so the rg-mask reaches the
+                // shader. Real PBR materials with SEPARATE normal+orm keep their own (primary wins).
+                bool isVat = n.find("vatanim") != std::string::npos || n.find("vattex") != std::string::npos ||
+                             (n.find("vat") != std::string::npos && n.find("anim") != std::string::npos);
+                if (isVat)           v = (gm.vatView ? gm.vatView : blackView);  // VAT offset tex (decoded .exr) or zero-offset rest pose
+                else if (isCube)     v = (iblSpecView ? iblSpecView : whiteView);   // specular reflection cube
                 else if (isEmissive) v = (gm.emissiveView ? gm.emissiveView : whiteView);  // emissiveTex (glow)
-                else if (isNorm) v = (gm.normalView ? gm.normalView : flatNormalView);
+                else if (isNorm) v = (gm.normalView ? gm.normalView : (gm.ormView ? gm.ormView : flatNormalView));
                 else if (isLm)   v = (gm.lmView ? gm.lmView : whiteView);   // missing lightmap -> white
                 else if (isBase || (int)d.binding == s2base) v = gm.texView;
-                else if (isOrm)  v = (gm.ormView ? gm.ormView : whiteView);
+                else if (isOrm)  v = (gm.ormView ? gm.ormView : (gm.normalView ? gm.normalView : whiteView));
                 else             v = whiteView;
                 imgInfos.push_back({VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
                 w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -1001,8 +1110,11 @@ public:
         vkUpdateDescriptorSets(device, (u32)writes.size(), writes.data(), 0, nullptr);
 
         // ── Skinned pipeline extras ──────────────────────────────────────────────
-        // Only when the mesh has bones AND the skinned descriptor layout is ready.
-        if (md.hasBones && descSetLayout2Skin != VK_NULL_HANDLE) {
+        // Only when the mesh has bones AND the skinned descriptor layout is ready. NOT for VAT meshes:
+        // a VAT mesh is mis-flagged hasBones by the stride>=28 heuristic, and setting isSkinned makes the
+        // DRAW bind the skinned pipeline (32-byte bone vertex layout) to read the bubble's 44-byte
+        // vatlitbubble VBO -> misaligned attributes -> verts read garbage -> the bubble shoots off in spikes.
+        if (md.hasBones && descSetLayout2Skin != VK_NULL_HANDLE && !md.hasVat) {
             gm.isSkinned = true;
 
             // Bone matrices UBO: 256 bone slots * 64 bytes (mat4) = 16384 bytes.
@@ -1188,7 +1300,7 @@ public:
         rpInfo.framebuffer = framebuffers[imageIndex];
         rpInfo.renderArea.extent = swapchainExtent;
         VkClearValue clearColors[2] = {};
-        clearColors[0].color = {{0.05f, 0.05f, 0.08f, 1.0f}};
+        clearColors[0].color = {{clearRGB[0], clearRGB[1], clearRGB[2], 1.0f}};
         clearColors[1].depthStencil = {0.0f, 0};  // reversed-Z: clear to 0 (far)
         rpInfo.clearValueCount = 2;
         rpInfo.pClearValues = clearColors;
@@ -1918,21 +2030,41 @@ public:
         createSolidCubemap(0.0f, 0.0f, 0.0f, iblSpecImage, iblSpecMem, iblSpecView);
     }
 
-    void createSolidCubemap(float r, float g, float b, VkImage& image, VkDeviceMemory& mem, VkImageView& view) {
-        const u32 S = 4;                       // 4x4 faces is plenty for a flat color
+    void createSolidCubemap(float r, float g, float b, VkImage& image, VkDeviceMemory& mem, VkImageView& view,
+                            float gr=-1.0f, float gg=-1.0f, float gb=-1.0f) {
+        // HEMISPHERE gradient: sky colour (r,g,b) toward +Y, ground colour (gr,gg,gb) toward -Y. The PBR
+        // shaders sample this IBL diffuse cube by the surface NORMAL, so a vertical gradient gives natural
+        // top-down shading (up-faces brighter, down-faces dimmer) and makes the NORMAL MAP visible — vs a
+        // solid cube which lights everything flat (the "unlit/unnatural" walls). ground<0 => solid (legacy).
+        if (gr < 0) { gr = r; gg = g; gb = b; }
+        const u32 S = 16;                      // smooth gradient
         const u32 faceBytes = S * S * 4;
-        std::vector<u8> face(faceBytes);
-        // Clamp to [0,1] BEFORE the u8 cast — values >1 wrap (1.15*255=293 -> 37) and
-        // turned the neutral IBL into a garbage blue/green tint on everything.
         auto q = [](float x){ x = x<0?0:(x>1?1:x); return (u8)(x*255.0f + 0.5f); };
-        u8 R=q(r), G=q(g), B=q(b);
-        for (u32 p = 0; p < S*S; ++p) { face[p*4+0]=R; face[p*4+1]=G; face[p*4+2]=B; face[p*4+3]=255; }
+        std::vector<u8> faces((size_t)faceBytes * 6);
+        for (u32 f = 0; f < 6; ++f) {
+            for (u32 ty = 0; ty < S; ++ty) for (u32 tx = 0; tx < S; ++tx) {
+                float a = ((tx + 0.5f) / S) * 2.0f - 1.0f, bb = ((ty + 0.5f) / S) * 2.0f - 1.0f;
+                float dx, dy, dz;
+                switch (f) {
+                    case 0: dx= 1; dy=-bb; dz=-a; break;  // +X
+                    case 1: dx=-1; dy=-bb; dz= a; break;  // -X
+                    case 2: dx= a; dy= 1;  dz= bb; break; // +Y (sky)
+                    case 3: dx= a; dy=-1;  dz=-bb; break; // -Y (ground)
+                    case 4: dx= a; dy=-bb; dz= 1; break;  // +Z
+                    default:dx=-a; dy=-bb; dz=-1; break;  // -Z
+                }
+                float len = std::sqrt(dx*dx + dy*dy + dz*dz); float ny = dy / len;
+                float t = ny * 0.5f + 0.5f;            // 0 = ground, 1 = sky
+                u8* px = &faces[(size_t)f*faceBytes + ((size_t)ty*S + tx)*4];
+                px[0]=q(gr + (r-gr)*t); px[1]=q(gg + (g-gg)*t); px[2]=q(gb + (b-gb)*t); px[3]=255;
+            }
+        }
         VkDeviceSize total = (VkDeviceSize)faceBytes * 6;
         VkBuffer staging; VkDeviceMemory stagingMem;
         createBuffer(total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging, stagingMem);
         void* ptr; vkMapMemory(device, stagingMem, 0, total, 0, &ptr);
-        for (u32 f = 0; f < 6; ++f) memcpy((u8*)ptr + f*faceBytes, face.data(), faceBytes);
+        memcpy(ptr, faces.data(), total);
         vkUnmapMemory(device, stagingMem);
 
         VkImageCreateInfo ii = {};
@@ -2028,8 +2160,13 @@ public:
 
         // Neutral IBL cubemaps (diffuse irradiance + reflection). Mid neutral so the PBR
         // shader's ambient/specular terms light the scene rather than reading nothing.
-        createSolidCubemap(ambientRGB[0], ambientRGB[1], ambientRGB[2], iblDiffImage, iblDiffMem, iblDiffView);
-        createSolidCubemap(ambientRGB[0]*0.9f, ambientRGB[1]*0.9f, ambientRGB[2]*0.9f, iblReflImage, iblReflMem, iblReflView);
+        // Hemisphere IBL: bright warm sky overhead, dimmer warm ground bounce below. Surfaces shade by
+        // their normal (incl. the normal map) -> natural top-down lighting instead of flat unlit walls.
+        float sky = std::getenv("HSR_HEMI") ? (float)atof(std::getenv("HSR_HEMI")) : 1.0f;
+        createSolidCubemap(ambientRGB[0]*sky, ambientRGB[1]*sky, ambientRGB[2]*sky, iblDiffImage, iblDiffMem, iblDiffView,
+                           ambientRGB[0]*0.30f, ambientRGB[1]*0.27f, ambientRGB[2]*0.22f);
+        createSolidCubemap(ambientRGB[0]*0.95f, ambientRGB[1]*0.92f, ambientRGB[2]*0.88f, iblReflImage, iblReflMem, iblReflView,
+                           ambientRGB[0]*0.40f, ambientRGB[1]*0.37f, ambientRGB[2]*0.32f);
 
         // 1x1 shadow map (depth=1.0 -> fully lit) + comparison-less sampler.
         {
@@ -2544,14 +2681,69 @@ public:
     }
 
     // Lazily get/build the program for a material's ".surface". -1 => not available (use global path).
-    int programForSurface(const std::string& surface) {
+    // MurmurHash3 of every sampler-like name (…_Tx / …Map / …Sampler / …Cube) a fragment declares.
+    // The material's textureParameters name its slots by the same hash, so this lets us pick the variant
+    // whose samplers MATCH the material (instead of the largest übershader the builder defaulted to).
+    static std::vector<u32> fragSamplerHashes(const std::vector<u32>& spv) {
+        std::vector<u32> out; u32 n=(u32)spv.size(), i=5;
+        while (i < n) { u32 w=spv[i], op=w&0xFFFF, wc=w>>16; if (wc==0 || i+wc>n) break;
+            if (op==5 && wc>=3) {                                   // OpName: id, literal string
+                std::string s; for (u32 k=i+2;k<i+wc;++k){ u32 ww=spv[k]; bool done=false;
+                    for (int b=0;b<4;++b){ char c=(char)((ww>>(b*8))&0xFF); if(!c){done=true;break;} s+=c; } if(done)break; }
+                if (s.find("_Tx")!=std::string::npos || s.find("Map")!=std::string::npos ||
+                    s.find("Sampler")!=std::string::npos || s.find("Cube")!=std::string::npos)
+                    out.push_back(murmur3_x86_32(s.data(), s.size(), 0));
+            }
+            i += wc;
+        }
+        return out;
+    }
+    // True if a fragment declares the set1 LIGHTING resources (IBL/shadow/light list). Such a "lit"
+    // variant multiplies albedo by scene lighting we can't fully feed (synthesised ambient only) ->
+    // dark/black. For these surfaces the intended variant is the UNLIT colour one (no set1).
+    static bool fragHasLighting(const std::vector<u32>& spv) {
+        u32 n=(u32)spv.size(), i=5;
+        while (i<n) { u32 w=spv[i], op=w&0xFFFF, wc=w>>16; if (wc==0 || i+wc>n) break;
+            if (op==5 && wc>=3) {
+                std::string s; for (u32 k=i+2;k<i+wc;++k){ u32 ww=spv[k]; bool d=false;
+                    for(int b=0;b<4;++b){char c=(char)((ww>>(b*8))&0xFF); if(!c){d=true;break;} s+=(char)tolower((unsigned char)c);} if(d)break; }
+                if (s.find("globalibl")!=std::string::npos || s.find("shadowmap")!=std::string::npos ||
+                    s.find("lightuniforms")!=std::string::npos || s.find("lightprobe")!=std::string::npos ||
+                    s.find("sblightitems")!=std::string::npos) return true;
+            }
+            i += wc;
+        }
+        return false;
+    }
+    int programForSurface(const std::string& surface, const std::vector<u32>* texSlots=nullptr) {
         if (surface.empty()) return -1;
         for (int i=0;i<(int)programs.size();++i) if (programs[i].surface==surface) return i;
-        for (auto& ls : loadedShaders) if (ls.surface==surface && !ls.vert.empty() && !ls.frag.empty()) {
-            ShaderProgram p; p.surface=surface; p.vert=ls.vert; p.frag=ls.frag;
-            buildProgram(p); programs.push_back(std::move(p)); return (int)programs.size()-1;
+        // Among ALL variants of this surface, score by: (1) most samplers matching the material's
+        // textureParameters slots, (2) prefer UNLIT (no set1 lighting we can't feed), (3) largest
+        // (the full colour shader vs depth/shadow prepasses).
+        int bestLs=-1; long bestScore=-1;
+        for (int li=0; li<(int)loadedShaders.size(); ++li) {
+            auto& ls=loadedShaders[li];
+            if (ls.surface!=surface || ls.vert.empty() || ls.frag.empty()) continue;
+            int sc=0;
+            if (texSlots && !texSlots->empty()) {
+                for (u32 h : fragSamplerHashes(ls.frag))
+                    if (std::find(texSlots->begin(), texSlots->end(), h) != texSlots->end()) ++sc;
+            }
+            long score = (long)sc * 100000000L
+                       + (fragHasLighting(ls.frag) ? 0L : 50000000L)
+                       + (long)ls.frag.size();
+            if (score > bestScore) { bestScore=score; bestLs=li; }
         }
-        return -1;
+        int bestFragSz = bestLs>=0 ? (int)loadedShaders[bestLs].frag.size() : 0; (void)bestFragSz;
+        if (bestLs < 0) return -1;
+        auto& ls=loadedShaders[bestLs];
+        ShaderProgram p; p.surface=surface; p.vert=ls.vert; p.frag=ls.frag;
+        buildProgram(p); programs.push_back(std::move(p));
+        if (std::getenv("HSR_MATDBG"))
+            log("  [PERMAT] surface '%s' picked variant %d (sampler match=%d, %zu candidates)",
+                surface.c_str(), bestLs, bestScore, loadedShaders.size());
+        return (int)programs.size()-1;
     }
     // The skinned program variant (surface name contains "skinned", e.g. nuxd's unlitblendskinned) —
     // bone meshes must use it (vstride 32 + sbSkinningMatrices) instead of the non-skinned default.

@@ -12,6 +12,7 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_vulkan.h"
 #include "ImGuizmo.h"
+#include "hsl_cooker.h"   // self-contained V203/HSL APK cooker — the "Export APK" path
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -35,6 +36,10 @@ struct Editor {
     // UI state
     char  search[96] = "";
     int   selected   = -1;
+    std::vector<MeshData>* sceneMeshes = nullptr;   // CPU geometry/textures (parallel to r->gpuMeshes) for Export APK
+    std::function<std::vector<float>(int meshIdx, int frames, int& nvOut)> vatBaker;  // bound to GltfLoader::bakeVAT (V79) — VAT animation
+    std::function<void(int meshIdx, int frames, hslcook::ExportMesh& em)> hzAnimExtractor;  // bound to GltfLoader::extractHzAnim (V79) — HZANIM skeletal
+    std::string exportStatus;                       // last Export APK result line (shown in the toolbar)
     float audioVol   = 1.0f;
     bool  audioMute  = false;
     bool  showLocal  = false;        // outliner matrix display: false=world (model), true=local/base
@@ -506,6 +511,68 @@ struct Editor {
         ImGui::PopID();
     }
 
+    // ── Export the CURRENT (edited) scene to a bootable V203/HSL APK via the self-contained cooker.
+    //    Each mesh's positions are baked through its final model matrix (gm.model) into WORLD space, so the
+    //    cooked entities use identity transforms and the export matches exactly what's on screen. UNSIGNED
+    //    (sign with apksigner, or the built-in v2 signer once enabled). Paths overridable via env. ──────────
+    void exportAPK() {
+        using namespace hslcook;
+        auto envOr = [](const char* k, const char* d){ const char* v = std::getenv(k); return std::string(v ? v : d); };
+        std::string nuxd  = envOr("HSR_COOK_SHELL",   "Envs To check/v203 Ufficial Envs/Nuxd.apk");
+        std::string shdir = envOr("HSR_COOK_SHADERS", "cooker/shaders");
+        std::string out   = envOr("HSR_COOK_OUT",     "cooker/out/edited_export_unsigned.apk");
+        auto rd = [](const std::string& p){ std::vector<uint8_t> b; FILE* f=fopen(p.c_str(),"rb"); if(!f) return b;
+            fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ b.resize(n); size_t r=fread(b.data(),1,n,f); b.resize(r);} fclose(f); return b; };
+        auto vspv = rd(shdir + "/myunlit.vert.spv"), fspv = rd(shdir + "/myunlit.frag.spv");
+        if (vspv.empty() || fspv.empty()) { exportStatus = "ERROR: shaders missing in " + shdir; return; }
+        if (!r || !sceneMeshes) { exportStatus = "ERROR: renderer/scene not bound"; return; }
+        std::vector<ExportMesh> ems;
+        size_t n = std::min(sceneMeshes->size(), r->gpuMeshes.size());
+        for (size_t i = 0; i < n; ++i) {
+            if (r->isHidden((int)i)) continue;
+            const MeshData& md = (*sceneMeshes)[i];
+            const VkGpuMesh& gm = r->gpuMeshes[i];
+            size_t nv = md.positions.size() / 3;
+            if (nv < 3 || md.indices.size() < 3) continue;
+            ExportMesh em; em.name = md.name; em.positions.resize(nv * 3);
+            for (size_t v = 0; v < nv; ++v) {
+                float p[3] = { md.positions[v*3], md.positions[v*3+1], md.positions[v*3+2] }, o[3];
+                xformPoint(gm.model, p, o);            // bake the edited world transform into the geometry
+                em.positions[v*3] = o[0]; em.positions[v*3+1] = o[1]; em.positions[v*3+2] = o[2];
+            }
+            em.uvs = md.uvs; em.indices = md.indices;
+            em.blend = gm.useBlend || gm.additive;     // transparent -> unlitblend.surface (fixes black-where-see-through)
+            if (vatBaker) {                            // animated node -> bake a VAT (non-skeletal); 64-frame loop
+                int bnv = 0; auto off = vatBaker((int)i, 64, bnv);
+                if (!off.empty() && bnv == (int)nv) { em.vatOffsets = std::move(off); em.vatFrames = 64; }
+            }
+            if (hzAnimExtractor) hzAnimExtractor((int)i, 64, em);   // HZANIM: skinned+animated -> fill em's skeletal fields
+            if (md.hasTexture && md.texRGBA.size() >= (size_t)md.texW * md.texH * 4) { em.rgba = md.texRGBA; em.w = md.texW; em.h = md.texH; }
+            ems.push_back(std::move(em));
+        }
+        if (ems.empty()) { exportStatus = "ERROR: no exportable meshes"; return; }
+        bool ok = false;
+        float camSpawn[3] = { r->cam.pos[0], r->cam.pos[1], r->cam.pos[2] };   // spawn the player where the V79 view is
+        std::vector<uint8_t> sceneZip;
+        auto apk = exportSceneAPK(ems, nuxd, vspv, fspv, true, &ok, camSpawn, &sceneZip);   // unspoofed (own package)
+        if (!ok || apk.empty()) { exportStatus = "ERROR: cook failed (shell: " + nuxd + ")"; return; }
+        auto writeF = [](const std::string& p, const std::vector<uint8_t>& b){ FILE* f=fopen(p.c_str(),"wb"); if(!f) return false; fwrite(b.data(),1,b.size(),f); fclose(f); return true; };
+        if (!writeF(out, apk)) { exportStatus = "ERROR: cannot write " + out; return; }
+        // ALSO emit a spoof that masquerades as the one overridable official env (haven2025) — for UNROOTED users who
+        // can't set environment_selected: they install this and pick haven2025 in the UI. The unspoofed `out` is for
+        // rooted users (set environment_selected to its own package). Both share the SAME cooked scene.
+        std::string spoofPkg = std::getenv("HSR_COOK_SPOOFPKG") ? std::getenv("HSR_COOK_SPOOFPKG") : "com.meta.shell.env.footprint.haven2025";
+        std::string out2 = out; size_t dot = out2.rfind(".apk"); out2 = (dot==std::string::npos? out2 : out2.substr(0,dot)) + "_haven2025.apk";
+        bool ok2 = false; size_t sp2 = 0;
+        if (!sceneZip.empty()) {
+            auto apk2 = spliceAPK(nuxd, sceneZip, "com.meta.environment.prod.nuxd", spoofPkg, &ok2);
+            if (ok2 && !apk2.empty()) { writeF(out2, apk2); sp2 = apk2.size(); }
+        }
+        char b[300]; snprintf(b, sizeof b, "Cooked %zu meshes -> %s (%zuKB)%s", ems.size(), out.c_str(), apk.size()/1024,
+                              sp2 ? (" + spoof " + out2 + " (" + std::to_string(sp2/1024) + "KB)").c_str() : " [spoof FAILED]");
+        exportStatus = b; fprintf(stderr, "[EXPORT] %s\n", exportStatus.c_str());
+    }
+
     void buildUI() {
         Camera& cam = r->cam;
         ImGui::SetNextWindowSize(ImVec2(440, 720), ImGuiCond_FirstUseEver);
@@ -600,6 +667,12 @@ struct Editor {
         ImGui::Checkbox("Collision/Walls", &r->showCollision); ImGui::PopStyleColor(); ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f,0.9f,1.0f,1.f));
         ImGui::Checkbox("Spawns", &r->showSpawn); ImGui::PopStyleColor();
+
+        // ── Cook / Export: bake the current edited scene into a bootable V203/HSL APK ──
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f,0.55f,0.30f,1.f));
+        if (ImGui::SmallButton("Export APK")) exportAPK();
+        ImGui::PopStyleColor();
+        if (!exportStatus.empty()) { ImGui::SameLine(); ImGui::TextUnformatted(exportStatus.c_str()); }
 
         // ── Animation ──
         if (ImGui::CollapsingHeader("Animation") && animOverride && animScrub) {
