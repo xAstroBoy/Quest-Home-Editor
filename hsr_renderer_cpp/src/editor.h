@@ -544,11 +544,19 @@ struct Editor {
             em.uvs = md.uvs; em.indices = md.indices;
             em.blend = gm.useBlend || gm.additive;     // transparent -> unlitblend.surface (fixes black-where-see-through)
             for (int k=0;k<4;k++) em.matTint[k] = md.tint[k];   // carry the mesh's own base-color tint to the cooker
-            if (vatBaker) {                            // animated node -> bake a VAT (non-skeletal); 64-frame loop
-                int bnv = 0; auto off = vatBaker((int)i, 64, bnv);
-                if (!off.empty() && bnv == (int)nv) { em.vatOffsets = std::move(off); em.vatFrames = 64; }
+            // V79 spritesheet FLIPBOOK (sonic_schoolhouse Sprite_3x3): 9 overlapping cell-quads skinned to bones the
+            // armature scale-toggles. Collapse to ONE quad (UV 0..1) + flag flipbook; the getTime() shader cycles the
+            // cells. Do this BEFORE VAT/HZANIM so the sprite ports as a flat animated material, NOT a skinned mesh.
+            int fcols = 0, frows = 0;
+            if (hslcook::detectAndCollapseFlipbook(em.positions, em.uvs, em.indices, fcols, frows)) {
+                em.flipbook = true; em.flipCols = fcols; em.flipRows = frows; em.blend = true;
+            } else {
+                if (vatBaker) {                            // animated node -> bake a VAT (non-skeletal); 64-frame loop
+                    int bnv = 0; auto off = vatBaker((int)i, 64, bnv);
+                    if (!off.empty() && bnv == (int)nv) { em.vatOffsets = std::move(off); em.vatFrames = 64; }
+                }
+                if (hzAnimExtractor) hzAnimExtractor((int)i, 64, em);   // HZANIM: skinned+animated -> fill em's skeletal fields
             }
-            if (hzAnimExtractor) hzAnimExtractor((int)i, 64, em);   // HZANIM: skinned+animated -> fill em's skeletal fields
             if (md.hasTexture && md.texRGBA.size() >= (size_t)md.texW * md.texH * 4) { em.rgba = md.texRGBA; em.w = md.texW; em.h = md.texH; }
             ems.push_back(std::move(em));
         }

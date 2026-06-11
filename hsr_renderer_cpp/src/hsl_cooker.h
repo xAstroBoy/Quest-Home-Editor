@@ -5,6 +5,7 @@
 // was verified end-to-end against libshell by the python prototype (a fully self-cooked checkerboard env renders +
 // installs). See the project_hsl_cooker_apk_baker memory for the full format notes.
 #include "types.h"
+#include "haven_manifest_axml.h"   // haven2025's AndroidManifest.xml (binary AXML), hardcoded; the cook rewrites its package
 #include <vector>
 #include <string>
 #include <map>
@@ -384,7 +385,7 @@ inline std::string entityJson(const std::string& id, const std::string& name,
                               const float pos[3], const float rotEuler[3], const float scale[3],
                               const AssetKey3& meshRef, const std::vector<AssetKey3>& matRefs,
                               const AssetKey3& colliderRef = AssetKey3{0,0,0}, const std::string& extraComp = std::string(),
-                              int meshVer = 5, bool animated = false) {
+                              int meshVer = 5, bool animated = false, const std::string& poseAnimVal = std::string()) {
     // GROUND TRUTH — extracted from the WORKING calming_butterflies.hstf (a skinned+animated entity that renders AND
     // animates on device). Its component layout is EXACTLY: Transform **v1** -> Mesh **v5** -> Material v1
     // {materials,constantParameters:[],textureParameters:[]} -> AnimatorPlatformComponent v4 {skeleton,animations,
@@ -406,7 +407,28 @@ inline std::string entityJson(const std::string& id, const std::string& name,
         comps += "," + comp("ColliderMeshPlatformComponent", 1, std::string("{\"meshAsset\":") + refJson(colliderRef) + "}");
         comps += "," + comp("PhysicsBodyPlatformComponent", 1, "{\"type\":\"StaticCollision\"}");
     }
-    return std::string("{\"id\":\"") + id + "\",\"name\":\"" + name + "\",\"components\":[" + comps + "],\"attributes\":[]}";
+    // "poseAnimation" = a TOP-LEVEL entity key (IDA V205 EnvironmentEntitySystem), sibling to components[], NOT a component.
+    std::string poseKv = poseAnimVal.empty() ? std::string() : (std::string(",\"poseAnimation\":") + poseAnimVal);
+    return std::string("{\"id\":\"") + id + "\",\"name\":\"" + name + "\",\"components\":[" + comps + "]" + poseKv + ",\"attributes\":[]}";
+}
+// Component wrapper with an EXPLICIT full class string (Shell-anim components are NOT under horizon::platform_api::).
+inline std::string compFull(const std::string& fullClass, int ver, const std::string& data) {
+    return std::string("{\"data\":{\"class\":\"") + fullClass + "\",\"version\":" + std::to_string(ver) +
+           ",\"data\":" + data + "},\"dataType\":\"horizon::DataDefinitionAsset\"}";
+}
+// Non-skeletal pose animation VALUE object. ⛔ IDA V205 (device build): EnvironmentEntitySystem (sub_1148BFC) registers
+// the pose animation under the TOP-LEVEL entity key **"poseAnimation"** — NOT as a horizon::platform_api:: component in
+// components[] (that's why every earlier cook's pose component was SILENTLY IGNORED -> static wisp -> the "fade"). The
+// handler -> loader sub_1162EF0 reads start/end Position/Orientation/Scale + start/end time and LERPS the entity pose over
+// [start,end]. The mesh keeps its normal (unlitblend) shader, so transparency is unaffected; only the transform scales.
+inline std::string poseAnimationValue(const float pos[3], const float startScale[3], const float endScale[3], float dur) {
+    char b[640]; snprintf(b, sizeof b,
+        "{\"startPosition\":{\"x\":%g,\"y\":%g,\"z\":%g},\"startOrientation\":{\"x\":0,\"y\":0,\"z\":0,\"w\":1},\"startScale\":{\"x\":%g,\"y\":%g,\"z\":%g},"
+        "\"endPosition\":{\"x\":%g,\"y\":%g,\"z\":%g},\"endOrientation\":{\"x\":0,\"y\":0,\"z\":0,\"w\":1},\"endScale\":{\"x\":%g,\"y\":%g,\"z\":%g},"
+        "\"start\":0,\"end\":%g}",
+        pos[0],pos[1],pos[2], startScale[0],startScale[1],startScale[2],
+        pos[0],pos[1],pos[2], endScale[0],endScale[1],endScale[2], dur);
+    return b;
 }
 // AnimatorPlatformComponent v4 (HZANIM): binds a skeleton (HZAN:SKEL) + an animation (HZAN:ANIM/ACL clip). Drives the
 // skinned mesh's sbSkinningMatrices (HzAnimSystem). Same shape nuxd's prism_wave/motes use.
@@ -460,7 +482,7 @@ inline std::string shellConfigJson(const AssetKey3& spaceRef, bool locomotion) {
 
 // ── Binary AndroidManifest (AXML) package rename — port of axml.py: rebuild the string pool with `old`→`new`
 //    in every pooled string (node chunks reference strings by INDEX, so they stay valid). ───────────────────
-inline std::vector<uint8_t> patchAxml(const std::vector<uint8_t>& axml, const std::string& oldS, const std::string& newS) {
+inline std::vector<uint8_t> patchAxml(const std::vector<uint8_t>& axml, const std::string& oldS, const std::string& newS, bool exact=false) {
     auto u16=[&](size_t o){ uint16_t v; memcpy(&v,&axml[o],2); return v; };
     auto u32=[&](size_t o){ uint32_t v; memcpy(&v,&axml[o],4); return v; };
     if (axml.size()<8 || u16(0)!=0x0003) return axml;
@@ -475,9 +497,14 @@ inline std::vector<uint8_t> patchAxml(const std::vector<uint8_t>& axml, const st
             size_t q; dl(p,q); uint32_t bl=dl(q,q); strings[i].assign((const char*)&axml[q],bl);
         } else { uint32_t l=u16(p); size_t q=p+2; if(l&0x8000){ l=((l&0x7fff)<<16)|u16(q); q+=2; }
             std::string s; s.reserve(l); for(uint32_t c=0;c<l;c++){ uint16_t w=u16(q+c*2); s+=(char)(w&0xff); } strings[i]=s; } }
-    bool any=false; for (auto&s:strings) if (s.find(oldS)!=std::string::npos){ any=true; break; }
+    bool any=false; for (auto&s:strings) if (exact ? (s==oldS) : (s.find(oldS)!=std::string::npos)){ any=true; break; }
     if (!any) return axml;
-    auto repl=[&](std::string s){ size_t p; while((p=s.find(oldS))!=std::string::npos) s.replace(p,oldS.size(),newS); return s; };
+    // exact: replace ONLY whole-string matches (used to flip the hsr_package_type VALUE "footprint"->"combined" without
+    // touching the package name "com.meta.shell.env.footprint.haven2025" or build_rule "footprint-haven2025...").
+    // non-exact (substring): advance past each replacement — otherwise if newS contains oldS (e.g. the haven->haven
+    // spoof, oldS==newS) this would find the same spot forever and HANG the cook.
+    auto repl=[&](std::string s){ if(oldS.empty()||oldS==newS) return s; if(exact) return s==oldS ? newS : s;
+        size_t p=0; while((p=s.find(oldS,p))!=std::string::npos){ s.replace(p,oldS.size(),newS); p+=newS.size(); } return s; };
     std::vector<uint8_t> data; std::vector<uint32_t> noff;
     auto enc=[&](uint32_t n,std::vector<uint8_t>&o){ if(n<0x80)o.push_back((uint8_t)n); else { o.push_back(0x80|(n>>8)); o.push_back(n&0xff);} };
     for (auto&s0:strings){ std::string s=repl(s0); noff.push_back((uint32_t)data.size());
@@ -579,7 +606,21 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
         std::vector<uint8_t> data;
         if (name=="assets/scene.zip") data=sceneZip;
         else { size_t sz=0; void* p=mz_zip_reader_extract_to_heap(&in,i,&sz,0); if(!p) continue; data.assign((uint8_t*)p,(uint8_t*)p+sz); mz_free(p); }
-        if (name=="AndroidManifest.xml") data=patchAxml(data,oldPkg,newPkg);
+        // AndroidManifest = haven2025's (hardcoded), package renamed to the target. haven2025's is the LATEST manifest
+        // the engine tolerates; it's what makes the env's assets/shading resolve correctly. (User mandate — always haven.)
+        if (name=="AndroidManifest.xml") {
+            std::vector<uint8_t> hm(HAVEN_MANIFEST_AXML, HAVEN_MANIFEST_AXML + HAVEN_MANIFEST_AXML_LEN);
+            data = patchAxml(hm, "com.meta.shell.env.footprint.haven2025", newPkg);
+            // ⛔ CRITICAL (device-proven, logcat 2026-06-10): haven2025's manifest declares
+            //    com.meta.shell.env.hsr_package_type="footprint". The shell then loads the env as a FOOTPRINT OVERLAY —
+            //    it pulls a companion vista (vista.focused) + the base home_c25 template layers
+            //    (home_w_focused_lm.hstf -> home_audio.hstf) that a STANDALONE cook doesn't contain ->
+            //    "Asset data load failed" -> "Scene loaded: <none>" -> fallback to nuxd (the bug we hit on erebor).
+            //    Every working cook (aurora/OW) ships "combined" (envIsFootprint=0) and loads as a standalone Environment.
+            //    Flip ONLY that exact value string; exact=true leaves the package name + build_rule "footprint-haven2025..."
+            //    untouched, so the haven SPOOF package name stays valid.
+            data = patchAxml(data, "footprint", "combined", /*exact=*/true);
+        }
         mz_uint fl = (name=="resources.arsc")?MZ_NO_COMPRESSION:MZ_DEFAULT_COMPRESSION;
         mz_zip_writer_add_mem(&out,name.c_str(),data.data(),data.size(),fl);
     }
@@ -668,10 +709,14 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
                                             boneRemap[boneIdx[(size_t)g*4+2]], boneRemap[boneIdx[(size_t)g*4+3]] };  // remap to dense palette slot
                         pr.vb.insert(pr.vb.end(), bidx, bidx+4);
                         pr.vb.insert(pr.vb.end(), &boneWgt[(size_t)g*4], &boneWgt[(size_t)g*4]+4);
-                    } else if (vatVertexCount > 0) {   // VAT column: uv1.x = (vertexIndex+0.5)/count (u16 UNORM), replaces the normal slot
-                        float col = ((float)g + 0.5f) / (float)vatVertexCount; col = col < 0 ? 0 : (col > 1 ? 1 : col);
-                        uint16_t cu = (uint16_t)(col * 65535.0f + 0.5f);
-                        uint8_t cb[4] = { (uint8_t)cu, (uint8_t)(cu>>8), 0, 0 }; pr.vb.insert(pr.vb.end(),cb,cb+4);
+                    } else if (vatVertexCount > 0) {   // VAT column = the RAW vertex index as f16 (replaces the normal slot).
+                        // ⛔ The vatunlitbasecolor/doublesided VS does `vertexCol = uvVAT.x + 0.5` and texelFetches column
+                        // floor(vertexCol) DIRECTLY (no ×textureWidth) — so uvVAT.x MUST be the integer vertex index. The
+                        // old (index+0.5)/count value (a 0..1 UNORM fraction) floors to column 0/1 for EVERY corner -> all
+                        // verts read the same 1-2 texels -> the quad can't deform -> the "collapse". Store the raw index as
+                        // an f16 (UV0's SFLOAT format), exact for indices < 2048 (VAT meshes are small).
+                        uint16_t hx = f32_to_f16((float)g), hy = 0;
+                        uint8_t cb[4] = { (uint8_t)hx, (uint8_t)(hx>>8), (uint8_t)hy, (uint8_t)(hy>>8) }; pr.vb.insert(pr.vb.end(),cb,cb+4);
                     } else {
                         uint8_t nb[4] = { 0xFF,0xFF,0xFF,0xFF }; pr.vb.insert(pr.vb.end(),nb,nb+4);   // NORMAL fmt0x13 (stride 20)
                     }
@@ -695,7 +740,7 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
     uint8_t attr[24] = { 0,0x32,0,0, 5,0x21,0,0, 4,0x13,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0 };  // POS f32x3@0, UV f16x2@12, NORMAL(sem4) fmt0x13@16
     int nattr = 3;
     if (skinned) { attr[12]=7; attr[13]=0x13; attr[14]=0; attr[15]=0; attr[16]=8; attr[17]=0x13; attr[18]=0; attr[19]=0; nattr=5; }  // POS,UV,NORMAL(sem4),boneIdx(sem7),weight(sem8) stride28 — exact butterflies layout
-    else if (vatVertexCount > 0) { attr[8]=5; attr[9]=0x27; attr[10]=1; attr[11]=0; }   // 3rd attr -> UV1 u16x2 (VAT column)
+    else if (vatVertexCount > 0) { attr[8]=5; attr[9]=0x21; attr[10]=1; attr[11]=0; }   // 3rd attr -> UV1 f16x2 SFLOAT (VAT column = raw vertex index, NOT u16 UNORM 0x27 which can't hold an index >1)
     size_t cap = 2048 + embeddedMatl.size() * (parts.size() + 1); for (auto& p : parts) cap += p.vb.size() + p.ib.size() + 256;
     FB b(cap);
     std::vector<int> partOffs;
@@ -789,9 +834,20 @@ struct ExportMesh {
     std::vector<uint8_t> rgba;      // decoded base-color RGBA8 (optional)
     uint32_t w = 0, h = 0;
     bool blend = false;             // alpha-blended (transparent) -> route to unlitblend.surface
+    bool flipbook = false;          // animated flat material -> route to unlitspritesheetflipbookadditive.surface (GPU getTime() spritesheet cycle, NO skeleton)
+    int flipCols = 0, flipRows = 0; // spritesheet grid (0 -> use the template's 11x11)
     float matTint[4] = {1,1,1,1};   // the mesh's OWN base-color tint (glTF baseColorFactor) for its material params
     std::vector<float> vatOffsets;  // VAT vertex offsets, frames*vertexCount*3 (WORLD space) -> animated via VAT (non-skeletal)
     int vatFrames = 0;
+    bool pulse = false;             // node-animated billboard (flame wisp) -> CUSTOM wisp_pulse.surface (unlitblend + getTime() brightness pulse)
+    // V79 node Y-ROTATION (Outer Wilds skybox/Interloper) -> getTime() Y-rotation shader cooker/rot_<periodms>_<p|m>.surface.
+    bool rotAnim = false; float rotPeriod = 0.f; int rotDir = 1;
+    // V203 NON-skeletal pose/scale animation (the FAITHFUL wisp port — IDA: ShellPoseAnimationComponent -> CoPoseAnimation,
+    // ticked by AnimationSystem, NO skeleton). Lerps the entity pose start->end; for a wisp = startScale<->endScale (V79 min/max).
+    bool poseAnim = false;
+    float poseStartScale[3] = {1,1,1}, poseEndScale[3] = {1,1,1};   // V79 node-SCALE per-component min / max
+    float poseCentroid[3]  = {0,0,0};                               // wisp world centroid -> recenter geometry + entity pos (scale pivots in place)
+    float poseDuration = 1.f;                                       // seconds, the start->end window (V79 anim period)
     // HZANIM (skeletal): hzFrames>1 -> skinned RENDMESH + HZAN:SKEL + ACL HZAN:ANIM + AnimatorPlatformComponent
     std::vector<float> hzJointPos, hzJointQuat, hzJointScale;   // jointCount * {3, 4(wxyz), 1}
     std::vector<int>   hzParents;                               // jointCount
@@ -804,6 +860,70 @@ inline std::vector<uint8_t> readFileBytes(const std::string& p) {
     std::vector<uint8_t> b; FILE* f = fopen(p.c_str(), "rb"); if (!f) return b;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     if (n > 0) { b.resize((size_t)n); size_t r = fread(b.data(), 1, (size_t)n, f); b.resize(r); } fclose(f); return b;
+}
+// Detect a V79 "spritesheet flipbook" mesh (sonic_schoolhouse Sprite_3x3): K fully-OVERLAPPING quads whose UVs
+// tile a cols x rows grid — each quad is one frame, skinned to a bone the armature scale-toggles on/off (the V79
+// way to flipbook a flat sprite). If it's a clean 3x3 (the sonic posters) COLLAPSE to ONE quad with UV 0..1 and
+// return true (cols=rows=3); the getTime() flipbook.surface shader then cycles the 9 cells. Only 3x3 is matched
+// because that shader hardcodes the grid. Runs on the WORLD-baked export geometry (overlap survives the xform).
+inline bool detectAndCollapseFlipbook(std::vector<float>& pos, std::vector<float>& uvs,
+                                      std::vector<uint32_t>& idx, int& cols, int& rows) {
+    size_t nv = pos.size()/3;
+    if (nv < 8 || nv % 4 != 0 || uvs.size() < nv*2) return false;
+    size_t nq = nv/4;
+    auto fabsf2=[](float x){ return x<0?-x:x; };
+    // per-quad: bbox center + TRUE planar AREA (two triangles) + UV cell origin. Area (not bbox diag) is the key:
+    // the V79 skinned flipbook collapses each OFF frame's quad to a LINE (scale.Y->0) which keeps full X width
+    // (big diag) but ~zero area — orientation-independent, works for wall posters facing any axis.
+    auto triArea=[&](const float*a,const float*b,const float*c)->float{
+        float u[3]={b[0]-a[0],b[1]-a[1],b[2]-a[2]}, w[3]={c[0]-a[0],c[1]-a[1],c[2]-a[2]};
+        float cx=u[1]*w[2]-u[2]*w[1], cy=u[2]*w[0]-u[0]*w[2], cz=u[0]*w[1]-u[1]*w[0];
+        return 0.5f*(float)std::sqrt(cx*cx+cy*cy+cz*cz); };
+    auto quadInfo=[&](size_t q, float* c, float& area, float& u0, float& v0){
+        float lo[3]={1e30f,1e30f,1e30f}, hi[3]={-1e30f,-1e30f,-1e30f}; u0=v0=1e30f;
+        for (int k=0;k<4;k++){ size_t v=q*4+k;
+            for(int j=0;j<3;j++){ float p=pos[v*3+j]; if(p<lo[j])lo[j]=p; if(p>hi[j])hi[j]=p; }
+            if(uvs[v*2]<u0)u0=uvs[v*2]; if(uvs[v*2+1]<v0)v0=uvs[v*2+1]; }
+        for(int j=0;j<3;j++) c[j]=0.5f*(lo[j]+hi[j]);
+        const float *p0=&pos[(q*4)*3],*p1=&pos[(q*4+1)*3],*p2=&pos[(q*4+2)*3],*p3=&pos[(q*4+3)*3];
+        area = triArea(p0,p1,p2)+triArea(p0,p2,p3); };
+    auto addUnique=[](std::vector<int>& v,int x){ for(int e:v) if(e==x) return; v.push_back(x); };
+    std::vector<int> ucol, vrow;
+    int refQ=0; float maxArea=-1.f;
+    for (size_t q=0;q<nq;q++){ float c[3],ar,u0,v0; quadInfo(q,c,ar,u0,v0);
+        if (ar>maxArea){ maxArea=ar; refQ=(int)q; }
+        addUnique(ucol,(int)(u0*1000+0.5f)); addUnique(vrow,(int)(v0*1000+0.5f)); }
+    cols=(int)ucol.size(); rows=(int)vrow.size();
+    // every NON-visible quad must be DEGENERATE (area ~0 — a collapsed OFF frame) or COINCIDENT with the visible
+    // (max-area) quad. Side-by-side TILED images (9 spread, full-area quads) are rejected — NOT a flipbook.
+    float rc[3],rar,ru0,rv0; quadInfo((size_t)refQ,rc,rar,ru0,rv0);
+    float refDiag=0; { float lo[3]={1e30f,1e30f,1e30f},hi[3]={-1e30f,-1e30f,-1e30f};
+        for(int k=0;k<4;k++){ size_t v=(size_t)refQ*4+k; for(int j=0;j<3;j++){ float p=pos[v*3+j]; if(p<lo[j])lo[j]=p; if(p>hi[j])hi[j]=p; } }
+        float dx=hi[0]-lo[0],dy=hi[1]-lo[1],dz=hi[2]-lo[2]; refDiag=(float)std::sqrt(dx*dx+dy*dy+dz*dz); }
+    bool flipShape = (maxArea>1e-5f);
+    for (size_t q=0;q<nq && flipShape;q++){ float c[3],ar,u0,v0; quadInfo(q,c,ar,u0,v0);
+        bool degen = ar < 0.05f*maxArea;
+        float dd=0; for(int j=0;j<3;j++){ float e=c[j]-rc[j]; dd+=e*e; } dd=(float)std::sqrt(dd);
+        bool coinc = dd < 0.15f*(refDiag>1e-4f?refDiag:1.f);
+        if (!degen && !coinc) flipShape=false; }
+    if (std::getenv("HSR_FLIPDBG") && nq<=16)
+        fprintf(stderr, "[FLIPDBG] nv=%zu nq=%zu cols=%d rows=%d flipShape=%d refQ=%d maxArea=%.3f\n",
+            nv, nq, cols, rows, (int)flipShape, refQ, maxArea);
+    if (!flipShape) return false;
+    if (cols*rows != (int)nq || cols!=3 || rows!=3) return false;   // shader hardcodes 3x3
+    int q0=refQ; float um=ru0, vm=rv0;          // collapse to the visible (max-area) quad; remap ITS cell -> 0..1
+    float cw=1.f/cols, ch=1.f/rows;
+    std::vector<float> p2(12), u2(8);
+    for (int k=0;k<4;k++){ size_t v=(size_t)q0*4+k;
+        p2[k*3]=pos[v*3]; p2[k*3+1]=pos[v*3+1]; p2[k*3+2]=pos[v*3+2];
+        u2[k*2]=(uvs[v*2]-um)/cw; u2[k*2+1]=(uvs[v*2+1]-vm)/ch; }
+    std::vector<uint32_t> i2;
+    for (size_t t=0; t+2<idx.size(); t+=3){ uint32_t a=idx[t],bb=idx[t+1],c=idx[t+2];
+        uint32_t lo=(uint32_t)q0*4, hi=lo+4;
+        if (a>=lo&&a<hi&&bb>=lo&&bb<hi&&c>=lo&&c<hi){ i2.push_back(a-lo); i2.push_back(bb-lo); i2.push_back(c-lo); } }
+    if (i2.size()<6){ i2.clear(); uint32_t q[6]={0,1,2,0,2,3}; i2.assign(q,q+6); }
+    pos.swap(p2); uvs.swap(u2); idx.swap(i2);
+    return true;
 }
 // Split a LARGE static mesh (>cap unique verts) into SEPARATE single-part meshes (each its own entity). MULTI-PART
 // static RENDMESHes pass the device verifier but DON'T RENDER (no official env ships a size-split static mesh; the
@@ -853,6 +973,15 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     (void)vspv; (void)fspv;
     CookRng rng;
     std::vector<CookAsset> assets;
+    // ⛔ CACHE-BUST: the device's AssetManager caches parsed assets by AssetKey (= hash of the asset PATH) and serves the
+    //    cached copy across env reloads. Re-cooking with the SAME "meta/myhome/..." paths -> SAME keys -> the headset
+    //    keeps showing the PREVIOUS cook's materials/content.hstf (device-proven: a pose-anim re-cook still rendered the
+    //    old brightness-pulse wisps). A UNIQUE per-cook namespace forces fresh keys = a real reload every cook.
+    //    HSR_COOK_NS pins it (e.g. for diffing); default = "myhome_<time>" so every cook busts the cache.
+    std::string nsName;
+    if (const char* e = std::getenv("HSR_COOK_NS")) nsName = e;
+    else { char tb[32]; snprintf(tb, sizeof tb, "myhome_%llx", (unsigned long long)time(nullptr)); nsName = tb; }
+    const std::string MH = "meta/" + nsName;   // env-own asset namespace (NOT the shared renderer_module shaders)
     // Bundle the V203 render system's OWN shaders + materials: opaque -> unlit.surface (floor MATL), transparent ->
     // unlitblend.surface (dome MATL). V79 glTF envs are textured PBR (no custom GLSL), so these faithfully port the
     // shading AND fix the "black where transparent" bug (blend meshes were drawn opaque).
@@ -860,8 +989,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     auto shadBlend = readFileBytes("cooker/nuxd_unlitblend_shader.bin");
     auto matTpl    = readFileBytes("cooker/realfloor_mat.bin");   // unlit.surface MATL template
     auto matBlend  = readFileBytes("cooker/realdome_mat.bin");    // unlitblend.surface MATL template
-    auto shadVat   = readFileBytes("cooker/vat_shader.bin");      // vatunlitbasecolor (vertex-animation) shader
-    auto matVat    = readFileBytes("cooker/vat_mat.bin");         // VAT MATL template (416B, base@152/160 + VAT@192/200)
+    auto shadVat   = readFileBytes("cooker/vat_shader.bin");      // vatunlitbasecolor (vertex-animation) shader — OPAQUE (fish/foliage)
+    auto shadVatBlend = readFileBytes("cooker/vatunlitblend.surface.bin"); // vatunlitbasecolor made TRANSPARENT alpha-blend (cooker/make_vat_blend_shader.py): the faithful V79 wisp port (alphaMode=BLEND sparkle). Identical VAT vertex morph + descriptor layout as vatunlitbasecolor; only pass render-state fields f2,f3 are dropped to match the SHIPPED vatlitbubble's proven transparent state. ⛔ ALSO dropping f4 (doubleSided) = a combo NO shipped shader has → broke the pipeline → INVISIBLE sparkles on device (device-proven). Kept single-sided; the wisp billboards face the player.
+    auto matVat    = readFileBytes("cooker/vat_mat.bin");         // VAT MATL template (416B, shader@48/56/64 + base@152/160 + VAT@192/200)
+    auto shadFlip  = readFileBytes("cooker/flipbook.surface.bin"); // ALPHA-BLEND getTime() 3x3 spritesheet flipbook (unlitblend + UV cell-cycle in the forward vertex) — sonic_schoolhouse Sprite_3x3. Grid/9frames/5fps hardcoded in the shader.
+    auto matFlip   = readFileBytes("cooker/flipbook_mat.bin");    // (legacy additive template; unused by the blend flipbook which reuses matBlend)
     auto shadSkin  = readFileBytes("cooker/unlitdoublesidedskinned.bin");  // OPAQUE skinned (butterflies) — for opaque skinned meshes (droid body). matParams = uvScaleOffset.
     auto shadSkinB = readFileBytes("cooker/unlitblendskinned.bin");        // BLEND skinned (Nuxd renderer_module) — alpha-blends transparent skinned meshes (the omnidroid SHIELD force-field). SAME matParams layout (uvScaleOffset) as unlitdoublesidedskinned, so the SAME field-7 material template works; only the shader ref differs.
     auto matSkin   = readFileBytes("cooker/skinned_mat.bin");     // OLD motes MATL template (176B, NO field7 — fails device skinned path)
@@ -889,23 +1021,49 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         AssetKey3 shaderVatK = { 0x91897C97D84A4317ull, 0xFB22F5F00E5164C0ull, 0xA1767FE9u };
         assets.push_back({ "meta/horizon_shared_shaders/shaders/vat/vatunlitbasecolor.surface/shader", shaderVatK.tgt, shadVat, shaderVatK });
     }
+    // TRANSPARENT+DOUBLE-SIDED VAT shader (the V79 BLEND wisp port) shipped under the env's OWN namespace at a
+    // keyForPath AssetRef (same pattern as wisppulse/flipbook). Blend node-anim meshes (erebor's flame wisps =
+    // alphaMode BLEND) repoint their VAT material's shader ref @48/56/64 to this so the texture alpha FADES.
+    bool haveVatBlend = haveVat && !shadVatBlend.empty();
+    std::string pVatBlend = MH + "/shaders/vatunlitblend.surface/shader";
+    AssetKey3 vatBlendK = keyForPath(pVatBlend);
+    if (haveVatBlend) assets.push_back({ pVatBlend, vatBlendK.tgt, shadVatBlend, vatBlendK });
+    // FAITHFUL V79 wisp animation: unlitblend RENDSHAD with a getTime()-driven SCALE BREATHE injected into the forward
+    // VERTEX stage (cooker/make_wisp_scale_shader.py). The V79 wisps (Plane.001..012) are a 100-key node SCALE
+    // oscillation (~4.17s loop, z compresses more) — GEOMETRY scale, not a brightness/alpha pulse. The shader scales
+    // inPos in MODEL space (so the cooker centers the geometry + puts the entity at the centroid → pivots in place),
+    // loops off globalUniforms.time, and phases per-wisp off worldFromModel.translation.x. VAT didn't render on device
+    // and ShellPoseAnimation is a one-shot; this getTime() vertex shader loops + is the real scale motion.
+    auto shadPulse = readFileBytes("cooker/wispscale.surface.bin");
+    bool havePulse = !shadPulse.empty() && haveBlend;
+    std::string pPulse = MH + "/shaders/wispscale.surface/shader";
+    AssetKey3 shaderPulseK = keyForPath(pPulse);
+    if (havePulse) assets.push_back({ pPulse, shaderPulseK.tgt, shadPulse, shaderPulseK });
     bool haveSkin = !shadSkin.empty() && matSkin2.size() >= 176;   // require the CURRENT-format skinned material
     AssetKey3 shaderSkinK{}, shaderSkinBK{};
     if (haveSkin) {   // ship our skinned shaders ENV-LOCAL (the device resolves the env's own package; renderer_module copies
                       // are shadowed by the system module). The material's field7 ref is patched (below) to the exact key,
                       // so it resolves to our shipped shader. Ship BOTH the opaque (unlitdoublesidedskinned) and the BLEND
                       // (unlitblendskinned) skinned shaders; blend skinned meshes (the shield) route to the blend one.
-        std::string pSkinShader = "meta/myhome/shaders/unlitdoublesidedskinned.surface/shader";
+        std::string pSkinShader = MH + "/shaders/unlitdoublesidedskinned.surface/shader";
         shaderSkinK = keyForPath(pSkinShader);
         assets.push_back({ pSkinShader, shaderSkinK.tgt, shadSkin, shaderSkinK });
         if (!shadSkinB.empty()) {
-            std::string pSkinShaderB = "meta/myhome/shaders/unlitblendskinned.surface/shader";
+            std::string pSkinShaderB = MH + "/shaders/unlitblendskinned.surface/shader";
             shaderSkinBK = keyForPath(pSkinShaderB);
             assets.push_back({ pSkinShaderB, shaderSkinBK.tgt, shadSkinB, shaderSkinBK });
         }
     }
+    // FLIPBOOK shader (animated flat material, no skeleton): ship env-local when any mesh is a flipbook.
+    bool haveFlip = false; for (auto& mm : meshes) if (mm.flipbook) { haveFlip = true; break; }
+    AssetKey3 shaderFlipK{};
+    if (haveFlip && !shadFlip.empty() && haveBlend) {
+        std::string pFlip = MH + "/shaders/flipbook.surface/shader";
+        shaderFlipK = keyForPath(pFlip);
+        assets.push_back({ pFlip, shaderFlipK.tgt, shadFlip, shaderFlipK });
+    } else haveFlip = false;
     std::vector<uint8_t> whiteTex; { std::vector<uint8_t> w4((size_t)4*4*4, 255); whiteTex = encodeRendTxtr(w4.data(), 4, 4, 8, 8); }
-    std::string pWhite = "meta/myhome/white.tex/tex"; AssetKey3 whiteK = keyForPath(pWhite); bool whiteUsed = false;
+    std::string pWhite = MH + "/white.tex/tex"; AssetKey3 whiteK = keyForPath(pWhite); bool whiteUsed = false;
     struct SharedRig { std::vector<uint8_t> skel, anim; AssetKey3 skelK, animK; };  // dedup skel+anim across meshes sharing one armature (like nuxd)
     std::vector<SharedRig> rigs;
     std::string rootId = makeUuid(rng);
@@ -916,6 +1074,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     // Split >60000-vert STATIC meshes into separate single-part meshes (multi-part static doesn't render on device).
     std::vector<ExportMesh> meshesV = splitLargeStaticMeshes(meshes);
     std::unordered_map<uint64_t, std::pair<AssetKey3, std::string>> texCache;  // rgba hash -> shared texture (split chunks share one)
+    std::unordered_map<std::string, AssetKey3> rotShaders;  // rot shader filename -> shipped key (one per distinct period/dir Y-spin)
     for (size_t i = 0; i < meshesV.size(); ++i) {
         const ExportMesh& m = meshesV[i];
         if (m.positions.size() < 9 || m.indices.size() < 3) continue;   // skip empty
@@ -934,7 +1093,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         bool navCand = (navIdx >= 0) ? ((int)i == navIdx)
                      : (mnv >= 100 && m.name.find("sky") == std::string::npos && m.name.find("Sky") == std::string::npos);
         if (navCand) for (size_t v = 0; v + 2 < m.positions.size(); v += 3) for (int k = 0; k < 3; k++) { float p = m.positions[v + k]; if (p < smn[k]) smn[k] = p; if (p > smx[k]) smx[k] = p; }
-        char base[64]; snprintf(base, sizeof base, "meta/myhome/m%03zu", i);
+        char base[96]; snprintf(base, sizeof base, "%s/m%03zu", MH.c_str(), i);
         std::string pMesh = std::string(base) + ".rendmesh/mesh", pMat = std::string(base) + ".material/material",
                     pTex = std::string(base) + ".tex/tex";
         AssetKey3 meshK = keyForPath(pMesh), matK = keyForPath(pMat);
@@ -969,7 +1128,9 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     && m.hzBoneIdx.size() >= (size_t)vc*4 && m.hzBoneWgt.size() >= (size_t)vc*4
                     && m.hzTrsLocal.size() >= (size_t)m.hzFrames*m.hzJointCount*10
                     && m.hzRestPos.size() == m.positions.size();   // centered rest positions present
-        bool useVat = !useHz && !m.vatOffsets.empty() && m.vatFrames > 1 && haveVat && m.vatOffsets.size() >= (size_t)vc * m.vatFrames * 3;
+        bool useRot = !useHz && m.rotAnim && m.rotPeriod > 0.f;   // node Y-spin (Outer Wilds skybox/Interloper) -> getTime() rot shader
+        bool usePulse = !useHz && !useRot && m.pulse && havePulse;   // node-animated billboard -> custom getTime() pulse shader
+        bool useVat = !useHz && !useRot && !usePulse && !m.vatOffsets.empty() && m.vatFrames > 1 && haveVat && m.vatOffsets.size() >= (size_t)vc * m.vatFrames * 3;
         std::vector<uint8_t> vatTex; AssetKey3 vatTexK;
         if (useVat) { vatTex = encodeVatTexture(m.vatOffsets, vc, m.vatFrames); if (vatTex.empty()) useVat = false; }
         std::vector<uint8_t> matl; std::string animatorComp;
@@ -1011,7 +1172,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 int rigIdx = -1;
                 for (size_t r = 0; r < rigs.size(); ++r) if (rigs[r].skel == skelBytes && rigs[r].anim == anim) { rigIdx = (int)r; break; }
                 if (rigIdx < 0) {
-                    char rb[48]; snprintf(rb, sizeof rb, "meta/myhome/armature%zu", rigs.size());
+                    char rb[96]; snprintf(rb, sizeof rb, "%s/armature%zu", MH.c_str(), rigs.size());
                     std::string pSkel = std::string(rb) + ".skel/skeleton", pAnim = std::string(rb) + ".anim/anim";
                     AssetKey3 skK = keyForPath(pSkel), anK = keyForPath(pAnim);
                     // HZAN:SKEL / HZAN:ANIM use a FIXED type targetId across ALL official envs (nuxd/calming/horror all
@@ -1029,12 +1190,60 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 }
                 animatorComp = animatorComponentJson(rigs[rigIdx].skelK, rigs[rigIdx].animK);
             }
+        } else if (usePulse) {
+            // FAITHFUL wisp SCALE breathe: unlitblend material pointed at our getTime() vertex-scale shader.
+            // Same interface as unlitblend (realdome_mat verbatim); only the field7 shader ref changes. The geometry
+            // is centered + the entity sits at the centroid (below) so the shader's model-space scale pivots in place.
+            matl = matBlend;
+            memcpy(matl.data() + 48,  &shaderPulseK.pkg, 8); memcpy(matl.data() + 56,  &shaderPulseK.ing, 8);  // field7 -> wispscale shader
+            memcpy(matl.data() + 120, &texK.pkg, 8);         memcpy(matl.data() + 128, &texK.ing, 8);          // base tex
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' WISPSCALE (getTime vertex breathe)\n", i, m.name.c_str());
+        } else if (useRot) {
+            // V79 node Y-ROTATION (Outer Wilds skybox = +Y 333s; Interloper = -Y 81s): OPAQUE unlit material pointed at
+            // our getTime() Y-rotation shader (cooker/rot_<periodms>_<p|m>.surface, built from unlit so the skybox writes
+            // depth). The geometry is centered + the entity sits at the centroid (useCenter below) so the model-space Y
+            // spin turns it in place. One shader per distinct (period,dir); shipped lazily + cached in rotShaders.
+            long ms = (long)(m.rotPeriod * 1000.0 + 0.5);
+            char rfn[96]; snprintf(rfn, sizeof rfn, "cooker/rot_%ld_%s.surface.bin", ms, m.rotDir >= 0 ? "p" : "m");
+            AssetKey3 rotK{};
+            auto it = rotShaders.find(rfn);
+            if (it != rotShaders.end()) rotK = it->second;
+            else { auto rbytes = readFileBytes(rfn);
+                if (!rbytes.empty()) { char rp[128]; snprintf(rp, sizeof rp, "%s/shaders/rot_%ld_%s.surface/shader", MH.c_str(), ms, m.rotDir >= 0 ? "p" : "m");
+                    rotK = keyForPath(rp); assets.push_back({ rp, rotK.tgt, rbytes, rotK }); rotShaders[rfn] = rotK; } }
+            matl = matTpl;                                              // opaque unlit base (matches the rot shader's unlit family)
+            if (rotK.ing) { memcpy(matl.data() + 48, &rotK.pkg, 8); memcpy(matl.data() + 56, &rotK.ing, 8); }  // field7 -> rot shader (else static unlit = safe fallback)
+            memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);                  // base tex
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' YROT period=%.1fs dir=%+d %s\n", i, m.name.c_str(), m.rotPeriod, m.rotDir, rotK.ing ? "(rot shader)" : "(MISSING shader -> static)");
         } else if (useVat) {
             std::string pVatTex = std::string(base) + ".vat.tex/tex"; vatTexK = keyForPath(pVatTex);
             matl = matVat;
+            // BLEND wisp (V79 alphaMode=BLEND, e.g. erebor flames): repoint the VAT material's shader ref
+            // @48/56/64 to the transparent+doubleSided VAT shader so the texture alpha FADES (vatunlitbasecolor
+            // is opaque -> the V79 fade was lost). Opaque VAT meshes keep the baked-in vatunlitbasecolor ref.
+            bool vatBlend = m.blend && haveVatBlend && !std::getenv("HSR_VATOPAQUE");   // HSR_VATOPAQUE: test plain shipped vatunlitbasecolor (isolate VAT-renders? from my custom blend shader)
+            if (vatBlend) {
+                memcpy(matl.data() + 48, &vatBlendK.pkg, 8); memcpy(matl.data() + 56, &vatBlendK.ing, 8);
+                memcpy(matl.data() + 64, &vatBlendK.tgt, 4);
+            }
             memcpy(matl.data() + 152, &texK.pkg, 8);    memcpy(matl.data() + 160, &texK.ing, 8);     // base color tex
             memcpy(matl.data() + 192, &vatTexK.pkg, 8); memcpy(matl.data() + 200, &vatTexK.ing, 8);   // VAT offset tex
+            // ⛔ matParams blob @80 = {atlasSubDivX, atlasSubDivY, vat_AnimTracksCount, vat_AnimSkipFrames} (IDA: VAT vert
+            //    shader struct %191; the vert column is mapped through an atlasSubDivX×atlasSubDivY grid). The vat_mat
+            //    template is oceanarium's 4×4 per-INSTANCE atlas (fish variants), so for a SINGLE editor-baked node-anim
+            //    mesh each vertex lands in 1/16th of the row -> garbage texels -> the geometry "collapse". Force 1×1 / 1
+            //    track: our VAT tex is exactly width=vertexCount × height=frames, no atlas. (frameCount = texH / tracks.)
+            if (matl.size() >= 92) { uint32_t one = 1; memcpy(matl.data()+80,&one,4); memcpy(matl.data()+84,&one,4); memcpy(matl.data()+88,&one,4); }
             assets.push_back({ pVatTex, vatTexK.tgt, vatTex, vatTexK });
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' VAT frames=%d verts=%u (atlas 1x1)%s\n", i, m.name.c_str(), m.vatFrames, vc, vatBlend ? " BLEND" : " opaque");
+        } else if (haveFlip && m.flipbook) {
+            // FLIPBOOK (sonic_schoolhouse Sprite_3x3): unlitblend (ALPHA-BLEND) material -> our getTime() 3x3 cell-cycling
+            // VERTEX shader. The 9 overlapping cell-quads were collapsed to ONE quad (UV 0..1) in detectAndCollapseFlipbook;
+            // the shader offsets inUv to the current cell from globalUniforms.time (3x3/9frames/5fps hardcoded). Loops forever.
+            matl = matBlend;
+            memcpy(matl.data() + 48,  &shaderFlipK.pkg, 8); memcpy(matl.data() + 56,  &shaderFlipK.ing, 8);  // field7 -> flipbook shader
+            memcpy(matl.data() + 120, &texK.pkg, 8);        memcpy(matl.data() + 128, &texK.ing, 8);          // base tex -> the 3x3 spritesheet
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FLIPBOOK grid=%dx%d (collapsed to 1 quad)\n", i, m.name.c_str(), m.flipCols, m.flipRows);
         } else {
             matl = (m.blend && haveBlend) ? matBlend : matTpl;
             memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);
@@ -1069,6 +1278,22 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             for (size_t v=0;v+2<m.positions.size();v+=3) for(int k=0;k<3;k++) dbgPos[v+k]=(m.positions[v+k]-c[k])*sc+tgt[k];
             staticPos = &dbgPos;
         }
+        // SCALE-ANIM wisp: recenter the geometry on its centroid so the scale pivots IN PLACE — the entity transform
+        // puts it back at the centroid. Needed for BOTH the wispscale shader (model-space scale) and the (one-shot)
+        // ShellPoseAnimationComponent. Without centering, scaling model-space pos around origin flings the wisp.
+        std::vector<float> poseCentered; float poseCtr[3] = {0,0,0};
+        bool usePose = m.poseAnim && !useHz && !useVat;
+        bool useCenter = (usePose || usePulse || useRot) && !useHz && !useVat;
+        if (useCenter) {
+            size_t np = m.positions.size()/3; double c[3]={0,0,0};
+            for (size_t v=0;v+2<m.positions.size();v+=3) for(int k=0;k<3;k++) c[k]+=m.positions[v+k];
+            for (int k=0;k<3;k++) poseCtr[k] = np ? (float)(c[k]/(double)np) : 0.f;
+            poseCentered.resize(m.positions.size());
+            for (size_t v=0;v+2<m.positions.size();v+=3) for(int k=0;k<3;k++) poseCentered[v+k]=m.positions[v+k]-poseCtr[k];
+            staticPos = &poseCentered;
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' CENTERED ctr=(%.2f,%.2f,%.2f) for %s\n",
+                    i, m.name.c_str(), poseCtr[0],poseCtr[1],poseCtr[2], usePulse ? "wispscale shader" : "poseAnimation");
+        }
         auto mesh = useHz ? encodeRendMeshParts(hzMeshPos, m.uvs, m.indices, matl, 0, m.hzBoneIdx, m.hzBoneWgt, jointIds)
                           : encodeRendMeshParts(*staticPos, m.uvs, m.indices, matl, useVat ? vc : 0);
         // COOK-TIME VERIFY: check the just-cooked skinned RENDMESH against the Meta-shipped reference schema (the
@@ -1091,15 +1316,30 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             for (size_t v=0; v+2<m.positions.size(); v+=3) for(int k=0;k<3;k++){ float p=m.positions[v+k]; if(p<mn[k])mn[k]=p; if(p>mx[k])mx[k]=p; }
             for(int k=0;k<3;k++) skinPos[k]=0.5f*(mn[k]+mx[k]); }
         static const float fixedPos[3] = {0.f, 1.4f, 0.f}; static const float fixedScl[3] = {0.03f, 0.03f, 0.03f};  // HSR_HZFIXED: can't-miss visibility test (tiny droid at spawn)
-        const float* hzPos = (useHz && std::getenv("HSR_HZFIXED")) ? fixedPos : (useHz && std::getenv("HSR_HZCENTER")) ? skinPos : pos0;
+        const float* hzPos = (useHz && std::getenv("HSR_HZFIXED")) ? fixedPos : (useHz && std::getenv("HSR_HZCENTER")) ? skinPos : useCenter ? poseCtr : pos0;
         const float* hzScl = (useHz && std::getenv("HSR_HZFIXED")) ? fixedScl : scl1;
+        // skinned -> AnimatorPlatformComponent (a real components[] entry). pose-anim wisp -> the TOP-LEVEL "poseAnimation"
+        // entity key (IDA V205 EnvironmentEntitySystem sub_1148BFC), NOT a component — the mesh keeps its unlitblend shader.
+        std::string extraComp = !animatorComp.empty() ? animatorComp : std::string();
+        std::string poseKv = usePose ? poseAnimationValue(poseCtr, m.poseStartScale, m.poseEndScale, m.poseDuration) : std::string();
         // MeshPlatformComponent **v5** for ALL meshes (static AND skinned). GROUND TRUTH: the working calming butterfly
         // skinned entity uses Mesh v5 (extracted from calming_butterflies.hstf). v6 was a guess that contradicts it.
-        entities += "," + entityJson(mid, nm, hzPos, rot0, hzScl, meshK, { matK }, AssetKey3{0,0,0}, animatorComp, 5, false);
+        entities += "," + entityJson(mid, nm, hzPos, rot0, hzScl, meshK, { matK }, AssetKey3{0,0,0}, extraComp, 5, false, poseKv);
         rels += (rels.empty() ? std::string() : std::string(",")) + relChildOf(mid, rootId);
     }
     if (rels.empty()) return {};
     if (whiteUsed) assets.push_back({ pWhite, whiteK.tgt, whiteTex, whiteK });
+    // FALLBACK nav bounds for TILE-BASED envs (sonic_schoolhouse = hundreds of 4-vert wall/floor quads, NONE >=100
+    // verts -> the navCand heuristic bounded nothing -> no ground collider -> player FALLS THROUGH the floor). If no
+    // nav candidate set the bounds, accumulate ALL non-sky geometry so the collider still covers the walkable area.
+    if (smx[0] < smn[0]) {
+        for (const auto& m : meshesV) {
+            if (m.positions.size() < 9) continue;
+            if (m.name.find("sky") != std::string::npos || m.name.find("Sky") != std::string::npos) continue;
+            for (size_t v=0; v+2<m.positions.size(); v+=3) for(int k=0;k<3;k++){ float p=m.positions[v+k]; if(p<smn[k])smn[k]=p; if(p>smx[k])smx[k]=p; }
+        }
+        if (std::getenv("HSR_VERBOSE") && smx[0]>=smn[0]) fprintf(stderr, "[COOK] nav fallback (tile env): bounds (%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f)\n", smn[0],smn[1],smn[2],smx[0],smx[1],smx[2]);
+    }
     // auto-sized walkable ground collider: nuxd's flat ~12.8m PHSX:3MSH plane scaled to cover the nav bounds.
     // Centre it UNDER the camera at the camera's FOOT level (eye - 1.6m) — a 3D env (OW planets curve) has no flat
     // floor, so we drop a walkable plane right where the V79 view stands instead of at the terrain's lowest point.
@@ -1110,7 +1350,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     float gs = ext > 1.f ? (ext / 12.0f) * 2.0f : 8.0f;         // BIG invisible plane (nuxd circular floor ~12.8m x2 the scene)
     auto phys = readFileBytes("cooker/realfloor_phys.bin");
     if (!phys.empty() && smx[0] >= smn[0]) {
-        std::string pPhys = "meta/myhome/ground.phys/phys"; AssetKey3 colliderK = keyForPath(pPhys);
+        std::string pPhys = MH + "/ground.phys/phys"; AssetKey3 colliderK = keyForPath(pPhys);
         assets.push_back({ pPhys, colliderK.tgt, phys, colliderK, TYPE_PHSX, TYPE_3MSH });
         std::string gid = makeUuid(rng); float gp[3]={gx,gy,gz}, gsc[3]={gs,1.f,gs};
         entities += "," + colliderGroundEntityJson(gid, gp, gsc, colliderK);
@@ -1123,12 +1363,13 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     rels += "," + relChildOf(spawnId, rootId);
     fprintf(stderr, "[EXPORT] cam@(%.1f,%.1f,%.1f) navBounds=(%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f) ground@(%.1f,%.1f,%.1f) scale=%.1f spawn@(%.1f,%.1f,%.1f)\n",
             camPos?camPos[0]:0,camPos?camPos[1]:0,camPos?camPos[2]:0, smn[0],smn[1],smn[2], smx[0],smx[1],smx[2], gx,gy,gz, gs, spawnPos[0],spawnPos[1],spawnPos[2]);
-    AssetKey3 contentK = keyForPath("meta/myhome/content.hstf/template"), spaceK = keyForPath("meta/myhome/space.hstf/template");
+    std::string pContent = MH + "/content.hstf/template", pSpace = MH + "/space.hstf/template";
+    AssetKey3 contentK = keyForPath(pContent), spaceK = keyForPath(pSpace);
     std::string content = templateJson(entities, rels);
-    std::string space   = spaceJson(rng, "myhome", contentK);
+    std::string space   = spaceJson(rng, nsName.c_str(), contentK);
     auto shellcfg = jbytes(shellConfigJson(spaceK, locomotion));
-    assets.push_back({ "meta/myhome/content.hstf/template", TGT_TEMPLATE, jbytes(content), contentK });
-    assets.push_back({ "meta/myhome/space.hstf/template",   TGT_TEMPLATE, jbytes(space),   spaceK });
+    assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
+    assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });
     auto sceneZip = assembleSceneZip(assets, shellcfg);
     if (outSceneZip) *outSceneZip = sceneZip;     // expose so the caller can splice extra (spoofed) APKs without re-cooking
     // Package spoof: rename the shell's package to a chosen one so the port can MASQUERADE as an official env

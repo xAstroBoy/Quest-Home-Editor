@@ -150,15 +150,20 @@ endif()
 
 # ── hsl_cook — standalone self-contained APK cooker (no Vulkan/GLFW; builds fast) ──
 # Same hsl_cooker.h the editor's "Export APK" uses; this CLI driver validates the format pipeline.
-add_executable(hsl_cook src/_ckcook.cpp)
+# hzanim_acl.cpp defines hzAclEncode() — exportSceneAPK() calls it for skinned-anim (HZAN) clips, so it MUST be
+# linked here too (the hsr_renderer target already compiles it). Without it: LNK2019 unresolved hzAclEncode.
+add_executable(hsl_cook src/_ckcook.cpp src/hzanim_acl.cpp)
 target_include_directories(hsl_cook PRIVATE
     "${MINIZ_DIR}"
     "${astcenc_SOURCE_DIR}/Source"
     "${CMAKE_SOURCE_DIR}"
     "${CMAKE_SOURCE_DIR}/src"
+    "${CMAKE_SOURCE_DIR}/third_party/acl/includes"   # ACL (Animation Compression Library) — header-only encoder
+    "${CMAKE_SOURCE_DIR}/third_party/rtm/includes"   # RTM (Realtime Math) — ACL's math dependency
 )
 target_link_libraries(hsl_cook PRIVATE miniz ${ASTCENC_LIB})
 if(WIN32)
     target_compile_definitions(hsl_cook PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(hsl_cook PRIVATE /Zc:__cplusplus)  # ACL checks __cplusplus for the C++ level
     target_link_libraries(hsl_cook PRIVATE bcrypt crypt32)   # self-contained APK v2 signing (next increment)
 endif()
