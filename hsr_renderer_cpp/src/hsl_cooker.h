@@ -841,7 +841,7 @@ struct ExportMesh {
     int vatFrames = 0;
     bool pulse = false;             // node-animated billboard (flame wisp) -> CUSTOM wisp_pulse.surface (unlitblend + getTime() brightness pulse)
     // V79 node Y-ROTATION (Outer Wilds skybox/Interloper) -> getTime() Y-rotation shader cooker/rot_<periodms>_<p|m>.surface.
-    bool rotAnim = false; float rotPeriod = 0.f; int rotDir = 1;
+    bool rotAnim = false; float rotPeriod = 0.f; int rotDir = 1; float rotPivot[3] = {0,0,0};   // pivot = the animated node's WORLD origin (skybox node -> children orbit it)
     // V203 NON-skeletal pose/scale animation (the FAITHFUL wisp port — IDA: ShellPoseAnimationComponent -> CoPoseAnimation,
     // ticked by AnimationSystem, NO skeleton). Lerps the entity pose start->end; for a wisp = startScale<->endScale (V79 min/max).
     bool poseAnim = false;
@@ -1285,14 +1285,18 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         bool usePose = m.poseAnim && !useHz && !useVat;
         bool useCenter = (usePose || usePulse || useRot) && !useHz && !useVat;
         if (useCenter) {
-            size_t np = m.positions.size()/3; double c[3]={0,0,0};
-            for (size_t v=0;v+2<m.positions.size();v+=3) for(int k=0;k<3;k++) c[k]+=m.positions[v+k];
-            for (int k=0;k<3;k++) poseCtr[k] = np ? (float)(c[k]/(double)np) : 0.f;
+            if (useRot) {   // ROTATION pivots around the animated node's WORLD origin — the skybox node spins in place,
+                for (int k=0;k<3;k++) poseCtr[k] = m.rotPivot[k];   // its CHILD planets (offset from the pivot) ORBIT it.
+            } else {        // SCALE/pose: pivot in place around the mesh centroid.
+                size_t np = m.positions.size()/3; double c[3]={0,0,0};
+                for (size_t v=0;v+2<m.positions.size();v+=3) for(int k=0;k<3;k++) c[k]+=m.positions[v+k];
+                for (int k=0;k<3;k++) poseCtr[k] = np ? (float)(c[k]/(double)np) : 0.f;
+            }
             poseCentered.resize(m.positions.size());
             for (size_t v=0;v+2<m.positions.size();v+=3) for(int k=0;k<3;k++) poseCentered[v+k]=m.positions[v+k]-poseCtr[k];
             staticPos = &poseCentered;
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' CENTERED ctr=(%.2f,%.2f,%.2f) for %s\n",
-                    i, m.name.c_str(), poseCtr[0],poseCtr[1],poseCtr[2], usePulse ? "wispscale shader" : "poseAnimation");
+                    i, m.name.c_str(), poseCtr[0],poseCtr[1],poseCtr[2], useRot ? "Y-rotation (pivot)" : usePulse ? "wispscale shader" : "poseAnimation");
         }
         auto mesh = useHz ? encodeRendMeshParts(hzMeshPos, m.uvs, m.indices, matl, 0, m.hzBoneIdx, m.hzBoneWgt, jointIds)
                           : encodeRendMeshParts(*staticPos, m.uvs, m.indices, matl, useVat ? vc : 0);

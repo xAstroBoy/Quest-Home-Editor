@@ -829,17 +829,21 @@ public:
         duration = animDuration > 0.f ? animDuration : (ss->times.back() - ss->times.front());
         return true;
     }
-    // Extract a uniform NODE Y-ROTATION track (Outer Wilds skybox = +Y 333s; Interloper = -Y 81s). Returns false
-    // unless the node has a rotation channel that is a constant-speed spin about (near-)Y. period = the V79 loop
-    // seconds (one full revolution); dir = +1/-1 (rotation sense). The cooker centers the geometry on its centroid
-    // (like the wispscale path) so the getTime() Y-rotation shader spins it in place.
-    bool extractNodeYRotation(int meshIdx, float& period, int& dir) const {
+    // Extract a uniform NODE Y-ROTATION track (Outer Wilds skybox = +Y 333s; Interloper = -Y 81s). Walks the parent
+    // chain so a mesh INHERITS an animated ancestor's spin — the OW planets are children of the rotating skybox node,
+    // so they ORBIT origin (the skybox node's pivot), not spin in place. Returns period (one revolution, s), dir
+    // (+1/-1), and the rotation node's WORLD pivot. The cooker bakes the geometry RELATIVE to that pivot + puts the
+    // entity at the pivot, so the getTime() Y-rotation shader spins the node-mesh in place AND orbits its children.
+    bool extractNodeYRotation(int meshIdx, float& period, int& dir, float pivot[3]) const {
         int nodeIdx = -1; for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; break; }
         if (nodeIdx < 0) return false;
-        const GSampler* ss = nullptr;
-        for (auto& ch : gchannels)
-            if (ch.node == nodeIdx && ch.path == 1 && ch.sampler >= 0 && (size_t)ch.sampler < gsamplers.size()) { ss = &gsamplers[ch.sampler]; break; }
-        if (!ss || ss->comps < 4 || ss->times.size() < 3) return false;
+        int rotNode = -1; const GSampler* ss = nullptr;       // nearest ancestor (incl. self) with a rotation channel
+        for (int n = nodeIdx; n >= 0 && (size_t)n < gnodes.size(); n = gnodes[n].parent) {
+            for (auto& ch : gchannels)
+                if (ch.node == n && ch.path == 1 && ch.sampler >= 0 && (size_t)ch.sampler < gsamplers.size()) { ss = &gsamplers[ch.sampler]; rotNode = n; break; }
+            if (rotNode >= 0) break;
+        }
+        if (!ss || rotNode < 0 || ss->comps < 4 || ss->times.size() < 3) return false;
         auto qat = [&](size_t k, float* q){ for (int c = 0; c < 4; ++c) q[c] = ss->vals[k*4 + c]; };
         float q0[4], qm[4]; qat(0, q0); qat(ss->times.size()/4, qm);   // start vs ~quarter-turn keyframe
         float c0[4] = {-q0[0],-q0[1],-q0[2], q0[3]};                   // conj(q0)
@@ -853,7 +857,18 @@ public:
         if (fabsf(ay) < 0.85f) return false;                          // must be a (near-)Y spin
         dir = (ay >= 0.f) ? +1 : -1;
         period = ss->times.back();
-        return period > 0.f;
+        if (period <= 0.f) return false;
+        // pivot = rotNode's WORLD position (translation of its composed parent chain)
+        auto trsMat=[](const float* t,const float* r,const float* sc,float* mm){ float x=r[0],y=r[1],z=r[2],ww=r[3];
+            mm[0]=(1-2*(y*y+z*z))*sc[0]; mm[1]=(2*(x*y+ww*z))*sc[0]; mm[2]=(2*(x*z-ww*y))*sc[0]; mm[3]=0;
+            mm[4]=(2*(x*y-ww*z))*sc[1]; mm[5]=(1-2*(x*x+z*z))*sc[1]; mm[6]=(2*(y*z+ww*x))*sc[1]; mm[7]=0;
+            mm[8]=(2*(x*z+ww*y))*sc[2]; mm[9]=(2*(y*z-ww*x))*sc[2]; mm[10]=(1-2*(x*x+y*y))*sc[2]; mm[11]=0;
+            mm[12]=t[0]; mm[13]=t[1]; mm[14]=t[2]; mm[15]=1; };
+        auto mulMat=[](const float* a,const float* b,float* o){ for(int c=0;c<4;c++)for(int rr=0;rr<4;rr++) o[c*4+rr]=a[rr]*b[c*4]+a[4+rr]*b[c*4+1]+a[8+rr]*b[c*4+2]+a[12+rr]*b[c*4+3]; };
+        std::function<void(int,float*)> worldMat=[&](int n,float* out){ float loc[16]; trsMat(gnodes[n].t,gnodes[n].r,gnodes[n].s,loc);
+            if (gnodes[n].parent>=0 && (size_t)gnodes[n].parent<gnodes.size()){ float pw[16]; worldMat(gnodes[n].parent,pw); mulMat(pw,loc,out); } else memcpy(out,loc,64); };
+        float wm[16]; worldMat(rotNode, wm); pivot[0]=wm[12]; pivot[1]=wm[13]; pivot[2]=wm[14];
+        return true;
     }
     HzAnimExport extractHzAnim(int meshIdx, int frames) {
         HzAnimExport e;
