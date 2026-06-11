@@ -788,6 +788,73 @@ public:
         int jointCount = 0, frameCount = 0; float fps = 0.f;
         bool ok() const { return jointCount > 0 && frameCount > 1; }
     };
+    // True if this mesh's NODE has a TRS animation (no skin) — the candidate for a non-skeletal flipbook/material anim.
+    bool isNodeAnimated(int meshIdx) const {
+        for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) return true;
+        return false;
+    }
+    // Dump the V79 node's animation channels for a node-anim mesh (HSR_VERBOSE) — so we can replicate the wisp SCALE
+    // pulse FAITHFULLY (exact amplitude/period/keyframe shape) instead of guessing a sinusoid.
+    void dumpNodeAnimTrack(int meshIdx) const {
+        int nodeIdx = -1; for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; break; }
+        if (nodeIdx < 0) return;
+        for (auto& ch : gchannels) {
+            if (ch.node != nodeIdx || ch.sampler < 0 || (size_t)ch.sampler >= gsamplers.size()) continue;
+            const GSampler& s = gsamplers[ch.sampler]; int n = (int)s.times.size();
+            const char* pn = ch.path == 0 ? "T" : ch.path == 1 ? "R" : "S";
+            float mn[4] = {1e30f,1e30f,1e30f,1e30f}, mx[4] = {-1e30f,-1e30f,-1e30f,-1e30f};
+            for (int k = 0; k < n; k++) for (int c = 0; c < s.comps; c++) { float v = s.vals[(size_t)k*s.comps+c]; if(v<mn[c])mn[c]=v; if(v>mx[c])mx[c]=v; }
+            fprintf(stderr, "[V79ANIM] mesh%d node%d path=%s keys=%d t0=%.3f tN=%.3f step=%d comps=%d min=(%.3f,%.3f,%.3f) max=(%.3f,%.3f,%.3f)\n",
+                    meshIdx, nodeIdx, pn, n, n?s.times[0]:0.f, n?s.times[n-1]:0.f, s.step?1:0, s.comps, mn[0],mn[1],mn[2], mx[0],mx[1],mx[2]);
+            if (ch.path == 2) for (int k = 0; k < n && k < 20; k++)
+                fprintf(stderr, "    [k%02d] t=%.3f s=(%.4f,%.4f,%.4f)\n", k, s.times[k],
+                        s.vals[(size_t)k*s.comps], s.vals[(size_t)k*s.comps+1], s.vals[(size_t)k*s.comps+2]);
+        }
+    }
+    // Extract the V79 node SCALE track for a node-anim mesh as pose-animation endpoints (the FAITHFUL non-skeletal wisp
+    // port -> ShellPoseAnimationComponent). The cooked geometry is baked at the REST (t=0) pose, so we return the per-axis
+    // scale min/max RELATIVE to the t=0 scale: the device's pose anim then drives the entity scale start<->end, reproducing
+    // the V79 flicker in place. Returns false if the node has no scale channel. duration = the V79 loop length (seconds).
+    bool extractNodeScaleAnim(int meshIdx, float startScale[3], float endScale[3], float& duration) const {
+        int nodeIdx = -1; for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; break; }
+        if (nodeIdx < 0) return false;
+        const GSampler* ss = nullptr;
+        for (auto& ch : gchannels)
+            if (ch.node == nodeIdx && ch.path == 2 && ch.sampler >= 0 && (size_t)ch.sampler < gsamplers.size()) { ss = &gsamplers[ch.sampler]; break; }
+        if (!ss || ss->comps < 3 || ss->times.empty()) return false;
+        float mn[3] = {1e30f,1e30f,1e30f}, mx[3] = {-1e30f,-1e30f,-1e30f};
+        for (size_t k = 0; k < ss->times.size(); ++k) for (int c = 0; c < 3; ++c) { float v = ss->vals[k*(size_t)ss->comps+c]; if(v<mn[c])mn[c]=v; if(v>mx[c])mx[c]=v; }
+        const float* rest = &ss->vals[0];   // t=0 scale (clamped first key) = what's baked into the cooked geometry
+        for (int c = 0; c < 3; ++c) { float r = (rest[c] != 0.f) ? rest[c] : 1.f; startScale[c] = mn[c] / r; endScale[c] = mx[c] / r; }
+        duration = animDuration > 0.f ? animDuration : (ss->times.back() - ss->times.front());
+        return true;
+    }
+    // Extract a uniform NODE Y-ROTATION track (Outer Wilds skybox = +Y 333s; Interloper = -Y 81s). Returns false
+    // unless the node has a rotation channel that is a constant-speed spin about (near-)Y. period = the V79 loop
+    // seconds (one full revolution); dir = +1/-1 (rotation sense). The cooker centers the geometry on its centroid
+    // (like the wispscale path) so the getTime() Y-rotation shader spins it in place.
+    bool extractNodeYRotation(int meshIdx, float& period, int& dir) const {
+        int nodeIdx = -1; for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; break; }
+        if (nodeIdx < 0) return false;
+        const GSampler* ss = nullptr;
+        for (auto& ch : gchannels)
+            if (ch.node == nodeIdx && ch.path == 1 && ch.sampler >= 0 && (size_t)ch.sampler < gsamplers.size()) { ss = &gsamplers[ch.sampler]; break; }
+        if (!ss || ss->comps < 4 || ss->times.size() < 3) return false;
+        auto qat = [&](size_t k, float* q){ for (int c = 0; c < 4; ++c) q[c] = ss->vals[k*4 + c]; };
+        float q0[4], qm[4]; qat(0, q0); qat(ss->times.size()/4, qm);   // start vs ~quarter-turn keyframe
+        float c0[4] = {-q0[0],-q0[1],-q0[2], q0[3]};                   // conj(q0)
+        float dq[4] = { qm[3]*c0[0]+qm[0]*c0[3]+qm[1]*c0[2]-qm[2]*c0[1],
+                        qm[3]*c0[1]-qm[0]*c0[2]+qm[1]*c0[3]+qm[2]*c0[0],
+                        qm[3]*c0[2]+qm[0]*c0[1]-qm[1]*c0[0]+qm[2]*c0[3],
+                        qm[3]*c0[3]-qm[0]*c0[0]-qm[1]*c0[1]-qm[2]*c0[2] };
+        float w = dq[3]; if (w > 1.f) w = 1.f; if (w < -1.f) w = -1.f;
+        float s = sqrtf(1.f - w*w); if (s < 1e-5f) return false;
+        float ay = dq[1]/s;
+        if (fabsf(ay) < 0.85f) return false;                          // must be a (near-)Y spin
+        dir = (ay >= 0.f) ? +1 : -1;
+        period = ss->times.back();
+        return period > 0.f;
+    }
     HzAnimExport extractHzAnim(int meshIdx, int frames) {
         HzAnimExport e;
         const SkinnedRec* rec = nullptr;

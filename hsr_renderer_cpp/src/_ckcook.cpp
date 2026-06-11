@@ -54,9 +54,34 @@ static int exportTest(int argc, char** argv) {
     return 0;
 }
 
+// --remanifest <in.apk> <out_unsigned.apk> <newPkg> — re-splice an already-cooked APK through the (fixed) spliceAPK:
+// keeps its scene.zip byte-for-byte, regenerates the AndroidManifest (haven2025 base, hsr_package_type flipped
+// footprint->combined so the env loads as a standalone Environment instead of a footprint overlay). Lets us apply the
+// classification fix to existing APKs without re-running the full scene export — a clean A/B (only the manifest changes).
+static int remanifest(int argc, char** argv) {
+    using namespace hslcook;
+    if (argc < 5) { fprintf(stderr, "usage: hsl_cook --remanifest <in.apk> <out_unsigned.apk> <newPkg>\n"); return 2; }
+    std::string in = argv[2], out = argv[3], newPkg = argv[4];
+    mz_zip_archive z; memset(&z, 0, sizeof z);
+    if (!mz_zip_reader_init_file(&z, in.c_str(), 0)) { fprintf(stderr, "[remanifest] cannot open %s\n", in.c_str()); return 1; }
+    int idx = mz_zip_reader_locate_file(&z, "assets/scene.zip", nullptr, 0);
+    if (idx < 0) { fprintf(stderr, "[remanifest] no assets/scene.zip in %s\n", in.c_str()); mz_zip_reader_end(&z); return 1; }
+    size_t sz = 0; void* p = mz_zip_reader_extract_to_heap(&z, idx, &sz, 0); mz_zip_reader_end(&z);
+    if (!p) { fprintf(stderr, "[remanifest] failed to extract scene.zip\n"); return 1; }
+    std::vector<uint8_t> sceneZip((uint8_t*)p, (uint8_t*)p + sz); mz_free(p);
+    bool ok = false;
+    auto apk = spliceAPK(in, sceneZip, "com.meta.environment.prod.nuxd", newPkg, &ok);  // base=in (keeps libs/res/dex/navmesh)
+    if (!ok || apk.empty()) { fprintf(stderr, "[remanifest] splice failed\n"); return 1; }
+    FILE* f = fopen(out.c_str(), "wb"); if (!f) { fprintf(stderr, "[remanifest] cannot write %s\n", out.c_str()); return 1; }
+    fwrite(apk.data(), 1, apk.size(), f); fclose(f);
+    printf("REMANIFEST: %s -> %s (pkg=%s, scene.zip=%zuB, apk=%zuB)\n", in.c_str(), out.c_str(), newPkg.c_str(), sceneZip.size(), apk.size());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     using namespace hslcook;
     if (argc > 1 && std::string(argv[1]) == "--export-test") return exportTest(argc, argv);
+    if (argc > 1 && std::string(argv[1]) == "--remanifest") return remanifest(argc, argv);
     std::string nuxd  = argc > 1 ? argv[1] : "Envs To check/v203 Ufficial Envs/Nuxd.apk";
     std::string out   = argc > 2 ? argv[2] : "cooker/out/myhome_cpp_unsigned.apk";
     std::string shdir = argc > 3 ? argv[3] : "cooker/shaders";

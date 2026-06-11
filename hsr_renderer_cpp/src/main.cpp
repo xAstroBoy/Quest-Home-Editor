@@ -734,7 +734,11 @@ int main(int argc, char** argv) {
     glfwSetErrorCallback(errorCb);
     if (!glfwInit()) { fprintf(stderr, "GLFW init failed\n"); return 1; }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);  // always-on-top so external screenshot capture is reliable
+    // COOKING MODE (HSR_EXPORT) = console-only: hide the window so it doesn't pop a white "frozen" window with no
+    // feedback. The cook prints [GLTF]/[COOK]/[EXPORT] progress to the console; HSR_EXPORT_QUIT exits when done.
+    bool g_cookHeadless = std::getenv("HSR_EXPORT") != nullptr;
+    if (g_cookHeadless) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    else glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);  // always-on-top so external screenshot capture is reliable
     // Title shows WHICH loader/format is active (V79 glTF / V79 OPA / HSL) + the env file name.
     std::string g_fmtName = isV79 ? "V79 glTF" : (isOpa ? "V79 OPA" : "HSL");
     std::string g_baseName = apkPath; { size_t sl = g_baseName.find_last_of("/\\"); if (sl != std::string::npos) g_baseName = g_baseName.substr(sl + 1); }
@@ -932,10 +936,35 @@ int main(int argc, char** argv) {
     Editor editor;
     editor.r = &vkRenderer;             // bind the renderer up-front so Export works even when the UI is skipped (HSR_NOUI)
     editor.sceneMeshes = sceneMeshes;   // CPU geometry/textures for the "Export APK" cooker (parallel to gpuMeshes)
-    // VAT (vertex-animation) is for ORGANIC deformation (fish/foliage) — it morphs vertices + lerps frames, which is
-    // WRONG for rigid spins (warps the geometry instead of rotating). Off by default; HSR_VAT=1 to experiment.
+    // VAT (vertex-animation) bakes the per-frame V79 node deformation into a shader-sampled offset texture.
+    // ⛔ DEVICE-PROVEN 2026-06-10: the VAT EXPORT path does NOT render on the Quest (the cooked VAT meshes are
+    // invisible in-headset — the erebor wisp sparkles vanished when VAT was default-on), whereas the poseAnim path
+    // (ShellPoseAnimationComponent + unlitblend transparent material) renders + fades correctly. So VAT export is
+    // OPT-IN ONLY (HSR_VAT) until the on-device VAT entity setup is reversed; the DEFAULT wisp port = poseAnim.
     if (isV79 && std::getenv("HSR_VAT")) editor.vatBaker = [&gltf](int meshIdx, int frames, int& nv){ return gltf.bakeVAT(meshIdx, frames, nv); };
     if (isV79) editor.hzAnimExtractor = [&gltf](int meshIdx, int frames, hslcook::ExportMesh& em){   // HZANIM skeletal port
+        // FLIPBOOK: an animated flat material (node-animated, no skin) -> route to the GPU flipbook shader (no skeleton).
+        // HSR_FLIPGRID=CxR sets the spritesheet grid (default 11x11 from the template).
+        if (std::getenv("HSR_FLIPBOOK") && gltf.isNodeAnimated(meshIdx)) {
+            em.flipbook = true;
+            if (const char* g = std::getenv("HSR_FLIPGRID")) { int c=0,r=0; if (sscanf(g,"%dx%d",&c,&r)==2){ em.flipCols=c; em.flipRows=r; } }
+        }
+        // V203 wisp port. ⛔ DEVICE-PROVEN 2026-06-10: the getTime() PULSE shader is the DEFAULT — it self-loops off
+        // globalUniforms.time and fades the wisp's opacity+brightness CONTINUOUSLY ("slow fade in/out"), on the shipped
+        // unlitblend base that renders. ShellPoseAnimationComponent is a 2-keyframe ONE-SHOT (sub_14651D8) that plays
+        // once then HOLDS static ("visible but not moving"), so it's opt-in only (HSR_POSEANIM). HSR_NOPULSE = off.
+        else if (gltf.isNodeAnimated(meshIdx) && !std::getenv("HSR_NOPULSE")) {
+            // Y-ROTATION (Outer Wilds skybox/Interloper) takes precedence: a uniform node-spin -> getTime() Y-rotation
+            // shader. Falls through to the wisp scale-pulse for non-rotation node anims (erebor flames have no rot channel).
+            float rp = 0.f; int rd = 1;
+            if (!std::getenv("HSR_NOROT") && gltf.extractNodeYRotation(meshIdx, rp, rd)) {
+                em.rotAnim = true; em.rotPeriod = rp; em.rotDir = rd;
+                em.vatOffsets.clear(); em.vatFrames = 0;   // rotation -> getTime() Y-rot shader, NOT VAT (vatBaker also ran on this node-anim mesh)
+            } else if (std::getenv("HSR_POSEANIM") && gltf.extractNodeScaleAnim(meshIdx, em.poseStartScale, em.poseEndScale, em.poseDuration))
+                em.poseAnim = true;
+            else em.pulse = true;
+        }
+        if (gltf.isNodeAnimated(meshIdx) && std::getenv("HSR_VERBOSE")) gltf.dumpNodeAnimTrack(meshIdx);
         auto e = gltf.extractHzAnim(meshIdx, frames);
         if (e.ok()) { em.hzJointPos=std::move(e.jointPos); em.hzJointQuat=std::move(e.jointQuat); em.hzJointScale=std::move(e.jointScale);
                       em.hzParents=std::move(e.parents); em.hzBoneIdx=std::move(e.boneIdx); em.hzBoneWgt=std::move(e.boneWgt);
