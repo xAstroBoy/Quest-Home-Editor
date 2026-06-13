@@ -851,6 +851,13 @@ public:
             if (has){ rotNode=n; break; }
         }
         if (rotNode < 0) return false;
+        // FREEZE rotNode's animated ANCESTORS at t=0 so we isolate rotNode's OWN rotation. Otherwise a node that both
+        // spins itself AND rides a spinning ancestor (OW Interloper = node 3 spin under node 8 'skybox' Y-spin) gets a
+        // COMPOUND net axis that no longer passes through the mesh -> a flat billboard offset from rotNode tumbles
+        // edge-on out of view (invisible). The planets are unaffected: node 8 IS their rotNode (no own channel), so they
+        // still inherit/orbit it. (A node legitimately inheriting an ancestor's spin has NO own rotation channel.)
+        std::vector<char> freeze(gnodes.size(), 0);
+        for (int n = gnodes[rotNode].parent; n >= 0 && (size_t)n < gnodes.size(); n = gnodes[n].parent) freeze[n]=1;
         float clipDur = 0.f;       // the rotation NODE's OWN clip length = the period basis (NOT the global animDuration;
         for (auto& ch : gchannels) // sampling past a clip's last key clamps -> a bogus average for compound/short clips)
             if (ch.node==rotNode && ch.path==1 && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){ auto& tv=gsamplers[ch.sampler].times; if(!tv.empty()&&tv.back()>clipDur) clipDur=tv.back(); }
@@ -862,8 +869,9 @@ public:
             mm[12]=t[0]; mm[13]=t[1]; mm[14]=t[2]; mm[15]=1; };
         auto mulMat=[](const float* a,const float* b,float* o){ for(int c=0;c<4;c++)for(int rr=0;rr<4;rr++) o[c*4+rr]=a[rr]*b[c*4]+a[4+rr]*b[c*4+1]+a[8+rr]*b[c*4+2]+a[12+rr]*b[c*4+3]; };
         std::function<void(int,float,float*)> worldAt=[&](int n,float t,float* out){
+            float teff = (n>=0 && (size_t)n<freeze.size() && freeze[n]) ? 0.f : t;   // freeze animated ancestors -> isolate rotNode's own spin
             float q[4]={gnodes[n].r[0],gnodes[n].r[1],gnodes[n].r[2],gnodes[n].r[3]};
-            for (auto& ch : gchannels) if (ch.node==n && ch.path==1 && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){ float o4[4]; sampleSampler(gsamplers[ch.sampler], t, o4); for(int c=0;c<4;c++)q[c]=o4[c]; break; }
+            for (auto& ch : gchannels) if (ch.node==n && ch.path==1 && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){ float o4[4]; sampleSampler(gsamplers[ch.sampler], teff, o4); for(int c=0;c<4;c++)q[c]=o4[c]; break; }
             float loc[16]; trsMat(gnodes[n].t, q, gnodes[n].s, loc);
             if (gnodes[n].parent>=0 && (size_t)gnodes[n].parent<gnodes.size()){ float pw[16]; worldAt(gnodes[n].parent,t,pw); mulMat(pw,loc,out); } else memcpy(out,loc,64); };
         auto xf=[](const float* m, const float* p, float* o){ for(int k=0;k<3;k++) o[k]=m[k]*p[0]+m[4+k]*p[1]+m[8+k]*p[2]+m[12+k]; };
@@ -895,12 +903,33 @@ public:
         if (bestV < 1e-12f) return false;                   // never moves
         float ta=clipDur*(float)ti/(float)NS, tb=clipDur*(float)(ti+1)/(float)NS;
         float mA[16], mB[16]; worldAt(nodeIdx, ta, mA); worldAt(nodeIdx, tb, mB);
-        float qa0[3], qa1[3]; xf(mA,pa,qa0); xf(mB,pa,qa1);
-        float dA[3]={qa1[0]-qa0[0],qa1[1]-qa0[1],qa1[2]-qa0[2]};
-        float ax[3]={0,0,0}; float bestC=0.f;               // vertex B: axis = dA x dB (both tangential -> perp to axis)
-        for (size_t v=0; v<nv; v++){ if((int)v==ai) continue; float p[3]={(*base)[v*3],(*base)[v*3+1],(*base)[v*3+2]}, q0[3],q1[3]; xf(mA,p,q0); xf(mB,p,q1);
-            float dB[3]={q1[0]-q0[0],q1[1]-q0[1],q1[2]-q0[2]}, c[3]; cross(dA,dB,c); float mm=dot(c,c); if(mm>bestC){bestC=mm;ax[0]=c[0];ax[1]=c[1];ax[2]=c[2];} }
-        if (bestC < 1e-12f) cross(r0, &R[(size_t)(ti+1)*3], ax);   // all displacements parallel -> fall back to r0 x r(t*)
+        // TWO INDEPENDENT motion kinds (the OW planets ORBIT the skybox node; the skybox/Snake-Way planet SPIN IN
+        // PLACE). Decide by whether the CENTROID travels: sample the centroid trajectory over the clip.
+        const int KC=24;
+        std::vector<float> Cc((size_t)(KC+1)*3);
+        for (int i=0;i<=KC;i++){ float mm[16]; worldAt(nodeIdx, clipDur*(float)i/(float)KC, mm);
+            double sx=0,sy=0,sz=0; for(size_t v=0;v<nv;v++){ float w[3]; xf(mm,&(*base)[v*3],w); sx+=w[0];sy+=w[1];sz+=w[2]; }
+            Cc[(size_t)i*3]=(float)(sx/(double)nv); Cc[(size_t)i*3+1]=(float)(sy/(double)nv); Cc[(size_t)i*3+2]=(float)(sz/(double)nv); }
+        float Cm[3]={0,0,0}; for(int i=0;i<=KC;i++){ Cm[0]+=Cc[(size_t)i*3]; Cm[1]+=Cc[(size_t)i*3+1]; Cm[2]+=Cc[(size_t)i*3+2]; }
+        Cm[0]/=(KC+1);Cm[1]/=(KC+1);Cm[2]/=(KC+1);
+        float orbitSpan=0.f; for(int i=0;i<=KC;i++){ float d[3]={Cc[(size_t)i*3]-Cm[0],Cc[(size_t)i*3+1]-Cm[1],Cc[(size_t)i*3+2]-Cm[2]}; float s=dot(d,d); if(s>orbitSpan)orbitSpan=s; } orbitSpan=sqrtf(orbitSpan);
+        float bodySpan=0.f; for(size_t v=0;v<nv;v++){ float w[3]; xf(m0,&(*base)[v*3],w); float d[3]={w[0]-Cc[0],w[1]-Cc[1],w[2]-Cc[2]}; float s=dot(d,d); if(s>bodySpan)bodySpan=s; } bodySpan=sqrtf(bodySpan);
+        float ax[3]={0,0,0};
+        if (orbitSpan > bodySpan && orbitSpan > 1e-2f) {
+            // ORBIT: axis = normal of the centroid's swept plane (measured from the ORBIT CENTER Cm, so it's immune to
+            // the off-equator tilt AND to slow-rotation per-step noise that made the 333s planets' axis wobble off-Y).
+            for (int i=0;i<KC;i++){ float a[3]={Cc[(size_t)i*3]-Cm[0],Cc[(size_t)i*3+1]-Cm[1],Cc[(size_t)i*3+2]-Cm[2]},
+                b[3]={Cc[(size_t)(i+1)*3]-Cm[0],Cc[(size_t)(i+1)*3+1]-Cm[1],Cc[(size_t)(i+1)*3+2]-Cm[2]}, c[3]; cross(a,b,c); ax[0]+=c[0];ax[1]+=c[1];ax[2]+=c[2]; }
+        } else {
+            // SPIN IN PLACE: axis = ANGULAR MOMENTUM L = sum (p_i - C) x v_i at the max-velocity step (C = vertex
+            // centroid). L is PARALLEL to omega for any rigid rotation and clean for SOLID meshes (skybox dome, sphere).
+            float C[3]={0,0,0}; std::vector<float> P0((size_t)nv*3), VV((size_t)nv*3);
+            for (size_t v=0; v<nv; v++){ float p[3]={(*base)[v*3],(*base)[v*3+1],(*base)[v*3+2]}, q0[3],q1[3]; xf(mA,p,q0); xf(mB,p,q1);
+                P0[v*3]=q0[0];P0[v*3+1]=q0[1];P0[v*3+2]=q0[2]; VV[v*3]=q1[0]-q0[0];VV[v*3+1]=q1[1]-q0[1];VV[v*3+2]=q1[2]-q0[2];
+                C[0]+=q0[0];C[1]+=q0[1];C[2]+=q0[2]; }
+            C[0]/=(float)nv;C[1]/=(float)nv;C[2]/=(float)nv;
+            for (size_t v=0; v<nv; v++){ float ri[3]={P0[v*3]-C[0],P0[v*3+1]-C[1],P0[v*3+2]-C[2]}, c[3]; cross(ri,&VV[v*3],c); ax[0]+=c[0];ax[1]+=c[1];ax[2]+=c[2]; }
+        }
         if (nrm(ax) < 1e-6f) return false;
         auto signedAng=[&](const float* a,const float* b)->float{ float da=dot(a,ax),db=dot(b,ax);
             float pA[3]={a[0]-da*ax[0],a[1]-da*ax[1],a[2]-da*ax[2]}, pB[3]={b[0]-db*ax[0],b[1]-db*ax[1],b[2]-db*ax[2]};
