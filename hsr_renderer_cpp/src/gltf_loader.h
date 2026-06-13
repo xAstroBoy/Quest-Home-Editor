@@ -834,45 +834,93 @@ public:
     // so they ORBIT origin (the skybox node's pivot), not spin in place. Returns period (one revolution, s), dir
     // (+1/-1), and the rotation node's WORLD pivot. The cooker bakes the geometry RELATIVE to that pivot + puts the
     // entity at the pivot, so the getTime() Y-rotation shader spins the node-mesh in place AND orbits its children.
-    bool extractNodeYRotation(int meshIdx, float& period, int& dir, float pivot[3]) const {
+    // GENERAL node rotation: world-space AXIS (unit), signed OMEGA (rad/s), and the PIVOT (the rotation node's world
+    // origin). Works for ANY axis (Dragon Ball Snake Way's TILTED King Kai planet) AND compound spins (OW Interloper =
+    // own spin + orbiting skybox node). Method: sample the FULL composed world transform at t=0 and t=dt; each vertex's
+    // world DISPLACEMENT is perpendicular to the rotation axis, so axis = cross(dispA, dispB) — robust to mirror/
+    // negative scale (baked into the rest pose, cancels in M1·M0^-1). The cooker generates a Rodrigues shader for it.
+    bool extractNodeRotation(int meshIdx, float axis[3], float& omega, float pivot[3],
+                             bool& isOsc, float& amp, float& period) const {
+        isOsc=false; amp=0.f; period=0.f; omega=0.f;
         int nodeIdx = -1; const std::vector<float>* base = nullptr;
         for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; base = &r.basePos; break; }
         if (nodeIdx < 0 || !base || base->size() < 9 || animDuration <= 0.f) return false;
-        bool anyRot = false;       // any rotation channel anywhere up the chain (a mesh may inherit AND add its own spin)
-        for (int n = nodeIdx; n >= 0 && (size_t)n < gnodes.size(); n = gnodes[n].parent)
-            for (auto& ch : gchannels) if (ch.node == n && ch.path == 1) { anyRot = true; break; }
-        if (!anyRot) return false;
+        int rotNode = -1;          // nearest ancestor (incl. self) with a rotation channel -> the pivot node
+        for (int n = nodeIdx; n >= 0 && (size_t)n < gnodes.size(); n = gnodes[n].parent) {
+            bool has=false; for (auto& ch : gchannels) if (ch.node==n && ch.path==1){ has=true; break; }
+            if (has){ rotNode=n; break; }
+        }
+        if (rotNode < 0) return false;
+        float clipDur = 0.f;       // the rotation NODE's OWN clip length = the period basis (NOT the global animDuration;
+        for (auto& ch : gchannels) // sampling past a clip's last key clamps -> a bogus average for compound/short clips)
+            if (ch.node==rotNode && ch.path==1 && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){ auto& tv=gsamplers[ch.sampler].times; if(!tv.empty()&&tv.back()>clipDur) clipDur=tv.back(); }
+        if (clipDur <= 1e-4f) clipDur = animDuration;
         auto trsMat=[](const float* t,const float* r,const float* sc,float* mm){ float x=r[0],y=r[1],z=r[2],ww=r[3];
             mm[0]=(1-2*(y*y+z*z))*sc[0]; mm[1]=(2*(x*y+ww*z))*sc[0]; mm[2]=(2*(x*z-ww*y))*sc[0]; mm[3]=0;
             mm[4]=(2*(x*y-ww*z))*sc[1]; mm[5]=(1-2*(x*x+z*z))*sc[1]; mm[6]=(2*(y*z+ww*x))*sc[1]; mm[7]=0;
             mm[8]=(2*(x*z+ww*y))*sc[2]; mm[9]=(2*(y*z-ww*x))*sc[2]; mm[10]=(1-2*(x*x+y*y))*sc[2]; mm[11]=0;
             mm[12]=t[0]; mm[13]=t[1]; mm[14]=t[2]; mm[15]=1; };
         auto mulMat=[](const float* a,const float* b,float* o){ for(int c=0;c<4;c++)for(int rr=0;rr<4;rr++) o[c*4+rr]=a[rr]*b[c*4]+a[4+rr]*b[c*4+1]+a[8+rr]*b[c*4+2]+a[12+rr]*b[c*4+3]; };
-        // node WORLD matrix at time t — SAMPLES every rotation channel up the chain, so the net captures ALL stacked
-        // rotations (OW Interloper = its own node spin COMPOUNDED with the orbiting skybox node) AND any mirror/scale.
         std::function<void(int,float,float*)> worldAt=[&](int n,float t,float* out){
             float q[4]={gnodes[n].r[0],gnodes[n].r[1],gnodes[n].r[2],gnodes[n].r[3]};
             for (auto& ch : gchannels) if (ch.node==n && ch.path==1 && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){ float o4[4]; sampleSampler(gsamplers[ch.sampler], t, o4); for(int c=0;c<4;c++)q[c]=o4[c]; break; }
             float loc[16]; trsMat(gnodes[n].t, q, gnodes[n].s, loc);
             if (gnodes[n].parent>=0 && (size_t)gnodes[n].parent<gnodes.size()){ float pw[16]; worldAt(gnodes[n].parent,t,pw); mulMat(pw,loc,out); } else memcpy(out,loc,64); };
         auto xf=[](const float* m, const float* p, float* o){ for(int k=0;k<3;k++) o[k]=m[k]*p[0]+m[4+k]*p[1]+m[8+k]*p[2]+m[12+k]; };
-        float dt = animDuration < 5.f ? animDuration*0.1f : 0.5f;
-        float m0[16], m1[16]; worldAt(nodeIdx, 0.f, m0); worldAt(nodeIdx, dt, m1);
-        // measure the NET world rotation on the vertex with the largest XZ radius (off the spin axis)
-        size_t nv = base->size()/3; int best=-1; float bestR=0.f;
-        for (size_t v=0; v<nv; v++){ float p[3]={(*base)[v*3],(*base)[v*3+1],(*base)[v*3+2]}, w[3]; xf(m0,p,w); float r=w[0]*w[0]+w[2]*w[2]; if(r>bestR){bestR=r;best=(int)v;} }
-        if (best<0 || bestR<1e-2f) return false;
-        float p[3]={(*base)[best*3],(*base)[best*3+1],(*base)[best*3+2]}, w0[3], w1[3]; xf(m0,p,w0); xf(m1,p,w1);
-        float r0=sqrtf(w0[0]*w0[0]+w0[2]*w0[2]), r1=sqrtf(w1[0]*w1[0]+w1[2]*w1[2]);
-        if (fabsf(r1-r0) > 0.05f*r0 + 1e-3f || fabsf(w1[1]-w0[1]) > 0.05f*r0 + 1e-3f) return false;   // not a Y-axis spin about the origin
-        const float PI=3.14159265f;
-        float dth = atan2f(w1[2],w1[0]) - atan2f(w0[2],w0[0]); while(dth>PI)dth-=2*PI; while(dth<-PI)dth+=2*PI;
-        float omega = dth/dt;
-        if (fabsf(omega) < 1e-4f) return false;
-        period = 2.f*PI/fabsf(omega);
-        dir = (omega < 0.f) ? +1 : -1;                 // atan2 DECREASES for +Y CCW (matches the shader; skybox-verified)
-        pivot[0]=0.f; pivot[1]=0.f; pivot[2]=0.f;      // net spin is about the world-origin Y axis
-        return true;
+        auto cross=[](const float* a,const float* b,float* o){ o[0]=a[1]*b[2]-a[2]*b[1]; o[1]=a[2]*b[0]-a[0]*b[2]; o[2]=a[0]*b[1]-a[1]*b[0]; };
+        auto dot=[](const float* a,const float* b){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; };
+        auto nrm=[](float* a){ float l=sqrtf(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]); if(l>1e-9f){a[0]/=l;a[1]/=l;a[2]/=l;} return l; };
+        float pm[16]; worldAt(rotNode, 0.f, pm); pivot[0]=pm[12]; pivot[1]=pm[13]; pivot[2]=pm[14];
+        size_t nv = base->size()/3;
+        float m0[16]; worldAt(nodeIdx, 0.f, m0);
+        int ai=-1; float aR=0.f;                            // probe vertex A = farthest from pivot (cleanest arc)
+        for (size_t v=0; v<nv; v++){ float p[3]={(*base)[v*3],(*base)[v*3+1],(*base)[v*3+2]}, w[3]; xf(m0,p,w);
+            float r=(w[0]-pivot[0])*(w[0]-pivot[0])+(w[1]-pivot[1])*(w[1]-pivot[1])+(w[2]-pivot[2])*(w[2]-pivot[2]); if(r>aR){aR=r;ai=(int)v;} }
+        if (ai<0 || aR<1e-2f) return false;
+        float pa[3]={(*base)[ai*3],(*base)[ai*3+1],(*base)[ai*3+2]};
+        // Sample A's WORLD position across the rotation node's OWN clip -> the radius vector r(t)=pos(t)-pivot traces an
+        // arc. A continuous spin sweeps a full turn (|total swept| big); a sway swings out and back (zero net, bounded
+        // peak). Sampling the whole clip (not just t=0) is REQUIRED: a (1-cos) sway has ZERO velocity at t=0, so a single
+        // dt step there reads a bogus near-static "slow spin" (the Snake Way 1047s bug). Classify by the accumulated sweep.
+        const int NS=96;
+        std::vector<float> R((size_t)(NS+1)*3);
+        for (int i=0;i<=NS;i++){ float mm[16]; worldAt(nodeIdx, clipDur*(float)i/(float)NS, mm); float w[3]; xf(mm,pa,w);
+            R[(size_t)i*3]=w[0]-pivot[0]; R[(size_t)i*3+1]=w[1]-pivot[1]; R[(size_t)i*3+2]=w[2]-pivot[2]; }
+        float* r0=&R[0]; float r0l=sqrtf(dot(r0,r0)); if (r0l<1e-3f) return false;
+        // AXIS from TANGENTIAL displacements (always perp to the axis -> robust even for off-equator vertices, unlike
+        // r0 x r(t) which tilts by the axial component). Take the step of MAX speed (a (1-cos) sway has zero velocity at
+        // t=0): dA x dB over two probe vertices at that step = the rotation axis.
+        int ti=0; float bestV=0.f;                          // step with the largest probe-A displacement = max angular speed
+        for (int i=0;i<NS;i++){ float dx=R[(size_t)(i+1)*3]-R[(size_t)i*3], dy=R[(size_t)(i+1)*3+1]-R[(size_t)i*3+1], dz=R[(size_t)(i+1)*3+2]-R[(size_t)i*3+2]; float s=dx*dx+dy*dy+dz*dz; if(s>bestV){bestV=s;ti=i;} }
+        if (bestV < 1e-12f) return false;                   // never moves
+        float ta=clipDur*(float)ti/(float)NS, tb=clipDur*(float)(ti+1)/(float)NS;
+        float mA[16], mB[16]; worldAt(nodeIdx, ta, mA); worldAt(nodeIdx, tb, mB);
+        float qa0[3], qa1[3]; xf(mA,pa,qa0); xf(mB,pa,qa1);
+        float dA[3]={qa1[0]-qa0[0],qa1[1]-qa0[1],qa1[2]-qa0[2]};
+        float ax[3]={0,0,0}; float bestC=0.f;               // vertex B: axis = dA x dB (both tangential -> perp to axis)
+        for (size_t v=0; v<nv; v++){ if((int)v==ai) continue; float p[3]={(*base)[v*3],(*base)[v*3+1],(*base)[v*3+2]}, q0[3],q1[3]; xf(mA,p,q0); xf(mB,p,q1);
+            float dB[3]={q1[0]-q0[0],q1[1]-q0[1],q1[2]-q0[2]}, c[3]; cross(dA,dB,c); float mm=dot(c,c); if(mm>bestC){bestC=mm;ax[0]=c[0];ax[1]=c[1];ax[2]=c[2];} }
+        if (bestC < 1e-12f) cross(r0, &R[(size_t)(ti+1)*3], ax);   // all displacements parallel -> fall back to r0 x r(t*)
+        if (nrm(ax) < 1e-6f) return false;
+        auto signedAng=[&](const float* a,const float* b)->float{ float da=dot(a,ax),db=dot(b,ax);
+            float pA[3]={a[0]-da*ax[0],a[1]-da*ax[1],a[2]-da*ax[2]}, pB[3]={b[0]-db*ax[0],b[1]-db*ax[1],b[2]-db*ax[2]};
+            float c[3]; cross(pA,pB,c); return atan2f(dot(c,ax), dot(pA,pB)); };
+        float total=0.f, peak=0.f, maxR=0.f, minR=1e30f;    // total = net signed sweep; peak = signed extreme vs r0
+        for (int i=1;i<=NS;i++){ total += signedAng(&R[(size_t)(i-1)*3], &R[(size_t)i*3]);
+            float th = signedAng(r0, &R[(size_t)i*3]); if (fabsf(th)>fabsf(peak)) peak=th;
+            float rl=sqrtf(dot(&R[(size_t)i*3],&R[(size_t)i*3])); if(rl>maxR)maxR=rl; if(rl<minR)minR=rl; }
+        if (maxR-minR > 0.15f*r0l + 1e-3f) return false;     // radius must be ~constant -> a pivot rotation, not a translation
+        // Canonicalize the axis (dominant component positive) so the DIRECTION lives unambiguously in the SIGN of
+        // omega/amp — deterministic across meshes that share one physical rotation (the cross-product axis sign is
+        // otherwise arbitrary, e.g. the OW planets came out +Y vs -Y for the same orbit). total/peak flip with it.
+        int dom=0; if (fabsf(ax[1])>fabsf(ax[dom])) dom=1; if (fabsf(ax[2])>fabsf(ax[dom])) dom=2;
+        if (ax[dom] < 0.f) { ax[0]=-ax[0]; ax[1]=-ax[1]; ax[2]=-ax[2]; total=-total; peak=-peak; }
+        axis[0]=ax[0]; axis[1]=ax[1]; axis[2]=ax[2];
+        if (fabsf(total) > 4.712f) {                         // > ~270deg accumulated -> CONTINUOUS spin
+            omega = total/clipDur; isOsc=false; period=clipDur; return fabsf(omega) > 1e-4f;   // signed omega = CW/CCW direction
+        }
+        isOsc=true; amp=peak; period=clipDur; omega=0.f;     // bounded swing -> OSCILLATION (sway); signed amp = swing direction
+        return fabsf(amp) > 0.02f;                            // >~1deg sway, else treat as static
     }
     HzAnimExport extractHzAnim(int meshIdx, int frames) {
         HzAnimExport e;

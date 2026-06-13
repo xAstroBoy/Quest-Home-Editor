@@ -734,10 +734,11 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
     // frustum-culls per-draw with this STATIC AABB (it can't see the shader's rotation), so a planet orbiting at
     // radius R is culled whenever its REST AABB is off-screen -> "planets disappear when watched". Fix: bake the
     // AABB as the SWEPT CYLINDER (X,Z = ±maxR over the orbit; Y unchanged) so the box covers the whole orbit.
-    if (spinBoundsY) {
-        float maxR2 = 0; for (size_t v = 0; v + 2 < pos.size(); v += 3) { float x = pos[v], z = pos[v+2]; float r2 = x*x + z*z; if (r2 > maxR2) maxR2 = r2; }
+    if (spinBoundsY) {   // geometry is centered on the pivot; an axis-through-origin rotation preserves each vert's
+        float maxR2 = 0; // DISTANCE from origin, so the swept volume = a SPHERE of radius max|v|. Box it (±maxR all axes)
+        for (size_t v = 0; v + 2 < pos.size(); v += 3) { float r2 = pos[v]*pos[v] + pos[v+1]*pos[v+1] + pos[v+2]*pos[v+2]; if (r2 > maxR2) maxR2 = r2; }
         float maxR = sqrtf(maxR2);
-        aabb[0] = -maxR; aabb[2] = -maxR; aabb[3] = maxR; aabb[5] = maxR;
+        aabb[0] = -maxR; aabb[1] = -maxR; aabb[2] = -maxR; aabb[3] = maxR; aabb[4] = maxR; aabb[5] = maxR;
     }
     float radius = 0; for (int k = 0; k < 3; k++) { float a = aabb[k] < 0 ? -aabb[k] : aabb[k], c = aabb[k+3] < 0 ? -aabb[k+3] : aabb[k+3]; if (a > radius) radius = a; if (c > radius) radius = c; }
     // POS+UV0+NORMAL by default; for VAT the 3rd attr is UV1 (the column) and the format-hash differs (both reversed
@@ -851,7 +852,8 @@ struct ExportMesh {
     int vatFrames = 0;
     bool pulse = false;             // node-animated billboard (flame wisp) -> CUSTOM wisp_pulse.surface (unlitblend + getTime() brightness pulse)
     // V79 node Y-ROTATION (Outer Wilds skybox/Interloper) -> getTime() Y-rotation shader cooker/rot_<periodms>_<p|m>.surface.
-    bool rotAnim = false; float rotPeriod = 0.f; int rotDir = 1; float rotPivot[3] = {0,0,0};   // pivot = the animated node's WORLD origin (skybox node -> children orbit it)
+    bool rotAnim = false; float rotOmega = 0.f; float rotAxis[3] = {0,1,0}; float rotPivot[3] = {0,0,0};   // ARBITRARY-axis spin: signed rad/s about rotAxis around rotPivot (node WORLD origin; children orbit it)
+    bool rotOsc = false; float rotAmp = 0.f; float rotPeriod = 0.f;   // OSCILLATION (sway): angle=(amp/2)(1-cos(2pi t/period)) about rotAxis — clips that swing out & back (Snake Way King Kai planet), NOT a spin
     // V203 NON-skeletal pose/scale animation (the FAITHFUL wisp port — IDA: ShellPoseAnimationComponent -> CoPoseAnimation,
     // ticked by AnimationSystem, NO skeleton). Lerps the entity pose start->end; for a wisp = startScale<->endScale (V79 min/max).
     bool poseAnim = false;
@@ -1138,7 +1140,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     && m.hzBoneIdx.size() >= (size_t)vc*4 && m.hzBoneWgt.size() >= (size_t)vc*4
                     && m.hzTrsLocal.size() >= (size_t)m.hzFrames*m.hzJointCount*10
                     && m.hzRestPos.size() == m.positions.size();   // centered rest positions present
-        bool useRot = !useHz && m.rotAnim && m.rotPeriod > 0.f;   // node Y-spin (Outer Wilds skybox/Interloper) -> getTime() rot shader
+        bool useRot = !useHz && m.rotAnim && ((m.rotOmega > 1e-5f || m.rotOmega < -1e-5f) || (m.rotOsc && (m.rotAmp > 0.02f || m.rotAmp < -0.02f)));   // node spin OR sway (any axis) -> getTime() Rodrigues shader
         bool usePulse = !useHz && !useRot && m.pulse && havePulse;   // node-animated billboard -> custom getTime() pulse shader
         bool useVat = !useHz && !useRot && !usePulse && !m.vatOffsets.empty() && m.vatFrames > 1 && haveVat && m.vatOffsets.size() >= (size_t)vc * m.vatFrames * 3;
         std::vector<uint8_t> vatTex; AssetKey3 vatTexK;
@@ -1215,24 +1217,33 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // BOX; the opaque skybox uses unlit (depth write). Geometry is baked relative to the pivot + entity at the
             // pivot (useCenter below): the rotating node spins in place, its child meshes orbit it. Swept AABB (above).
             bool rblend = m.blend && haveBlend;
-            long ms = (long)(m.rotPeriod * 1000.0 + 0.5);
-            char rfn[160]; snprintf(rfn, sizeof rfn, "cooker/rot_%ld_%s%s.surface.bin", ms, m.rotDir >= 0 ? "p" : "m", rblend ? "_b" : "");
+            // hash the motion (spin: omega+axis ; sway: amp+period+axis) + blend -> a stable filename; the shader is
+            // GENERATED on demand for this EXACT motion — the global converter, no pre-baked per-env shaders.
+            long ax=(long)(m.rotAxis[0]*1000), ay=(long)(m.rotAxis[1]*1000), az=(long)(m.rotAxis[2]*1000);
+            long mv = m.rotOsc ? ((long)(m.rotAmp*100000) ^ ((long)(m.rotPeriod*1000)<<1)) : (long)(m.rotOmega*100000);
+            uint32_t h = (uint32_t)(0x9E3779B9u*(uint32_t)ax ^ 0x85EBCA6Bu*(uint32_t)ay ^ 0xC2B2AE35u*(uint32_t)az ^ 0x27D4EB2Fu*(uint32_t)mv ^ (m.rotOsc?0x5BD1E995u:0u));
+            const char* pfx = m.rotOsc ? "osc" : "rot";
+            char rfn[160]; snprintf(rfn, sizeof rfn, "cooker/%s_%08x%s.surface.bin", pfx, h, rblend ? "_b" : "");
             AssetKey3 rotK{};
             auto it = rotShaders.find(rfn);
             if (it != rotShaders.end()) rotK = it->second;
             else {
                 auto rbytes = readFileBytes(rfn);
-                if (rbytes.empty()) {   // generate it for this (period,dir,blend) — the global converter, not an env hack
-                    char cmd[400]; snprintf(cmd, sizeof cmd, "python cooker/make_rotate_shader.py %.5f %d cooker/%s %s",
-                        m.rotPeriod, m.rotDir, rblend ? "nuxd_unlitblend_shader.bin" : "nuxd_unlit_shader.bin", rfn);
+                if (rbytes.empty()) {   // Rodrigues shader for this exact motion (continuous spin OR (1-cos) sway)
+                    char cmd[400];
+                    if (m.rotOsc) snprintf(cmd, sizeof cmd, "python cooker/make_oscillate_shader.py %.6f %.6f %.5f %.5f %.5f cooker/%s %s",
+                        m.rotAmp, m.rotPeriod, m.rotAxis[0], m.rotAxis[1], m.rotAxis[2], rblend ? "nuxd_unlitblend_shader.bin" : "nuxd_unlit_shader.bin", rfn);
+                    else          snprintf(cmd, sizeof cmd, "python cooker/make_rotate_shader.py %.6f %.5f %.5f %.5f cooker/%s %s",
+                        m.rotOmega, m.rotAxis[0], m.rotAxis[1], m.rotAxis[2], rblend ? "nuxd_unlitblend_shader.bin" : "nuxd_unlit_shader.bin", rfn);
                     int rc = system(cmd); (void)rc; rbytes = readFileBytes(rfn);
                 }
-                if (!rbytes.empty()) { char rp[160]; snprintf(rp, sizeof rp, "%s/shaders/rot_%ld_%s%s.surface/shader", MH.c_str(), ms, m.rotDir >= 0 ? "p" : "m", rblend ? "_b" : "");
+                if (!rbytes.empty()) { char rp[160]; snprintf(rp, sizeof rp, "%s/shaders/%s_%08x%s.surface/shader", MH.c_str(), pfx, h, rblend ? "_b" : "");
                     rotK = keyForPath(rp); assets.push_back({ rp, rotK.tgt, rbytes, rotK }); rotShaders[rfn] = rotK; } }
             matl = rblend ? matBlend : matTpl;                          // blend base for transparent billboards, else opaque unlit
             if (rotK.ing) { memcpy(matl.data() + 48, &rotK.pkg, 8); memcpy(matl.data() + 56, &rotK.ing, 8); }  // field7 -> rot shader (else static = safe fallback)
             memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);                  // base tex
-            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' YROT period=%.1fs dir=%+d %s %s\n", i, m.name.c_str(), m.rotPeriod, m.rotDir, rblend ? "BLEND" : "opaque", rotK.ing ? "" : "(MISSING shader -> static)");
+            if (std::getenv("HSR_VERBOSE")) { if (m.rotOsc) fprintf(stderr, "[COOK] m%03zu '%s' SWAY amp=%+.0fdeg period=%.1fs axis=(%.2f,%.2f,%.2f) dir=%s %s %s\n", i, m.name.c_str(), m.rotAmp*57.2958f, m.rotPeriod, m.rotAxis[0],m.rotAxis[1],m.rotAxis[2], m.rotAmp>=0?"+":"-", rblend ? "BLEND" : "opaque", rotK.ing ? "" : "(MISSING -> static)");
+                else fprintf(stderr, "[COOK] m%03zu '%s' SPIN %.1fs axis=(%.2f,%.2f,%.2f) dir=%s(%+.4f rad/s) %s %s\n", i, m.name.c_str(), 6.2831853f/(m.rotOmega<0?-m.rotOmega:m.rotOmega), m.rotAxis[0],m.rotAxis[1],m.rotAxis[2], m.rotOmega>=0?"CCW":"CW", m.rotOmega, rblend ? "BLEND" : "opaque", rotK.ing ? "" : "(MISSING -> static)"); }
         } else if (useVat) {
             std::string pVatTex = std::string(base) + ".vat.tex/tex"; vatTexK = keyForPath(pVatTex);
             matl = matVat;

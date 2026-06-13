@@ -956,11 +956,12 @@ int main(int argc, char** argv) {
         else if (gltf.isNodeAnimated(meshIdx) && !std::getenv("HSR_NOPULSE")) {
             // Y-ROTATION (Outer Wilds skybox/Interloper) takes precedence: a uniform node-spin -> getTime() Y-rotation
             // shader. Falls through to the wisp scale-pulse for non-rotation node anims (erebor flames have no rot channel).
-            float rp = 0.f; int rd = 1; float rpiv[3] = {0,0,0};
-            if (!std::getenv("HSR_NOROT") && gltf.extractNodeYRotation(meshIdx, rp, rd, rpiv)) {
-                em.rotAnim = true; em.rotPeriod = rp; em.rotDir = rd;
+            float rax[3] = {0,1,0}, rom = 0.f, rpiv[3] = {0,0,0}, ramp = 0.f, rper = 0.f; bool rosc = false;
+            if (!std::getenv("HSR_NOROT") && gltf.extractNodeRotation(meshIdx, rax, rom, rpiv, rosc, ramp, rper)) {
+                em.rotAnim = true; em.rotOmega = rom; em.rotOsc = rosc; em.rotAmp = ramp; em.rotPeriod = rper;
+                em.rotAxis[0]=rax[0]; em.rotAxis[1]=rax[1]; em.rotAxis[2]=rax[2];
                 em.rotPivot[0]=rpiv[0]; em.rotPivot[1]=rpiv[1]; em.rotPivot[2]=rpiv[2];
-                em.vatOffsets.clear(); em.vatFrames = 0;   // rotation -> getTime() Y-rot shader, NOT VAT (vatBaker also ran on this node-anim mesh)
+                em.vatOffsets.clear(); em.vatFrames = 0;   // rotation/sway -> getTime() Rodrigues shader, NOT VAT (vatBaker also ran on this node-anim mesh)
             } else if (std::getenv("HSR_POSEANIM") && gltf.extractNodeScaleAnim(meshIdx, em.poseStartScale, em.poseEndScale, em.poseDuration))
                 em.poseAnim = true;
             else em.pulse = true;
