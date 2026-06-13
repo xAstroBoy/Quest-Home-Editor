@@ -835,43 +835,43 @@ public:
     // (+1/-1), and the rotation node's WORLD pivot. The cooker bakes the geometry RELATIVE to that pivot + puts the
     // entity at the pivot, so the getTime() Y-rotation shader spins the node-mesh in place AND orbits its children.
     bool extractNodeYRotation(int meshIdx, float& period, int& dir, float pivot[3]) const {
-        int nodeIdx = -1; for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; break; }
-        if (nodeIdx < 0) return false;
-        int rotNode = -1; const GSampler* ss = nullptr;       // nearest ancestor (incl. self) with a rotation channel
-        for (int n = nodeIdx; n >= 0 && (size_t)n < gnodes.size(); n = gnodes[n].parent) {
-            for (auto& ch : gchannels)
-                if (ch.node == n && ch.path == 1 && ch.sampler >= 0 && (size_t)ch.sampler < gsamplers.size()) { ss = &gsamplers[ch.sampler]; rotNode = n; break; }
-            if (rotNode >= 0) break;
-        }
-        if (!ss || rotNode < 0 || ss->comps < 4 || ss->times.size() < 3) return false;
-        auto qat = [&](size_t k, float* q){ for (int c = 0; c < 4; ++c) q[c] = ss->vals[k*4 + c]; };
-        float q0[4], qm[4]; qat(0, q0); qat(ss->times.size()/4, qm);   // start vs ~quarter-turn keyframe
-        float c0[4] = {-q0[0],-q0[1],-q0[2], q0[3]};                   // conj(q0)
-        float dq[4] = { qm[3]*c0[0]+qm[0]*c0[3]+qm[1]*c0[2]-qm[2]*c0[1],
-                        qm[3]*c0[1]-qm[0]*c0[2]+qm[1]*c0[3]+qm[2]*c0[0],
-                        qm[3]*c0[2]+qm[0]*c0[1]-qm[1]*c0[0]+qm[2]*c0[3],
-                        qm[3]*c0[3]-qm[0]*c0[0]-qm[1]*c0[1]-qm[2]*c0[2] };
-        float w = dq[3]; if (w > 1.f) w = 1.f; if (w < -1.f) w = -1.f;
-        float s = sqrtf(1.f - w*w); if (s < 1e-5f) return false;
-        float ay = dq[1]/s;
-        if (fabsf(ay) < 0.85f) return false;                          // must be a (near-)Y spin
-        dir = (ay >= 0.f) ? +1 : -1;
-        period = ss->times.back();
-        if (period <= 0.f) return false;
-        // pivot = rotNode's WORLD position (translation of its composed parent chain)
+        int nodeIdx = -1; const std::vector<float>* base = nullptr;
+        for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; base = &r.basePos; break; }
+        if (nodeIdx < 0 || !base || base->size() < 9 || animDuration <= 0.f) return false;
+        bool anyRot = false;       // any rotation channel anywhere up the chain (a mesh may inherit AND add its own spin)
+        for (int n = nodeIdx; n >= 0 && (size_t)n < gnodes.size(); n = gnodes[n].parent)
+            for (auto& ch : gchannels) if (ch.node == n && ch.path == 1) { anyRot = true; break; }
+        if (!anyRot) return false;
         auto trsMat=[](const float* t,const float* r,const float* sc,float* mm){ float x=r[0],y=r[1],z=r[2],ww=r[3];
             mm[0]=(1-2*(y*y+z*z))*sc[0]; mm[1]=(2*(x*y+ww*z))*sc[0]; mm[2]=(2*(x*z-ww*y))*sc[0]; mm[3]=0;
             mm[4]=(2*(x*y-ww*z))*sc[1]; mm[5]=(1-2*(x*x+z*z))*sc[1]; mm[6]=(2*(y*z+ww*x))*sc[1]; mm[7]=0;
             mm[8]=(2*(x*z+ww*y))*sc[2]; mm[9]=(2*(y*z-ww*x))*sc[2]; mm[10]=(1-2*(x*x+y*y))*sc[2]; mm[11]=0;
             mm[12]=t[0]; mm[13]=t[1]; mm[14]=t[2]; mm[15]=1; };
         auto mulMat=[](const float* a,const float* b,float* o){ for(int c=0;c<4;c++)for(int rr=0;rr<4;rr++) o[c*4+rr]=a[rr]*b[c*4]+a[4+rr]*b[c*4+1]+a[8+rr]*b[c*4+2]+a[12+rr]*b[c*4+3]; };
-        std::function<void(int,float*)> worldMat=[&](int n,float* out){ float loc[16]; trsMat(gnodes[n].t,gnodes[n].r,gnodes[n].s,loc);
-            if (gnodes[n].parent>=0 && (size_t)gnodes[n].parent<gnodes.size()){ float pw[16]; worldMat(gnodes[n].parent,pw); mulMat(pw,loc,out); } else memcpy(out,loc,64); };
-        float wm[16]; worldMat(rotNode, wm); pivot[0]=wm[12]; pivot[1]=wm[13]; pivot[2]=wm[14];
-        // NEGATIVE-scale (mirror) node -> composed world matrix has det<0, which visually FLIPS the rotation sense
-        // (OW Interloper scale = -22.5 -> "rotating in a diff angle"). Flip dir so the spin matches V79.
-        float det3 = wm[0]*(wm[5]*wm[10]-wm[6]*wm[9]) - wm[4]*(wm[1]*wm[10]-wm[2]*wm[9]) + wm[8]*(wm[1]*wm[6]-wm[2]*wm[5]);
-        if (det3 < 0.f) dir = -dir;
+        // node WORLD matrix at time t — SAMPLES every rotation channel up the chain, so the net captures ALL stacked
+        // rotations (OW Interloper = its own node spin COMPOUNDED with the orbiting skybox node) AND any mirror/scale.
+        std::function<void(int,float,float*)> worldAt=[&](int n,float t,float* out){
+            float q[4]={gnodes[n].r[0],gnodes[n].r[1],gnodes[n].r[2],gnodes[n].r[3]};
+            for (auto& ch : gchannels) if (ch.node==n && ch.path==1 && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){ float o4[4]; sampleSampler(gsamplers[ch.sampler], t, o4); for(int c=0;c<4;c++)q[c]=o4[c]; break; }
+            float loc[16]; trsMat(gnodes[n].t, q, gnodes[n].s, loc);
+            if (gnodes[n].parent>=0 && (size_t)gnodes[n].parent<gnodes.size()){ float pw[16]; worldAt(gnodes[n].parent,t,pw); mulMat(pw,loc,out); } else memcpy(out,loc,64); };
+        auto xf=[](const float* m, const float* p, float* o){ for(int k=0;k<3;k++) o[k]=m[k]*p[0]+m[4+k]*p[1]+m[8+k]*p[2]+m[12+k]; };
+        float dt = animDuration < 5.f ? animDuration*0.1f : 0.5f;
+        float m0[16], m1[16]; worldAt(nodeIdx, 0.f, m0); worldAt(nodeIdx, dt, m1);
+        // measure the NET world rotation on the vertex with the largest XZ radius (off the spin axis)
+        size_t nv = base->size()/3; int best=-1; float bestR=0.f;
+        for (size_t v=0; v<nv; v++){ float p[3]={(*base)[v*3],(*base)[v*3+1],(*base)[v*3+2]}, w[3]; xf(m0,p,w); float r=w[0]*w[0]+w[2]*w[2]; if(r>bestR){bestR=r;best=(int)v;} }
+        if (best<0 || bestR<1e-2f) return false;
+        float p[3]={(*base)[best*3],(*base)[best*3+1],(*base)[best*3+2]}, w0[3], w1[3]; xf(m0,p,w0); xf(m1,p,w1);
+        float r0=sqrtf(w0[0]*w0[0]+w0[2]*w0[2]), r1=sqrtf(w1[0]*w1[0]+w1[2]*w1[2]);
+        if (fabsf(r1-r0) > 0.05f*r0 + 1e-3f || fabsf(w1[1]-w0[1]) > 0.05f*r0 + 1e-3f) return false;   // not a Y-axis spin about the origin
+        const float PI=3.14159265f;
+        float dth = atan2f(w1[2],w1[0]) - atan2f(w0[2],w0[0]); while(dth>PI)dth-=2*PI; while(dth<-PI)dth+=2*PI;
+        float omega = dth/dt;
+        if (fabsf(omega) < 1e-4f) return false;
+        period = 2.f*PI/fabsf(omega);
+        dir = (omega < 0.f) ? +1 : -1;                 // atan2 DECREASES for +Y CCW (matches the shader; skybox-verified)
+        pivot[0]=0.f; pivot[1]=0.f; pivot[2]=0.f;      // net spin is about the world-origin Y axis
         return true;
     }
     HzAnimExport extractHzAnim(int meshIdx, int frames) {
