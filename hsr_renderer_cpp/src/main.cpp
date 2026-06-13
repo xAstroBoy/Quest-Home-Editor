@@ -901,8 +901,8 @@ int main(int argc, char** argv) {
 
     // ── Ambient audio: loop the env's *.ogg (e.g. _BACKGROUND_LOOP.ogg) from the APK ──
     AudioPlayer g_audio;
-    if (!std::getenv("HSR_NOAUDIO")) {
-        std::vector<u8> ogg;
+    std::vector<u8> ogg;   // the env's background .ogg — desktop playback AND the cooked FMOD SoundAsset (always extracted)
+    {
         mz_zip_archive az; memset(&az, 0, sizeof(az));
         if (mz_zip_reader_init_file(&az, apkPath.c_str(), 0)) {
             int si = mz_zip_reader_locate_file(&az, "assets/scene.zip", nullptr, 0);
@@ -927,15 +927,16 @@ int main(int argc, char** argv) {
             }
             mz_zip_reader_end(&az);
         }
-        if (!ogg.empty()) g_audio.start(ogg.data(), ogg.size());
-        else fprintf(stderr, "[AUDIO] no .ogg in this env\n");
     }
+    if (!ogg.empty() && !std::getenv("HSR_NOAUDIO")) g_audio.start(ogg.data(), ogg.size());
+    else if (ogg.empty()) fprintf(stderr, "[AUDIO] no .ogg in this env\n");
 
     // ── Editor UI (Dear ImGui): outliner, move, focus, anim/audio control, save ──
     float animDur = isOpa ? opa.animDuration() : (isV79 ? gltf.animDuration : 0.0f);
     Editor editor;
     editor.r = &vkRenderer;             // bind the renderer up-front so Export works even when the UI is skipped (HSR_NOUI)
     editor.sceneMeshes = sceneMeshes;   // CPU geometry/textures for the "Export APK" cooker (parallel to gpuMeshes)
+    editor.bgOgg = ogg;                 // the env's background loop -> cooked as an auto-start FMOD SoundAsset
     // VAT (vertex-animation) bakes the per-frame V79 node deformation into a shader-sampled offset texture.
     // ⛔ DEVICE-PROVEN 2026-06-10: the VAT EXPORT path does NOT render on the Quest (the cooked VAT meshes are
     // invisible in-headset — the erebor wisp sparkles vanished when VAT was default-on), whereas the poseAnim path
