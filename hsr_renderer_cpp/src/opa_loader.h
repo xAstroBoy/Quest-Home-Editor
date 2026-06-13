@@ -37,6 +37,7 @@
 #include "miniz.h"
 #include "rendtxtr_parser.h"   // astc::decodeASTC (KTX/ASTC -> RGBA)
 #include "ibl.h"               // SpecIbl diffuse irradiance cubemap (RGBA16F KTX)
+#include "node_rot_fit.h"      // shared spin/sway fitter (V79->V203 cook) — same core the glTF loader uses
 #include <vector>
 #include <string>
 #include <cstring>
@@ -310,6 +311,33 @@ public:
 
     bool hasAnimation() const { return (!animRecs.empty() || !skinRecs.empty() || !uvAnimRecs.empty() || !vatRecs.empty()) && (animMaxFrames > 1 || !vatRecs.empty()); }
     float animDuration() const { return animMaxFrames > 1 ? (float)animMaxFrames / animFps : 0.0f; }
+
+    // ── COOK: batch-fit every node-animated mesh to a SPIN/SWAY about an axis (the V79->V203 port). Samples each
+    //    animated mesh's WORLD positions across the clip via animate(t), runs the shared noderot::fit, and returns
+    //    meshIdx -> Result. Leaves the meshes at REST (animate(0)) so the static geometry bake is the t=0 pose. The
+    //    cooker's useRot path then ships a getTime() Rodrigues shader. (Node TRANSFORM anims = the bulk of OPA motion;
+    //    UV-scroll / skinned / VAT are separate passes.) ──
+    void cookExtractRotations(std::unordered_map<size_t, noderot::Result>& out) {
+        out.clear();
+        if (animRecs.empty() || animMaxFrames < 2) return;
+        float clipDur = animDuration(); if (clipDur <= 0.f) return;
+        struct M { size_t idx; size_t nv; uint32_t node; float pivot[3]; std::vector<std::vector<float>> frames; };
+        std::vector<M> ms; std::unordered_map<size_t,int> idxOf;
+        size_t totalV = 0;
+        for (auto& ar : animRecs) { size_t nv = ar.basePos.size()/3; if (nv < 3) continue; if (idxOf.count(ar.meshIdx)) continue;
+            idxOf[ar.meshIdx] = (int)ms.size(); M m; m.idx=ar.meshIdx; m.nv=nv; m.node=ar.nodeIdx; ms.push_back(std::move(m)); totalV += nv; }
+        if (ms.empty()) return;
+        int NS = 32; if (totalV) { long budget = 90000000L / (long)(totalV*3); if (budget < NS) NS = (int)budget; } if (NS < 8) NS = 8;   // bound memory (~1GB worst case)
+        for (auto& m : ms) m.frames.resize(NS+1);
+        for (int f=0; f<=NS; f++) { animate(clipDur * (float)f / (float)NS);
+            for (auto& m : ms) { const MeshData& md = meshes[m.idx]; size_t n = std::min(m.nv*3, md.positions.size());
+                m.frames[f].assign(md.positions.begin(), md.positions.begin()+n); if (m.frames[f].size() < m.nv*3) m.frames[f].resize(m.nv*3, 0.f); } }
+        animate(0.f);   // rest pose -> read each node's world origin as the pivot
+        for (auto& m : ms) if (m.node < nodeWorldAnim.size()) { m.pivot[0]=nodeWorldAnim[m.node].m[12]; m.pivot[1]=nodeWorldAnim[m.node].m[13]; m.pivot[2]=nodeWorldAnim[m.node].m[14]; }
+        for (auto& m : ms) { std::vector<const float*> fr(NS+1); for (int f=0;f<=NS;f++) fr[f]=m.frames[f].data();
+            noderot::Result r = noderot::fit(fr, m.nv, m.pivot, clipDur); if (r.rotAnim) out[m.idx] = r; }
+        animate(0.f);   // leave at rest for the geometry bake
+    }
 
     // ── Per-clip frame-rate READ FROM THE COOKED DATA, not hardcoded ─────────────────────────
     // libshell pulls the rate from a NAMED "FrameRate" field (driver sub_2EAEF5C does

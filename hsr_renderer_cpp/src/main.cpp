@@ -973,6 +973,21 @@ int main(int argc, char** argv) {
                       em.hzParents=std::move(e.parents); em.hzBoneIdx=std::move(e.boneIdx); em.hzBoneWgt=std::move(e.boneWgt);
                       em.hzTrsLocal=std::move(e.trsLocal); em.hzRestPos=std::move(e.restPos); em.hzJointCount=e.jointCount; em.hzFrames=e.frameCount; em.hzFps=e.fps; }
     };
+    // ── OPA node-animation port: batch-fit every animated OPA mesh to a spin/sway and feed the SAME getTime()
+    //    Rodrigues shader path the glTF rotations use (node TRANSFORM anims are the bulk of OPA motion). ──
+    std::unordered_map<size_t, noderot::Result> g_opaRot;
+    if (isOpa && !std::getenv("HSR_NOROT")) {
+        opa.cookExtractRotations(g_opaRot);
+        fprintf(stderr, "[OPA] cook node-anim: %zu/%zu meshes -> spin/sway\n", g_opaRot.size(), opa.meshes.size());
+        editor.hzAnimExtractor = [&g_opaRot](int meshIdx, int frames, hslcook::ExportMesh& em){
+            (void)frames; auto it = g_opaRot.find((size_t)meshIdx);
+            if (it != g_opaRot.end()) { const noderot::Result& r = it->second;
+                em.rotAnim=true; em.rotOmega=r.omega; em.rotOsc=r.isOsc; em.rotAmp=r.amp; em.rotPeriod=r.period;
+                em.rotAxis[0]=r.axis[0]; em.rotAxis[1]=r.axis[1]; em.rotAxis[2]=r.axis[2];
+                em.rotPivot[0]=r.pivot[0]; em.rotPivot[1]=r.pivot[1]; em.rotPivot[2]=r.pivot[2];
+                em.vatOffsets.clear(); em.vatFrames=0; }
+        };
+    }
     if (!std::getenv("HSR_NOUI"))   // HSR_NOUI = clean capture without the editor overlay
         editor.init(&vkRenderer, g_window, &g_audio, &g_animOverride, &g_animScrub, animDur);
 
