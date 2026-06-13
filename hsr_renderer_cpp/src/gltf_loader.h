@@ -868,6 +868,10 @@ public:
         std::function<void(int,float*)> worldMat=[&](int n,float* out){ float loc[16]; trsMat(gnodes[n].t,gnodes[n].r,gnodes[n].s,loc);
             if (gnodes[n].parent>=0 && (size_t)gnodes[n].parent<gnodes.size()){ float pw[16]; worldMat(gnodes[n].parent,pw); mulMat(pw,loc,out); } else memcpy(out,loc,64); };
         float wm[16]; worldMat(rotNode, wm); pivot[0]=wm[12]; pivot[1]=wm[13]; pivot[2]=wm[14];
+        // NEGATIVE-scale (mirror) node -> composed world matrix has det<0, which visually FLIPS the rotation sense
+        // (OW Interloper scale = -22.5 -> "rotating in a diff angle"). Flip dir so the spin matches V79.
+        float det3 = wm[0]*(wm[5]*wm[10]-wm[6]*wm[9]) - wm[4]*(wm[1]*wm[10]-wm[2]*wm[9]) + wm[8]*(wm[1]*wm[6]-wm[2]*wm[5]);
+        if (det3 < 0.f) dir = -dir;
         return true;
     }
     HzAnimExport extractHzAnim(int meshIdx, int frames) {
