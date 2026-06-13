@@ -40,6 +40,7 @@ struct Editor {
     std::function<std::vector<float>(int meshIdx, int frames, int& nvOut)> vatBaker;  // bound to GltfLoader::bakeVAT (V79) — VAT animation
     std::function<void(int meshIdx, int frames, hslcook::ExportMesh& em)> hzAnimExtractor;  // bound to GltfLoader::extractHzAnim (V79) — HZANIM skeletal
     std::string exportStatus;                       // last Export APK result line (shown in the toolbar)
+    std::vector<uint8_t> bgOgg;                      // the env's raw _BACKGROUND_LOOP.ogg -> cooked as a FMOD SoundAsset
     float audioVol   = 1.0f;
     bool  audioMute  = false;
     bool  showLocal  = false;        // outliner matrix display: false=world (model), true=local/base
@@ -564,7 +565,7 @@ struct Editor {
         bool ok = false;
         float camSpawn[3] = { r->cam.pos[0], r->cam.pos[1], r->cam.pos[2] };   // spawn the player where the V79 view is
         std::vector<uint8_t> sceneZip;
-        auto apk = exportSceneAPK(ems, nuxd, vspv, fspv, true, &ok, camSpawn, &sceneZip);   // unspoofed (own package)
+        auto apk = exportSceneAPK(ems, nuxd, vspv, fspv, true, &ok, camSpawn, &sceneZip, bgOgg);   // unspoofed (own package); bgOgg = the V79 background loop
         if (!ok || apk.empty()) { exportStatus = "ERROR: cook failed (shell: " + nuxd + ")"; return; }
         auto writeF = [](const std::string& p, const std::vector<uint8_t>& b){ FILE* f=fopen(p.c_str(),"wb"); if(!f) return false; fwrite(b.data(),1,b.size(),f); fclose(f); return true; };
         if (!writeF(out, apk)) { exportStatus = "ERROR: cannot write " + out; return; }

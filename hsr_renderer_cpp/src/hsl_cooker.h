@@ -453,6 +453,20 @@ inline std::string rootEntityJson(const std::string& id) {
     return std::string("{\"id\":\"") + id + "\",\"name\":\"Root\",\"components\":[" +
         comp("TransformPlatformComponent", 1, "{}") + "],\"attributes\":[]}";
 }
+// Background music: an entity whose SoundPlatformComponent (v14) AUTO-STARTs + LOOPs a SoundAsset. The asset is the
+// V79 `_BACKGROUND_LOOP.ogg` shipped RAW (manifest type FMOD:SND -> AudioFmodSoundAssetInitializer -> FMOD
+// createSound, which auto-detects ogg — no FSB/SoundDefinition needed). IDA: field names from reflection sub_22C6D44
+// (soundAsset@16 is the only required field; loop/autoStart/playVolume are simple bool/f32). Placed at the spawn so a
+// default 3D emitter is still audible right where the player starts.
+inline std::string audioEntityJson(const std::string& id, const float pos[3], const AssetKey3& soundRef) {
+    char tb[256]; snprintf(tb,sizeof tb,
+        "{\"localPosition\":{\"x\":%g,\"y\":%g,\"z\":%g},\"localRotation\":{\"x\":0,\"y\":0,\"z\":0},\"localScale\":{\"x\":1,\"y\":1,\"z\":1}}",
+        pos[0],pos[1],pos[2]);
+    std::string snd = comp("SoundPlatformComponent", 14,
+        std::string("{\"soundAsset\":") + refJson(soundRef) + ",\"playVolume\":1,\"loop\":true,\"autoStart\":true}");
+    std::string comps = comp("TransformPlatformComponent", 1, tb) + "," + snd;
+    return std::string("{\"id\":\"") + id + "\",\"name\":\"Background Audio\",\"components\":[" + comps + "],\"attributes\":[]}";
+}
 inline std::string relChildOf(const std::string& child, const std::string& parent) {
     return std::string("{\"relationshipType\":\"RelationChildOf\",\"source\":\"") + child + "\",\"destination\":\"" + parent + "\"}";
 }
@@ -980,7 +994,8 @@ inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMe
 inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes, const std::string& nuxdApk,
                                            const std::vector<uint8_t>& vspv, const std::vector<uint8_t>& fspv,
                                            bool locomotion = true, bool* ok = nullptr, const float* camPos = nullptr,
-                                           std::vector<uint8_t>* outSceneZip = nullptr) {
+                                           std::vector<uint8_t>* outSceneZip = nullptr,
+                                           const std::vector<uint8_t>& bgOgg = {}) {
     if (ok) *ok = false;
     (void)vspv; (void)fspv;
     CookRng rng;
@@ -1394,6 +1409,16 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     float spawnPos[3] = { camPos ? camPos[0] : gx, gy + 0.1f, camPos ? camPos[2] : gz };
     entities += "," + spawnPointEntityJson(spawnId, spawnPos);
     rels += "," + relChildOf(spawnId, rootId);
+    // Background music: ship the V79 _BACKGROUND_LOOP.ogg RAW as a SoundAsset (FMOD:SND -> FMOD auto-detects ogg),
+    // auto-started + looped by a SoundPlatformComponent. The global converter: ANY env with a loose .ogg gets its theme.
+    if (!bgOgg.empty()) {
+        std::string pSnd = MH + "/audio/background.ogg/sound"; AssetKey3 sndK = keyForPath(pSnd);
+        assets.push_back({ pSnd, sndK.tgt, bgOgg, sndK, 0x444F4D46u /*"FMOD"*/, 0x20444E53u /*"SND "*/ });
+        std::string audioId = makeUuid(rng);
+        entities += "," + audioEntityJson(audioId, spawnPos, sndK);
+        rels += "," + relChildOf(audioId, rootId);
+        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[EXPORT] background audio: %zu KB ogg -> FMOD:SND SoundAsset (auto-start, loop)\n", bgOgg.size()/1024);
+    }
     fprintf(stderr, "[EXPORT] cam@(%.1f,%.1f,%.1f) navBounds=(%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f) ground@(%.1f,%.1f,%.1f) scale=%.1f spawn@(%.1f,%.1f,%.1f)\n",
             camPos?camPos[0]:0,camPos?camPos[1]:0,camPos?camPos[2]:0, smn[0],smn[1],smn[2], smx[0],smx[1],smx[2], gx,gy,gz, gs, spawnPos[0],spawnPos[1],spawnPos[2]);
     std::string pContent = MH + "/content.hstf/template", pSpace = MH + "/space.hstf/template";
