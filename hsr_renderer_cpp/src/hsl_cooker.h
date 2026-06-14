@@ -1421,17 +1421,65 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     float gy = camPos ? camPos[1] - 1.6f : smn[1];
     float ex = smx[0]-smn[0], ez = smx[2]-smn[2], ext = ex > ez ? ex : ez;
     float gs = ext > 1.f ? (ext / 12.0f) * 2.0f : 8.0f;         // BIG invisible plane (nuxd circular floor ~12.8m x2 the scene)
+    float spawnSurfY = gy;   // road/floor surface Y under the spawn (set from the heightfield) -> spawn ON it, not above
     auto phys = readFileBytes("cooker/realfloor_phys.bin");
     if (!phys.empty() && smx[0] >= smn[0]) {
         std::string pPhys = MH + "/ground.phys/phys"; AssetKey3 colliderK = keyForPath(pPhys);
         assets.push_back({ pPhys, colliderK.tgt, phys, colliderK, TYPE_PHSX, TYPE_3MSH });
-        std::string gid = makeUuid(rng); float gp[3]={gx,gy,gz}, gsc[3]={gs,1.f,gs};
-        entities += "," + colliderGroundEntityJson(gid, gp, gsc, colliderK);
-        rels += "," + relChildOf(gid, rootId);
+        int nTiles = 0; bool flatFloor = std::getenv("HSR_FLATFLOOR") != nullptr;
+        // ── SMART FLOOR (default): rasterize the scene's WALKABLE (up-facing) triangles into an XZ heightfield, then
+        //    drop one flat collider tile per occupied cell at its surface height. You walk the ACTUAL floor/road shape
+        //    (Dragon Ball Snake Way's winding road) at the right height — not a generic flat disk over the void. Gaps
+        //    (cells with no walkable geometry) get no tile, so you can't walk on air. Rooms get their floor; the disk
+        //    is the fallback when nothing walkable is found (e.g. a fully-curved env). HSR_FLATFLOOR forces the disk. ──
+        if (!flatFloor) {
+            const float planeBase = 12.8f;                          // realfloor_phys.bin plane size
+            float camY = camPos ? camPos[1] : smx[1];
+            float headY = camY + 2.0f;                              // ignore surfaces above ~head (roofs, floating planet)
+            float ex2 = smx[0]-smn[0], ez2 = smx[2]-smn[2], ext2 = ex2>ez2?ex2:ez2;
+            int N = (int)(ext2 / 6.0f); if (N < 4) N = 4; if (N > 40) N = 40;   // ~6m cells, cap 40x40 (bound tile count)
+            float cell = ext2 / (float)N; if (cell < 0.1f) cell = 0.1f;
+            std::vector<float> hf((size_t)N*N, -1e30f);             // per-cell highest walkable surface Y
+            for (const auto& m : meshesV) {
+                if (m.positions.size() < 9 || m.indices.size() < 3) continue;
+                if (m.name.find("sky")!=std::string::npos || m.name.find("Sky")!=std::string::npos) continue;
+                for (size_t t=0; t+2<m.indices.size(); t+=3) {
+                    uint32_t a=m.indices[t], b=m.indices[t+1], c=m.indices[t+2];
+                    if ((size_t)c*3+2 >= m.positions.size() || (size_t)a*3+2 >= m.positions.size() || (size_t)b*3+2 >= m.positions.size()) continue;
+                    const float* pa=&m.positions[a*3]; const float* pb=&m.positions[b*3]; const float* pc=&m.positions[c*3];
+                    float ux=pb[0]-pa[0],uy=pb[1]-pa[1],uz=pb[2]-pa[2], vx=pc[0]-pa[0],vy=pc[1]-pa[1],vz=pc[2]-pa[2];
+                    float ny=uz*vx-ux*vz; float nl=sqrtf((uy*vz-uz*vy)*(uy*vz-uz*vy)+ny*ny+(ux*vy-uy*vx)*(ux*vy-uy*vx));
+                    if (nl<1e-6f || fabsf(ny)/nl < 0.5f) continue;   // not roughly horizontal -> not walkable
+                    float cy=(pa[1]+pb[1]+pc[1])/3.f; if (cy > headY) continue;   // above head -> roof/floating, skip
+                    float tminx=fminf(pa[0],fminf(pb[0],pc[0])), tmaxx=fmaxf(pa[0],fmaxf(pb[0],pc[0]));
+                    float tminz=fminf(pa[2],fminf(pb[2],pc[2])), tmaxz=fmaxf(pa[2],fmaxf(pb[2],pc[2]));
+                    int x0=(int)((tminx-smn[0])/cell), x1=(int)((tmaxx-smn[0])/cell), z0=(int)((tminz-smn[2])/cell), z1=(int)((tmaxz-smn[2])/cell);
+                    if(x0<0)x0=0; if(z0<0)z0=0; if(x1>=N)x1=N-1; if(z1>=N)z1=N-1;
+                    for(int cz=z0;cz<=z1;cz++) for(int cx=x0;cx<=x1;cx++){ float& h=hf[(size_t)cz*N+cx]; if(cy>h) h=cy; }
+                }
+            }
+            { int scx=(int)((gx-smn[0])/cell), scz=(int)((gz-smn[2])/cell);   // spawn ON the road surface at the camera XZ
+              if (scx>=0&&scx<N&&scz>=0&&scz<N && hf[(size_t)scz*N+scx] > -1e29f) spawnSurfY = hf[(size_t)scz*N+scx]; }
+            float ts = (cell/planeBase)*1.15f;                      // tile scale (slight overlap -> no cracks between tiles)
+            for (int cz=0; cz<N; cz++) for (int cx=0; cx<N; cx++) {
+                float h=hf[(size_t)cz*N+cx]; if (h < -1e29f) continue;   // no walkable surface in this cell -> a gap, leave it
+                float tx=smn[0]+((float)cx+0.5f)*cell, tz=smn[2]+((float)cz+0.5f)*cell;
+                std::string gid=makeUuid(rng); float gp[3]={tx,h,tz}, gsc[3]={ts,1.f,ts};
+                entities += "," + colliderGroundEntityJson(gid, gp, gsc, colliderK);
+                rels += "," + relChildOf(gid, rootId); nTiles++;
+            }
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] smart floor: %d tiles (%dx%d grid, %.1fm cells)\n", nTiles, N, N, cell);
+        }
+        if (flatFloor || nTiles == 0) {   // fallback: a single flat disk at the camera foot (the old behaviour)
+            std::string gid = makeUuid(rng); float gp[3]={gx,gy,gz}, gsc[3]={gs,1.f,gs};
+            entities += "," + colliderGroundEntityJson(gid, gp, gsc, colliderK);
+            rels += "," + relChildOf(gid, rootId);
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] flat-disk floor @ (%.1f,%.1f,%.1f) ext=%.1f\n", gx,gy,gz,gs);
+        }
     }
     // spawn where the V79 camera/view is (XZ), at ground level — else the navmesh centre
     std::string spawnId = makeUuid(rng);
-    float spawnPos[3] = { camPos ? camPos[0] : gx, gy + 0.1f, camPos ? camPos[2] : gz };
+    float spawnPos[3] = { camPos ? camPos[0] : gx, spawnSurfY + 0.1f, camPos ? camPos[2] : gz };   // stand ON the detected floor/road surface
     entities += "," + spawnPointEntityJson(spawnId, spawnPos);
     rels += "," + relChildOf(spawnId, rootId);
     // Background music: ship the V79 _BACKGROUND_LOOP.ogg RAW as a SoundAsset (FMOD:SND -> FMOD auto-detects ogg),
