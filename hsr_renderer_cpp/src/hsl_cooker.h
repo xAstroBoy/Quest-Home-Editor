@@ -868,6 +868,7 @@ struct ExportMesh {
     // V79 node Y-ROTATION (Outer Wilds skybox/Interloper) -> getTime() Y-rotation shader cooker/rot_<periodms>_<p|m>.surface.
     bool rotAnim = false; float rotOmega = 0.f; float rotAxis[3] = {0,1,0}; float rotPivot[3] = {0,0,0};   // ARBITRARY-axis spin: signed rad/s about rotAxis around rotPivot (node WORLD origin; children orbit it)
     bool rotOsc = false; float rotAmp = 0.f; float rotPeriod = 0.f;   // OSCILLATION (sway): angle=(amp/2)(1-cos(2pi t/period)) about rotAxis — clips that swing out & back (Snake Way King Kai planet), NOT a spin
+    bool uvScroll = false; float uvRate[2] = {0.f, 0.f};   // mat.sanim UV-SCROLL (water/foam/waterfall) -> getTime() uv += uvRate*time shader
     // V203 NON-skeletal pose/scale animation (the FAITHFUL wisp port — IDA: ShellPoseAnimationComponent -> CoPoseAnimation,
     // ticked by AnimationSystem, NO skeleton). Lerps the entity pose start->end; for a wisp = startScale<->endScale (V79 min/max).
     bool poseAnim = false;
@@ -1156,8 +1157,9 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     && m.hzTrsLocal.size() >= (size_t)m.hzFrames*m.hzJointCount*10
                     && m.hzRestPos.size() == m.positions.size();   // centered rest positions present
         bool useRot = !useHz && m.rotAnim && ((m.rotOmega > 1e-5f || m.rotOmega < -1e-5f) || (m.rotOsc && (m.rotAmp > 0.02f || m.rotAmp < -0.02f)));   // node spin OR sway (any axis) -> getTime() Rodrigues shader
-        bool usePulse = !useHz && !useRot && m.pulse && havePulse;   // node-animated billboard -> custom getTime() pulse shader
-        bool useVat = !useHz && !useRot && !usePulse && !m.vatOffsets.empty() && m.vatFrames > 1 && haveVat && m.vatOffsets.size() >= (size_t)vc * m.vatFrames * 3;
+        bool useUvScroll = !useHz && !useRot && m.uvScroll && (m.uvRate[0]!=0.f || m.uvRate[1]!=0.f);   // mat.sanim UV scroll (water/foam) -> getTime() uv-translate shader
+        bool usePulse = !useHz && !useRot && !useUvScroll && m.pulse && havePulse;   // node-animated billboard -> custom getTime() pulse shader
+        bool useVat = !useHz && !useRot && !useUvScroll && !usePulse && !m.vatOffsets.empty() && m.vatFrames > 1 && haveVat && m.vatOffsets.size() >= (size_t)vc * m.vatFrames * 3;
         std::vector<uint8_t> vatTex; AssetKey3 vatTexK;
         if (useVat) { vatTex = encodeVatTexture(m.vatOffsets, vc, m.vatFrames); if (vatTex.empty()) useVat = false; }
         std::vector<uint8_t> matl; std::string animatorComp;
@@ -1259,6 +1261,29 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);                  // base tex
             if (std::getenv("HSR_VERBOSE")) { if (m.rotOsc) fprintf(stderr, "[COOK] m%03zu '%s' SWAY amp=%+.0fdeg period=%.1fs axis=(%.2f,%.2f,%.2f) dir=%s %s %s\n", i, m.name.c_str(), m.rotAmp*57.2958f, m.rotPeriod, m.rotAxis[0],m.rotAxis[1],m.rotAxis[2], m.rotAmp>=0?"+":"-", rblend ? "BLEND" : "opaque", rotK.ing ? "" : "(MISSING -> static)");
                 else fprintf(stderr, "[COOK] m%03zu '%s' SPIN %.1fs axis=(%.2f,%.2f,%.2f) dir=%s(%+.4f rad/s) %s %s\n", i, m.name.c_str(), 6.2831853f/(m.rotOmega<0?-m.rotOmega:m.rotOmega), m.rotAxis[0],m.rotAxis[1],m.rotAxis[2], m.rotOmega>=0?"CCW":"CW", m.rotOmega, rblend ? "BLEND" : "opaque", rotK.ing ? "" : "(MISSING -> static)"); }
+        } else if (useUvScroll) {
+            // mat.sanim UV-SCROLL (water/foam/waterfall): a getTime() uv += rate*time shader, generated on demand per
+            // (rate,blend) — the global converter. Cooked geometry is unchanged; only the sampled UV scrolls.
+            bool ublend = m.blend && haveBlend;
+            long ru=(long)(m.uvRate[0]*100000), rv=(long)(m.uvRate[1]*100000);
+            uint32_t h = (uint32_t)(0x9E3779B9u*(uint32_t)ru ^ 0xC2B2AE35u*(uint32_t)rv ^ (ublend?0x68bc21ebu:0u));
+            char ufn[160]; snprintf(ufn, sizeof ufn, "cooker/uvscroll_%08x%s.surface.bin", h, ublend ? "_b" : "");
+            AssetKey3 uvK{};
+            auto it = rotShaders.find(ufn);
+            if (it != rotShaders.end()) uvK = it->second;
+            else {
+                auto ubytes = readFileBytes(ufn);
+                if (ubytes.empty()) {
+                    char cmd[400]; snprintf(cmd, sizeof cmd, "python cooker/make_uvscroll_shader.py %.6f %.6f cooker/%s %s",
+                        m.uvRate[0], m.uvRate[1], ublend ? "nuxd_unlitblend_shader.bin" : "nuxd_unlit_shader.bin", ufn);
+                    int rc = system(cmd); (void)rc; ubytes = readFileBytes(ufn);
+                }
+                if (!ubytes.empty()) { char up[160]; snprintf(up, sizeof up, "%s/shaders/uvscroll_%08x%s.surface/shader", MH.c_str(), h, ublend ? "_b" : "");
+                    uvK = keyForPath(up); assets.push_back({ up, uvK.tgt, ubytes, uvK }); rotShaders[ufn] = uvK; } }
+            matl = ublend ? matBlend : matTpl;
+            if (uvK.ing) { memcpy(matl.data() + 48, &uvK.pkg, 8); memcpy(matl.data() + 56, &uvK.ing, 8); }   // field7 -> uvscroll shader
+            memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);                  // base tex
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' UVSCROLL rate=(%.3f,%.3f)/s %s %s\n", i, m.name.c_str(), m.uvRate[0], m.uvRate[1], ublend ? "BLEND" : "opaque", uvK.ing ? "" : "(MISSING -> static)");
         } else if (useVat) {
             std::string pVatTex = std::string(base) + ".vat.tex/tex"; vatTexK = keyForPath(pVatTex);
             matl = matVat;

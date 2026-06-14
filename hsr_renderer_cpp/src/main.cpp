@@ -976,16 +976,20 @@ int main(int argc, char** argv) {
     // ── OPA node-animation port: batch-fit every animated OPA mesh to a spin/sway and feed the SAME getTime()
     //    Rodrigues shader path the glTF rotations use (node TRANSFORM anims are the bulk of OPA motion). ──
     std::unordered_map<size_t, noderot::Result> g_opaRot;
+    std::unordered_map<size_t, std::pair<float,float>> g_opaUv;
     if (isOpa && !std::getenv("HSR_NOROT")) {
         opa.cookExtractRotations(g_opaRot);
-        fprintf(stderr, "[OPA] cook node-anim: %zu/%zu meshes -> spin/sway\n", g_opaRot.size(), opa.meshes.size());
-        editor.hzAnimExtractor = [&g_opaRot](int meshIdx, int frames, hslcook::ExportMesh& em){
+        opa.cookExtractUVScroll(g_opaUv);   // mat.sanim water/foam UV scrolls
+        fprintf(stderr, "[OPA] cook anim: %zu spin/sway + %zu uv-scroll (of %zu meshes)\n", g_opaRot.size(), g_opaUv.size(), opa.meshes.size());
+        editor.hzAnimExtractor = [&g_opaRot,&g_opaUv](int meshIdx, int frames, hslcook::ExportMesh& em){
             (void)frames; auto it = g_opaRot.find((size_t)meshIdx);
             if (it != g_opaRot.end()) { const noderot::Result& r = it->second;
                 em.rotAnim=true; em.rotOmega=r.omega; em.rotOsc=r.isOsc; em.rotAmp=r.amp; em.rotPeriod=r.period;
                 em.rotAxis[0]=r.axis[0]; em.rotAxis[1]=r.axis[1]; em.rotAxis[2]=r.axis[2];
                 em.rotPivot[0]=r.pivot[0]; em.rotPivot[1]=r.pivot[1]; em.rotPivot[2]=r.pivot[2];
                 em.vatOffsets.clear(); em.vatFrames=0; }
+            auto uit = g_opaUv.find((size_t)meshIdx);   // UV scroll (cooker prioritizes rotation over scroll if both)
+            if (uit != g_opaUv.end()) { em.uvScroll=true; em.uvRate[0]=uit->second.first; em.uvRate[1]=uit->second.second; }
         };
     }
     if (!std::getenv("HSR_NOUI"))   // HSR_NOUI = clean capture without the editor overlay
