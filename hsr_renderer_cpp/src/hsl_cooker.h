@@ -1436,10 +1436,10 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             const float planeBase = 12.8f;                          // realfloor_phys.bin plane size
             float camY = camPos ? camPos[1] : smx[1];
             float headY = camY + 2.0f;                              // ignore surfaces above ~head (roofs, floating planet)
-            float ex2 = smx[0]-smn[0], ez2 = smx[2]-smn[2], ext2 = ex2>ez2?ex2:ez2;
-            int N = (int)(ext2 / 6.0f); if (N < 4) N = 4; if (N > 40) N = 40;   // ~6m cells, cap 40x40 (bound tile count)
-            float cell = ext2 / (float)N; if (cell < 0.1f) cell = 0.1f;
-            std::vector<float> hf((size_t)N*N, -1e30f);             // per-cell highest walkable surface Y
+            // PASS 1: collect the WALKABLE triangles + their own XZ bounds (the road footprint). Gridding THAT instead
+            // of the inflated whole-scene nav bounds gives far finer cells that hug the road, not a coarse disk.
+            struct WT { float pa[3],pb[3],pc[3]; };
+            std::vector<WT> wt; float wmnx=1e30f,wmnz=1e30f,wmxx=-1e30f,wmxz=-1e30f;
             for (const auto& m : meshesV) {
                 if (m.positions.size() < 9 || m.indices.size() < 3) continue;
                 if (m.name.find("sky")!=std::string::npos || m.name.find("Sky")!=std::string::npos) continue;
@@ -1451,24 +1451,37 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     float ny=uz*vx-ux*vz; float nl=sqrtf((uy*vz-uz*vy)*(uy*vz-uz*vy)+ny*ny+(ux*vy-uy*vx)*(ux*vy-uy*vx));
                     if (nl<1e-6f || fabsf(ny)/nl < 0.5f) continue;   // not roughly horizontal -> not walkable
                     float cy=(pa[1]+pb[1]+pc[1])/3.f; if (cy > headY) continue;   // above head -> roof/floating, skip
-                    float tminx=fminf(pa[0],fminf(pb[0],pc[0])), tmaxx=fmaxf(pa[0],fmaxf(pb[0],pc[0]));
-                    float tminz=fminf(pa[2],fminf(pb[2],pc[2])), tmaxz=fmaxf(pa[2],fmaxf(pb[2],pc[2]));
-                    int x0=(int)((tminx-smn[0])/cell), x1=(int)((tmaxx-smn[0])/cell), z0=(int)((tminz-smn[2])/cell), z1=(int)((tmaxz-smn[2])/cell);
-                    if(x0<0)x0=0; if(z0<0)z0=0; if(x1>=N)x1=N-1; if(z1>=N)z1=N-1;
-                    for(int cz=z0;cz<=z1;cz++) for(int cx=x0;cx<=x1;cx++){ float& h=hf[(size_t)cz*N+cx]; if(cy>h) h=cy; }
+                    WT w; for(int k=0;k<3;k++){w.pa[k]=pa[k];w.pb[k]=pb[k];w.pc[k]=pc[k];} wt.push_back(w);
+                    for (const float* p : {pa,pb,pc}){ if(p[0]<wmnx)wmnx=p[0]; if(p[0]>wmxx)wmxx=p[0]; if(p[2]<wmnz)wmnz=p[2]; if(p[2]>wmxz)wmxz=p[2]; }
                 }
             }
-            { int scx=(int)((gx-smn[0])/cell), scz=(int)((gz-smn[2])/cell);   // spawn ON the road surface at the camera XZ
+            if (wt.empty() || wmxx<=wmnx || wmxz<=wmnz) goto floorFallback;
+            {
+            float ex2=wmxx-wmnx, ez2=wmxz-wmnz, ext2=ex2>ez2?ex2:ez2;
+            int N=(int)(ext2/3.0f); if(N<4)N=4; if(N>26)N=26;   // grid the ROAD footprint; cap 26x26 -> each tile = the 4608-tri plane, so keep the TOTAL collider-triangle budget sane on-device
+            float cell=ext2/(float)N; if(cell<0.1f)cell=0.1f;
+            std::vector<float> hf((size_t)N*N, -1e30f);            // per-cell highest walkable surface Y
+            for (const WT& w : wt) {
+                float cy=(w.pa[1]+w.pb[1]+w.pc[1])/3.f;
+                float tminx=fminf(w.pa[0],fminf(w.pb[0],w.pc[0])), tmaxx=fmaxf(w.pa[0],fmaxf(w.pb[0],w.pc[0]));
+                float tminz=fminf(w.pa[2],fminf(w.pb[2],w.pc[2])), tmaxz=fmaxf(w.pa[2],fmaxf(w.pb[2],w.pc[2]));
+                int x0=(int)((tminx-wmnx)/cell), x1=(int)((tmaxx-wmnx)/cell), z0=(int)((tminz-wmnz)/cell), z1=(int)((tmaxz-wmnz)/cell);
+                if(x0<0)x0=0; if(z0<0)z0=0; if(x1>=N)x1=N-1; if(z1>=N)z1=N-1;
+                for(int cz=z0;cz<=z1;cz++) for(int cx=x0;cx<=x1;cx++){ float& h=hf[(size_t)cz*N+cx]; if(cy>h) h=cy; }
+            }
+            { int scx=(int)((gx-wmnx)/cell), scz=(int)((gz-wmnz)/cell);   // spawn ON the road surface at the camera XZ
               if (scx>=0&&scx<N&&scz>=0&&scz<N && hf[(size_t)scz*N+scx] > -1e29f) spawnSurfY = hf[(size_t)scz*N+scx]; }
             float ts = (cell/planeBase)*1.15f;                      // tile scale (slight overlap -> no cracks between tiles)
             for (int cz=0; cz<N; cz++) for (int cx=0; cx<N; cx++) {
                 float h=hf[(size_t)cz*N+cx]; if (h < -1e29f) continue;   // no walkable surface in this cell -> a gap, leave it
-                float tx=smn[0]+((float)cx+0.5f)*cell, tz=smn[2]+((float)cz+0.5f)*cell;
+                float tx=wmnx+((float)cx+0.5f)*cell, tz=wmnz+((float)cz+0.5f)*cell;
                 std::string gid=makeUuid(rng); float gp[3]={tx,h,tz}, gsc[3]={ts,1.f,ts};
                 entities += "," + colliderGroundEntityJson(gid, gp, gsc, colliderK);
                 rels += "," + relChildOf(gid, rootId); nTiles++;
             }
-            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] smart floor: %d tiles (%dx%d grid, %.1fm cells)\n", nTiles, N, N, cell);
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] smart floor: %d tiles (%dx%d grid, %.1fm cells, footprint %.0fx%.0fm)\n", nTiles, N, N, cell, ex2, ez2);
+            }
+            floorFallback: ;
         }
         if (flatFloor || nTiles == 0) {   // fallback: a single flat disk at the camera foot (the old behaviour)
             std::string gid = makeUuid(rng); float gp[3]={gx,gy,gz}, gsc[3]={gs,1.f,gs};
