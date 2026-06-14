@@ -321,22 +321,69 @@ public:
         out.clear();
         if (animRecs.empty() || animMaxFrames < 2) return;
         float clipDur = animDuration(); if (clipDur <= 0.f) return;
-        struct M { size_t idx; size_t nv; uint32_t node; float pivot[3]; std::vector<std::vector<float>> frames; };
-        std::vector<M> ms; std::unordered_map<size_t,int> idxOf;
-        size_t totalV = 0;
-        for (auto& ar : animRecs) { size_t nv = ar.basePos.size()/3; if (nv < 3) continue; if (idxOf.count(ar.meshIdx)) continue;
-            idxOf[ar.meshIdx] = (int)ms.size(); M m; m.idx=ar.meshIdx; m.nv=nv; m.node=ar.nodeIdx; ms.push_back(std::move(m)); totalV += nv; }
-        if (ms.empty()) return;
-        int NS = 32; if (totalV) { long budget = 90000000L / (long)(totalV*3); if (budget < NS) NS = (int)budget; } if (NS < 8) NS = 8;   // bound memory (~1GB worst case)
-        for (auto& m : ms) m.frames.resize(NS+1);
-        for (int f=0; f<=NS; f++) { animate(clipDur * (float)f / (float)NS);
-            for (auto& m : ms) { const MeshData& md = meshes[m.idx]; size_t n = std::min(m.nv*3, md.positions.size());
-                m.frames[f].assign(md.positions.begin(), md.positions.begin()+n); if (m.frames[f].size() < m.nv*3) m.frames[f].resize(m.nv*3, 0.f); } }
-        animate(0.f);   // rest pose -> read each node's world origin as the pivot
+        const int NS = 24;
+        const size_t budget = 48000000;                  // ≤ ~190MB of position floats in flight at once (no swap/softlock)
+        const size_t maxNv  = budget / ((size_t)(NS+1)*3);   // a single mesh bigger than this cooks static (huge meshes aren't the spinning ones)
+        struct M { size_t idx; size_t nv; uint32_t node; const std::vector<float>* base; float pivot[3]; };
+        std::vector<M> ms; std::unordered_map<size_t,int> seen;
+        for (auto& ar : animRecs) { size_t nv = ar.basePos.size()/3; if (nv < 3 || nv > maxNv) continue; if (seen.count(ar.meshIdx)) continue;
+            seen[ar.meshIdx]=1; ms.push_back({ar.meshIdx, nv, ar.nodeIdx, &ar.basePos, {0,0,0}}); }
+        if (ms.empty()) { animate(0.f); return; }
+        evalAnimNodes(0.f);   // rest pose -> each node's world origin = its pivot
         for (auto& m : ms) if (m.node < nodeWorldAnim.size()) { m.pivot[0]=nodeWorldAnim[m.node].m[12]; m.pivot[1]=nodeWorldAnim[m.node].m[13]; m.pivot[2]=nodeWorldAnim[m.node].m[14]; }
-        for (auto& m : ms) { std::vector<const float*> fr(NS+1); for (int f=0;f<=NS;f++) fr[f]=m.frames[f].data();
-            noderot::Result r = noderot::fit(fr, m.nv, m.pivot, clipDur); if (r.rotAnim) out[m.idx] = r; }
-        animate(0.f);   // leave at rest for the geometry bake
+        // MEMORY-BOUNDED chunks: sample NS frames for a chunk of meshes (node-only eval), fit, free, repeat.
+        size_t i0 = 0;
+        while (i0 < ms.size()) {
+            size_t i1 = i0, cv = 0;
+            while (i1 < ms.size() && (cv + ms[i1].nv) * (size_t)(NS+1) * 3 <= budget) { cv += ms[i1].nv; ++i1; }
+            if (i1 == i0) i1 = i0 + 1;
+            std::vector<std::vector<std::vector<float>>> fr(i1 - i0);
+            for (size_t k=i0;k<i1;k++) fr[k-i0].resize(NS+1);
+            for (int f=0; f<=NS; f++) { evalAnimNodes(clipDur * (float)f / (float)NS);
+                for (size_t k=i0;k<i1;k++){ M& m=ms[k]; auto& F=fr[k-i0][f]; F.resize(m.nv*3); Mat4 w=(m.node<nodeWorldAnim.size())?nodeWorldAnim[m.node]:identity();
+                    for (size_t v=0; v<m.nv; v++){ float o[3]; xform(w,(*m.base)[v*3],(*m.base)[v*3+1],(*m.base)[v*3+2],o); F[v*3]=o[0];F[v*3+1]=o[1];F[v*3+2]=o[2]; } } }
+            for (size_t k=i0;k<i1;k++){ M& m=ms[k]; std::vector<const float*> fp(NS+1); for (int f=0;f<=NS;f++) fp[f]=fr[k-i0][f].data();
+                noderot::Result r = noderot::fit(fp, m.nv, m.pivot, clipDur); if (r.rotAnim) out[m.idx] = r; }
+            i0 = i1;
+        }
+        animate(0.f);   // FULL restore (skinning/UV too) -> leave every mesh at rest for the geometry bake
+    }
+
+    // ── COOK: mat.sanim UV-SCROLL port. A UVTrack is a per-frame 2x3 affine [a,b,c,d,e,f]; a continuous SCROLL
+    //    (water/foam/waterfall) keeps the 2x2 ~ identity and TRANSLATES (c,f). Derive the VISIBLE scroll rate the
+    //    same way animate() plays it (net UV travel over min(clipLen, HSR_MATLOOP=5s)) -> uvRate (UV/s) for a
+    //    getTime() uv += rate*time shader. Flipbook atlases (2x2 = cell scale) are a separate pass -> skipped. ──
+    void cookExtractUVScroll(std::unordered_map<size_t, std::pair<float,float>>& out) {
+        out.clear();
+        if (uvAnimRecs.empty() || animFps <= 0.f) return;
+        float matLoopMax = 5.0f; if (const char* e = std::getenv("HSR_MATLOOP")) matLoopMax = (float)atof(e);
+        for (auto& ur : uvAnimRecs) {
+            if (out.count(ur.meshIdx)) continue;
+            auto it = matUVAnim.find(ur.node);
+            if (it == matUVAnim.end() || it->second.nFrames < 2) continue;
+            const UVTrack& tr = it->second; const float* M0 = tr.m.data();
+            float a=M0[0], b=M0[1], dd=M0[3], e=M0[4];
+            if (std::fabs(a-1.f)>0.05f || std::fabs(e-1.f)>0.05f || std::fabs(b)>0.05f || std::fabs(dd)>0.05f) continue;  // flipbook atlas, not a scroll
+            // AVERAGE per-frame delta from a CAPPED window (water tracks are uniform; iterating 10k+ frames softlocks),
+            // then scale to the full track length.
+            int win = tr.nFrames - 1; if (win > 256) win = 256;
+            double sdu=0, sdv=0; int n=0;
+            for (int f=0; f<win; f++) {
+                float dc = tr.m[(size_t)(f+1)*6+2] - tr.m[(size_t)f*6+2];
+                float df = tr.m[(size_t)(f+1)*6+5] - tr.m[(size_t)f*6+5];
+                if (std::fabs(dc)>0.5f || std::fabs(df)>0.5f) continue;   // skip wrap jumps
+                sdu += dc; sdv += df; ++n;
+            }
+            if (n < 1) continue;
+            double totalU = (sdu/n) * (double)(tr.nFrames-1), totalV = (sdv/n) * (double)(tr.nFrames-1);
+            float loopSec = (float)tr.nFrames / animFps; if (matLoopMax > 0.f && loopSec > matLoopMax) loopSec = matLoopMax;
+            if (loopSec < 1e-3f) continue;
+            float ru = (float)(totalU/loopSec), rv = (float)(totalV/loopSec);
+            float sp = std::sqrt(ru*ru+rv*rv);
+            if (sp < 1e-3f) continue;
+            if (sp > 0.5f) { ru *= 0.5f/sp; rv *= 0.5f/sp; }    // clamp to a watery max so dense tracks don't blur
+            out[ur.meshIdx] = std::make_pair(ru, rv);
+        }
     }
 
     // ── Per-clip frame-rate READ FROM THE COOKED DATA, not hardcoded ─────────────────────────
@@ -356,6 +403,32 @@ public:
             if (f > 0.5f && f < 480.0f) return f;       // sane fps only
         }
         return -1.0f;
+    }
+
+    // Evaluate ONLY the animated node hierarchy at time t -> nodeWorldAnim (NO mesh deform, NO skinning/UV/tint).
+    // The cook rotation sampler calls this per frame instead of the full animate() (which skins/UV-transforms EVERY
+    // mesh -> far too slow over 33 frames on a big env like lakesidepeak).
+    void evalAnimNodes(float t) {
+        nodeWorldAnim.resize(animNodes.size());
+        for (size_t i = 0; i < animNodes.size(); ++i) {
+            const Node& nd = animNodes[i];
+            float T[3]={nd.t[0],nd.t[1],nd.t[2]};
+            float R[4]={nd.r[0],nd.r[1],nd.r[2],nd.r[3]};  // static R already (x,y,z,w)
+            float S[3]={nd.s[0],nd.s[1],nd.s[2]};
+            auto it = nodeAnim.find(nd.name);
+            if (it != nodeAnim.end()) {
+                const NodeTracks& nt = it->second;
+                sampleTrack(nt.t, t, animFps, 3, T);
+                sampleTrack(nt.r, t, animFps, 4, R);
+                sampleTrack(nt.s, t, animFps, 3, S);
+                if (nt.r.nFrames > 0) { float qw=R[0],qx=R[1],qy=R[2],qz=R[3]; R[0]=qx; R[1]=qy; R[2]=qz; R[3]=qw; }
+                float ql = sqrtf(R[0]*R[0]+R[1]*R[1]+R[2]*R[2]+R[3]*R[3]);
+                if (ql > 1e-6f) { R[0]/=ql; R[1]/=ql; R[2]/=ql; R[3]/=ql; } else { R[0]=R[1]=R[2]=0; R[3]=1; }
+            }
+            Mat4 local = trs(T, R, S);
+            int par = nd.parent;
+            nodeWorldAnim[i] = (par >= 0 && par < (int)i) ? mul(nodeWorldAnim[par], local) : local;
+        }
     }
 
     static void sampleTrack(const Track& tr, float t, float fps, int comps, float* out) {
@@ -378,32 +451,7 @@ public:
         //    node is keyed, else the node's STATIC local transform. This makes a mesh move when ANY
         //    ANCESTOR is animated (e.g. the bird mesh under the animated `birdBody_path` node) — not
         //    only when its own node is keyed. (Nodes are stored parent-before-child, so one pass.)
-        if (!animRecs.empty()) {
-            nodeWorldAnim.resize(animNodes.size());
-            for (size_t i = 0; i < animNodes.size(); ++i) {
-                const Node& nd = animNodes[i];
-                float T[3]={nd.t[0],nd.t[1],nd.t[2]};
-                float R[4]={nd.r[0],nd.r[1],nd.r[2],nd.r[3]};  // static R already (x,y,z,w)
-                float S[3]={nd.s[0],nd.s[1],nd.s[2]};
-                auto it = nodeAnim.find(nd.name);
-                if (it != nodeAnim.end()) {
-                    const NodeTracks& nt = it->second;
-                    // sanim only supplies SOME channels (a fan has Rotation only) — unkeyed channels
-                    // keep the static value (else the fan loses its elevation and drops to the floor).
-                    sampleTrack(nt.t, t, animFps, 3, T);
-                    sampleTrack(nt.r, t, animFps, 4, R);
-                    sampleTrack(nt.s, t, animFps, 3, S);
-                    // sanim Rotation quats are W-FIRST (w,x,y,z); trs() wants (x,y,z,w). Reorder ONLY
-                    // when a real rotation track was sampled (else the static x,y,z,w would corrupt).
-                    if (nt.r.nFrames > 0) { float qw=R[0],qx=R[1],qy=R[2],qz=R[3]; R[0]=qx; R[1]=qy; R[2]=qz; R[3]=qw; }
-                    float ql = sqrtf(R[0]*R[0]+R[1]*R[1]+R[2]*R[2]+R[3]*R[3]);
-                    if (ql > 1e-6f) { R[0]/=ql; R[1]/=ql; R[2]/=ql; R[3]/=ql; } else { R[0]=R[1]=R[2]=0; R[3]=1; }
-                }
-                Mat4 local = trs(T, R, S);
-                int par = nd.parent;
-                nodeWorldAnim[i] = (par >= 0 && par < (int)i) ? mul(nodeWorldAnim[par], local) : local;
-            }
-        }
+        if (!animRecs.empty()) evalAnimNodes(t);   // node hierarchy -> nodeWorldAnim (shared with the cook sampler)
         for (auto& ar : animRecs) {
             Mat4 m = (ar.nodeIdx < nodeWorldAnim.size()) ? nodeWorldAnim[ar.nodeIdx] : identity();
             MeshData& md = meshes[ar.meshIdx];
