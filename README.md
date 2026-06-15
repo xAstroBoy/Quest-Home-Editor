@@ -81,6 +81,19 @@ hsr_renderer.exe <env.apk | env.gltf.ovrscene>
 
 Drag-and-drop an environment onto the window, or pass it on the command line.
 
+### Sign a cooked APK
+
+If a shared/cooked home won't install — `INSTALL_PARSE_FAILED_NO_CERTIFICATES` ("Failed to collect
+certificate") — it's **unsigned**. Sign it (no re-cook needed):
+
+```
+hsr_renderer.exe --sign home.apk [more.apk ...]
+```
+
+→ writes `home_signed.apk`, then `adb install home_signed.apk`. Needs a JDK on `PATH` (`apksigner` /
+`keytool`); the Android build-tools are auto-detected (or drop `apksigner` + `zipalign` beside the exe).
+Freshly cooked APKs are already signed automatically — this is only for older/shared unsigned ones.
+
 ## Layout
 
 | Path | What |

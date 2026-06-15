@@ -317,6 +317,25 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    // ── standalone APK signer: `hsr_renderer --sign <foo.apk> [more.apk ...]` ──────────────────────────────
+    // Signs an ALREADY-BUILT APK (e.g. a shared/unsigned cooked home someone sent you) in place -> <name>_signed.apk,
+    // so it installs without INSTALL_PARSE_FAILED_NO_CERTIFICATES. NO re-cook needed. Same auto-detected build-tools +
+    // auto-generated debug keystore as the cooker (drop apksigner+zipalign beside the exe if you have no Android SDK).
+    if (argc >= 2 && (std::string(argv[1]) == "--sign" || std::string(argv[1]) == "-s")) {
+        if (argc < 3) { fprintf(stderr, "usage: hsr_renderer --sign <apk> [more.apk ...]\n"); return 2; }
+        int fails = 0;
+        for (int i = 2; i < argc; ++i) {
+            std::string in = argv[i];
+            std::string out = (in.size() > 4 && in.substr(in.size() - 4) == ".apk")
+                                ? in.substr(0, in.size() - 4) + "_signed.apk" : in + "_signed.apk";
+            fprintf(stderr, "\n[SIGN] %s\n", in.c_str());
+            bool ok = hslcook::signApk(in, out, [](float f, const char* s){ fprintf(stderr, "  [%3d%%] %s\n", (int)(f * 100.f), s); });
+            if (ok) fprintf(stderr, "[SIGN]  OK -> %s\n", out.c_str());
+            else  { fprintf(stderr, "[SIGN]  FAILED: %s\n", in.c_str()); ++fails; }
+        }
+        return fails ? 1 : 0;
+    }
+
     std::string apkPath;
     if (argc >= 2) {
         apkPath = argv[1];
