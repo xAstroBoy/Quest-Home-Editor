@@ -15,8 +15,8 @@ environment into an APK you can install on a current Quest 2 / 3 / Pro.
 2. Plug in the Quest over USB, accept the **"Allow USB debugging"** prompt in the headset.
 3. Drag the old home (`env.apk` / `.gltf.ovrscene`) onto `hsr_renderer.exe`.
 4. Open the **Cook** tab → leave the defaults → press **`COOK + SIGN + INSTALL`**.
-5. Put the headset on. If the home didn't change automatically, open the **Home/Environment picker**
-   and select **"Haven 2025"** — that slot is now your ported home.
+5. Put the headset on — your env loads **in place of Haven 2025** (the tool relaunches the shell for you).
+   An unrooted Quest **can't switch to a custom environment**, so the spoof *becomes* Haven 2025 instead.
 
 That's it. The tool cooks, signs, picks the correct APK for your device, and installs it.
 
@@ -66,17 +66,21 @@ A cook produces up to **two** APKs, written **next to the loaded environment**:
 
 | File | Package | Install on… | How it loads |
 | --- | --- | --- | --- |
-| **`<env>_NoRoot-Spoof.apk`** | masquerades as `…haven2025` | **any** Quest (no root) | replaces the **Haven 2025** home; you pick "Haven 2025" in the menu |
+| **`<env>_NoRoot-Spoof.apk`** | masquerades as `…haven2025` | **any** Quest (no root) | **replaces** the Haven 2025 home in place; loads after the shell relaunches |
 | **`<env>_Rooted-System.apk`** | the env's own package | **rooted / dev** headsets only | auto-selected via `adb` (`oculuspreferences`) — needs root |
+
+**Why a spoof at all?** An unrooted Quest **can't switch to a custom home environment** — only Meta's
+built-in ones, and only *root* can point the shell at an arbitrary env. The spoof gets around this by
+**taking over the built-in Haven 2025 home**: it installs *as* Haven 2025, so the home the shell already
+loads becomes your ported env. **There is nothing to "switch" to — and on an unrooted headset you can't.**
 
 **Which one do I use?**
 
-- **Normal retail Quest (not rooted): use the `NoRoot-Spoof` APK.** It is the only one that can be
-  loaded without root, because it takes over the existing **Haven 2025** home slot (which the system
-  already lists in the home picker). After installing it, open the **Home/Environment picker** and
-  choose **"Haven 2025"**.
-- **Rooted / userdebug headset: the `Rooted-System` APK** keeps your env under its own package name
-  and is auto-selected for you.
+- **Normal retail Quest (not rooted): the `NoRoot-Spoof` APK.** The only one loadable without root. It
+  replaces Haven 2025 in place; after install the tool relaunches the shell and your env loads where
+  Haven 2025 was.
+- **Rooted / userdebug headset: the `Rooted-System` APK** keeps your env under its own package name and
+  is auto-selected for you (root can point the shell at any env).
 
 **You normally don't choose manually** — the auto-installer does it for you (next section).
 
@@ -119,7 +123,8 @@ If you turn off auto-install (or want to install a file someone sent you):
 adb install -r -d <env>_NoRoot-Spoof.apk
 adb shell kill $(adb shell pidof com.oculus.vrshell)    # relaunch the shell so it reloads
 ```
-Then pick **"Haven 2025"** in the headset's home menu.
+Your env now loads **in place of Haven 2025** after the relaunch — there's no env to switch to (an
+unrooted Quest can't). If you don't see it, make sure **Haven 2025** is your selected home environment.
 
 **Signing a file that won't install** (`INSTALL_PARSE_FAILED_NO_CERTIFICATES` = it's unsigned):
 ```
@@ -154,8 +159,9 @@ adb shell kill $(adb shell pidof com.oculus.vrshell)
 **I still see the default foggy / blue home, not my env.**
 The cook didn't get loaded — the shell fell back to its default. Checklist:
 - Did you install the **`NoRoot-Spoof`** APK (not the `Rooted-System` one) on a non-rooted Quest?
-- After install, did you **pick "Haven 2025"** in the Home/Environment picker?
-- Did the shell relaunch? Re-pick the home, or kill `com.oculus.vrshell` (see §5), or sleep/wake the headset.
+- Is **Haven 2025** your headset's selected home environment? The spoof replaces it **in place**, so your
+  env only appears where Haven 2025 would. (You don't switch to a custom env — an unrooted Quest can't.)
+- Did the shell relaunch? Kill `com.oculus.vrshell` (see §5) or sleep/wake the headset to force a reload.
 - Was the install actually accepted? Re-run with the headset connected and read the status line; a
   `spoof install FAILED` means Haven 2025 is a non-removable system app on your device (use the rooted path).
 
