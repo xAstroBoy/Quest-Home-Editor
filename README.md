@@ -42,13 +42,36 @@ Do not expect a polished result. Bugs, crashes, and visual errors are expected.
 
 ## Building
 
-Requires a C++17 toolchain, the Vulkan SDK, and Ninja. From `hsr_renderer_cpp/`:
+The vendored deps are bundled (Vulkan headers, volk, miniz, miniaudio, stb, ACL/RTM);
+GLFW + astc-encoder are fetched by CMake. **PhysX is off by default** (the cooker uses the
+device-compatible ColliderBox grid, not the incompatible cooked trimesh), so the build is
+dependency-light and **cross-platform**. Vulkan is loaded at runtime via volk — no SDK needed.
 
+### Windows
+MSVC (C++17) + Ninja. From `hsr_renderer_cpp/`:
 ```
-python build.py
+python build.py          # or: build.bat
+```
+→ `hsr_renderer_cpp/build/hsr_renderer.exe`.
+
+### Linux
+```
+sudo apt-get install -y cmake ninja-build libvulkan-dev \
+  libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libwayland-dev libxkbcommon-dev
+cmake -S hsr_renderer_cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target hsr_renderer
 ```
 
-The renderer is written to `hsr_renderer_cpp/build/hsr_renderer.exe`.
+### macOS
+Install MoltenVK first (`brew install molten-vk vulkan-loader vulkan-headers ninja`), then the
+same two CMake commands as Linux.
+
+> The UI loads `third_party/fonts/InterVariable.ttf` at runtime — keep it next to the binary on
+> Linux/macOS (the Windows Segoe/Arial fallbacks don't exist there).
+
+**Prebuilt binaries:** see [Releases](../../releases). `.github/workflows/release.yml` builds all
+three platforms on a `v*` tag — it's committed but **dormant** (GitHub Actions isn't enabled on
+this repo); enable Actions or fork to use it.
 
 ## Usage
 

@@ -53,3 +53,5 @@ cooker/ow/
 cooker/realfloor/
 cooker/debug.keystore
 hsr_renderer_cpp/third_party/physx/
+hsr_renderer_cpp/third_party/fonts/SegoeUI.ttf
+hsr_renderer_cpp/third_party/fonts/Consola.ttf

@@ -2,6 +2,13 @@
 // The ONE TU that includes PhysX. cookNavmeshSEBD(): cookTriangleMesh(BVH33) -> PxTriangleMesh -> PxCollection ->
 // serializeCollectionToBinary -> the exact `SEBD`+GUID 77E92B17... bytes (platform tag patched to ANDR for Quest).
 #include "cook/physx_navmesh.h"
+
+// PhysX is OPTIONAL (-DHSR_HAVE_PHYSX=ON + the vendored Windows PhysX libs). It is OFF by default because the cooked
+// PhysX SEBD trimesh is binary-incompatible with the device's PhysX (crashes its BVH33 narrow-phase); the real,
+// device-proven walkable collision is the ColliderBox grid (navmeshToBoxes / navmeshTrisToBoxes), which needs NO
+// cooked data. With PhysX off, cookNavmeshSEBD() returns {} and every caller already falls back to ColliderBox.
+// Keeping it off makes the whole build PhysX-free → it compiles on Linux/macOS, not just Windows.
+#ifdef HSR_HAVE_PHYSX
 #include "PxPhysicsAPI.h"
 using namespace physx;
 
@@ -45,3 +52,7 @@ std::vector<uint8_t> cookNavmeshSEBD(const float* verts, uint32_t nv, const uint
     foundation->release();
     return out;
 }
+#else
+// PhysX disabled (default) → no SEBD; the cooker falls back to the device-compatible ColliderBox grid.
+std::vector<uint8_t> cookNavmeshSEBD(const float*, uint32_t, const uint32_t*, uint32_t) { return {}; }
+#endif

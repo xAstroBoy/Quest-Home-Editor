@@ -65,8 +65,11 @@ set(STB_DIR       "${CMAKE_SOURCE_DIR}/third_party/stb")
 # ── Editor UI = a from-scratch custom C++ toolkit (src/ui/), NOT Dear ImGui. Drawn through the renderer's
 #    own Vulkan; text via stb_truetype (impl in its own TU, like stb_image/stb_vorbis). No external UI libs. ──
 
-# ── PhysX 4.x (VENDORED static libs, /MD) — linked straight into the editor so the navmesh/collider cook
-#    (src/cook/physx_navmesh.cpp) is a direct function call, no external exe. third_party/physx = headers + .lib. ──
+# ── PhysX 4.x (OPTIONAL, vendored Windows static libs). OFF by default: the cooked SEBD trimesh is binary-
+#    incompatible with the device PhysX (crashes its BVH33 narrow-phase), so the real walkable collision is the
+#    ColliderBox grid (no cooked data). With it off, physx_navmesh.cpp is a stub and the build is PhysX-free, so it
+#    compiles on Linux/macOS — not just Windows. Turn ON with -DHSR_HAVE_PHYSX=ON if you have the vendored libs. ──
+option(HSR_HAVE_PHYSX "Cook PhysX SEBD trimesh navmesh (needs the vendored Windows PhysX static libs)" OFF)
 set(PHYSX_DIR "${CMAKE_SOURCE_DIR}/third_party/physx")
 set(PHYSX_LIBS
     "${PHYSX_DIR}/lib/PhysXExtensions_static.lib"
@@ -89,7 +92,7 @@ add_executable(hsr_renderer
     $<$<BOOL:${WIN32}>:${CMAKE_SOURCE_DIR}/app.rc>   # Win32 .exe file icon
 )
 
-target_compile_definitions(hsr_renderer PRIVATE VK_NO_PROTOTYPES GLFW_INCLUDE_VULKAN PX_PHYSX_STATIC_LIB)
+target_compile_definitions(hsr_renderer PRIVATE VK_NO_PROTOTYPES GLFW_INCLUDE_VULKAN)
 
 target_include_directories(hsr_renderer PRIVATE
     "${VULKAN_HEADERS_DIR}"
@@ -99,8 +102,6 @@ target_include_directories(hsr_renderer PRIVATE
     "${STB_DIR}"
     "${CMAKE_SOURCE_DIR}"
     "${CMAKE_SOURCE_DIR}/src"
-    "${PHYSX_DIR}/include"
-    "${PHYSX_DIR}/pxshared/include"
 )
 
 target_include_directories(hsr_renderer PRIVATE
@@ -118,8 +119,14 @@ target_link_libraries(hsr_renderer PRIVATE
     miniz
     ${GLFW_TARGET}
     ${ASTCENC_LIB}
-    ${PHYSX_LIBS}
 )
+
+# ── PhysX (optional) — only when -DHSR_HAVE_PHYSX=ON + the vendored libs are present ──
+if(HSR_HAVE_PHYSX)
+    target_compile_definitions(hsr_renderer PRIVATE HSR_HAVE_PHYSX PX_PHYSX_STATIC_LIB)
+    target_include_directories(hsr_renderer PRIVATE "${PHYSX_DIR}/include" "${PHYSX_DIR}/pxshared/include")
+    target_link_libraries(hsr_renderer PRIVATE ${PHYSX_LIBS})
+endif()
 
 # ── Platform-specific ───────────────────────────────────────────
 if(MSVC)
@@ -158,12 +165,15 @@ target_include_directories(hsl_cook PRIVATE
     "${CMAKE_SOURCE_DIR}/src"
     "${CMAKE_SOURCE_DIR}/third_party/acl/includes"   # ACL (Animation Compression Library) — header-only encoder
     "${CMAKE_SOURCE_DIR}/third_party/rtm/includes"   # RTM (Realtime Math) — ACL's math dependency
-    "${PHYSX_DIR}/include"
-    "${PHYSX_DIR}/pxshared/include"
 )
-target_link_libraries(hsl_cook PRIVATE miniz ${ASTCENC_LIB} ${PHYSX_LIBS})
+target_link_libraries(hsl_cook PRIVATE miniz ${ASTCENC_LIB})
+if(HSR_HAVE_PHYSX)
+    target_compile_definitions(hsl_cook PRIVATE HSR_HAVE_PHYSX PX_PHYSX_STATIC_LIB)
+    target_include_directories(hsl_cook PRIVATE "${PHYSX_DIR}/include" "${PHYSX_DIR}/pxshared/include")
+    target_link_libraries(hsl_cook PRIVATE ${PHYSX_LIBS})
+endif()
 if(WIN32)
-    target_compile_definitions(hsl_cook PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS PX_PHYSX_STATIC_LIB)
+    target_compile_definitions(hsl_cook PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
     target_compile_options(hsl_cook PRIVATE /Zc:__cplusplus)  # ACL checks __cplusplus for the C++ level
     target_link_libraries(hsl_cook PRIVATE bcrypt crypt32)   # self-contained APK v2 signing (next increment)
 endif()
