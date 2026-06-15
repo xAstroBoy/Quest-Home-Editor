@@ -129,23 +129,23 @@ static void hsrHttpServer(int port) {
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
-#include "src/types.h"
-#include "src/camera.h"
-#include "src/asmh_parser.h"
-#include "src/rendmesh_parser.h"
-#include "src/rendtxtr_parser.h"
-#include "src/matlmatl_parser.h"
-#include "src/hstf_parser.h"
-#include "src/rendshad_parser.h"
-#include "src/universal_shader.h"
-#include "src/audio.h"
-#include "src/v79_shader.h"
-#include "src/vk_renderer.h"
-#include "src/scene_loader.h"
-#include "src/gltf_loader.h"
-#include "src/opa_loader.h"
-#include "src/audio.h"
-#include "src/editor.h"
+#include "core/types.h"
+#include "core/camera.h"
+#include "loaders/asmh_parser.h"
+#include "loaders/rendmesh_parser.h"
+#include "loaders/rendtxtr_parser.h"
+#include "loaders/matlmatl_parser.h"
+#include "loaders/hstf_parser.h"
+#include "loaders/rendshad_parser.h"
+#include "render/universal_shader.h"
+#include "core/audio.h"
+#include "render/v79_shader.h"
+#include "render/vk_renderer.h"
+#include "loaders/scene_loader.h"
+#include "loaders/gltf_loader.h"
+#include "loaders/opa_loader.h"
+#include "core/audio.h"
+#include "ui/editor.h"
 #include "miniz.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -169,6 +169,16 @@ static double          g_pressX = 0, g_pressY = 0, g_clickX = 0, g_clickY = 0;
 static bool            g_clickPick = false;
 static bool            g_rDown = false, g_rightClick = false;
 static double          g_rPressX = 0, g_rPressY = 0, g_rightX = 0, g_rightY = 0;
+static Editor*         g_editor = nullptr;      // the custom-UI editor (defined in editor.h above); callbacks route input here
+
+// Procedural editor icon: a dark disc with the R/G/B move-gizmo motif (matches the editor's gizmo). No asset file.
+static void genEditorIcon(int S, std::vector<unsigned char>& px) {
+    px.assign((size_t)S*S*4, 0); float c=(S-1)*0.5f, R=S*0.47f;
+    auto set=[&](int x,int y,int r,int g,int b,int a){ if(x<0||y<0||x>=S||y>=S)return; size_t i=((size_t)y*S+x)*4; px[i]=(unsigned char)r;px[i+1]=(unsigned char)g;px[i+2]=(unsigned char)b;px[i+3]=(unsigned char)a; };
+    for (int y=0;y<S;y++) for (int x=0;x<S;x++){ float dx=x-c,dy=y-c; if (dx*dx+dy*dy<=R*R) set(x,y,44,46,54,255); }
+    auto axis=[&](float ang,float L,int r,int g,int b){ float dx=std::sin(ang),dy=-std::cos(ang); for(float t=0;t<=L;t+=0.5f){ float xx=c+dx*t,yy=c+dy*t; for(int oy=-1;oy<=1;oy++)for(int ox=-1;ox<=1;ox++) set((int)(xx+0.5f)+ox,(int)(yy+0.5f)+oy,r,g,b,255);} for(int oy=-2;oy<=2;oy++)for(int ox=-2;ox<=2;ox++) set((int)(c+dx*L+0.5f)+ox,(int)(c+dy*L+0.5f)+oy,r,g,b,255); };
+    float L=S*0.34f; axis(1.5708f,L,232,72,72); axis(0.f,L,96,210,96); axis(3.6651f,L,80,130,245);  // X red, Y green, Z blue
+}
 
 static void dropCb(GLFWwindow*, int count, const char** paths) {
     if (count > 0 && paths[0]) {
@@ -207,7 +217,8 @@ static void updateMeshSelection(int idx) {
 }
 
 static void keyCb(GLFWwindow* w, int key, int sc, int act, int mods) {
-    if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureKeyboard) return;  // editor has focus
+    if (g_editor && g_editor->ready) g_editor->onKey(key, act, mods);
+    if (g_editor && g_editor->ready && g_editor->wantsKeyboard()) return;  // typing in a UI text field
     if (key == GLFW_KEY_ESCAPE && act == GLFW_PRESS) {
         if (g_renderer && g_renderer->selectedMesh >= 0) {
             // Deselect first, exit on second Esc
@@ -240,57 +251,32 @@ static void keyCb(GLFWwindow* w, int key, int sc, int act, int mods) {
         updateMeshSelection(g_renderer->selectedMesh - 1);
 }
 
-static bool uiWantsMouse() {
-    if (!ImGui::GetCurrentContext()) return false;
-    if (ImGui::GetIO().WantCaptureMouse) return true;
-    if (ImGuizmo::IsOver() || ImGuizmo::IsUsing()) return true;   // over/dragging the move gizmo
-    return false;
-}
-static bool uiWantsKeyboard() { return ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureKeyboard; }
+static bool uiWantsMouse()    { return g_editor && g_editor->ready && g_editor->wantsMouse(); }
+static bool uiWantsKeyboard() { return g_editor && g_editor->ready && g_editor->wantsKeyboard(); }
 
+// The editor owns pick + the gizmo (in onMouseButton). Here we only manage the fly-cam look-drag: a left
+// press that DIDN'T land on a panel/gizmo (uiWantsMouse) begins a look; the editor decides click-vs-drag.
 static void mouseBtnCb(GLFWwindow* w, int btn, int act, int mods) {
+    if (g_editor && g_editor->ready) g_editor->onMouseButton(btn, act, mods);
     if (btn == GLFW_MOUSE_BUTTON_LEFT) {
-        if (act == GLFW_PRESS) {
-            if (uiWantsMouse()) { g_mouseDown = false; return; }   // click started on a panel / gizmo
-            g_mouseDown = true;
-            glfwGetCursorPos(w, &g_mx, &g_my);
-            g_pressX = g_mx; g_pressY = g_my;
-        } else if (act == GLFW_RELEASE) {
-            bool wasDown = g_mouseDown;
-            g_mouseDown = false;
-            if (!wasDown) return;                       // press began on UI/gizmo -> not a scene click
-            double cx, cy; glfwGetCursorPos(w, &cx, &cy);
-            double dx = cx - g_pressX, dy = cy - g_pressY;
-            if (dx*dx + dy*dy < 25.0) {                 // moved < 5px => a click (select), not a look-drag
-                g_clickPick = true; g_clickX = cx; g_clickY = cy;
-            }
-        }
-    } else if (btn == GLFW_MOUSE_BUTTON_RIGHT) {   // right-click in the 3D view -> object context menu
-        if (act == GLFW_PRESS) {
-            if (uiWantsMouse()) { g_rDown = false; return; }
-            g_rDown = true; glfwGetCursorPos(w, &g_rPressX, &g_rPressY);
-        } else if (act == GLFW_RELEASE) {
-            bool wasDown = g_rDown; g_rDown = false;
-            if (!wasDown) return;
-            double cx, cy; glfwGetCursorPos(w, &cx, &cy);
-            double dx = cx - g_rPressX, dy = cy - g_rPressY;
-            if (dx*dx + dy*dy < 25.0) { g_rightClick = true; g_rightX = cx; g_rightY = cy; }
-        }
+        if (act == GLFW_PRESS) { g_mouseDown = !uiWantsMouse(); glfwGetCursorPos(w, &g_mx, &g_my); }
+        else if (act == GLFW_RELEASE) g_mouseDown = false;
     }
 }
 
 static void cursorCb(GLFWwindow* w, double x, double y) {
-    if (uiWantsMouse()) return;
-    if (!g_mouseDown || !g_renderer) return;
-    g_renderer->cam.rotate((float)(x - g_mx), (float)(y - g_my));
+    if (g_editor && g_editor->ready) g_editor->onCursorPos(x, y);
+    if (g_mouseDown && !uiWantsMouse() && g_renderer)        // look-drag only over the viewport
+        g_renderer->cam.rotate((float)(x - g_mx), (float)(y - g_my));
     g_mx = x; g_my = y;
 }
 
 static void scrollCb(GLFWwindow* w, double xo, double yo) {
-    if (uiWantsMouse()) return;
-    // Mousewheel adjusts FLY speed: up = faster, down = slower (1.25x per notch for a wide range).
+    if (g_editor && g_editor->ready) g_editor->onScroll(xo, yo);
+    if (uiWantsMouse()) return;                              // scrolling a panel, not the fly-cam
     if (g_renderer) g_renderer->cam.adjustSpeed(yo > 0 ? 1.25f : 0.8f);
 }
+static void charCb(GLFWwindow* w, unsigned int cp) { if (g_editor && g_editor->ready) g_editor->onChar(cp); }
 
 static void fbSizeCb(GLFWwindow* w, int w_, int h_) {
     g_winW = w_; g_winH = h_;
@@ -746,11 +732,14 @@ int main(int argc, char** argv) {
                           "   |   WASD=move drag=look  Tab/N=next mesh B=prev  F=wire  Esc=quit";
     g_window = glfwCreateWindow(g_winW, g_winH, g_title.c_str(), nullptr, nullptr);
     if (!g_window) { fprintf(stderr, "Window creation failed\n"); glfwTerminate(); return 1; }
+    { GLFWimage icons[2]; std::vector<unsigned char> p48, p32; genEditorIcon(48,p48); genEditorIcon(32,p32);  // window/taskbar icon
+      icons[0]={48,48,p48.data()}; icons[1]={32,32,p32.data()}; glfwSetWindowIcon(g_window, 2, icons); }
 
     glfwSetKeyCallback(g_window, keyCb);
     glfwSetMouseButtonCallback(g_window, mouseBtnCb);
     glfwSetCursorPosCallback(g_window, cursorCb);
     glfwSetScrollCallback(g_window, scrollCb);
+    glfwSetCharCallback(g_window, charCb);    // text input for the editor's fields (package name, search)
     glfwSetFramebufferSizeCallback(g_window, fbSizeCb);
     glfwSetDropCallback(g_window, dropCb);   // drag an .apk onto the window -> reload that env
 
@@ -934,9 +923,20 @@ int main(int argc, char** argv) {
     // ── Editor UI (Dear ImGui): outliner, move, focus, anim/audio control, save ──
     float animDur = isOpa ? opa.animDuration() : (isV79 ? gltf.animDuration : 0.0f);
     Editor editor;
+    g_editor = &editor;            // expose to the GLFW input callbacks
     editor.r = &vkRenderer;             // bind the renderer up-front so Export works even when the UI is skipped (HSR_NOUI)
     editor.sceneMeshes = sceneMeshes;   // CPU geometry/textures for the "Export APK" cooker (parallel to gpuMeshes)
     editor.bgOgg = ogg;                 // the env's background loop -> cooked as an auto-start FMOD SoundAsset
+    // Auto-import the V79 env's assets/markup.json (portal->Spawn, seat-hotspots->Chair, others->Hotspot) as editable items
+    if (!apkPath.empty()) {
+        mz_zip_archive mkz; memset(&mkz, 0, sizeof(mkz));
+        if (mz_zip_reader_init_file(&mkz, apkPath.c_str(), 0)) {
+            int mi = mz_zip_reader_locate_file(&mkz, "assets/markup.json", nullptr, 0);
+            if (mi >= 0) { size_t msz=0; void* md=mz_zip_reader_extract_to_heap(&mkz, mi, &msz, 0); if (md) { editor.importMarkup(std::string((char*)md, msz)); mz_free(md); } }
+            mz_zip_reader_end(&mkz);
+        }
+    }
+    // (navmesh is MANUAL: multi-select the meshes you want walkable -> "+ Add" -> Navmesh (from selection) -> Cook)
     // VAT (vertex-animation) bakes the per-frame V79 node deformation into a shader-sampled offset texture.
     // ⛔ DEVICE-PROVEN 2026-06-10: the VAT EXPORT path does NOT render on the Quest (the cooked VAT meshes are
     // invisible in-headset — the erebor wisp sparkles vanished when VAT was default-on), whereas the poseAnim path
@@ -992,14 +992,29 @@ int main(int argc, char** argv) {
             if (uit != g_opaUv.end()) { em.uvScroll=true; em.uvRate[0]=uit->second.first; em.uvRate[1]=uit->second.second; }
         };
     }
-    if (!std::getenv("HSR_NOUI"))   // HSR_NOUI = clean capture without the editor overlay
+    // Cook package = the LOADED env's OWN package (read from its AndroidManifest), not a hardcoded one.
+    {
+        mz_zip_archive mz; memset(&mz, 0, sizeof mz);
+        if (mz_zip_reader_init_file(&mz, apkPath.c_str(), 0)) {
+            int mi = mz_zip_reader_locate_file(&mz, "AndroidManifest.xml", nullptr, 0);
+            if (mi >= 0) { size_t msz=0; void* md=mz_zip_reader_extract_to_heap(&mz, mi, &msz, 0);
+                if (md) { std::vector<uint8_t> ax((uint8_t*)md,(uint8_t*)md+msz); std::string pkg=hslcook::readAxmlPackage(ax);
+                    if (!pkg.empty()) { editor.cookPkg = pkg; fprintf(stderr,"[MAIN] env package from manifest: %s (cook target)\n", pkg.c_str()); }
+                    mz_free(md); } }
+            mz_zip_reader_end(&mz);
+        }
+    }
+    if (!std::getenv("HSR_NOUI")) {  // HSR_NOUI = clean capture without the editor overlay
         editor.init(&vkRenderer, g_window, &g_audio, &g_animOverride, &g_animScrub, animDur);
+        editor.projectPath = apkPath;   // session saves/loads to <env>.hsledit
+        editor.loadProject();           // auto-restore a prior session (transforms/renames/items) if one exists
+    }
 
     // One-shot headless re-cook: HSR_EXPORT exports the loaded (optionally edited) scene to an APK then,
     // with HSR_EXPORT_QUIT, exits — lets the editor's Export path run batch / from the command line.
     if (std::getenv("HSR_EXPORT")) {
-        editor.exportAPK();
-        fprintf(stderr, "[MAIN] HSR_EXPORT -> %s\n", editor.exportStatus.c_str());
+        if (editor.projectPath.empty()) { editor.projectPath = apkPath; editor.loadProject(); }   // headless cook includes the saved session
+        editor.exportAPKSync();   // synchronous cook + auto-sign with a terminal progress bar
         if (std::getenv("HSR_EXPORT_QUIT")) return 0;
     }
 
@@ -1210,17 +1225,7 @@ int main(int argc, char** argv) {
 
         vkRenderer.render();
         glfwPollEvents();
-
-        // Click-to-select: cast a ray from the cursor and pick the nearest mesh's AABB.
-        if (g_clickPick) {
-            g_clickPick = false;
-            if (!std::getenv("HSR_NOUI")) editor.pick(g_clickX, g_clickY);
-        }
-        // Right-click-to-menu: pick the mesh under the cursor and open its context menu.
-        if (g_rightClick) {
-            g_rightClick = false;
-            if (!std::getenv("HSR_NOUI")) editor.pickForMenu(g_rightX, g_rightY);
-        }
+        // (pick + the gizmo are handled immediately in editor.onMouseButton, using the viewport pane rect)
 
         // Drag-and-drop reload: an .apk was dropped -> relaunch on it (inherits HSR_* params) and exit.
         if (g_doReload) {

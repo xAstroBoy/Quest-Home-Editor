@@ -45,3 +45,11 @@ v203_spv/
 v203_shaders/
 .claude/
 _audio_tmp/
+
+# Session: cooker scratch / cooked output / signing key / large vendored libs
+cooker/_*
+cooker/out/
+cooker/ow/
+cooker/realfloor/
+cooker/debug.keystore
+hsr_renderer_cpp/third_party/physx/

@@ -1,0 +1,113 @@
+// ── config.h — the editor/cooker CONFIG (replaces the user-facing HSR_ env flags) ──────────────────────────
+// "Everything smarter, config-based, no HSR_ flags": a tiny key=value config file loaded next to the exe, with
+// SMART AUTO-DETECTION of everything it can find (Android build-tools, debug keystore, a shell APK, the out dir).
+// Normal use — load an env, edit, Cook + auto-sign — needs ZERO environment variables. The editor's Cook panel
+// is the editing surface; values persist to hsr_editor.cfg. (Deep RE/debug toggles stay as dev-only env reads.)
+#pragma once
+#include <string>
+#include <vector>
+#include <map>
+#include <cstdio>
+#include <cstdlib>
+#include <algorithm>
+#include <filesystem>
+
+struct AppConfig {
+    // ── cook / sign ──
+    std::string cookShellApk;     // the V203 shell APK the port splices into (Nuxd.apk)
+    std::string cookOutDir = "cooker/out";
+    std::string cookPackage = "com.environment.outerwilds";       // the cooked APK's own package
+    bool        autoSign   = true;
+    bool        emitSpoof  = true;                                 // also emit a haven2025-spoof for unrooted users
+    std::string buildTools;       // Android build-tools dir (has zipalign.exe + apksigner.bat)
+    std::string keystore;         // signing keystore
+    std::string keyAlias = "myhome";
+    std::string keyPass  = "android";
+    // ── app ──
+    float       uiScale  = 0.f;   // 0 = auto (monitor content scale)
+    bool        audio    = true;
+
+    // Scan the usual Android SDK locations for the NEWEST build-tools dir that has apksigner.bat.
+    static std::string detectBuildTools() {
+        namespace fs = std::filesystem; std::vector<std::string> roots;
+        auto add = [&](const char* e){ if (const char* v = std::getenv(e)) roots.push_back(std::string(v) + "/build-tools"); };
+        add("ANDROID_HOME"); add("ANDROID_SDK_ROOT");
+        if (const char* la = std::getenv("LOCALAPPDATA")) roots.push_back(std::string(la) + "/Android/Sdk/build-tools");
+        roots.push_back("C:/Android/build-tools");
+        roots.push_back("C:/Android/Sdk/build-tools");
+        std::string best, bestVer;
+        for (auto& r : roots) {
+            std::error_code ec; if (!fs::is_directory(r, ec)) continue;
+            for (auto& e : fs::directory_iterator(r, ec)) {
+                if (!e.is_directory()) continue;
+                std::string ver = e.path().filename().string();
+                if (!fs::exists(e.path() / "apksigner.bat", ec)) continue;
+                if (ver > bestVer) { bestVer = ver; best = e.path().string(); }   // lexical max ~ newest (e.g. 37 > 34)
+            }
+            if (!best.empty()) break;
+        }
+        return best;
+    }
+    static std::string firstExisting(std::initializer_list<const char*> cands) {
+        namespace fs = std::filesystem; std::error_code ec;
+        for (auto c : cands) if (fs::exists(c, ec)) return c;
+        return "";
+    }
+
+    // Fill any empty field with a smart default.
+    void autoDetect() {
+        if (buildTools.empty())   buildTools  = detectBuildTools();
+        if (keystore.empty())     keystore    = firstExisting({ "cooker/debug.keystore", "debug.keystore" });
+        if (cookShellApk.empty()) cookShellApk = firstExisting({
+            "Envs To check/v203 Ufficial Envs/Nuxd.apk", "cooker/Nuxd.apk", "Nuxd.apk" });
+        std::error_code ec; std::filesystem::create_directories(cookOutDir, ec);
+    }
+
+    // ── tiny key=value persistence ──
+    bool load(const std::string& path) {
+        FILE* f = fopen(path.c_str(), "rb"); if (!f) return false;
+        char line[1024];
+        while (fgets(line, sizeof line, f)) {
+            std::string s(line); auto h = s.find('#'); if (h != std::string::npos) s = s.substr(0, h);
+            auto eq = s.find('='); if (eq == std::string::npos) continue;
+            std::string k = trim(s.substr(0, eq)), v = trim(s.substr(eq + 1));
+            set(k, v);
+        }
+        fclose(f); return true;
+    }
+    void save(const std::string& path) const {
+        FILE* f = fopen(path.c_str(), "wb"); if (!f) return;
+        fprintf(f, "# HSR editor config (auto-saved). Delete to reset to auto-detected defaults.\n");
+        fprintf(f, "cookShellApk = %s\n", cookShellApk.c_str());
+        fprintf(f, "cookOutDir   = %s\n", cookOutDir.c_str());
+        fprintf(f, "cookPackage  = %s\n", cookPackage.c_str());
+        fprintf(f, "autoSign     = %d\n", autoSign ? 1 : 0);
+        fprintf(f, "emitSpoof    = %d\n", emitSpoof ? 1 : 0);
+        fprintf(f, "buildTools   = %s\n", buildTools.c_str());
+        fprintf(f, "keystore     = %s\n", keystore.c_str());
+        fprintf(f, "keyAlias     = %s\n", keyAlias.c_str());
+        fprintf(f, "keyPass      = %s\n", keyPass.c_str());
+        fprintf(f, "uiScale      = %g\n", uiScale);
+        fprintf(f, "audio        = %d\n", audio ? 1 : 0);
+        fclose(f);
+    }
+
+private:
+    static std::string trim(std::string s) {
+        size_t a = s.find_first_not_of(" \t\r\n"); size_t b = s.find_last_not_of(" \t\r\n");
+        return (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
+    }
+    void set(const std::string& k, const std::string& v) {
+        if      (k == "cookShellApk") cookShellApk = v;
+        else if (k == "cookOutDir")   cookOutDir = v;
+        else if (k == "cookPackage")  cookPackage = v;
+        else if (k == "autoSign")     autoSign = (v != "0");
+        else if (k == "emitSpoof")    emitSpoof = (v != "0");
+        else if (k == "buildTools")   buildTools = v;
+        else if (k == "keystore")     keystore = v;
+        else if (k == "keyAlias")     keyAlias = v;
+        else if (k == "keyPass")      keyPass = v;
+        else if (k == "uiScale")      uiScale = (float)atof(v.c_str());
+        else if (k == "audio")        audio = (v != "0");
+    }
+};

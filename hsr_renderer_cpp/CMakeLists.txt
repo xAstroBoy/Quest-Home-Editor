@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(hsr_renderer LANGUAGES C CXX)
+if(WIN32)
+    enable_language(RC)   # compile app.rc -> the .exe file icon
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -59,40 +62,34 @@ endif()
 set(MINIAUDIO_DIR "${CMAKE_SOURCE_DIR}/third_party/miniaudio")
 set(STB_DIR       "${CMAKE_SOURCE_DIR}/third_party/stb")
 
-# ── Dear ImGui (editor UI) — fetched, sources compiled into the exe ──
-FetchContent_Declare(imgui
-    GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG v1.90.9
-    GIT_SHALLOW TRUE
-)
-FetchContent_MakeAvailable(imgui)
+# ── Editor UI = a from-scratch custom C++ toolkit (src/ui/), NOT Dear ImGui. Drawn through the renderer's
+#    own Vulkan; text via stb_truetype (impl in its own TU, like stb_image/stb_vorbis). No external UI libs. ──
 
-# ── ImGuizmo (move/rotate/scale gizmo) — vendored src (master, imgui-1.90 compatible) ──
-set(IMGUIZMO_DIR "${CMAKE_SOURCE_DIR}/third_party/imguizmo")
-
-set(IMGUI_SRC
-    "${imgui_SOURCE_DIR}/imgui.cpp"
-    "${imgui_SOURCE_DIR}/imgui_draw.cpp"
-    "${imgui_SOURCE_DIR}/imgui_tables.cpp"
-    "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
-    "${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp"
-    "${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp"
-    "${IMGUIZMO_DIR}/ImGuizmo.cpp"
-)
+# ── PhysX 4.x (VENDORED static libs, /MD) — linked straight into the editor so the navmesh/collider cook
+#    (src/cook/physx_navmesh.cpp) is a direct function call, no external exe. third_party/physx = headers + .lib. ──
+set(PHYSX_DIR "${CMAKE_SOURCE_DIR}/third_party/physx")
+set(PHYSX_LIBS
+    "${PHYSX_DIR}/lib/PhysXExtensions_static.lib"
+    "${PHYSX_DIR}/lib/PhysXCooking_static.lib"
+    "${PHYSX_DIR}/lib/PhysX_static.lib"
+    "${PHYSX_DIR}/lib/PhysXCommon_static.lib"
+    "${PHYSX_DIR}/lib/PhysXPvdSDK_static.lib"
+    "${PHYSX_DIR}/lib/PhysXFoundation_static.lib")
 
 # ── Executable ──────────────────────────────────────────────────
 add_executable(hsr_renderer
     src/main.cpp
-    src/miniaudio_impl.c
-    src/stb_vorbis_impl.c
-    src/stb_image_impl.c
-    src/hzanim_acl.cpp
-    ${IMGUI_SRC}
+    src/impl/miniaudio_impl.c
+    src/impl/stb_vorbis_impl.c
+    src/impl/stb_image_impl.c
+    src/impl/stb_truetype_impl.c
+    src/cook/hzanim_acl.cpp
+    src/cook/physx_navmesh.cpp
+    src/cook/embedded_assets.cpp
+    $<$<BOOL:${WIN32}>:${CMAKE_SOURCE_DIR}/app.rc>   # Win32 .exe file icon
 )
 
-# VK_NO_PROTOTYPES for ALL TUs (incl. imgui_impl_vulkan) so it uses volk-loaded fn pointers
-# via ImGui_ImplVulkan_LoadFunctions().
-target_compile_definitions(hsr_renderer PRIVATE VK_NO_PROTOTYPES GLFW_INCLUDE_VULKAN IMGUI_DEFINE_MATH_OPERATORS)
+target_compile_definitions(hsr_renderer PRIVATE VK_NO_PROTOTYPES GLFW_INCLUDE_VULKAN PX_PHYSX_STATIC_LIB)
 
 target_include_directories(hsr_renderer PRIVATE
     "${VULKAN_HEADERS_DIR}"
@@ -100,10 +97,10 @@ target_include_directories(hsr_renderer PRIVATE
     "${MINIZ_DIR}"
     "${MINIAUDIO_DIR}"
     "${STB_DIR}"
-    "${imgui_SOURCE_DIR}"
-    "${imgui_SOURCE_DIR}/backends"
-    "${IMGUIZMO_DIR}"
     "${CMAKE_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/src"
+    "${PHYSX_DIR}/include"
+    "${PHYSX_DIR}/pxshared/include"
 )
 
 target_include_directories(hsr_renderer PRIVATE
@@ -121,6 +118,7 @@ target_link_libraries(hsr_renderer PRIVATE
     miniz
     ${GLFW_TARGET}
     ${ASTCENC_LIB}
+    ${PHYSX_LIBS}
 )
 
 # ── Platform-specific ───────────────────────────────────────────
@@ -152,7 +150,7 @@ endif()
 # Same hsl_cooker.h the editor's "Export APK" uses; this CLI driver validates the format pipeline.
 # hzanim_acl.cpp defines hzAclEncode() — exportSceneAPK() calls it for skinned-anim (HZAN) clips, so it MUST be
 # linked here too (the hsr_renderer target already compiles it). Without it: LNK2019 unresolved hzAclEncode.
-add_executable(hsl_cook src/_ckcook.cpp src/hzanim_acl.cpp)
+add_executable(hsl_cook src/cook/_ckcook.cpp src/cook/hzanim_acl.cpp src/cook/physx_navmesh.cpp src/cook/embedded_assets.cpp)
 target_include_directories(hsl_cook PRIVATE
     "${MINIZ_DIR}"
     "${astcenc_SOURCE_DIR}/Source"
@@ -160,10 +158,12 @@ target_include_directories(hsl_cook PRIVATE
     "${CMAKE_SOURCE_DIR}/src"
     "${CMAKE_SOURCE_DIR}/third_party/acl/includes"   # ACL (Animation Compression Library) — header-only encoder
     "${CMAKE_SOURCE_DIR}/third_party/rtm/includes"   # RTM (Realtime Math) — ACL's math dependency
+    "${PHYSX_DIR}/include"
+    "${PHYSX_DIR}/pxshared/include"
 )
-target_link_libraries(hsl_cook PRIVATE miniz ${ASTCENC_LIB})
+target_link_libraries(hsl_cook PRIVATE miniz ${ASTCENC_LIB} ${PHYSX_LIBS})
 if(WIN32)
-    target_compile_definitions(hsl_cook PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(hsl_cook PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS PX_PHYSX_STATIC_LIB)
     target_compile_options(hsl_cook PRIVATE /Zc:__cplusplus)  # ACL checks __cplusplus for the C++ level
     target_link_libraries(hsl_cook PRIVATE bcrypt crypt32)   # self-contained APK v2 signing (next increment)
 endif()
