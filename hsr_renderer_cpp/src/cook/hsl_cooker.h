@@ -1297,6 +1297,43 @@ inline std::string ensureJava(const std::function<void(float,const char*)>& prog
     return jh;
 }
 
+// Is a command runnable (quietly probe `<cmd> <verArg>`)?
+inline bool toolPresent(const char* cmd, const char* verArg = "--version") {
+    std::string c = std::string(cmd) + " " + verArg;
+#ifdef _WIN32
+    c += " >NUL 2>&1";
+#else
+    c += " >/dev/null 2>&1";
+#endif
+    return system(c.c_str()) == 0;
+}
+
+// One-shot STARTUP readiness check: report what the APK-signing toolchain has now, and what will be auto-fetched
+// on first use. Cheap (a couple of quiet `--version` probes + a filesystem scan); doesn't download anything.
+inline void reportToolchain(FILE* out = stderr) {
+    namespace fs = std::filesystem; std::error_code ec;
+#ifdef _WIN32
+    bool curl = toolPresent("curl.exe");
+#else
+    bool curl = toolPresent("curl");
+#endif
+    bool java = toolPresent("java", "-version");   // keytool ships in the same bin dir, so java is the proxy
+    const char* btEnv = std::getenv("HSR_BUILDTOOLS");
+    std::string bt = btEnv ? std::string(btEnv) : AppConfig::detectBuildTools();
+    if (bt.empty()) bt = findToolDirUnder(AppConfig::exeRel("android-build-tools"), "apksigner");  // already downloaded?
+    std::string jdl = java ? "" : findToolDirUnder(AppConfig::exeRel("jre"), "keytool");           // downloaded JRE?
+
+    fprintf(out, "[TOOLS] APK signing toolchain (cook / --sign):\n");
+    fprintf(out, "  curl ......... %s\n", curl ? "ok (auto-download available)" : "MISSING (auto-download disabled)");
+    if (!bt.empty())     fprintf(out, "  build-tools .. ok: %s\n", bt.c_str());
+    else                 fprintf(out, "  build-tools .. none%s\n", curl ? " -> auto-download (~58MB) on first sign" : " -> install Android SDK or set HSR_BUILDTOOLS (no curl)");
+    if (java)            fprintf(out, "  java/keytool . on PATH\n");
+    else if (!jdl.empty()) fprintf(out, "  java/keytool . ok: %s (downloaded)\n", fs::path(jdl).parent_path().string().c_str());
+    else                 fprintf(out, "  java/keytool . none%s\n", curl ? " -> auto-download a JRE on first sign" : " -> install a JDK (no curl)");
+    bool ready = !bt.empty() && (java || !jdl.empty());
+    fprintf(out, "  status ....... %s\n", ready ? "READY" : (curl ? "will auto-provision on first sign" : "NOT READY (need curl, or install the SDK/JDK)"));
+}
+
 // AUTO-SIGN a cooked APK: zipalign + apksigner with a debug keystore -> an INSTALLABLE signed APK. PORTABLE (no
 // hardcoded SDK path): build-tools are AUTO-DETECTED (AppConfig::detectBuildTools scans ANDROID_HOME / ANDROID_SDK_ROOT
 // / LOCALAPPDATA / ~/Android/Sdk / common dirs), and the keystore is AUTO-GENERATED with keytool if missing (so a fresh

@@ -305,6 +305,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, " HSR Renderer / Editor — libshell.so Vulkan replica\n");
     fprintf(stderr, " Drag an .apk onto the window to load it\n");
     fprintf(stderr, "========================================================\n\n");
+    if (!std::getenv("HSR_NO_TOOLCHECK")) hslcook::reportToolchain();   // startup readiness of the signing toolchain
 #ifdef _WIN32
     // Console is VISIBLE by default (you need it to read coords/logs while debugging). Only hide it
     // when HSR_HIDE_CONSOLE is explicitly set (GUI-only mode). Also bring it to the foreground.
