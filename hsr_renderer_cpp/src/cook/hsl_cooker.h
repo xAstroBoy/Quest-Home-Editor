@@ -83,7 +83,12 @@ inline uint16_t f32_to_f16(float f) { uint32_t x; memcpy(&x, &f, 4); uint32_t s 
 // ── RENDMESH (file_id "MESH"): fully replicate nuxd's mesh so the device MeshAssetBuilder accepts it. Vertex
 //    format = nuxd's common stride-20 layout (POS f32x3@0, TEXCOORD0 f16x2@12, NORMAL fmt0x13@16=0xFFFFFFFF).
 //    Structure: VS{ field0=format-hash const, 1=count, 2=VB, 3=attrs(3), 4=content-hash } ; part{ 0=VS,1=IB,
-//    4=boundMin,5=content-hash,6=52 } ; LOD{ 0=parts,1=0.2 screen-size,3=boundMin } ; root{ 1=LOD,2=materials,
+//    4=boundMin,5=content-hash,6=52 } ; LOD{ 0=parts,1=screenSize,3=boundMin } ; root{ 1=LOD,2=materials,
+//    LOD.field1 = the per-LOD "screen-size" cutoff. IDA: MeshDefinition::parseLod defaults it to 0.0 when absent, and
+//    MeshAssetBuilder aggregates the MIN across LODs as the asset's visibility floor — so an object is dropped once its
+//    on-screen coverage falls below the SMALLEST LOD's cutoff. We emit 0.0 (= libshell's own default = "never size-cull",
+//    matching V79's no-LOD-cull behavior). The old 0.2 was blindly copied from nuxd's full-screen skybox DOME (which never
+//    shrinks past 0.2), so it culled small/distant single-LOD props at range ("objects disappear at distance").
 //    3=min,4=max,8=1.0 }. (format-hash 0xDBE0A523 is CONSTANT for this layout; content-hashes appear to be cache
 //    keys — using deterministic placeholders. part.field3 material-binding is omitted; the entity's
 //    MaterialPlatformComponent supplies the material.) ────────────────────────────────────────────────────────
@@ -115,7 +120,7 @@ inline std::vector<uint8_t> encodeRendMesh(const std::vector<float>& posXYZ, con
     int matEmb = embeddedMatl.empty() ? 0 : b.createByteVector(embeddedMatl.data(), embeddedMatl.size());  // part.field3 = embedded MATL
     b.startObject(7); b.addOffset(0, vsvec); b.addOffset(1, ibo); b.addOffset(3, matEmb); b.addStructSlot(4, (const uint8_t*)aabb, 24, 4); b.addStructSlot(5, pf5, 12, 4); b.addScalar<uint32_t>(6, 52u); int part = b.endObject();
     int pv = b.createOffsetVector({ part });
-    b.startObject(4); b.addOffset(0, pv); b.addScalar<float>(1, 0.2f); b.addStructSlot(3, (const uint8_t*)aabb, 24, 4); int lod = b.endObject();
+    b.startObject(4); b.addOffset(0, pv); b.addScalar<float>(1, 0.0f /*screenSize: 0 = never size-cull (libshell parseLod default; 0.2 was the dome's)*/); b.addStructSlot(3, (const uint8_t*)aabb, 24, 4); int lod = b.endObject();
     int lv = b.createOffsetVector({ lod });
     int matVec = b.createOffsetVector({});   // EMPTY materials vector (the dome's root.f2 is empty — a populated
                                              // {field0=4} element fails the verifier); materials come from part.field3
@@ -949,13 +954,13 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
     uint16_t zero16 = 0;
     int lod;
     if (markers) {
-        b.startObject(5); b.addOffset(0, pv); b.addScalar<float>(1, 0.2f);
+        b.startObject(5); b.addOffset(0, pv); b.addScalar<float>(1, 0.0f /*screenSize: 0 = never size-cull*/);
         b.addStructSlot(2, (const uint8_t*)&maxBoneIdx, 2, 2);
         b.addStructSlot(3, (const uint8_t*)aabb, 24, 4);
         b.addStructSlot(4, (const uint8_t*)&zero16, 2, 2);
         lod = b.endObject();
     } else {
-        b.startObject(4); b.addOffset(0, pv); b.addScalar<float>(1, 0.2f); b.addStructSlot(3, (const uint8_t*)aabb, 24, 4); lod = b.endObject();
+        b.startObject(4); b.addOffset(0, pv); b.addScalar<float>(1, 0.0f /*screenSize: 0 = never size-cull*/); b.addStructSlot(3, (const uint8_t*)aabb, 24, 4); lod = b.endObject();
     }
     int lv = b.createOffsetVector({ lod });
     // ROOT.f2: static meshes leave this EMPTY. SKINNED meshes populate it with ONE element whose field0 is an OFFSET to a
