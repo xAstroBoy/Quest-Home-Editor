@@ -337,6 +337,12 @@ int main(int argc, char** argv) {
         return fails ? 1 : 0;
     }
 
+    // `hsr_renderer --restore-haven` puts the ORIGINAL Meta Haven 2025 back from the auto-backup the cooker made
+    // (folder "Haven2025_Backup" beside the exe) before it installed a spoof, then relaunches the shell.
+    if (argc >= 2 && std::string(argv[1]) == "--restore-haven") {
+        return Editor::cliRestoreHaven();
+    }
+
     // `hsr_renderer --fetch-tools` pre-downloads the Android signing toolchain (Google build-tools + a Temurin JRE
     // if no Java) right beside the exe, so later --sign / Cook works on a clean machine with no SDK and no JDK.
     if (argc >= 2 && std::string(argv[1]) == "--fetch-tools") {

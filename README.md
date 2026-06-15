@@ -19,7 +19,7 @@ Known unfinished areas:
   render flat, mis-shaded, or with wrong colors. The per-material constants
   (`matParams`) are not yet mapped by name, and some texture/UV mappings are off.
 - **The V79 → HSL cooking / repack pipeline produces installable, signed APKs** (see the
-  [**Converter Guide**](GUIDE.md)), but the **rendering of ported content is not yet faithful** —
+  [**Converter Guide (Wiki)**](https://github.com/xAstroBoy/v79-quest-home-porter/wiki)), but the **rendering of ported content is not yet faithful** —
   expect wrong colours, flat shading, and some content that doesn't draw on older headsets (Quest 2).
 - **Vistas and many environments are not yet faithful.**
 
@@ -84,7 +84,7 @@ Drag-and-drop an environment onto the window, or pass it on the command line.
 
 ### Convert an old home to an installable APK
 
-See the **[Converter Guide](GUIDE.md)** for the full walkthrough. In short: drop `adb.exe` +
+See the **[Converter Guide (Wiki)](https://github.com/xAstroBoy/v79-quest-home-porter/wiki)** for the full walkthrough. In short: drop `adb.exe` +
 `AdbWinApi.dll` + `AdbWinUsbApi.dll` beside the exe, load the old home, open the **Cook** tab, and
 press **`COOK + SIGN + INSTALL`**. A cook writes up to two APKs next to the env:
 
