@@ -133,7 +133,7 @@ inline std::vector<uint8_t> encodeRendMesh(const std::vector<float>& posXYZ, con
     int matEmb = embeddedMatl.empty() ? 0 : b.createByteVector(embeddedMatl.data(), embeddedMatl.size());  // part.field3 = embedded MATL
     b.startObject(7); b.addOffset(0, vsvec); b.addOffset(1, ibo); b.addOffset(3, matEmb); b.addStructSlot(4, (const uint8_t*)aabb, 24, 4); b.addStructSlot(5, pf5, 12, 4); b.addScalar<uint32_t>(6, 52u); int part = b.endObject();
     int pv = b.createOffsetVector({ part });
-    b.startObject(4); b.addOffset(0, pv); b.addScalar<float>(1, 0.0f /*screenSize: 0 = never size-cull (libshell parseLod default; 0.2 was the dome's)*/); b.addStructSlot(3, (const uint8_t*)aabb, 24, 4); int lod = b.endObject();
+    b.startObject(4); b.addOffset(0, pv); b.addScalar<float>(1, 0.2f); b.addStructSlot(3, (const uint8_t*)aabb, 24, 4); int lod = b.endObject();   // LOD screenSize MUST be non-zero: addScalar elides a 0.0 -> field omitted -> device MeshDefinition verifier REJECTS the mesh (all-dark). Size-cull is handled by HSR_NOCULL bounds, not this value.
     int lv = b.createOffsetVector({ lod });
     int matVec = b.createOffsetVector({});   // EMPTY materials vector (the dome's root.f2 is empty — a populated
                                              // {field0=4} element fails the verifier); materials come from part.field3
@@ -968,13 +968,13 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
     uint16_t zero16 = 0;
     int lod;
     if (markers) {
-        b.startObject(5); b.addOffset(0, pv); b.addScalar<float>(1, 0.0f /*screenSize: 0 = never size-cull*/);
+        b.startObject(5); b.addOffset(0, pv); b.addScalar<float>(1, 0.2f);   // non-zero required (addScalar elides 0.0 -> verifier rejects)
         b.addStructSlot(2, (const uint8_t*)&maxBoneIdx, 2, 2);
         b.addStructSlot(3, (const uint8_t*)aabb, 24, 4);
         b.addStructSlot(4, (const uint8_t*)&zero16, 2, 2);
         lod = b.endObject();
     } else {
-        b.startObject(4); b.addOffset(0, pv); b.addScalar<float>(1, 0.0f /*screenSize: 0 = never size-cull*/); b.addStructSlot(3, (const uint8_t*)aabb, 24, 4); lod = b.endObject();
+        b.startObject(4); b.addOffset(0, pv); b.addScalar<float>(1, 0.2f); b.addStructSlot(3, (const uint8_t*)aabb, 24, 4); lod = b.endObject();   // non-zero required (addScalar elides 0.0 -> verifier rejects)
     }
     int lv = b.createOffsetVector({ lod });
     // ROOT.f2: static meshes leave this EMPTY. SKINNED meshes populate it with ONE element whose field0 is an OFFSET to a

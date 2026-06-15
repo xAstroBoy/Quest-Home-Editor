@@ -1395,6 +1395,7 @@ struct Editor {
     // headless / CLI entry (replaces HSR_EXPORT path): synchronous, with a terminal progress bar.
     void exportAPKSync() {
         if (std::getenv("HSR_NOHZ")) animSkinned=false;   // diag: cook with skinned anim OFF (isolate the HZANIM crash)
+        if (std::getenv("HSR_NOINSTALL")) installAfterCook=false;   // batch/CLI: cook the APK files only, don't touch the device
         auto ems = buildExportMeshes();
         std::array<float,3> spawn{ r->cam.pos[0], r->cam.pos[1], r->cam.pos[2] };
         std::vector<sitem::Item> its=items; bakeNavmeshes(its);
