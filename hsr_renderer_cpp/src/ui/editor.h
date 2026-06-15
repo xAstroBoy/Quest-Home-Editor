@@ -230,6 +230,7 @@ struct Editor {
                                        // adb root: ROOT -> install the UNSPOOFED own-package APK (+ auto-select it);
                                        // NO root -> back up the real haven2025, then install the haven2025 SPOOF.
     std::string adbSerial, wifiIp;     // device serial ("" = default); wifiIp -> "adb connect" for wireless adb
+    std::thread restoreThread; std::atomic<bool> restoring{false};   // "Restore original Haven 2025" button (runs off the UI thread)
     bool animSkinned = false;  // HZANIM skinned clips (clouds/koi/droids). DEFAULT OFF: the clip cook still emits a malformed
                                // string -> device std::length_error -> crash. Opt-in/experimental until the HZANIM clip is fixed.
 
@@ -255,9 +256,10 @@ struct Editor {
     }
     void shutdown() {
         if (cookThread.joinable()) cookThread.join();
+        if (restoreThread.joinable()) restoreThread.join();
         if (ready) { vkDeviceWaitIdle(r->device); uiDraw.destroy(); ready = false; }
     }
-    ~Editor() { if (cookThread.joinable()) cookThread.join(); }
+    ~Editor() { if (cookThread.joinable()) cookThread.join(); if (restoreThread.joinable()) restoreThread.join(); }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  INPUT  (GLFW callbacks in main route here; we accumulate into cx.in, cleared at end of buildFrame)
@@ -860,6 +862,15 @@ struct Editor {
         else { y0=y; if (cx.button(ui::hashId("cookgo"), x, y, w, th.rowH+4*uiScale, installAfterCook?"COOK + SIGN + INSTALL":"COOK  +  SIGN", true)) startCook();
                cx.tip(x,y0,w,th.rowH+4*uiScale,"Cook the edited scene to APK(s), sign them, and (if Install\nis on) push to the headset. Outputs land next to the loaded\nenv:  <env>_Rooted-System.apk  +  <env>_NoRoot-Spoof.apk"); }
         y += th.rowH+12*uiScale;
+        // Undo a spoof: put the REAL Haven 2025 back from the auto-backup (off the UI thread).
+        if (!busy && !restoring.load()) {
+            y0=y; if (cx.button(ui::hashId("restorehaven"), x, y, w, th.rowH, "Restore original Haven 2025")) {
+                if (restoreThread.joinable()) restoreThread.join();
+                restoring.store(true);
+                restoreThread = std::thread([this]{ restoreHaven(); restoring.store(false); });
+            }
+            cx.tip(x,y0,w,th.rowH,"Reinstall the ORIGINAL Haven 2025 from the auto-backup\n(folder \"Haven2025_Backup\" beside the exe) + relaunch the shell.\nUse this to undo a spoof install."); y += th.rowH+8*uiScale;
+        } else if (restoring.load()) { cx.label(x,y,w,th.rowH,"Restoring Haven 2025…",th.textDim); y += th.rowH+8*uiScale; }
         std::string st; { std::lock_guard<std::mutex> l(statusMx); st = cookStatus; }
         if (!st.empty()) {
             // word-ish wrap into the panel width
@@ -1193,10 +1204,17 @@ struct Editor {
                 bool inst = installToDevice(finalSystem, pkg, progress);
                 msg += inst ? "  || ROOT -> installed UNSPOOFED ("+pkg+") + auto-selected + relaunched shell" : "  || install FAILED (adb/device?)";
             } else if (!finalSpoof.empty()) {
-                std::string bkp = backupHaven2025(outDir);
-                bool inst = installToDevice(finalSpoof, "com.meta.shell.env.footprint.haven2025", progress);
-                msg += inst ? ("  || no root -> installed SPOOF (REPLACES Haven 2025 in place) + relaunched shell"+std::string(bkp.empty()?"":"; haven2025 backed up")+". Loads where Haven 2025 does (unrooted can't switch envs); set Haven 2025 as your home if it isn't already.")
-                            : "  || spoof install FAILED (adb/device? haven2025 may be a non-removable system app)";
+                // SAFE ORDER: back up the ORIGINAL Haven 2025 first; THEN (cert mismatch) uninstall it; THEN install the
+                // spoof. Only uninstall if the backup succeeded (or there was nothing installed to back up).
+                std::string bkp; HavenBkp hb = backupOriginalHaven(bkp);
+                if (hb == HB_FAILED) {
+                    msg += "  || ABORTED: could NOT back up the original Haven 2025, so it was left UNTOUCHED (your original is safe). Check the device/storage and retry, or use the Rooted-System APK.";
+                } else {
+                    setStatus("Replacing Haven 2025: it's signed with Meta's certificate (not ours), so the ORIGINAL is uninstalled first (backup kept in "+havenBackupDir()+"). Restore anytime: --restore-haven.");
+                    bool inst = installToDevice(finalSpoof, HAVEN_PKG(), progress, /*uninstallFirst=*/true);
+                    msg += inst ? ("  || no root -> "+std::string(hb==HB_OK?("backed up Haven 2025 ("+havenBackupDir()+"), "):"")+"uninstalled the original + installed the SPOOF + relaunched shell. It loads where Haven 2025 does (unrooted can't switch envs); set Haven 2025 as your home if it isn't already. Restore: --restore-haven.")
+                                : "  || spoof install FAILED (adb/device? Haven 2025 may be a non-removable system app — try the Rooted-System APK). Restore the original with --restore-haven if needed.";
+                }
             } else {
                 msg += rooted ? "  || ROOT but no system APK" : "  || no root and no spoof APK (enable the spoof toggle)";
             }
@@ -1253,29 +1271,69 @@ struct Editor {
         if (adbCapture(ADB, sel, "shell su -c id").find("uid=0") != std::string::npos)  return true;   // su available
         return adbCapture(ADB, sel, "shell getprop ro.debuggable").find('1') != std::string::npos;     // userdebug/eng
     }
-    // Back up the REAL haven2025 APK off the device BEFORE the spoof overwrites it, so it can be restored
-    // (`adb install -r haven2025_ORIGINAL_backup.apk`). Keeps the first/pristine backup; never overwrites it.
-    // Returns the backup path, or "" if haven2025 isn't installed / the pull failed.
-    std::string backupHaven2025(const std::string& outDir) {
+    // ── Haven 2025 backup/restore ───────────────────────────────────────────────────────────────────────────
+    static const char* HAVEN_PKG() { return "com.meta.shell.env.footprint.haven2025"; }
+    // ONE canonical pristine backup, in a clearly-named FOLDER beside the EXE (not per-output-folder). Why a single
+    // beside-the-exe spot: the FIRST spoof install must capture the REAL haven2025; a per-folder backup would, on a
+    // later env, save the previous env's already-installed spoof as "the original" and lose the real one.
+    static std::string havenBackupDir() { return AppConfig::s_exeDir.empty() ? std::string("Haven2025_Backup") : AppConfig::exeRel("Haven2025_Backup"); }
+    static std::string havenBackupApk() { return havenBackupDir() + "/haven2025_ORIGINAL_backup.apk"; }
+    enum HavenBkp { HB_ABSENT, HB_OK, HB_FAILED };   // not installed / backed-up (or already had one) / pull failed
+    // Back up the REAL haven2025 off the device BEFORE anything is uninstalled. Keeps the first/pristine backup;
+    // never overwrites it. Writes a HOW_TO_RESTORE.txt next to it and reports the folder.
+    HavenBkp backupOriginalHaven(std::string& outBkp) {
         auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
-        // ONE canonical pristine backup, beside the EXE (not per-output-folder). Why: the very first spoof install
-        // must capture the REAL haven2025; if each env folder kept its own backup, cooking a 2nd env into a new
-        // folder would back up the FIRST env's already-installed spoof as "the original" and lose the real one.
-        std::string bkp = AppConfig::s_exeDir.empty() ? ((outDir.empty()?std::string("."):outDir) + "/haven2025_ORIGINAL_backup.apk")
-                                                      : AppConfig::exeRel("haven2025_ORIGINAL_backup.apk");
-        if (fileEx(bkp)) { fprintf(stderr, "[COOK] haven2025 backup already exists (keeping pristine, NOT overwriting): %s\n", bkp.c_str()); return bkp; }
-        std::string out = adbCapture(ADB, sel, "shell pm path com.meta.shell.env.footprint.haven2025");
+        std::string dir = havenBackupDir(); outBkp = havenBackupApk();
+        if (fileEx(outBkp)) { fprintf(stderr, "[COOK] Haven 2025 backup already exists (pristine, kept): %s\n", outBkp.c_str()); return HB_OK; }
+        std::string out = adbCapture(ADB, sel, std::string("shell pm path ")+HAVEN_PKG());
         size_t p = out.find("package:");
-        if (p == std::string::npos) { fprintf(stderr, "[COOK] WARN: haven2025 not installed on device — nothing to back up\n"); return ""; }
+        if (p == std::string::npos) { fprintf(stderr, "[COOK] Haven 2025 not installed on device — nothing to back up\n"); outBkp.clear(); return HB_ABSENT; }
         p += 8; size_t e = out.find_first_of("\r\n", p);
         std::string dev = out.substr(p, e==std::string::npos ? std::string::npos : e-p);
         while (!dev.empty() && (dev.back()=='\r'||dev.back()=='\n'||dev.back()==' '||dev.back()=='\t')) dev.pop_back();
-        if (dev.empty()) return "";
-        runAdb(ADB, sel, "pull \""+dev+"\" \""+bs(bkp)+"\"");
-        bool ok = fileEx(bkp);
-        fprintf(stderr, ok ? "[COOK] backed up REAL haven2025 -> %s\n" : "[COOK] WARN: haven2025 backup pull failed (%s)\n", bkp.c_str());
-        return ok ? bkp : "";
+        if (dev.empty()) { outBkp.clear(); return HB_FAILED; }
+        std::error_code ec; std::filesystem::create_directories(dir, ec);
+        runAdb(ADB, sel, "pull \""+dev+"\" \""+bs(outBkp)+"\"");
+        if (!fileEx(outBkp)) { fprintf(stderr, "[COOK] WARN: Haven 2025 backup pull FAILED (%s)\n", outBkp.c_str()); outBkp.clear(); return HB_FAILED; }
+        if (FILE* rf = fopen((dir+"/HOW_TO_RESTORE.txt").c_str(), "wb")) {            // plain-language recovery note
+            fputs("This folder holds a backup of the ORIGINAL Meta \"Haven 2025\" home APK, taken automatically\n"
+                  "before the converter replaced it with a spoofed (custom) home.\n\n"
+                  "RESTORE the original Haven 2025:\n"
+                  "  hsr_renderer.exe --restore-haven\n"
+                  "  (or manually:  adb install -r -d \"haven2025_ORIGINAL_backup.apk\"\n"
+                  "                 adb shell kill $(adb shell pidof com.oculus.vrshell) )\n\n"
+                  "Do NOT delete this folder — it is the only copy of your original Haven 2025.\n"
+                  "If you ever lose it, re-download Haven 2025 from Meta (headset Settings) or factory-reset.\n", rf);
+            fclose(rf);
+        }
+        fprintf(stderr, "[COOK] Backed up REAL Haven 2025 -> %s  (restore: hsr_renderer --restore-haven)\n", dir.c_str());
+        return HB_OK;
+    }
+    // RESTORE the original Haven 2025 from the backup (button + --restore-haven CLI share this idea).
+    void restoreHaven() {
+        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial), bkp=havenBackupApk();
+        if (!fileEx(bkp)) { setStatus("No Haven 2025 backup found at "+bkp+" — nothing to restore. See the guide for re-download / factory-reset."); return; }
+        int rc = runAdb(ADB, sel, "install -r -d \""+bs(bkp)+"\"");
+        if (rc!=0){ runAdb(ADB, sel, std::string("uninstall ")+HAVEN_PKG()); rc = runAdb(ADB, sel, "install \""+bs(bkp)+"\""); }
+        relaunchShell(ADB, sel);
+        setStatus(rc==0 ? "Restored the ORIGINAL Haven 2025 from backup + relaunched shell." : "Restore FAILED (adb/device?). Backup is still at "+bkp);
+    }
+    // Static CLI restore (no Editor instance / no serial) for `hsr_renderer --restore-haven`.
+    static int cliRestoreHaven() {
+        std::string ADB=adbPath(); for(char&c:ADB) if(c=='/')c='\\';
+        std::string bkp=havenBackupApk(), bbkp=bkp; for(char&c:bbkp) if(c=='/')c='\\';
+        if (!fileEx(bkp)) { fprintf(stderr, "[RESTORE] no backup at %s — nothing to restore.\n", bkp.c_str()); return 1; }
+        auto run=[&](const std::string& tail){ char c[1600]; snprintf(c,sizeof c,"\"\"%s\" %s\"", ADB.c_str(), tail.c_str()); return system(c); };
+        int rc = run("install -r -d \""+bbkp+"\"");
+        if (rc!=0){ run(std::string("uninstall ")+HAVEN_PKG()); rc = run("install \""+bbkp+"\""); }
+        std::string pids = adbCapture(ADB, "", "shell pidof com.oculus.vrshell"); std::string pid;
+        for (char c : pids){ if(c=='\r'||c=='\n') break; pid.push_back(c); }
+        while(!pid.empty() && (pid.back()==' '||pid.back()=='\t')) pid.pop_back();
+        if (!pid.empty()){ run("shell su -c \"kill "+pid+"\""); run("shell kill "+pid); }
+        fprintf(stderr, rc==0 ? "[RESTORE] restored ORIGINAL Haven 2025 from %s + relaunched shell\n" : "[RESTORE] FAILED (adb/device?). Backup kept at %s\n", bkp.c_str());
+        return rc==0 ? 0 : 1;
     }
     // Connect wireless adb to wifiIp (e.g. "192.168.1.35[:5555]"); call before installing over Wi-Fi.
     bool wifiConnect() {
@@ -1287,13 +1345,16 @@ struct Editor {
         setStatus(ok?("Wi-Fi adb connected: "+ip):("Wi-Fi connect FAILED: "+ip));
         return ok;
     }
-    // adb install -r (uninstall+retry on signature/version clash) + set environment_selected so it auto-loads.
-    bool installToDevice(const std::string& apkPath, const std::string& pkg, const std::function<void(float,const char*)>& progress) {
+    // Install an APK. uninstallFirst = overlay/spoof case: the existing package (Meta's Haven 2025) is signed with a
+    // DIFFERENT certificate than our debug-signed spoof, so Android refuses an in-place update — it MUST be uninstalled
+    // first. (The caller backs it up before allowing this.) Then best-effort select + relaunch.
+    bool installToDevice(const std::string& apkPath, const std::string& pkg, const std::function<void(float,const char*)>& progress, bool uninstallFirst=false) {
         auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
         std::string ADB=bs(adbPath()), AP=bs(apkPath), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         if (progress) progress(0.95f, "adb install");
-        int rc = runAdb(ADB, sel, "install -r -d \""+AP+"\"");   // -d = allow version downgrade (spoof vs the newer installed haven2025)
-        if (rc!=0){ runAdb(ADB, sel, "uninstall "+pkg); rc = runAdb(ADB, sel, "install \""+AP+"\""); }   // sig/version clash
+        if (uninstallFirst) runAdb(ADB, sel, "uninstall "+pkg);   // overlay: remove the differently-signed original UP FRONT (cert mismatch -> in-place update is impossible)
+        int rc = runAdb(ADB, sel, "install -r -d \""+AP+"\"");    // -d = allow version downgrade
+        if (rc!=0 && !uninstallFirst){ runAdb(ADB, sel, "uninstall "+pkg); rc = runAdb(ADB, sel, "install \""+AP+"\""); }   // own-package sig/version clash fallback
         if (rc!=0) return false;
         if (progress) progress(0.98f, "select env");
         // environment_selected = apk://pkg/assets/scene.zip (needs root/su; best-effort — else pick it in the headset).
