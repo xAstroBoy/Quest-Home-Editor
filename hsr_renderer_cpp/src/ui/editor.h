@@ -226,7 +226,9 @@ struct Editor {
     std::mutex statusMx; std::string cookStage = "idle", cookStatus;
     std::string cookPkg = "com.environment.outerwilds";
     bool autoSign = true, spoofHaven = true;
-    bool installAfterCook = false;     // after cook+sign: adb install + select the env on the headset
+    bool installAfterCook = true;      // DEFAULT ON: cook -> sign -> install to the headset. The installer auto-detects
+                                       // adb root: ROOT -> install the UNSPOOFED own-package APK (+ auto-select it);
+                                       // NO root -> back up the real haven2025, then install the haven2025 SPOOF.
     std::string adbSerial, wifiIp;     // device serial ("" = default); wifiIp -> "adb connect" for wireless adb
     bool animSkinned = false;  // HZANIM skinned clips (clouds/koi/droids). DEFAULT OFF: the clip cook still emits a malformed
                                // string -> device std::length_error -> crash. Opt-in/experimental until the HZANIM clip is fixed.
@@ -378,6 +380,7 @@ struct Editor {
         drawSplitters();
         drawContextMenu();                                      // floating; drawn last = on top
         drawAddMenu();
+        cx.drawTooltip();                                       // deferred hover tooltips — drawn ABOVE everything
         cx.in.newFrame();                                       // consume per-frame input edges/deltas
     }
 
@@ -830,24 +833,32 @@ struct Editor {
     // ── Cook / Export panel: package name, auto-sign + spoof toggles, Cook button, live progress, status ──
     void drawCookPanel(float x, float y, float w) {
         auto& th=cx.th;
+        float y0;
         cx.label(x,y,w,th.rowH,"Cook to bootable Quest APK",th.text); y+=th.rowH+6*uiScale;
-        cx.label(x,y,90*uiScale,th.rowH,"Package",th.textDim);
-        cx.textField(ui::hashId("cookpkg"), x+92*uiScale, y, w-92*uiScale, th.rowH, cookPkg); y+=th.rowH+4*uiScale;
-        cx.checkbox(ui::hashId("autosign"), x, y, "Auto-sign (zipalign + apksigner)", autoSign); y+=th.rowH;
-        cx.checkbox(ui::hashId("spoof"), x, y, "Also emit haven2025 spoof (unrooted)", spoofHaven); y+=th.rowH;
-        cx.checkbox(ui::hashId("hzanim"), x, y, "Animate skinned meshes (HZANIM — EXPERIMENTAL, can crash)", animSkinned); y+=th.rowH+6*uiScale;
-        // ── Install to headset (USB or Wi-Fi adb) + auto-select the env ──
-        cx.checkbox(ui::hashId("install"), x, y, "Install to headset + select after cook", installAfterCook); y+=th.rowH+2*uiScale;
-        cx.label(x,y,64*uiScale,th.rowH,"Wi-Fi IP",th.textDim);
+        y0=y; cx.label(x,y,90*uiScale,th.rowH,"Package",th.textDim);
+        cx.textField(ui::hashId("cookpkg"), x+92*uiScale, y, w-92*uiScale, th.rowH, cookPkg);
+        cx.tip(x,y0,w,th.rowH,"Android package id for the UNSPOOFED (rooted) APK,\ne.g. com.environment.outerwilds.\nThe haven2025 spoof always uses Meta's haven2025\npackage and ignores this field."); y+=th.rowH+4*uiScale;
+        y0=y; cx.checkbox(ui::hashId("autosign"), x, y, "Auto-sign (zipalign + apksigner)", autoSign);
+        cx.tip(x,y0,w,th.rowH,"Sign the APKs so the Quest will install them (unsigned ->\nINSTALL_PARSE_FAILED_NO_CERTIFICATES). Build-tools are\nauto-detected, or auto-downloaded beside the exe on first\nuse (pre-fetch with --fetch-tools). Keep this ON."); y+=th.rowH;
+        y0=y; cx.checkbox(ui::hashId("spoof"), x, y, "Emit haven2025 spoof (no-root install)", spoofHaven);
+        cx.tip(x,y0,w,th.rowH,"Also build <env>_NoRoot-Spoof.apk, which masquerades as\nMeta's haven2025 home. This is the ONLY way to install on a\nNON-rooted Quest: it replaces haven2025, then you pick\n\"Haven 2025\" in the home menu. Keep this ON."); y+=th.rowH;
+        y0=y; cx.checkbox(ui::hashId("hzanim"), x, y, "Animate skinned meshes (HZANIM — EXPERIMENTAL)", animSkinned);
+        cx.tip(x,y0,w,th.rowH,"Emit skeletal animation for skinned meshes (clouds/koi/\ndroids). EXPERIMENTAL: the clip cook can still crash the\nenvironment on the device. Leave OFF unless testing."); y+=th.rowH+6*uiScale;
+        // ── Install to headset (USB or Wi-Fi adb); the installer auto-detects root and picks spoofed vs unspoofed ──
+        y0=y; cx.checkbox(ui::hashId("install"), x, y, "Install to headset after cook (auto)", installAfterCook);
+        cx.tip(x,y0,w,th.rowH,"After cooking, install over adb. The installer detects root:\n  ROOT  -> install the UNSPOOFED APK + auto-select it.\n  NO root-> back up the real haven2025, install the SPOOF,\n           and relaunch the shell (then pick Haven 2025).\nNeeds adb bundled beside the exe or on PATH."); y+=th.rowH+2*uiScale;
+        y0=y; cx.label(x,y,64*uiScale,th.rowH,"Wi-Fi IP",th.textDim);
         cx.textField(ui::hashId("wifiip"), x+66*uiScale, y, w-66*uiScale-70*uiScale, th.rowH, wifiIp);
         if (cx.button(ui::hashId("wificon"), x+w-68*uiScale, y, 66*uiScale, th.rowH, "Connect")) wifiConnect();
-        y+=th.rowH+2*uiScale;
-        cx.label(x,y,64*uiScale,th.rowH,"Device",th.textDim);
+        cx.tip(x,y0,w,th.rowH,"Wireless adb: type the headset IP (e.g. 192.168.1.35) and\nConnect. Enable Wi-Fi adb on the headset first.\nLeave blank to use a USB cable."); y+=th.rowH+2*uiScale;
+        y0=y; cx.label(x,y,64*uiScale,th.rowH,"Device",th.textDim);
         cx.textField(ui::hashId("adbser"), x+66*uiScale, y, w-66*uiScale, th.rowH, adbSerial);
-        cx.label(x,y+th.rowH,w,th.rowH*0.85f,"(USB: leave blank = default. Wi-Fi: type IP, Connect.)",th.textDim); y+=th.rowH*1.85f+6*uiScale;
+        cx.tip(x,y0,w,th.rowH,"adb device serial to target (see `adb devices`).\nBlank = the default/only device. Set this when several\ndevices are attached at once."); y+=th.rowH;
+        cx.label(x,y,w,th.rowH*0.85f,"USB: leave blank. Wi-Fi: type IP, Connect.",th.textDim); y+=th.rowH*0.95f+6*uiScale;
         bool busy = cooking.load();
         if (busy) { cx.progressBar(x, y, w, th.rowH+2*uiScale, cookProg.load(), stageStr().c_str()); }
-        else if (cx.button(ui::hashId("cookgo"), x, y, w, th.rowH+4*uiScale, installAfterCook?"COOK + SIGN + INSTALL":"COOK  +  SIGN", true)) startCook();
+        else { y0=y; if (cx.button(ui::hashId("cookgo"), x, y, w, th.rowH+4*uiScale, installAfterCook?"COOK + SIGN + INSTALL":"COOK  +  SIGN", true)) startCook();
+               cx.tip(x,y0,w,th.rowH+4*uiScale,"Cook the edited scene to APK(s), sign them, and (if Install\nis on) push to the headset. Outputs land next to the loaded\nenv:  <env>_Rooted-System.apk  +  <env>_NoRoot-Spoof.apk"); }
         y += th.rowH+12*uiScale;
         std::string st; { std::lock_guard<std::mutex> l(statusMx); st = cookStatus; }
         if (!st.empty()) {
@@ -1139,6 +1150,14 @@ struct Editor {
         using namespace hslcook;
         if (ems.empty()) { setStatus("ERROR: no exportable meshes"); cooking.store(false); return; }
         std::string nuxd=cookShellPath(), out=cookOutPath();
+        std::string outDir; { size_t sl=out.find_last_of("/\\"); outDir = (sl==std::string::npos)? std::string(".") : out.substr(0,sl); }
+        // CLEAR, self-describing final names (the tester found "_cooked_signed / _cooked_haven2025" confusing):
+        //   <env>_Rooted-System.apk = the env's OWN package; needs adb root/su to auto-select (rooted/dev headsets).
+        //   <env>_NoRoot-Spoof.apk  = masquerades as haven2025; install on any headset, then pick "Haven 2025" in the home menu.
+        std::string stem = out; { size_t d=stem.rfind(".apk"); if(d!=std::string::npos) stem=stem.substr(0,d); }
+        if (stem.size()>=7 && stem.substr(stem.size()-7)=="_cooked") stem=stem.substr(0,stem.size()-7);
+        std::string systemOut = stem + "_Rooted-System.apk";
+        std::string spoofOut  = stem + "_NoRoot-Spoof.apk";
         auto progress = [this,terminalBar](float f, const char* s){ setStage(f,s); if (terminalBar) printBar(f,s); };
         bool ok=false; std::vector<uint8_t> sceneZip; float spawn[3]={camSpawn[0],camSpawn[1],camSpawn[2]};
         // package spoof for the unsigned/own-package APK uses the env's COOK_PKG; we override via the field
@@ -1148,41 +1167,115 @@ struct Editor {
         auto apk = exportSceneAPK(ems, nuxd, vspv, fspv, true, &ok, spawn, &sceneZip, bgOgg, progress, sceneItems);
         if (!ok || apk.empty()) { setStatus("ERROR: cook failed (shell: "+nuxd+")"); cooking.store(false); return; }
         if (!writeFile(out, apk)) { setStatus("ERROR: cannot write "+out); cooking.store(false); return; }
-        std::string finalOut = out, msg = "Cooked "+std::to_string(ems.size())+" meshes -> "+out+" ("+std::to_string(apk.size()/1024)+"KB)";
-        // spoof emit
+        std::string finalSystem, finalSpoof, msg = "Cooked "+std::to_string(ems.size())+" meshes ("+std::to_string(apk.size()/1024)+"KB)";
+        // ── own-package APK (sign -> <env>_Rooted-System.apk; drop the unsigned intermediate on success) ──
+        if (sign) {
+            if (signApk(out, systemOut, progress)) { finalSystem=systemOut; std::remove(out.c_str()); msg += "  | system(rooted) APK: "+systemOut; }
+            else { finalSystem=out; msg += "  | sign FAILED (UNSIGNED "+out+"; run `--fetch-tools`)"; }
+        } else finalSystem=out;
+        // ── haven2025 spoof APK (-> <env>_NoRoot-Spoof.apk) ──
         if (spoof && !sceneZip.empty()) {
-            std::string out2 = out; size_t dot=out2.rfind(".apk"); out2=(dot==std::string::npos?out2:out2.substr(0,dot))+"_haven2025.apk";
             bool ok2=false; auto apk2=spliceAPK(nuxd, sceneZip, "com.meta.environment.prod.nuxd", "com.meta.shell.env.footprint.haven2025", &ok2);
             if (ok2 && !apk2.empty()){
                 if (sign) {   // the spoof must ALSO be signed or it can't install (INSTALL_PARSE_FAILED_NO_CERTIFICATES)
-                    std::string tmp2 = out2 + ".unsigned"; writeFile(tmp2, apk2);
-                    if (signApk(tmp2, out2, progress)) msg += " + spoof(signed) "+out2;
-                    else { writeFile(out2, apk2); msg += " + spoof(UNSIGNED: sign failed) "+out2; }
+                    std::string tmp2 = spoofOut + ".unsigned"; writeFile(tmp2, apk2);
+                    if (signApk(tmp2, spoofOut, progress)) { finalSpoof=spoofOut; msg += "  | no-root spoof APK: "+spoofOut; }
+                    else { writeFile(spoofOut, apk2); finalSpoof=spoofOut; msg += "  | spoof UNSIGNED: "+spoofOut; }
                     std::remove(tmp2.c_str());
-                } else { writeFile(out2, apk2); msg += " + spoof "+out2; }
+                } else { writeFile(spoofOut, apk2); finalSpoof=spoofOut; msg += "  | spoof: "+spoofOut; }
             }
         }
-        // auto-sign
-        if (sign) {
-            std::string signedOut = out; size_t dot=signedOut.rfind(".apk"); signedOut=(dot==std::string::npos?signedOut:signedOut.substr(0,dot))+"_signed.apk";
-            if (signApk(out, signedOut, progress)) { msg += "  | SIGNED -> "+signedOut; finalOut=signedOut; }
-            else msg += "  | sign FAILED (check HSR_BUILDTOOLS)";
-        }
-        // INSTALL + select on the headset (adb install -r + oculuspreferences environment_selected)
+        // ── auto-install: ROOT -> own package (+auto-select); else back up haven2025 and install the spoof ──
         if (installAfterCook) {
-            bool inst = installToDevice(finalOut, pkg, progress);
-            msg += inst ? "  | INSTALLED + selected on headset" : "  | INSTALL FAILED (adb/device?)";
+            progress(0.9f, "detect root");
+            bool rooted = deviceIsRooted();
+            if (rooted && !finalSystem.empty()) {
+                bool inst = installToDevice(finalSystem, pkg, progress);
+                msg += inst ? "  || ROOT -> installed UNSPOOFED ("+pkg+") + auto-selected + relaunched shell" : "  || install FAILED (adb/device?)";
+            } else if (!finalSpoof.empty()) {
+                std::string bkp = backupHaven2025(outDir);
+                bool inst = installToDevice(finalSpoof, "com.meta.shell.env.footprint.haven2025", progress);
+                msg += inst ? ("  || no root -> installed SPOOF + relaunched shell"+std::string(bkp.empty()?"":" (haven2025 backed up)")+"; if the home didn't change, open the Home menu and pick \"Haven 2025\"")
+                            : "  || spoof install FAILED (adb/device? haven2025 may be a non-removable system app)";
+            } else {
+                msg += rooted ? "  || ROOT but no system APK" : "  || no root and no spoof APK (enable the spoof toggle)";
+            }
         }
         if (terminalBar) fprintf(stderr, "\n");
         setStatus(msg); setStage(1.f, "Done"); cooking.store(false);
     }
+    static bool fileEx(const std::string& p){ FILE* f=fopen(p.c_str(),"rb"); if(f){ fclose(f); return true; } return false; }
+    // adb resolution order: $HSR_ADB -> bundled beside the exe (adb.exe + AdbWinApi.dll + AdbWinUsbApi.dll, or a
+    // platform-tools/ folder next to the renderer) -> the usual SDK path -> "adb" on PATH. Bundling those 3 files
+    // beside the exe means users never need to install Android platform-tools.
     static std::string adbPath() {
         if (const char* a=std::getenv("HSR_ADB")) return a;
-        FILE* f=fopen("C:/Android/platform-tools/adb.exe","rb"); if(f){ fclose(f); return "C:/Android/platform-tools/adb.exe"; }
+        std::string e1=AppConfig::exeRel("adb.exe"), e2=AppConfig::exeRel("platform-tools/adb.exe"), e3=AppConfig::exeRel("adb");
+        if (fileEx(e1)) return e1;
+        if (fileEx(e2)) return e2;
+        if (fileEx(e3)) return e3;          // POSIX (Linux/macOS) bundled next to the binary
+        if (fileEx("C:/Android/platform-tools/adb.exe")) return "C:/Android/platform-tools/adb.exe";
         return "adb";   // on PATH
     }
     int runAdb(const std::string& adb, const std::string& sel, const std::string& tail) {
         char cmd[1600]; snprintf(cmd, sizeof cmd, "\"\"%s\"%s %s\"", adb.c_str(), sel.c_str(), tail.c_str()); return system(cmd);
+    }
+    // Run an adb command and CAPTURE its stdout+stderr (needed for getprop / id / pm path probing).
+    static std::string adbCapture(const std::string& adb, const std::string& sel, const std::string& tail) {
+        char cmd[1600];
+#ifdef _WIN32
+        snprintf(cmd, sizeof cmd, "\"\"%s\"%s %s 2>&1\"", adb.c_str(), sel.c_str(), tail.c_str());
+        FILE* p = _popen(cmd, "r");
+#else
+        snprintf(cmd, sizeof cmd, "\"%s\"%s %s 2>&1", adb.c_str(), sel.c_str(), tail.c_str());
+        FILE* p = popen(cmd, "r");
+#endif
+        if (!p) return "";
+        std::string out; char b[512]; size_t n;
+        while ((n = fread(b, 1, sizeof b, p)) > 0) out.append(b, n);
+#ifdef _WIN32
+        _pclose(p);
+#else
+        pclose(p);
+#endif
+        return out;
+    }
+    // True if the device's adb shell can act as root (su works, or adbd itself is root, or it's a userdebug build).
+    // ROOT lets us install the proper own-package env and auto-select it via `oculuspreferences --setc`; without it
+    // we fall back to the haven2025 spoof (which the user picks manually in the home menu).
+    bool deviceIsRooted() {
+        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
+        runAdb(ADB, sel, "root");                                   // best-effort: restart adbd as root (no-op on retail builds)
+        if (!wifiIp.empty()) { std::string ip=wifiIp; if(ip.find(':')==std::string::npos) ip+=":5555"; runAdb(ADB,"","connect "+ip); }
+        else runAdb(ADB, sel, "wait-for-device");                   // adbd may have restarted
+        if (adbCapture(ADB, sel, "shell id").find("uid=0") != std::string::npos)        return true;   // adbd is root
+        if (adbCapture(ADB, sel, "shell su -c id").find("uid=0") != std::string::npos)  return true;   // su available
+        return adbCapture(ADB, sel, "shell getprop ro.debuggable").find('1') != std::string::npos;     // userdebug/eng
+    }
+    // Back up the REAL haven2025 APK off the device BEFORE the spoof overwrites it, so it can be restored
+    // (`adb install -r haven2025_ORIGINAL_backup.apk`). Keeps the first/pristine backup; never overwrites it.
+    // Returns the backup path, or "" if haven2025 isn't installed / the pull failed.
+    std::string backupHaven2025(const std::string& outDir) {
+        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
+        // ONE canonical pristine backup, beside the EXE (not per-output-folder). Why: the very first spoof install
+        // must capture the REAL haven2025; if each env folder kept its own backup, cooking a 2nd env into a new
+        // folder would back up the FIRST env's already-installed spoof as "the original" and lose the real one.
+        std::string bkp = AppConfig::s_exeDir.empty() ? ((outDir.empty()?std::string("."):outDir) + "/haven2025_ORIGINAL_backup.apk")
+                                                      : AppConfig::exeRel("haven2025_ORIGINAL_backup.apk");
+        if (fileEx(bkp)) { fprintf(stderr, "[COOK] haven2025 backup already exists (keeping pristine, NOT overwriting): %s\n", bkp.c_str()); return bkp; }
+        std::string out = adbCapture(ADB, sel, "shell pm path com.meta.shell.env.footprint.haven2025");
+        size_t p = out.find("package:");
+        if (p == std::string::npos) { fprintf(stderr, "[COOK] WARN: haven2025 not installed on device — nothing to back up\n"); return ""; }
+        p += 8; size_t e = out.find_first_of("\r\n", p);
+        std::string dev = out.substr(p, e==std::string::npos ? std::string::npos : e-p);
+        while (!dev.empty() && (dev.back()=='\r'||dev.back()=='\n'||dev.back()==' '||dev.back()=='\t')) dev.pop_back();
+        if (dev.empty()) return "";
+        runAdb(ADB, sel, "pull \""+dev+"\" \""+bs(bkp)+"\"");
+        bool ok = fileEx(bkp);
+        fprintf(stderr, ok ? "[COOK] backed up REAL haven2025 -> %s\n" : "[COOK] WARN: haven2025 backup pull failed (%s)\n", bkp.c_str());
+        return ok ? bkp : "";
     }
     // Connect wireless adb to wifiIp (e.g. "192.168.1.35[:5555]"); call before installing over Wi-Fi.
     bool wifiConnect() {
@@ -1199,13 +1292,26 @@ struct Editor {
         auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
         std::string ADB=bs(adbPath()), AP=bs(apkPath), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         if (progress) progress(0.95f, "adb install");
-        int rc = runAdb(ADB, sel, "install -r \""+AP+"\"");
+        int rc = runAdb(ADB, sel, "install -r -d \""+AP+"\"");   // -d = allow version downgrade (spoof vs the newer installed haven2025)
         if (rc!=0){ runAdb(ADB, sel, "uninstall "+pkg); rc = runAdb(ADB, sel, "install \""+AP+"\""); }   // sig/version clash
         if (rc!=0) return false;
         if (progress) progress(0.98f, "select env");
         // environment_selected = apk://pkg/assets/scene.zip (needs root/su; best-effort — else pick it in the headset).
         runAdb(ADB, sel, "shell su -c \"oculuspreferences --setc environment_selected apk://"+pkg+"/assets/scene.zip\"");
+        if (progress) progress(0.99f, "relaunch shell");
+        relaunchShell(ADB, sel);
         return true;
+    }
+    // Make the running shell pick up the freshly-installed env: kill its EXACT pid so it relaunches.
+    // ⚠ `am force-stop` does NOT reload the home, and a broad `pkill vrshell` reboots the headset — so target the
+    // exact com.oculus.vrshell pid only. Best-effort: su first (rooted), then a plain kill (works if adb shell has it).
+    void relaunchShell(const std::string& ADB, const std::string& sel) {
+        std::string pids = adbCapture(ADB, sel, "shell pidof com.oculus.vrshell");
+        std::string pid; for (char c : pids) { if (c=='\r'||c=='\n') break; pid.push_back(c); }   // 1st line = space-sep pids of the exact pkg
+        while (!pid.empty() && (pid.back()==' '||pid.back()=='\t')) pid.pop_back();
+        if (pid.empty()) return;
+        runAdb(ADB, sel, "shell su -c \"kill "+pid+"\"");   // rooted
+        runAdb(ADB, sel, "shell kill "+pid);                // non-root best-effort
     }
     void startCook() {
         if (cooking.load()) return;
