@@ -27,12 +27,25 @@ struct AppConfig {
     float       uiScale  = 0.f;   // 0 = auto (monitor content scale)
     bool        audio    = true;
 
-    // Scan the usual Android SDK locations for the NEWEST build-tools dir that has apksigner.bat.
+    // The directory the EXE lives in (set by the app at startup). The build-tools AND the auto-generated debug
+    // keystore can live right next to the exe, so a machine with NO Android SDK installed just needs the signing
+    // tools dropped beside the exe — no env vars, no SDK install. exeRel() resolves a path relative to it.
+    static inline std::string s_exeDir;
+    static std::string exeRel(const std::string& rel) { return s_exeDir.empty() ? rel : (s_exeDir + "/" + rel); }
+
+    // Scan the usual Android SDK locations for the NEWEST build-tools dir that has apksigner.
     static std::string detectBuildTools() {
-        namespace fs = std::filesystem; std::vector<std::string> roots;
+        namespace fs = std::filesystem; std::error_code ec0; std::vector<std::string> roots;
+        // 0) apksigner dropped DIRECTLY beside the exe -> that dir IS the build-tools dir.
+        if (!s_exeDir.empty() && (fs::exists(fs::path(s_exeDir)/"apksigner.bat", ec0) || fs::exists(fs::path(s_exeDir)/"apksigner", ec0))) return s_exeDir;
         auto add = [&](const char* e){ if (const char* v = std::getenv(e)) roots.push_back(std::string(v) + "/build-tools"); };
         add("ANDROID_HOME"); add("ANDROID_SDK_ROOT");
+        if (!s_exeDir.empty()) roots.push_back(s_exeDir + "/build-tools");   // a build-tools/ folder beside the exe
         if (const char* la = std::getenv("LOCALAPPDATA")) roots.push_back(std::string(la) + "/Android/Sdk/build-tools");
+        if (const char* h = std::getenv("HOME")) {   // Linux / macOS default SDK locations
+            roots.push_back(std::string(h) + "/Android/Sdk/build-tools");
+            roots.push_back(std::string(h) + "/Library/Android/sdk/build-tools");
+        }
         roots.push_back("C:/Android/build-tools");
         roots.push_back("C:/Android/Sdk/build-tools");
         std::string best, bestVer;
@@ -41,7 +54,7 @@ struct AppConfig {
             for (auto& e : fs::directory_iterator(r, ec)) {
                 if (!e.is_directory()) continue;
                 std::string ver = e.path().filename().string();
-                if (!fs::exists(e.path() / "apksigner.bat", ec)) continue;
+                if (!fs::exists(e.path() / "apksigner.bat", ec) && !fs::exists(e.path() / "apksigner", ec)) continue;   // Win .bat OR POSIX
                 if (ver > bestVer) { bestVer = ver; best = e.path().string(); }   // lexical max ~ newest (e.g. 37 > 34)
             }
             if (!best.empty()) break;

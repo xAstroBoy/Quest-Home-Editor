@@ -5,6 +5,7 @@
 // was verified end-to-end against libshell by the python prototype (a fully self-cooked checkerboard env renders +
 // installs). See the project_hsl_cooker_apk_baker memory for the full format notes.
 #include "core/types.h"
+#include "core/config.h"                 // AppConfig::detectBuildTools() — portable Android SDK auto-detect for signing
 #include "core/scene_items.h"           // editor-authored haven2025 components (spawn/chair/collider/wall/hotspot)
 #include "cook/physx_navmesh.h"          // INTEGRATED PhysX navmesh cook (cookNavmeshSEBD — links the vendored PhysX libs)
 #include "cook/haven_manifest_axml.h"   // haven2025's AndroidManifest.xml (binary AXML), hardcoded; the cook rewrites its package
@@ -1154,27 +1155,59 @@ inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMe
     }
     return out;
 }
-// AUTO-SIGN a cooked APK in one step: zipalign + apksigner with the debug keystore (same as cooker/sign.ps1), so
-// the editor's Cook button (and CLI) yield an INSTALLABLE signed APK. Overridable via HSR_BUILDTOOLS / HSR_KEYSTORE.
-// Returns true on success. Reports progress 0.92->1.0. Windows paths are backslashed for cmd/.bat invocation.
+// AUTO-SIGN a cooked APK: zipalign + apksigner with a debug keystore -> an INSTALLABLE signed APK. PORTABLE (no
+// hardcoded SDK path): build-tools are AUTO-DETECTED (AppConfig::detectBuildTools scans ANDROID_HOME / ANDROID_SDK_ROOT
+// / LOCALAPPDATA / ~/Android/Sdk / common dirs), and the keystore is AUTO-GENERATED with keytool if missing (so a fresh
+// clone on any machine signs with zero setup — keytool ships with the JDK that apksigner needs anyway). Cross-platform
+// (Windows .bat/.exe + backslashes; POSIX apksigner/zipalign). Override via HSR_BUILDTOOLS / HSR_KEYSTORE.
 inline bool signApk(const std::string& unsignedApk, const std::string& signedApk,
                     const std::function<void(float,const char*)>& progress = {}) {
     auto prog = [&](float f, const char* s){ if (progress) progress(f, s); };
+    namespace fs = std::filesystem;
+    const char* btEnv = std::getenv("HSR_BUILDTOOLS");
+    std::string BT = btEnv ? std::string(btEnv) : AppConfig::detectBuildTools();
+    if (BT.empty()) { prog(1.0f, "no Android build-tools found (set ANDROID_HOME or HSR_BUILDTOOLS)"); return false; }
+    const char* ksEnv = std::getenv("HSR_KEYSTORE");
+    std::error_code ec;
+    std::string KS;
+    if (ksEnv) KS = ksEnv;
+    else {   // prefer an existing keystore: beside the exe, then cooker/, then cwd
+        for (const std::string& c : { AppConfig::exeRel("debug.keystore"), std::string("cooker/debug.keystore"), std::string("debug.keystore") })
+            if (fs::exists(c, ec)) { KS = c; break; }
+        if (KS.empty()) KS = AppConfig::exeRel("debug.keystore");   // none found -> auto-generate it beside the exe
+    }
+    if (!fs::exists(KS, ec)) {                                 // no keystore on this machine -> make a throwaway debug one
+        prog(0.90f, "Generating debug keystore");
+        if (!fs::path(KS).parent_path().empty()) fs::create_directories(fs::path(KS).parent_path(), ec);
+        std::string kt = "keytool -genkeypair -keystore \"" + KS + "\" -alias myhome -storepass android -keypass android"
+                         " -keyalg RSA -keysize 2048 -validity 36500 -dname \"CN=HSR Debug\"";
+        if (system(kt.c_str()) != 0 || !fs::exists(KS, ec)) { prog(1.0f, "keystore gen failed (need JDK keytool on PATH)"); return false; }
+    }
+#ifdef _WIN32
     auto bs = [](std::string p){ for (char& c : p) if (c == '/') c = '\\'; return p; };
-    const char* bt = std::getenv("HSR_BUILDTOOLS"); std::string BT = bs(bt ? bt : "C:/Android/build-tools/34.0.0");
-    const char* ks = std::getenv("HSR_KEYSTORE");   std::string KS = bs(ks ? ks : "cooker/debug.keystore");
-    std::string U = bs(unsignedApk), S = bs(signedApk), A = S + ".aligned";
-    char cmd[1400];
-    // NOTE: Windows system() runs `cmd /c <str>` which strips ONE outer quote pair from <str>; with several
-    // quoted args that mangles the exe path ("system cannot find the path"). Wrap the WHOLE command in an extra
-    // outer quote pair so the inner quotes survive.  cmd /c ""prog" "a" "b""  ->  "prog" "a" "b"
+    std::string ZA = bs(BT) + "\\zipalign.exe", AS = bs(BT) + "\\apksigner.bat";
+    std::string U = bs(unsignedApk), S = bs(signedApk), A = S + ".aligned", K = bs(KS);
+    char cmd[1600];
+    // Windows system() runs `cmd /c <str>` which strips ONE outer quote pair; wrap the WHOLE command in an extra pair.
     prog(0.92f, "Zipalign");
-    snprintf(cmd, sizeof cmd, "\"\"%s\\zipalign.exe\" -f -p 4 \"%s\" \"%s\"\"", BT.c_str(), U.c_str(), A.c_str());
+    snprintf(cmd, sizeof cmd, "\"\"%s\" -f -p 4 \"%s\" \"%s\"\"", ZA.c_str(), U.c_str(), A.c_str());
     if (system(cmd) != 0) { remove(A.c_str()); prog(1.0f, "Zipalign failed"); return false; }
     prog(0.96f, "apksigner");
-    snprintf(cmd, sizeof cmd, "\"\"%s\\apksigner.bat\" sign --ks \"%s\" --ks-pass pass:android --key-pass pass:android --ks-key-alias myhome --out \"%s\" \"%s\"\"",
-             BT.c_str(), KS.c_str(), S.c_str(), A.c_str());
+    snprintf(cmd, sizeof cmd, "\"\"%s\" sign --ks \"%s\" --ks-pass pass:android --key-pass pass:android --ks-key-alias myhome --out \"%s\" \"%s\"\"",
+             AS.c_str(), K.c_str(), S.c_str(), A.c_str());
     int rc = system(cmd);
+#else
+    std::string ZA = BT + "/zipalign", AS = BT + "/apksigner";
+    std::string U = unsignedApk, S = signedApk, A = S + ".aligned", K = KS;
+    char cmd[1600];
+    prog(0.92f, "Zipalign");
+    snprintf(cmd, sizeof cmd, "\"%s\" -f -p 4 \"%s\" \"%s\"", ZA.c_str(), U.c_str(), A.c_str());
+    if (system(cmd) != 0) { remove(A.c_str()); prog(1.0f, "Zipalign failed"); return false; }
+    prog(0.96f, "apksigner");
+    snprintf(cmd, sizeof cmd, "\"%s\" sign --ks \"%s\" --ks-pass pass:android --key-pass pass:android --ks-key-alias myhome --out \"%s\" \"%s\"",
+             AS.c_str(), K.c_str(), S.c_str(), A.c_str());
+    int rc = system(cmd);
+#endif
     remove(A.c_str()); remove((signedApk + ".idsig").c_str());
     prog(1.0f, rc == 0 ? "Signed OK" : "Sign failed");   // ASCII only (the editor font atlas is Latin-1)
     return rc == 0;
@@ -1201,10 +1234,15 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     //    keeps showing the PREVIOUS cook's materials/content.hstf (device-proven: a pose-anim re-cook still rendered the
     //    old brightness-pulse wisps). A UNIQUE per-cook namespace forces fresh keys = a real reload every cook.
     //    HSR_COOK_NS pins it (e.g. for diffing); default = "myhome_<time>" so every cook busts the cache.
+    // The scene.zip's PACKAGE dir matches stock haven2025: `content/meta/home_c25/...`. decomposePath() takes the
+    // baseDir = the FIRST TWO path segments, so MH = "meta/home_c25/<token>" => baseDir = "meta/home_c25" (== stock,
+    // resolves the same way via the field2 string->hash map) while the per-cook <token> lands in the RELPATH. That keeps
+    // the cache-bust (re-cooks get fresh relPath keys = a real reload) WITHOUT moving the package off home_c25. The
+    // rest of the assets are just relinked under it. HSR_COOK_NS pins the <token> (e.g. for diffing).
     std::string nsName;
     if (const char* e = std::getenv("HSR_COOK_NS")) nsName = e;
-    else { char tb[32]; snprintf(tb, sizeof tb, "myhome_%llx", (unsigned long long)time(nullptr)); nsName = tb; }
-    const std::string MH = "meta/" + nsName;   // env-own asset namespace (NOT the shared renderer_module shaders)
+    else { char tb[32]; snprintf(tb, sizeof tb, "%llx", (unsigned long long)time(nullptr)); nsName = tb; }
+    const std::string MH = "meta/home_c25/" + nsName;   // baseDir = meta/home_c25 (stock); <token>/asset = the relinked relPath
     // Bundle the V203 render system's OWN shaders + materials: opaque -> unlit.surface (floor MATL), transparent ->
     // unlitblend.surface (dome MATL). V79 glTF envs are textured PBR (no custom GLSL), so these faithfully port the
     // shading AND fix the "black where transparent" bug (blend meshes were drawn opaque).
@@ -1844,7 +1882,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     std::string pContent = MH + "/content.hstf/template", pSpace = MH + "/space.hstf/template";
     AssetKey3 contentK = keyForPath(pContent), spaceK = keyForPath(pSpace);
     std::string content = templateJson(entities, rels);
-    std::string space   = spaceJson(rng, nsName.c_str(), contentK);
+    std::string space   = spaceJson(rng, "home_c25", contentK);   // space display name = stock package (cosmetic)
     auto shellcfg = jbytes(shellConfigJson(spaceK, locomotion));
     assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
     assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });

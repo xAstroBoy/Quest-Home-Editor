@@ -1153,7 +1153,14 @@ struct Editor {
         if (spoof && !sceneZip.empty()) {
             std::string out2 = out; size_t dot=out2.rfind(".apk"); out2=(dot==std::string::npos?out2:out2.substr(0,dot))+"_haven2025.apk";
             bool ok2=false; auto apk2=spliceAPK(nuxd, sceneZip, "com.meta.environment.prod.nuxd", "com.meta.shell.env.footprint.haven2025", &ok2);
-            if (ok2 && !apk2.empty()){ writeFile(out2, apk2); msg += " + spoof "+out2; }
+            if (ok2 && !apk2.empty()){
+                if (sign) {   // the spoof must ALSO be signed or it can't install (INSTALL_PARSE_FAILED_NO_CERTIFICATES)
+                    std::string tmp2 = out2 + ".unsigned"; writeFile(tmp2, apk2);
+                    if (signApk(tmp2, out2, progress)) msg += " + spoof(signed) "+out2;
+                    else { writeFile(out2, apk2); msg += " + spoof(UNSIGNED: sign failed) "+out2; }
+                    std::remove(tmp2.c_str());
+                } else { writeFile(out2, apk2); msg += " + spoof "+out2; }
+            }
         }
         // auto-sign
         if (sign) {

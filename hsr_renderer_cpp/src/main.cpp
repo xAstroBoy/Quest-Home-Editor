@@ -291,6 +291,16 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(hsrCrashHandler);   // segfault → symbolized stack in stderr + _crash.txt
 #endif
+    // Record the exe's own directory so APK signing can find/auto-create the Android build-tools + debug keystore
+    // right beside the exe (a machine with no Android SDK just needs the tools dropped next to the exe).
+#ifdef _WIN32
+    { char exe[MAX_PATH]; DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
+      std::string p(exe, (n>0&&n<MAX_PATH)?(size_t)n:0); size_t s = p.find_last_of("\\/");
+      if (s != std::string::npos) AppConfig::s_exeDir = p.substr(0, s); }
+#else
+    if (argc > 0 && argv[0]) { std::error_code ec; std::string p = std::filesystem::absolute(argv[0], ec).string();
+      size_t s = p.find_last_of('/'); if (s != std::string::npos) AppConfig::s_exeDir = p.substr(0, s); }
+#endif
     fprintf(stderr, "========================================================\n");
     fprintf(stderr, " HSR Renderer / Editor — libshell.so Vulkan replica\n");
     fprintf(stderr, " Drag an .apk onto the window to load it\n");
