@@ -18,8 +18,9 @@ Known unfinished areas:
   emissive, rgbmasked, the isotropic family) are only partially wired — many surfaces
   render flat, mis-shaded, or with wrong colors. The per-material constants
   (`matParams`) are not yet mapped by name, and some texture/UV mappings are off.
-- **The V79 → HSL cooking / repack pipeline is not complete.** You cannot yet produce
-  a final, installable ported home.
+- **The V79 → HSL cooking / repack pipeline produces installable, signed APKs** (see the
+  [**Converter Guide**](GUIDE.md)), but the **rendering of ported content is not yet faithful** —
+  expect wrong colours, flat shading, and some content that doesn't draw on older headsets (Quest 2).
 - **Vistas and many environments are not yet faithful.**
 
 Do not expect a polished result. Bugs, crashes, and visual errors are expected.
@@ -80,6 +81,20 @@ hsr_renderer.exe <env.apk | env.gltf.ovrscene>
 ```
 
 Drag-and-drop an environment onto the window, or pass it on the command line.
+
+### Convert an old home to an installable APK
+
+See the **[Converter Guide](GUIDE.md)** for the full walkthrough. In short: drop `adb.exe` +
+`AdbWinApi.dll` + `AdbWinUsbApi.dll` beside the exe, load the old home, open the **Cook** tab, and
+press **`COOK + SIGN + INSTALL`**. A cook writes up to two APKs next to the env:
+
+- **`<env>_NoRoot-Spoof.apk`** — masquerades as Meta's **Haven 2025** home; the **only** option that
+  installs on a **non-rooted** Quest. Install it, then pick "Haven 2025" in the home menu.
+- **`<env>_Rooted-System.apk`** — the env's own package; auto-selectable only on **rooted / dev** headsets.
+
+The auto-installer detects root over `adb` and picks the right one for you (rooted → unspoofed +
+auto-select; non-rooted → **back up the real Haven 2025**, install the spoof, relaunch the shell).
+The pristine backup is kept beside the exe as `haven2025_ORIGINAL_backup.apk` and is never overwritten.
 
 ### Sign a cooked APK
 

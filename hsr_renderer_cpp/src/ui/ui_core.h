@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
 namespace ui {
 
@@ -214,6 +215,29 @@ struct Context {
         dl->font=of;
         dl->popClip();
         return committed;
+    }
+
+    // ── deferred tooltips ── call tip() right after a widget (same rect); call drawTooltip() ONCE at the very end
+    // of the frame (after every panel/popup, with all clips popped) so the box renders on top and isn't clipped.
+    std::string ttText; float ttX=0, ttY=0; bool ttShow=false;
+    void tip(float x,float y,float w,float h,const char* s){ if(s && *s && hover(x,y,w,h)){ ttText=s; ttX=in.mx; ttY=in.my; ttShow=true; } }
+    void drawTooltip(){
+        if(!ttShow){ return; }
+        ttShow=false;                                   // consume; re-armed next frame while still hovering
+        Font* fnt = font?font:mono; if(!fnt||!dl){ return; }
+        std::vector<std::string> lines; { const std::string& s=ttText; size_t i=0;
+            while(true){ size_t nl=s.find('\n',i); if(nl==std::string::npos){ lines.push_back(s.substr(i)); break; } lines.push_back(s.substr(i,nl-i)); i=nl+1; } }
+        float pad=6.f, lineH=(fnt->ascent-fnt->descent)+3.f, wmax=0;
+        for(auto&l:lines){ float lw=fnt->textWidth(l.c_str(),(int)l.size()); if(lw>wmax)wmax=lw; }
+        float bw=wmax+2*pad, bh=lines.size()*lineH+2*pad;
+        VkRect2D root=dl->cur(); float W=(float)root.offset.x+root.extent.width, H=(float)root.offset.y+root.extent.height;
+        float bx=ttX+14, by=ttY+18;
+        if(bx+bw>W) bx=ttX-bw-6; if(bx<0)bx=0;          // flip left / clamp on-screen
+        if(by+bh>H) by=H-bh;      if(by<0)by=0;
+        dl->rect(bx,by,bw,bh, rgba(22,22,22,238)); dl->border(bx,by,bw,bh, th.accent);
+        Font* of=dl->font; dl->font=fnt; float ty=by+pad+fnt->ascent;
+        for(auto&l:lines){ dl->text(bx+pad,ty,l.c_str(),th.textSel); ty+=lineH; }
+        dl->font=of;
     }
 };
 
