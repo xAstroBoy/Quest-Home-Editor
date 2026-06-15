@@ -92,6 +92,18 @@ inline uint16_t f32_to_f16(float f) { uint32_t x; memcpy(&x, &f, 4); uint32_t s 
 //    3=min,4=max,8=1.0 }. (format-hash 0xDBE0A523 is CONSTANT for this layout; content-hashes appear to be cache
 //    keys — using deterministic placeholders. part.field3 material-binding is omitted; the entity's
 //    MaterialPlatformComponent supplies the material.) ────────────────────────────────────────────────────────
+// HSR_NOCULL — the "why do vistas never clip but cooked homes do" fix, replicating V79. V79 shipped NO environment-mesh
+// culler (it drew everything); V205 added GPU frustum + Hi-Z occlusion + CLOD-budget + distance/size culling. There is no
+// per-env "disableCulling" flag we can ship (it's a global engine setting). But every cull is driven off each renderable's
+// BOUNDS — and frustum culling honoring the cooked AABB is DEVICE-PROVEN (the existing spinBoundsY swept-bounds fix). So
+// scene-spanning bounds make V205 treat every mesh as always-visible: never frustum/occlusion/size-culled. The geometry
+// still renders at its real baked vertex positions (bounds don't move verts) — only culling is defeated. Opt-in: it trades
+// the Quest's culling perf for V79-style "draw everything," which is exactly what porting old homes wants.
+inline void nocullBounds(float aabb[6], float& radius) {
+    const char* e = std::getenv("HSR_NOCULL");
+    if (!e || !*e || *e=='0') return;   // unset / empty / "0" = off (setenv_ with "" can leave an empty-but-present var)
+    aabb[0]=aabb[1]=aabb[2]=-1.0e5f; aabb[3]=aabb[4]=aabb[5]=1.0e5f; radius=1.74e5f;
+}
 inline std::vector<uint8_t> encodeRendMesh(const std::vector<float>& posXYZ, const std::vector<float>& uvUV, const std::vector<uint16_t>& idx, const std::vector<uint8_t>& embeddedMatl = {}) {
     int nv = (int)(posXYZ.size() / 3); std::vector<uint8_t> vb;
     float mn[3] = { 1e30f,1e30f,1e30f }, mx[3] = { -1e30f,-1e30f,-1e30f };
@@ -107,6 +119,7 @@ inline std::vector<uint8_t> encodeRendMesh(const std::vector<float>& posXYZ, con
     // 12-byte format struct (CONSTANT for this stride-20 layout). VS.f4 / part.f5 = {murmur64A(VB/IB) u64, 0} (12B).
     float aabb[6] = { mn[0],mn[1],mn[2], mx[0],mx[1],mx[2] };
     float radius = 0; for (int k = 0; k < 3; k++) { float a = mn[k] < 0 ? -mn[k] : mn[k], c = mx[k] < 0 ? -mx[k] : mx[k]; if (a > radius) radius = a; if (c > radius) radius = c; }
+    nocullBounds(aabb, radius);   // HSR_NOCULL: V79-style "draw everything" — scene-spanning bounds so V205's frustum/occlusion/size culler can't drop the mesh
     static const uint8_t VSF0[12] = { 0x23,0xa5,0xe0,0xdb, 0x22,0x95,0x8f,0xf3, 0,0,0,0 };
     uint64_t vbH = murmur64A(vb.data(), vb.size()), ibH = murmur64A(ib.data(), ib.size());
     uint8_t vsf4[12] = {0}; memcpy(vsf4, &vbH, 8);
@@ -918,6 +931,7 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
         aabb[0] = -maxR; aabb[1] = -maxR; aabb[2] = -maxR; aabb[3] = maxR; aabb[4] = maxR; aabb[5] = maxR;
     }
     float radius = 0; for (int k = 0; k < 3; k++) { float a = aabb[k] < 0 ? -aabb[k] : aabb[k], c = aabb[k+3] < 0 ? -aabb[k+3] : aabb[k+3]; if (a > radius) radius = a; if (c > radius) radius = c; }
+    nocullBounds(aabb, radius);   // HSR_NOCULL: V79-style draw-everything (scene-spanning bounds defeat V205 frustum/occlusion/size cull)
     // POS+UV0+NORMAL by default; for VAT the 3rd attr is UV1 (the column) and the format-hash differs (both reversed
     // from real meshes: oceanarium VAT-format VS.f0 = {0x4157E789,0x79BF0758,0}).
     static const uint8_t VSF0_N[12] = { 0x23,0xa5,0xe0,0xdb, 0x22,0x95,0x8f,0xf3, 0,0,0,0 };
