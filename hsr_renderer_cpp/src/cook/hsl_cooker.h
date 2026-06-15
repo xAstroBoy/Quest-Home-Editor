@@ -1166,7 +1166,7 @@ inline bool signApk(const std::string& unsignedApk, const std::string& signedApk
     namespace fs = std::filesystem;
     const char* btEnv = std::getenv("HSR_BUILDTOOLS");
     std::string BT = btEnv ? std::string(btEnv) : AppConfig::detectBuildTools();
-    if (BT.empty()) { prog(1.0f, "no Android build-tools found (set ANDROID_HOME or HSR_BUILDTOOLS)"); return false; }
+    if (BT.empty()) { prog(1.0f, "no Android build-tools found - set ANDROID_HOME/HSR_BUILDTOOLS, or drop apksigner+zipalign beside the exe"); return false; }
     const char* ksEnv = std::getenv("HSR_KEYSTORE");
     std::error_code ec;
     std::string KS;
