@@ -336,6 +336,18 @@ int main(int argc, char** argv) {
         return fails ? 1 : 0;
     }
 
+    // `hsr_renderer --fetch-tools` pre-downloads the Android signing toolchain (Google build-tools + a Temurin JRE
+    // if no Java) right beside the exe, so later --sign / Cook works on a clean machine with no SDK and no JDK.
+    if (argc >= 2 && std::string(argv[1]) == "--fetch-tools") {
+        auto p = [](float f, const char* s){ fprintf(stderr, "  [%3d%%] %s\n", (int)(f * 100.f), s); };
+        std::string bt = hslcook::downloadBuildTools(p);
+        if (bt.empty()) fprintf(stderr, "[TOOLS] build-tools: FAILED (need curl + network)\n");
+        else            fprintf(stderr, "[TOOLS] build-tools -> %s\n", bt.c_str());
+        std::string jh = hslcook::ensureJava(p);
+        fprintf(stderr, "[TOOLS] java -> %s\n", jh.empty() ? "(already on PATH)" : jh.c_str());
+        return bt.empty() ? 1 : 0;
+    }
+
     std::string apkPath;
     if (argc >= 2) {
         apkPath = argv[1];

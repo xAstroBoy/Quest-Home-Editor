@@ -1155,6 +1155,148 @@ inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMe
     }
     return out;
 }
+// ── AUTO-PROVISION the signing toolchain when a machine has NOTHING installed ───────────────────────────────
+// curl (ships with Win10+/Linux/macOS) fetches the OS's official package; miniz/tar extracts it BESIDE the exe.
+// Cached after the first run. So `--sign` / Cook works on a clean PC with no Android SDK and no JDK — zero setup.
+inline bool httpDownload(const std::string& url, const std::string& outPath,
+                         const std::function<void(float,const char*)>& prog, const char* what) {
+    namespace fs = std::filesystem; std::error_code ec;
+    fs::create_directories(fs::path(outPath).parent_path(), ec);
+    if (prog) prog(0.10f, what);
+#ifdef _WIN32
+    auto bs = [](std::string p){ for (char& c : p) if (c == '/') c = '\\'; return p; };
+    std::string cmd = "curl.exe -L --fail --silent --show-error -o \"" + bs(outPath) + "\" \"" + url + "\"";
+#else
+    std::string cmd = "curl -L --fail --silent --show-error -o \"" + outPath + "\" \"" + url + "\"";
+#endif
+    int rc = system(cmd.c_str());
+    if (rc != 0 || !fs::exists(outPath, ec) || fs::file_size(outPath, ec) < 1000000) {
+        if (prog) prog(1.0f, "download failed (need curl + a network connection)");
+        return false;
+    }
+    return true;
+}
+
+inline bool extractZipTo(const std::string& zipPath, const std::string& destDir) {
+    namespace fs = std::filesystem; std::error_code ec; fs::create_directories(destDir, ec);
+    mz_zip_archive z; memset(&z, 0, sizeof z);
+    if (!mz_zip_reader_init_file(&z, zipPath.c_str(), 0)) return false;
+    mz_uint n = mz_zip_reader_get_num_files(&z); bool ok = true;
+    for (mz_uint i = 0; i < n; ++i) {
+        mz_zip_archive_file_stat st;
+        if (!mz_zip_reader_file_stat(&z, i, &st)) { ok = false; break; }
+        std::string outp = destDir + "/" + st.m_filename;
+        if (mz_zip_reader_is_file_a_directory(&z, i)) { fs::create_directories(outp, ec); continue; }
+        fs::create_directories(fs::path(outp).parent_path(), ec);
+        if (!mz_zip_reader_extract_to_file(&z, i, outp.c_str(), 0)) { ok = false; break; }
+    }
+    mz_zip_reader_end(&z); return ok;
+}
+
+// find the dir directly containing `tool`(.bat/.exe) anywhere under `root`.
+inline std::string findToolDirUnder(const std::string& root, const char* tool) {
+    namespace fs = std::filesystem; std::error_code ec;
+    if (!fs::is_directory(root, ec)) return "";
+    for (auto it = fs::recursive_directory_iterator(root, ec); it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (!it->is_directory(ec)) continue;
+        const auto& d = it->path();
+        if (fs::exists(d / (std::string(tool) + ".bat"), ec) || fs::exists(d / tool, ec) ||
+            fs::exists(d / (std::string(tool) + ".exe"), ec)) return d.string();
+    }
+    return "";
+}
+#ifndef _WIN32
+inline void chmodExec(const std::string& dir, std::initializer_list<const char*> tools) {
+    namespace fs = std::filesystem; std::error_code ec;
+    for (const char* t : tools) { auto p = fs::path(dir) / t;
+        if (fs::exists(p, ec)) fs::permissions(p, fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec, fs::perm_options::add, ec); }
+}
+#endif
+
+// DOWNLOAD Google's official Android build-tools (apksigner + zipalign) beside the exe. `force` ignores any SDK.
+inline std::string downloadBuildTools(const std::function<void(float,const char*)>& prog) {
+    namespace fs = std::filesystem; std::error_code ec;
+    std::string root = AppConfig::exeRel("android-build-tools");
+    std::string have = findToolDirUnder(root, "apksigner");        // already fetched on a previous run?
+    if (!have.empty()) return have;
+#if defined(_WIN32)
+    const char* osTag = "windows";
+#elif defined(__APPLE__)
+    const char* osTag = "macosx";
+#else
+    const char* osTag = "linux";
+#endif
+    std::string url = std::string("https://dl.google.com/android/repository/build-tools_r34-") + osTag + ".zip";
+    std::string zip = root + "/build-tools.zip";
+    if (!httpDownload(url, zip, prog, "Downloading Android build-tools (~58MB, one time)")) return "";
+    if (prog) prog(0.55f, "Extracting build-tools");
+    if (!extractZipTo(zip, root)) { if (prog) prog(1.0f, "build-tools extract failed"); return ""; }
+    fs::remove(zip, ec);
+    std::string bt = findToolDirUnder(root, "apksigner");
+#ifndef _WIN32
+    if (!bt.empty()) chmodExec(bt, { "apksigner", "zipalign", "aapt2", "aapt", "d8" });
+#endif
+    return bt;
+}
+
+// build-tools to use: HSR_BUILDTOOLS -> installed SDK -> AUTO-DOWNLOAD beside the exe.
+inline std::string ensureBuildTools(const std::function<void(float,const char*)>& prog) {
+    const char* btEnv = std::getenv("HSR_BUILDTOOLS");
+    std::string bt = btEnv ? std::string(btEnv) : AppConfig::detectBuildTools();
+    if (!bt.empty()) return bt;
+    return downloadBuildTools(prog);   // nothing installed -> fetch it
+}
+
+// JAVA to use for apksigner/keytool. "" = a working `java` is already on PATH (use it). Otherwise auto-download a
+// Temurin JRE beside the exe and return its home (caller puts <home>/bin on PATH + sets JAVA_HOME). "" on failure.
+inline std::string ensureJava(const std::function<void(float,const char*)>& prog) {
+    namespace fs = std::filesystem; std::error_code ec;
+#ifdef _WIN32
+    if (system("java -version >NUL 2>&1") == 0) return "";
+#else
+    if (system("java -version >/dev/null 2>&1") == 0) return "";
+#endif
+    std::string root = AppConfig::exeRel("jre");
+    auto findJavaHome = [&](const std::string& r)->std::string{
+        if (!fs::is_directory(r, ec)) return "";
+        for (auto it = fs::recursive_directory_iterator(r, ec); it != fs::recursive_directory_iterator(); it.increment(ec)) {
+            if (!it->is_directory(ec) || it->path().filename() != "bin") continue;
+#ifdef _WIN32
+            if (fs::exists(it->path() / "keytool.exe", ec)) return it->path().parent_path().string();
+#else
+            if (fs::exists(it->path() / "keytool", ec)) return it->path().parent_path().string();
+#endif
+        }
+        return "";
+    };
+    std::string jh = findJavaHome(root);
+    if (!jh.empty()) return jh;
+#if defined(_WIN32)
+    const char* os = "windows"; const char* ext = "zip";
+#elif defined(__APPLE__)
+    const char* os = "mac"; const char* ext = "tar.gz";
+#else
+    const char* os = "linux"; const char* ext = "tar.gz";
+#endif
+    std::string url = std::string("https://api.adoptium.net/v3/binary/latest/17/ga/") + os + "/x64/jre/hotspot/normal/eclipse";
+    std::string arc = root + "/jre." + ext;
+    if (!httpDownload(url, arc, prog, "Downloading Java runtime (~40MB, one time)")) return "";
+    if (prog) prog(0.20f, "Extracting Java runtime");
+    bool ex;
+#ifdef _WIN32
+    ex = extractZipTo(arc, root);
+#else
+    ex = (system(("tar -xzf \"" + arc + "\" -C \"" + root + "\"").c_str()) == 0);
+#endif
+    fs::remove(arc, ec);
+    if (!ex) return "";
+    jh = findJavaHome(root);
+#ifndef _WIN32
+    if (!jh.empty()) chmodExec(jh + "/bin", { "java", "keytool" });
+#endif
+    return jh;
+}
+
 // AUTO-SIGN a cooked APK: zipalign + apksigner with a debug keystore -> an INSTALLABLE signed APK. PORTABLE (no
 // hardcoded SDK path): build-tools are AUTO-DETECTED (AppConfig::detectBuildTools scans ANDROID_HOME / ANDROID_SDK_ROOT
 // / LOCALAPPDATA / ~/Android/Sdk / common dirs), and the keystore is AUTO-GENERATED with keytool if missing (so a fresh
@@ -1164,9 +1306,17 @@ inline bool signApk(const std::string& unsignedApk, const std::string& signedApk
                     const std::function<void(float,const char*)>& progress = {}) {
     auto prog = [&](float f, const char* s){ if (progress) progress(f, s); };
     namespace fs = std::filesystem;
-    const char* btEnv = std::getenv("HSR_BUILDTOOLS");
-    std::string BT = btEnv ? std::string(btEnv) : AppConfig::detectBuildTools();
-    if (BT.empty()) { prog(1.0f, "no Android build-tools found - set ANDROID_HOME/HSR_BUILDTOOLS, or drop apksigner+zipalign beside the exe"); return false; }
+    std::string BT = ensureBuildTools(progress);                  // installed SDK, or AUTO-DOWNLOAD beside the exe
+    if (BT.empty()) { prog(1.0f, "no Android build-tools (auto-download failed - need curl + a network connection, or set HSR_BUILDTOOLS)"); return false; }
+    std::string JH = ensureJava(progress);                        // "" = java already on PATH; else a downloaded JRE
+    if (!JH.empty()) {                                            // route apksigner + keytool at the fetched JRE
+        std::string p = std::getenv("PATH") ? std::getenv("PATH") : "";
+#ifdef _WIN32
+        _putenv_s("JAVA_HOME", JH.c_str()); _putenv_s("PATH", (JH + "\\bin;" + p).c_str());
+#else
+        setenv("JAVA_HOME", JH.c_str(), 1); setenv("PATH", (JH + "/bin:" + p).c_str(), 1);
+#endif
+    }
     const char* ksEnv = std::getenv("HSR_KEYSTORE");
     std::error_code ec;
     std::string KS;

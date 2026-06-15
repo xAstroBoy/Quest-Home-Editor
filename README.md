@@ -90,9 +90,12 @@ certificate") — it's **unsigned**. Sign it (no re-cook needed):
 hsr_renderer.exe --sign home.apk [more.apk ...]
 ```
 
-→ writes `home_signed.apk`, then `adb install home_signed.apk`. Needs a JDK on `PATH` (`apksigner` /
-`keytool`); the Android build-tools are auto-detected (or drop `apksigner` + `zipalign` beside the exe).
-Freshly cooked APKs are already signed automatically — this is only for older/shared unsigned ones.
+→ writes `home_signed.apk`, then `adb install home_signed.apk`. **Zero setup:** the Android build-tools are
+auto-detected from an installed SDK, and if the machine has **no SDK (and no Java)** they're **auto-downloaded
+beside the exe** on first use — Google's official build-tools + a Temurin JRE (needs `curl` + a network
+connection; Windows 10+/Linux/macOS all ship `curl`). Pre-fetch them anytime with `hsr_renderer.exe
+--fetch-tools`. Freshly cooked APKs are already signed automatically — `--sign` is only for older/shared
+unsigned ones.
 
 ## Layout
 

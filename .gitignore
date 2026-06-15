@@ -46,6 +46,10 @@ v203_shaders/
 .claude/
 _audio_tmp/
 
+# Auto-downloaded signing toolchain (build-tools / JRE) — fetched beside the exe at runtime, never committed
+android-build-tools/
+jre/
+
 # Session: cooker scratch / cooked output / signing key / large vendored libs
 cooker/_*
 cooker/out/
