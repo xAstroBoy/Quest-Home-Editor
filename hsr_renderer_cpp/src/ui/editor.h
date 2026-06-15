@@ -846,7 +846,7 @@ struct Editor {
         cx.tip(x,y0,w,th.rowH,"Emit skeletal animation for skinned meshes (clouds/koi/\ndroids). EXPERIMENTAL: the clip cook can still crash the\nenvironment on the device. Leave OFF unless testing."); y+=th.rowH+6*uiScale;
         // ── Install to headset (USB or Wi-Fi adb); the installer auto-detects root and picks spoofed vs unspoofed ──
         y0=y; cx.checkbox(ui::hashId("install"), x, y, "Install to headset after cook (auto)", installAfterCook);
-        cx.tip(x,y0,w,th.rowH,"After cooking, install over adb. The installer detects root:\n  ROOT  -> install the UNSPOOFED APK + auto-select it.\n  NO root-> back up the real haven2025, install the SPOOF,\n           and relaunch the shell (then pick Haven 2025).\nNeeds adb bundled beside the exe or on PATH."); y+=th.rowH+2*uiScale;
+        cx.tip(x,y0,w,th.rowH,"After cooking, install over adb. The installer detects root:\n  ROOT  -> install the UNSPOOFED APK + auto-select it.\n  NO root-> back up the real haven2025, install the SPOOF,\n           and relaunch the shell. The spoof REPLACES Haven 2025\n           in place (unrooted Quests can't switch envs).\nNeeds adb bundled beside the exe or on PATH."); y+=th.rowH+2*uiScale;
         y0=y; cx.label(x,y,64*uiScale,th.rowH,"Wi-Fi IP",th.textDim);
         cx.textField(ui::hashId("wifiip"), x+66*uiScale, y, w-66*uiScale-70*uiScale, th.rowH, wifiIp);
         if (cx.button(ui::hashId("wificon"), x+w-68*uiScale, y, 66*uiScale, th.rowH, "Connect")) wifiConnect();
@@ -1195,7 +1195,7 @@ struct Editor {
             } else if (!finalSpoof.empty()) {
                 std::string bkp = backupHaven2025(outDir);
                 bool inst = installToDevice(finalSpoof, "com.meta.shell.env.footprint.haven2025", progress);
-                msg += inst ? ("  || no root -> installed SPOOF + relaunched shell"+std::string(bkp.empty()?"":" (haven2025 backed up)")+"; if the home didn't change, open the Home menu and pick \"Haven 2025\"")
+                msg += inst ? ("  || no root -> installed SPOOF (REPLACES Haven 2025 in place) + relaunched shell"+std::string(bkp.empty()?"":"; haven2025 backed up")+". Loads where Haven 2025 does (unrooted can't switch envs); set Haven 2025 as your home if it isn't already.")
                             : "  || spoof install FAILED (adb/device? haven2025 may be a non-removable system app)";
             } else {
                 msg += rooted ? "  || ROOT but no system APK" : "  || no root and no spoof APK (enable the spoof toggle)";
