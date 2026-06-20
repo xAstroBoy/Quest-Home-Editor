@@ -123,7 +123,7 @@ target_link_libraries(hsr_renderer PRIVATE
 
 # ── PhysX (optional) — only when -DHSR_HAVE_PHYSX=ON + the vendored libs are present ──
 if(HSR_HAVE_PHYSX)
-    target_compile_definitions(hsr_renderer PRIVATE HSR_HAVE_PHYSX PX_PHYSX_STATIC_LIB)
+    target_compile_definitions(hsr_renderer PRIVATE HSR_HAVE_PHYSX PX_PHYSX_STATIC_LIB PX_CHECKED=1)
     target_include_directories(hsr_renderer PRIVATE "${PHYSX_DIR}/include" "${PHYSX_DIR}/pxshared/include")
     target_link_libraries(hsr_renderer PRIVATE ${PHYSX_LIBS})
 endif()
@@ -168,7 +168,7 @@ target_include_directories(hsl_cook PRIVATE
 )
 target_link_libraries(hsl_cook PRIVATE miniz ${ASTCENC_LIB})
 if(HSR_HAVE_PHYSX)
-    target_compile_definitions(hsl_cook PRIVATE HSR_HAVE_PHYSX PX_PHYSX_STATIC_LIB)
+    target_compile_definitions(hsl_cook PRIVATE HSR_HAVE_PHYSX PX_PHYSX_STATIC_LIB PX_CHECKED=1)
     target_include_directories(hsl_cook PRIVATE "${PHYSX_DIR}/include" "${PHYSX_DIR}/pxshared/include")
     target_link_libraries(hsl_cook PRIVATE ${PHYSX_LIBS})
 endif()

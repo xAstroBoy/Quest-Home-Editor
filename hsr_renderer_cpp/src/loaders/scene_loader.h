@@ -5,6 +5,7 @@
 #include "loaders/rendtxtr_parser.h"
 #include "loaders/matlmatl_parser.h"
 #include "loaders/hstf_parser.h"
+#include "loaders/rendshad_parser.h"   // parseRendShadForward -> faithful transparent-pass (f4-omitted) detection
 
 #include "miniz.h"
 
@@ -27,53 +28,159 @@
 class SceneLoader {
 public:
     std::vector<MeshData> meshes;
+    // V203 IBL: captured EQUIRECT reflection panorama (RGBA8) from the skybox reflectionMap / assets/ibl/ —
+    // gated by HSR_SKYIBL. main.cpp feeds it to vkRenderer.setIblEquirectRGBA8() for the SpecIbl per-vertex bake.
+    std::vector<u8> iblEquirectRGBA8; u32 iblEqW = 0, iblEqH = 0;
     bool verbose = true;
+    // ── Baked-lightmap binding (the warm baked room lighting), DEVICE-FAITHFUL via the override chain:
+    //   lmGuidName : meshGUID(13) -> mesh name   (cooked USD templates  *.usda/template_9k0v)
+    //   lmGuidRaw  : meshGUID(13) -> raw lightmap (calming_lightmap_overrides/*_lm.hstf deltas:
+    //                sourceId -> MeshPlatformComponent.lightingParams.lightMapTexture asset, readAsset'd)
+    // Combine via GUID -> {mesh name -> baked lightmap} (incl shared merge-group atlases). Both maps cached
+    // at load (scene.zip is freed after). Cross-loader: vista ships overrides+lightmaps, home ships USD
+    // names+meshes -> pass the companion. lmRawByKey = stem name-match FALLBACK (envs without override HSTFs).
+    std::map<std::string, std::vector<u8>> lmRawByKey;
+    std::map<std::string, std::string>     lmGuidName;
+    std::map<std::string, std::vector<u8>> lmGuidRaw;
+    float sceneNearClip = 0.f, sceneFarClip = 0.f;   // device finite near/far clip planes (space.hstf ScenePlatformComponent)
+
+    void applyLightmapOverrides(std::vector<MeshData>& targets, SceneLoader* other = nullptr) {
+        auto lower = [](std::string s){ for (auto& c : s) c = (char)tolower((unsigned char)c); return s; };
+        auto bind = [&](MeshData& md, const std::vector<u8>& raw) -> bool {
+            RendtxtrInfo ti;
+            if (!parseRendtxtrHeader(raw, ti)) return false;
+            if (!astc::decodeASTC(raw.data()+ti.rawDataOffset, ti.rawDataLen,
+                                  ti.width, ti.height, ti.blockW, ti.blockH, md.lmRGBA, true)) return false;
+            md.lmW=ti.width; md.lmH=ti.height; md.hasLightmap=true; md.bakeLightmapVtx=true; return true;
+        };
+        // FAITHFUL: meshGUID -> name (this+other) crossed with meshGUID -> raw lightmap (this+other).
+        std::map<std::string, const std::vector<u8>*> nameRaw;
+        auto nameOf = [&](const std::string& g) -> const std::string* {
+            auto it = lmGuidName.find(g); if (it != lmGuidName.end()) return &it->second;
+            if (other) { auto j = other->lmGuidName.find(g); if (j != other->lmGuidName.end()) return &j->second; }
+            return nullptr; };
+        auto addRaw = [&](std::map<std::string,std::vector<u8>>& m){ for (auto& kv : m){ const std::string* nm=nameOf(kv.first); if (nm && !kv.second.empty()) nameRaw[lower(*nm)] = &kv.second; } };
+        addRaw(lmGuidRaw); if (other) addRaw(other->lmGuidRaw);
+        int bound = 0;
+        for (auto& md : targets) {
+            if (md.hasLightmap || md.uvs2.empty()) continue;
+            auto it = nameRaw.find(lower(md.name));
+            if (it != nameRaw.end() && bind(md, *it->second)) ++bound;
+        }
+        if (bound && verbose) log("  [LM-faithful] bound %d baked lightmaps via override GUID chain", bound);
+        // FALLBACK: stem name-match (this loader's lmRawByKey) for envs lacking override HSTFs.
+        int fb = 0;
+        if (!lmRawByKey.empty()) for (auto& md : targets) {
+            if (md.hasLightmap || md.uvs2.empty()) continue;
+            std::string mk = lower(md.name);
+            if (mk.rfind("root_xform_",0)==0) mk = mk.substr(11);
+            { size_t l=mk.find("_lod"); if (l!=std::string::npos) mk=mk.substr(0,l); }
+            for (bool ch=true; ch;){ ch=false; for (std::string pre : {std::string("sm_"),std::string("lbg_"),std::string("merged_"),std::string("inst_")}) if (mk.rfind(pre,0)==0){ mk=mk.substr(pre.size()); ch=true; } }
+            const std::vector<u8>* raw=nullptr; auto it=lmRawByKey.find(mk); if (it!=lmRawByKey.end()) raw=&it->second;
+            if (!raw) for (auto& kv : lmRawByKey){ const std::string& k=kv.first; if ((k.size()>3&&mk.find(k)!=std::string::npos)||(mk.size()>3&&k.find(mk)!=std::string::npos)){ raw=&kv.second; break; } }
+            if (raw && bind(md, *raw)) ++fb;
+        }
+        if (fb && verbose) log("  [LM-namematch] bound %d via stem fallback", fb);
+        // ORM MERGE-GROUP fallback (faithful): a mesh whose own name misses its lightmap shares a baked
+        // merge-group with its ORM/rbaodir texture — the rbaodir map and the lmhdr lightmap for a baked
+        // mesh-group carry the same group stem. The haven ceiling is the case: mesh "Root_Xform_SM_LBG_cieling"
+        // (misspelled) + ORM "t_merged_ceilingtrim_rbaodir" + lightmap "t_sm_merged_ceilingtrim_..._lmhdr" are
+        // ONE group, so match the lightmap by the ORM's group stem when the mesh name fails.
+        int fg = 0;
+        if (!lmRawByKey.empty()) for (auto& md : targets) {
+            if (md.hasLightmap || md.uvs2.empty() || md.ormTexName.empty()) continue;
+            std::string base = lower(md.ormTexName);
+            size_t ext = base.find(".png"); if (ext==std::string::npos) ext = base.find(".hdr");
+            if (ext==std::string::npos) continue;
+            size_t st = base.rfind('/', ext); st = (st==std::string::npos)?0:st+1;
+            base = base.substr(st, ext-st);                                  // t_merged_ceilingtrim_rbaodir
+            for (std::string pre : {std::string("t_sm_"),std::string("t_")}) if (base.rfind(pre,0)==0){ base=base.substr(pre.size()); break; }
+            for (std::string suf : {std::string("_rbaodir"),std::string("_onxrny"),std::string("_orm"),std::string("_nx"),std::string("_normal"),std::string("_basecolor")}) { size_t f=base.rfind(suf); if (f!=std::string::npos){ base=base.substr(0,f); break; } }
+            for (bool ch=true; ch;){ ch=false; for (std::string pre : {std::string("sm_"),std::string("lbg_"),std::string("merged_")}) if (base.rfind(pre,0)==0){ base=base.substr(pre.size()); ch=true; } }  // -> ceilingtrim
+            if (base.size()<4) continue;
+            const std::vector<u8>* raw=nullptr; auto it=lmRawByKey.find(base); if (it!=lmRawByKey.end()) raw=&it->second;
+            if (!raw) for (auto& kv : lmRawByKey){ const std::string& k=kv.first; if ((k.size()>3&&base.find(k)!=std::string::npos)||(base.size()>3&&k.find(base)!=std::string::npos)){ raw=&kv.second; break; } }
+            if (raw && bind(md, *raw)) { ++fg; if (verbose) log("  [LM-ormgroup] '%s' lightmap via ORM merge-group '%s'", md.name.c_str(), base.c_str()); }
+        }
+        if (fg && verbose) log("  [LM-ormgroup] bound %d via ORM merge-group", fg);
+
+        // MERGE-GROUP SIBLING fallback (faithful): per AREA (moat/front/rear/planter/window/garden/...), the
+        // ground{X} + boulder{X} shell meshes share ONE baked lightmap ATLAS named after the boulder
+        // (t_sm_merged_calming_boulder{X}_shell_lmhdr). The cooked override deltas bind the boulder{X} mesh but
+        // MISS the ground{X} mesh -> its pbrlightmap material gets a white lightmap = the "groundMoat too white /
+        // should be greenish" wash. Both meshes sample the SAME atlas (each keeps its OWN uv2 region), so copy the
+        // bound same-area sibling's decoded lightmap texture to the unmapped one. HSR_NOLMSIB disables.
+        if (!std::getenv("HSR_NOLMSIB")) {
+            auto areaOf = [](const std::string& name) -> std::string {
+                std::string n = name; for (char& c : n) c = (char)tolower((unsigned char)c);
+                size_t p = n.find("ground"); size_t off = 6;
+                if (p == std::string::npos) { p = n.find("boulder"); off = 7; }
+                if (p == std::string::npos) return "";
+                std::string a = n.substr(p + off); size_t e = 0;
+                while (e < a.size() && a[e] >= 'a' && a[e] <= 'z') ++e;   // moat/front/rear/planter/window/garden/pot
+                return a.substr(0, e);
+            };
+            int sib = 0;
+            if (!lmRawByKey.empty()) for (auto& md : targets) {
+                if (md.hasLightmap || md.uvs2.empty()) continue;
+                std::string area = areaOf(md.name); if (area.size() < 3) continue;
+                // the merged atlas is named after the boulder of this area (…calming_boulder{area}…_lmhdr).
+                const std::vector<u8>* raw = nullptr; std::string hit;
+                for (auto& kv : lmRawByKey) if (kv.first.find("boulder"+area) != std::string::npos || kv.first.find("ground"+area) != std::string::npos) { raw = &kv.second; hit = kv.first; break; }
+                if (raw && bind(md, *raw)) { ++sib; if (verbose) log("  [LM-mergegroup] '%s' lightmap '%s' (area '%s')", md.name.c_str(), hit.c_str(), area.c_str()); }
+            }
+            if (sib && verbose) log("  [LM-mergegroup] bound %d via ground/boulder area sibling", sib);
+        }
+        if (std::getenv("HSR_LMDBG")) for (auto& md : targets) { if (md.hasLightmap||md.overlayKind) continue;
+            log("  [LM-MISS] '%s' uv2=%zu", md.name.c_str(), md.uvs2.size()); }
+    }
     // Skipped / undecoded elements, recorded during load and printed as a summary at the end (always, even
     // with verbose off) — so missing textures / unparsed meshes / unresolved assets are never silent.
     std::vector<std::string> skips;
     void recordSkip(const std::string& s) { skips.push_back(s); }
 
     // ── v203 HzAnim skeletal animation (CPU skin into dynamicVerts, like OPA/glTF) ──
-    RendSkel skel; RendClip clip;
     struct SkinRec { size_t meshIdx; std::vector<float> basePos; std::vector<u8> bIdx, bWgt; };
-    std::vector<SkinRec> skinRecs;
+    // Per-asset animation group: each animated fbx (bat/owl/windmill/lantern) owns its OWN skeleton+clip+
+    // skinned meshes. The device AnimationSystem is PER-ENTITY; the old single skel/clip drove only ONE rig
+    // (whale/incredibles), so multi-rig envs like horror had nothing/everything-wrong animate.
+    struct AnimGroup { RendSkel skel; RendClip clip; std::vector<SkinRec> skinRecs; };
+    std::vector<AnimGroup> animGroups;
 
     // Player spawn points (home_spawn_points.hstf JSON) -> editable cone markers (overlayKind 4).
     // tag "local" = the player start (cyan), "remote" = other spawns (yellow).
     struct SpawnPt { std::string name, tag; float pos[3]={0,0,0}, euler[3]={0,0,0}; int meshIdx=-1; };
     std::vector<SpawnPt> spawnPts;
-    bool hasAnimation() const { return skel.ok() && clip.ok() && !skinRecs.empty(); }
+    bool hasAnimation() const {
+        for (auto& g : animGroups) if (g.skel.ok() && g.clip.ok() && !g.skinRecs.empty()) return true;
+        return false;
+    }
     void animate(float t) {
-        if (!hasAnimation()) return;
-        std::vector<float> skin; sampleRendClip(skel, clip, t, skin);
-        int nj = (int)skin.size()/16;
-        for (auto& r : skinRecs) {
-            auto& md = meshes[r.meshIdx];
-            size_t nv = r.basePos.size()/3;
-            if (md.positions.size() < nv*3) md.positions.resize(nv*3);
-            for (size_t v=0; v<nv; ++v) {
-                float bx=r.basePos[v*3], by=r.basePos[v*3+1], bz=r.basePos[v*3+2];
-                float ox=0,oy=0,oz=0,wsum=0;
-                for (int k=0;k<4;k++) {
-                    if (v*4+k >= r.bWgt.size()) break;
-                    float w = r.bWgt[v*4+k]/255.0f; if (w<=0.f) continue;
-                    int j = r.bIdx[v*4+k]; if (j<0||j>=nj) continue;
-                    const float* m=&skin[16*j];
-                    ox += w*(m[0]*bx+m[4]*by+m[8]*bz+m[12]);
-                    oy += w*(m[1]*bx+m[5]*by+m[9]*bz+m[13]);
-                    oz += w*(m[2]*bx+m[6]*by+m[10]*bz+m[14]);
-                    wsum += w;
+        for (auto& g : animGroups) {
+            if (!(g.skel.ok() && g.clip.ok() && !g.skinRecs.empty())) continue;
+            std::vector<float> skin; sampleRendClip(g.skel, g.clip, t, skin);   // device: quat->mat3*scale+T per joint
+            int nj = (int)skin.size()/16;
+            for (auto& r : g.skinRecs) {
+                auto& md = meshes[r.meshIdx];
+                size_t nv = r.basePos.size()/3;
+                if (md.positions.size() < nv*3) md.positions.resize(nv*3);
+                for (size_t v=0; v<nv; ++v) {
+                    float bx=r.basePos[v*3], by=r.basePos[v*3+1], bz=r.basePos[v*3+2];
+                    float ox=0,oy=0,oz=0,wsum=0;
+                    for (int k=0;k<4;k++) {
+                        if (v*4+k >= r.bWgt.size()) break;
+                        float w = r.bWgt[v*4+k]/255.0f; if (w<=0.f) continue;
+                        int j = r.bIdx[v*4+k]; if (j<0||j>=nj) continue;
+                        const float* m=&skin[16*j];
+                        ox += w*(m[0]*bx+m[4]*by+m[8]*bz+m[12]);
+                        oy += w*(m[1]*bx+m[5]*by+m[9]*bz+m[13]);
+                        oz += w*(m[2]*bx+m[6]*by+m[10]*bz+m[14]);
+                        wsum += w;
+                    }
+                    if (wsum < 1e-4f) { ox=bx; oy=by; oz=bz; }
+                    else { float inv=1.0f/wsum; ox*=inv; oy*=inv; oz*=inv; }   // normalize (weights may not sum to 1)
+                    md.positions[v*3]=ox; md.positions[v*3+1]=oy; md.positions[v*3+2]=oz;
                 }
-                if (wsum < 1e-4f) { ox=bx; oy=by; oz=bz; }
-                else { float inv=1.0f/wsum; ox*=inv; oy*=inv; oz*=inv; }   // normalize (weights may not sum to 1)
-                md.positions[v*3]=ox; md.positions[v*3+1]=oy; md.positions[v*3+2]=oz;
-            }
-            if (std::getenv("HSR_ANIMDBG") && nv > 1000) {
-                float mn[3]={1e9f,1e9f,1e9f},mx[3]={-1e9f,-1e9f,-1e9f}, smin=1e9f,smax=-1e9f;
-                for (size_t v=0; v<nv; ++v){ for(int c=0;c<3;c++){float p=md.positions[v*3+c]; if(p<mn[c])mn[c]=p; if(p>mx[c])mx[c]=p;} }
-                for (int j=0;j<nj;j++){ if(skel.joints[j].scale<smin)smin=skel.joints[j].scale; if(skel.joints[j].scale>smax)smax=skel.joints[j].scale; }
-                fprintf(stderr,"[ANIMDBG] mesh%zu nv=%zu pos x[%.1f,%.1f] y[%.1f,%.1f] z[%.1f,%.1f] jointScale[%.2f,%.2f]\n",
-                        r.meshIdx, nv, mn[0],mx[0],mn[1],mx[1],mn[2],mx[2], smin,smax);
             }
         }
     }
@@ -384,6 +491,20 @@ public:
             float identMat[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
             loadHstfRec(*spacePath, 6, Transform{}, identMat);
         }
+        // DEDUP empty-transform template duplicates. A mesh defined in a level .usda with NO transform lands
+        // at the ORIGIN (it's the PROTOTYPE); a sibling entity of the SAME NAME placed by an .hstf carries the
+        // real transform. The device renders only the placed instance — so drop the origin-stuck empty
+        // duplicate (the "plant in the center that shouldn't be there": Root_..._plantC = empty in the .usda
+        // → origin, but calming_fgpocket.hstf places it at (-13.5,..)). Empty meshes with NO real-placed
+        // namesake are untouched (they keep the group-offset inheritance path — the oceanarium sand).
+        {
+            std::set<std::string> realNamed;
+            for (auto& e : entities) if (!e.emptyTransform && e.meshRef.ing != 0) realNamed.insert(e.name);
+            size_t before = entities.size();
+            entities.erase(std::remove_if(entities.begin(), entities.end(), [&](const DrawableEntity& e){
+                return e.emptyTransform && e.meshRef.ing != 0 && realNamed.count(e.name) != 0; }), entities.end());
+            if (entities.size() != before) log("  dropped %zu empty-transform template duplicate(s) at origin (real-placed namesake exists)", before - entities.size());
+        }
         log("  Total drawable entities from HSTF hierarchy: %zu", entities.size());
         if (entities.empty()) {
             log("FATAL: No drawable entities found in HSTF hierarchy");
@@ -581,6 +702,18 @@ public:
                     continue;
                 ut.texW = ti.width; ut.texH = ti.height;
                 log("  [UnrefTex] %s (%ux%u)", path.c_str(), ti.width, ti.height);
+                // V203 IBL capture: the skybox reflectionMap / assets/ibl/ panorama (equirect ASTC-HDR). Prefer a
+                // "refl"-named map; gated by HSR_SKYIBL so default rendering is untouched.
+                if (std::getenv("HSR_SKYIBL")) {
+                    std::string lp = path; for (char& c : lp) c = (char)tolower((unsigned char)c);
+                    bool isRefl = lp.find("/ibl/")!=std::string::npos || lp.find("refl")!=std::string::npos ||
+                                  lp.find("radiance")!=std::string::npos || lp.find("skydome")!=std::string::npos ||
+                                  lp.find("panorama")!=std::string::npos;
+                    if (isRefl && (iblEquirectRGBA8.empty() || lp.find("refl")!=std::string::npos)) {
+                        iblEquirectRGBA8 = ut.texRGBA; iblEqW = ti.width; iblEqH = ti.height;
+                        log("  [SKYIBL] captured IBL equirect: %s (%ux%u)", path.c_str(), ti.width, ti.height);
+                    }
+                }
                 unrefTextures.push_back(std::move(ut));
             }
             // Sort descending by area (largest = most likely skybox)
@@ -606,6 +739,19 @@ public:
             const std::string* sp = resolve(sk);
             if (!sp) { sk.pkg = matInfo.shaderPkg; sp = resolve(sk); }
             if (sp) md.shaderPath = *sp;             // so the renderer can match it to the global shader
+            // FAITHFUL blend (data-proven, NOT name-based): the surface's RENDSHAD forward pass has field 4
+            // OMITTED iff its pass is alpha-blended — true for animatedfog + mattepaintingalpha (the "white
+            // fog" / "broken matte"), false for every opaque forward shader. Read the .surface + check it.
+            // (Only ADDS blend. Other transparents whose pass == opaque are caught by the name rules below.)
+            if (sp) {
+                auto surfData = readAsset(*sp);
+                if (!surfData.empty()) {
+                    std::vector<SpirvBlob> tmpBlobs; bool passTransparent = false;
+                    bool parsed = parseRendShadForward(surfData, tmpBlobs, &passTransparent);
+                    if (passTransparent) { md.useBlend = true; log("  [blend] '%s' forward pass = ALPHA-BLENDED (f4-omitted)", md.name.c_str()); }
+                    if (std::getenv("HSR_BLENDDBG")) log("  [blendchk] '%s' surf=%zuB parsed=%d transp=%d sp=%s", md.name.c_str(), surfData.size(), (int)parsed, (int)passTransparent, sp->c_str());
+                }
+            }
             if (sp && (sp->find("blend") != std::string::npos ||
                        sp->find("Blend") != std::string::npos))
                 md.useBlend = true;
@@ -618,6 +764,23 @@ public:
             // discards by design but the per-material variant pick doesn't always hit the discard variant, so
             // mark it alpha-test (and blend as the safety net) to kill the black halo.
             if (sp && sp->find("foliage") != std::string::npos) { md.alphaTest = true; md.useBlend = true; }
+            // Transparent atmospheric/water shaders that lack a "blend" token but ARE alpha-blended on device:
+            // unlitmist (the mist planes rendered as SOLID BLOCKS), lakesurf/water (transparent surface), smoke.
+            if (sp && (sp->find("mist") != std::string::npos || sp->find("smoke") != std::string::npos ||
+                       sp->find("lakesurf") != std::string::npos || sp->find("water") != std::string::npos))
+                md.useBlend = true;
+            // animatedfog (atmospheric_fog_*, waterfallSplash) + mattepaintingalpha (waterfall_matte) are
+            // ALPHA-BLENDED on device, but their forward pass-state is byte-identical to OPAQUE (proven via
+            // readAsset f4-check: transp=0) — the blend lives in the MATL render-queue (not yet parsed). Their
+            // base texture is opaque (alpha=255) so the device shader computes the fog/matte alpha itself; we
+            // just need the alpha-blend pipeline. Match by device shader name as the render-queue proxy until
+            // the MATL queue field is decoded. (The skybox 'skyboxwithglobalfog' is excluded — opaque dome.)
+            if (sp && (sp->find("animatedfog") != std::string::npos || sp->find("mattepainting") != std::string::npos))
+                md.useBlend = true;
+            // Candle FLAME / glow = ADDITIVE emissive (self-lit, brightens the scene; not opaque).
+            if (sp && (sp->find("flame") != std::string::npos || sp->find("glow") != std::string::npos)) {
+                md.useBlend = true; md.additive = true;
+            }
 
             // Load EVERY texture the material references into its role slot, exactly as
             // libshell binds each shader texture resource by name. A HAVEN prop material
@@ -629,11 +792,38 @@ public:
             // texture whose name actually marks it as a base colour ("basecolor"/"albedo"/"diffuse") over
             // the generic white/renderer_module default.
             u64 baseIng = 0, defaultBaseIng = 0;
+            // FAITHFUL texture-role assignment by samplerNameHash (device binds each texture to its shader
+            // sampler by MurmurHash3(samplerName,0) — see matlmatl textureValues). The old filename heuristic
+            // (texRole) missed horror's lightmaps (named _lm/.hdr/candle_lightmap) -> gm.lmView stayed WHITE
+            // -> the baked-dark scene washed bright. PROVEN: MurmurHash3("baseColorTex")==0xe9c182de.
+            auto roleFromSamplerHash = [](u32 h) -> int {
+                static const std::pair<std::string,int> kS[] = {
+                    {"lightmap",4},{"Lightmap_Tx",4},{"LightMap_Tx",4},
+                    {"ONxRNy_Tx",1},{"Normal_Tx",1},
+                    {"RBAoDir_Tx",2},{"metalnessRoughnessOcclusionTex",2},
+                    {"EmissiveColor_Tx",3},{"Emissive_Tx",3},{"emissiveTex",3},
+                    {"baseColorTex",0},{"BaseColorMetallic_Tx",0},{"BaseColor_Tx",0},
+                };
+                for (auto& s : kS) if (murmur3_x86_32(s.first.data(), s.first.size(), 0) == h) return s.second;
+                return -1;
+            };
+            auto samplerHashForIng = [&](u64 ing) -> u32 {
+                for (auto& st : matInfo.samplerTex) if (st.second == ing) return st.first;
+                return 0;
+            };
             for (u64 ing : matInfo.texIngs) {
                 AssetKey k = {0, ing, matInfo.texTgt};
                 const std::string* tp = resolve(k);
                 if (!tp) { k.pkg = matInfo.texPkg; tp = resolve(k); }
                 if (!tp) continue;
+                {   // NEVER bind renderer_module/missing_lightmap.png — it's the "no baked lightmap yet"
+                    // PLACEHOLDER (gray 64x64) the device swaps for the real baked lightmap at runtime.
+                    // It was a role-4 entry listed AFTER the real lightmap (candle_lightmap) and OVERWROTE
+                    // md.lmRGBA -> the candle (and others) rendered gray. Skip it so the real lightmap wins
+                    // (and meshes that ONLY have it fall to the white default = show base albedo, not gray).
+                    std::string ln=*tp; for (char& c:ln) c=(char)tolower((unsigned char)c);
+                    if (ln.find("missing_lightmap") != std::string::npos) continue;
+                }
                 {   // VAT offset texture (half-float) — decode separately, never as ASTC/base.
                     std::string ln = *tp; for (char& c : ln) c = (char)tolower((unsigned char)c);
                     if (ln.find("vatdata") != std::string::npos) {
@@ -642,7 +832,9 @@ public:
                         continue;
                     }
                 }
-                int role = texRole(*tp);
+                u32 sh = samplerHashForIng(ing);
+                int role = sh ? roleFromSamplerHash(sh) : -1;   // device-faithful: role by samplerNameHash
+                if (role < 0) role = texRole(*tp);              // fallback: filename heuristic
                 AssetKey tk = {matInfo.texPkg, ing, matInfo.texTgt};
                 switch (role) {
                     case 1: if (decodeTexInto(tk, md.normalRGBA, md.normalW, md.normalH)) {
@@ -655,9 +847,21 @@ public:
                                       md.ormRGBA=md.normalRGBA; md.ormW=md.normalW; md.ormH=md.normalH; md.hasOrm=true; } }
                             } break;
                     case 2: if (decodeTexInto(tk, md.ormRGBA, md.ormW, md.ormH)) {
-                                md.hasOrm = true; log("    [orm]      %s", tp->c_str()); } break;
-                    case 4: if (decodeTexInto(tk, md.lmRGBA, md.lmW, md.lmH)) {
-                                md.hasLightmap = true; log("    [lightmap] %s", tp->c_str()); } break;
+                                md.hasOrm = true; md.ormTexName = *tp; log("    [orm]      %s", tp->c_str()); } break;
+                    case 4: {
+                                // ⛔ The pbrlightmap materials reference white.png / a renderer_module default in
+                                // their lightmap slot as a PLACEHOLDER (the device swaps it for the real baked
+                                // lightmap at runtime, like missing_lightmap.png). Binding it set hasLightmap=true,
+                                // which made applyLightmapOverrides SKIP the mesh (line "if md.hasLightmap continue")
+                                // -> the REAL baked lightmap (shipped by the vista's *_lm override) never bound ->
+                                // haven ceiling/cushions/candles rendered FLAT/DARK ("not lit"). Skip the placeholder
+                                // so the override chain binds the real lightmap.
+                                std::string ln=*tp; for (char& c:ln) c=(char)tolower((unsigned char)c);
+                                bool placeholder = ln.find("white.png")!=std::string::npos || ln.find("renderer_module")!=std::string::npos;
+                                if (!placeholder && decodeTexInto(tk, md.lmRGBA, md.lmW, md.lmH)) {
+                                    md.hasLightmap = true; log("    [lightmap] %s", tp->c_str());
+                                }
+                            } break;
                     case 3: if (decodeTexInto(tk, md.emissiveRGBA, md.emissiveW, md.emissiveH)) {
                                 md.hasEmissive = true; log("    [emissive] %s", tp->c_str()); } break;
                     case 0: default: {
@@ -697,6 +901,116 @@ public:
         size_t fallbackMatIdx = 0;  // cycles through fallbackMats for no-matRef entities
         size_t unrefTexIdx = 0;     // cycles through unrefTextures for no-mat prod entities
 
+        // ── Baked-LIGHTMAP OVERRIDE map (THE warm room lighting). V205 binds each mesh's baked lightmap
+        //    (t_<mesh>_lmhdr[2].hdr under .../lightmaps/) BY NAME, NOT via material textureValues — so they
+        //    show up "unreferenced" and the room renders FLAT (vs the device's soft warm baked light). Build
+        //    name->AssetKey so each mesh fetches its lightmap. (Vista envs ship these; haven2025 alone doesn't.)
+        auto lmKeyOf = [](std::string p) -> std::string {
+            for (auto& c : p) c = (char)tolower((unsigned char)c);
+            // the asset path is ".../lightmaps/t_<mesh>_lmhdr[2].hdr/tex_r676" — the lightmap name is the
+            // PATH COMPONENT containing "_lmhdr", NOT the basename ("tex_r676"). Extract that component.
+            size_t h = p.find("_lmhdr"); if (h == std::string::npos) return "";
+            size_t s = p.rfind('/', h); s = (s == std::string::npos) ? 0 : s + 1;
+            std::string name = p.substr(s, h - s);     // e.g. "t_sm_platformblocks"
+            if (name.rfind("t_", 0) == 0) name = name.substr(2);
+            size_t sh = name.find("_shell"); if (sh != std::string::npos) name = name.substr(0, sh);
+            // strip prefixes in ANY order (sm_merged_cabinetb -> cabinetb, sm_lbg_x -> x) so the lightmap
+            // name ("t_sm_merged_cabinetb_shell") matches the mesh ("SM_LBG_cabinetB").
+            for (bool ch = true; ch; ) { ch = false;
+                for (std::string pre : {std::string("sm_"),std::string("merged_"),std::string("lbg_"),std::string("inst_")})
+                    if (name.rfind(pre,0)==0) { name = name.substr(pre.size()); ch = true; } }
+            return name;
+        };
+        for (auto& [key, path] : assetMap) {
+            if (path.find("_lmhdr") == std::string::npos) continue;
+            std::string k = lmKeyOf(path);
+            if (k.empty() || lmRawByKey.count(k)) continue;
+            auto raw = readAsset(path);
+            if (!raw.empty()) lmRawByKey[k] = std::move(raw);
+        }
+        log("  Lightmap-override: cached %zu baked lightmaps", lmRawByKey.size());
+
+        // ── DEVICE-FAITHFUL baked-lightmap mapping (JSON): cooked USD templates give meshGUID->name; the
+        //    calming_lightmap_overrides *_lm.hstf give sourceId(meshGUID)->lightMapTexture(the _lmhdr asset).
+        {
+            auto guid13 = [](const std::string& s) -> std::string {
+                size_t sl = s.find_last_of('/'); std::string g = (sl==std::string::npos)?s:s.substr(sl+1);
+                return g.substr(0, 13);
+            };
+            int nf_lm = (int)mz_zip_reader_get_num_files(&sceneZip);
+            mz_zip_archive_file_stat lmst;
+            for (int zi = 0; zi < nf_lm; ++zi) {
+                if (!mz_zip_reader_file_stat(&sceneZip, zi, &lmst)) continue;
+                std::string path = lmst.m_filename;              // "content/meta/.../X.usda/template_9k0v"
+                bool isUsdTpl   = path.find(".usda/template")     != std::string::npos;
+                bool isOverride = path.find("_lm.hstf")           != std::string::npos ||
+                                  path.find("lightmap_overrides") != std::string::npos;
+                bool isSpace    = path.find("space.hstf")         != std::string::npos;
+                if (!isUsdTpl && !isOverride && !isSpace) continue;
+                size_t zsz = 0; void* zd = mz_zip_reader_extract_to_heap(&sceneZip, zi, &zsz, 0);
+                if (!zd) continue;
+                std::string t((const char*)zd, zsz); mz_free(zd);
+                if (t.empty() || t[0] != '{') continue;
+                if (isSpace) {  // ScenePlatformComponent/ClippingPlanesComponent: the DEVICE's finite far/near
+                    auto num = [&](const char* k) -> float { size_t q=t.find(k); if(q==std::string::npos) return 0.f;
+                        size_t c=t.find(':',q+strlen(k)); if(c==std::string::npos) return 0.f;
+                        return (float)atof(t.c_str()+c+1); };
+                    float fc=num("\"farClippingPlane\""), nc=num("\"nearClippingPlane\"");
+                    if (fc>0.f) { sceneFarClip=fc; if(nc>0.f) sceneNearClip=nc;
+                        log("  Scene clip planes (device-faithful): near=%.3f far=%.0f", sceneNearClip, sceneFarClip); }
+                }
+                if (t.empty() || (!isUsdTpl && !isOverride)) continue;
+                // whitespace-tolerant: from key opening-quote pos, read its quoted string value (JSON is
+                // pretty-printed: `"id": "..."` with spaces). Returns the value's closing-quote pos.
+                auto vstr = [&](size_t keyPos, size_t keyLen, std::string& out) -> size_t {
+                    size_t c = t.find(':', keyPos + keyLen); if (c == std::string::npos) return std::string::npos;
+                    size_t q1 = t.find('"', c + 1); if (q1 == std::string::npos) return std::string::npos;
+                    size_t q2 = t.find('"', q1 + 1); if (q2 == std::string::npos) return std::string::npos;
+                    out = t.substr(q1 + 1, q2 - q1 - 1); return q2;
+                };
+                if (isUsdTpl) {                                   // "id": "<guid>" ... "name": "<name>"
+                    size_t p = 0;
+                    while ((p = t.find("\"id\"", p)) != std::string::npos) {
+                        std::string idv; size_t ke = vstr(p, 4, idv);
+                        if (ke == std::string::npos) { p += 4; continue; }
+                        std::string gd = guid13(idv);
+                        size_t nmpos = t.find("\"name\"", ke), nextid = t.find("\"id\"", ke);
+                        if (nmpos != std::string::npos && (nextid == std::string::npos || nmpos < nextid)) {
+                            std::string nm; vstr(nmpos, 6, nm);
+                            if (!nm.empty() && !lmGuidName.count(gd)) lmGuidName[gd] = nm;
+                        }
+                        p = ke;
+                    }
+                }
+                if (isOverride) {                                 // "sourceId": "<guid>" ... "lightMapTexture": {...}
+                    size_t p = 0;
+                    while ((p = t.find("\"sourceId\"", p)) != std::string::npos) {
+                        std::string srcv; size_t ke = vstr(p, 10, srcv);
+                        if (ke == std::string::npos) { p += 10; continue; }
+                        std::string gd = guid13(srcv);
+                        size_t nextSrc = t.find("\"sourceId\"", ke);
+                        size_t lm = t.find("\"lightMapTexture\"", ke);
+                        if (lm != std::string::npos && (nextSrc == std::string::npos || lm < nextSrc) && !lmGuidRaw.count(gd)) {
+                            size_t ip = t.find("\"ingestionId\"", lm), pp = t.find("\"packageOrRemoteId\"", lm), tp = t.find("\"targetId\"", lm);
+                            std::string ing, pkg, tgt;
+                            if (ip != std::string::npos && (nextSrc==std::string::npos || ip<nextSrc)) vstr(ip, 13, ing);
+                            if (pp != std::string::npos && (nextSrc==std::string::npos || pp<nextSrc)) vstr(pp, 19, pkg);
+                            if (tp != std::string::npos && (nextSrc==std::string::npos || tp<nextSrc)) { size_t c=t.find(':',tp+10); if(c!=std::string::npos){ size_t e=t.find_first_of(",}",c+1); tgt=t.substr(c+1,e-c-1); } }
+                            if (!ing.empty()) {
+                                AssetKey lk{}; lk.ing = strtoull(ing.c_str(),nullptr,10);
+                                lk.pkg = strtoull(pkg.c_str(),nullptr,10); lk.tgt = (u32)strtoul(tgt.c_str(),nullptr,10);
+                                const std::string* lp = resolve(lk);
+                                if (!lp) { lk.pkg = 0; lp = resolve(lk); }
+                                if (lp) { auto lr = readAsset(*lp); if (!lr.empty()) lmGuidRaw[gd] = std::move(lr); }
+                            }
+                        }
+                        p = ke;
+                    }
+                }
+            }
+            log("  Lightmap GUID chain: %zu mesh-names, %zu override lightmaps", lmGuidName.size(), lmGuidRaw.size());
+        }
+
         for (size_t ei = 0; ei < entities.size(); ++ei) {
             auto& obj = entities[ei];
             log("========================================");
@@ -735,15 +1049,21 @@ public:
                 // blktFloorBlock/blktPlatformBlockB is a flat untextured (stride-12) twin of a DETAILED mesh
                 // (gardenWall, deskWall, ...). Rendering it overlaps & HIDES the real grooved wall ("misplaced,
                 // needs groves"). libshell doesn't show greybox — the detailed twin is the visual. Skip it.
-                bool isBlkt = nlow.find("blkt") != npos;
-                // Editor: load navmesh (1) + collision/walls (2) as editable translucent overlays
-                // instead of dropping them. Still skip physics-duplicate (__phys_) meshes and UI quads.
-                if (isNav && !isPhys) { overlayKind = 1; recordSkip("NOT RENDERED — classified navmesh overlay: "+obj.name); }
-                else if (isCol && !isPhys) { overlayKind = 2; recordSkip("NOT RENDERED — classified collision overlay: "+obj.name); }
-                if (isPhys || isUI || isBlkt) {
+                // ⛔ blkt (blockout) meshes are REAL render geometry — DO NOT skip them. IDA-VERIFIED (2026-06-18):
+                // libshell has NO "blkt"/"blockout"/"greybox" string or skip path; the blkt meshes live in the
+                // RENDER template (home_3d_staticarch_shell.usda, same as the detailed walls), carry the SAME
+                // material (ing 3870980354968886336) + a MeshPlatformComponent with isVisibleSelf=true. The old
+                // name-skip ("detailed twin renders instead") was a wrong guess: it dropped structural surfaces,
+                // and blktGardenGravel has NO detailed twin → its gravel surface went MISSING ([NOT RENDERED] bug).
+                // Editor: load navmesh (1) + collision/walls (2) as editable translucent overlays instead of
+                // dropping them. Still skip physics-duplicate (__phys_) meshes and isVisibleSelf=false UI quads.
+                // Navmesh/collision are RENDERED as editable overlays (green/red) — not "not rendered". Log them as
+                // OVERLAY so the [NOT RENDERED] report only lists genuinely-dropped meshes (phys dup / hidden UI).
+                if (isNav && !isPhys) { overlayKind = 1; log("  OVERLAY (navmesh, editable): %s", obj.name.c_str()); }
+                else if (isCol && !isPhys) { overlayKind = 2; log("  OVERLAY (collision, editable): %s", obj.name.c_str()); }
+                if (isPhys || isUI) {
                     if (isUI) recordSkip("NOT RENDERED — classified UI/gizmo: "+obj.name);
-                    else if (isBlkt) recordSkip("NOT RENDERED — blockout greybox (detailed twin renders instead): "+obj.name);
-                    log("  SKIP: non-visual (phys-duplicate / UI gizmo / blockout greybox)");
+                    log("  SKIP: non-visual (phys-duplicate / UI gizmo)");
                     continue;
                 }
             }
@@ -757,8 +1077,23 @@ public:
 
             MeshData md;
             md.name      = obj.name;
+            md.components = obj.components;   // all hstf components -> editor inspector
+            // V203 skybox-IBL (gated HSR_SKYIBL): mark meshes to receive the equirect diffuse-IBL ambient bake
+            // (vk_renderer per-vertex). Opt-in so default rendering (lightmaps) is untouched.
+            if (std::getenv("HSR_SKYIBL")) md.iblLit = true;
+            md.meshPath  = *meshPath;   // for multi-rig skeleton matching (shared .fbx path)
             md.transform = obj.transform;
             md.atlasCellIndex = obj.atlasCellIndex;                         // per-instance atlas variant (coral colour)
+            md.vatTrackIndex = obj.vatTrackIndex; md.vatRateFactor = obj.vatRateFactor; md.vatTimeOffset = obj.vatTimeOffset; // per-instance VAT track/phase
+            // Per-instance MaterialPropertyOverrides (matParams.* over the cooked block). Carry them onto the mesh,
+            // and pull out matParams.tint as the per-instance colour multiplier (grey butterfly -> rose-tinted).
+            md.matOverrides = obj.matOverrides;
+            for (const auto& ov : obj.matOverrides) {
+                if (ov.name.find("tint") != std::string::npos || ov.name.find("Tint") != std::string::npos) {
+                    md.tint[0]=ov.v[0]; md.tint[1]=ov.v[1]; md.tint[2]=ov.v[2];
+                    md.tint[3] = (ov.v[3] > 0.0f) ? ov.v[3] : 1.0f;  // alpha defaults to opaque (override w often 0)
+                }
+            }
             md.hasWorldMatrix = obj.hasWorldMatrix;                         // faithful 4×4 world (parent→child)
             if (obj.hasWorldMatrix) memcpy(md.worldMatrix, obj.worldMatrix, sizeof(md.worldMatrix));
             md.overlayKind = overlayKind;
@@ -772,7 +1107,7 @@ public:
               }
             }
             if (!parseRendMesh(meshData, md.positions, md.uvs, md.indices,
-                               &md.boneIndices, &md.boneWeights, md.name.c_str(), &md.uvs2)) {
+                               &md.boneIndices, &md.boneWeights, md.name.c_str(), &md.uvs2, &md.bonePalette, &md.colors, &md.uvs3, &md.uvs4)) {
                 recordSkip("RENDMESH parse failed: " + (meshPath ? *meshPath : md.name));
                 log("  SKIP: RENDMESH parse failed");
                 failedCount++;
@@ -801,6 +1136,14 @@ public:
 
             // ── Resolve material → texture
             bool gotTex = false;
+            // SKYBOX dome (SkyboxPlatformComponent): bind its colorTexture panorama directly — it has no material.
+            // Drawn as opaque geometry (the dome surrounds the scene). Without this the sky was missing entirely.
+            md.isSkybox = obj.isSkybox;
+            if (obj.isSkybox) {
+                if (obj.skyboxTex.ing != 0 && loadTexture(obj.skyboxTex, md)) {
+                    gotTex = true; log("  [skybox] '%s' colorTexture bound (%ux%u)", md.name.c_str(), md.texW, md.texH);
+                } else log("  [skybox] '%s' has skyboxMesh but no colorTexture", md.name.c_str());
+            }
 
             // Path 1: HSTF-provided matRefs (MaterialPlatformComponent — prod envs)
             for (auto& matRef : obj.matRefs) {
@@ -872,8 +1215,8 @@ public:
                 // nothing (no white blob) but the disk/glow adds light. The no-material shader outputs
                 // alpha=1, so plain alpha-blend can't drop the surround — additive on a premultiplied tex is
                 // the only way to get the sun glow visible WITHOUT the full-white quad. Boost so it reads.
-                md.useBlend = isVfx;
-                md.additive = isVfx;
+                md.useBlend = md.useBlend || isVfx;   // PRESERVE an already-set alpha-blend (f4-omitted fog/matte); don't reset to opaque
+                md.additive = md.additive || isVfx;
                 if (isVfx) {
                     for (size_t p = 0; p + 3 < md.texRGBA.size(); p += 4) {
                         u32 a = md.texRGBA[p+3];
@@ -906,6 +1249,8 @@ public:
                 md.hasTexture = true;
             }
 
+            // Bind this mesh's baked LIGHTMAP override (the warm room lighting), matched BY NAME — only if it
+            // didn't already get a lightmap from its material and it has lightmap UVs (uv1) to sample.
             meshes.push_back(std::move(md));
             loadedCount++;
         }
@@ -950,7 +1295,8 @@ public:
                 std::vector<u8> mdata((u8*)mdptr, (u8*)mdptr + msz);
                 mz_free(mdptr);
 
-                if (!parseRendMesh(mdata, md.positions, md.uvs, md.indices, &md.boneIndices, &md.boneWeights)) {
+                if (!parseRendMesh(mdata, md.positions, md.uvs, md.indices, &md.boneIndices, &md.boneWeights,
+                                   nullptr, nullptr, nullptr, &md.colors, &md.uvs3, &md.uvs4)) {   // also extract sem4 vertexColor0 + uv2/uv3
                     log("  RENDMESH parse failed — skip");
                     failedCount++;
                     continue;
@@ -985,55 +1331,96 @@ public:
                     if (strstr(st.m_filename, marker)) { size_t sz=0; void* p=mz_zip_reader_extract_to_heap(&sceneZip, fi, &sz, 0);
                         if (p){ out.assign((u8*)p,(u8*)p+sz); mz_free(p); return true; } } }
                 return false; };
-            std::vector<u8> sb, ab;
-            // nuxd names these "__hzanim_*_sub_targets__"; OUR cooker names them "mNNN.skel/skeleton" + ".anim/anim".
-            // For OUR cooked envs the per-vertex bone indices are ALREADY direct skel-joint indices (the glTF skin's
-            // JOINTS_0 palette == our skeleton order) — so the nuxd palette-slot->joint DFS remap must be SKIPPED.
-            bool cookedNaming = false;
-            bool foundSkel = extractBy("__hzanim_skel_sub_targets__", sb);
-            if (!foundSkel) { foundSkel = extractBy(".skel/skeleton", sb); cookedNaming = foundSkel; }
-            if (foundSkel && parseRendSkel(sb, skel)) {
-                log("  HzAnim skeleton: %zu joints (first '%s')", skel.joints.size(), skel.joints.empty()?"":skel.joints[0].name.c_str());
-                if ((extractBy("__hzanim_anim_sub_targets__", ab) || extractBy(".anim/anim", ab)) && parseRendClip(ab, (int)skel.joints.size(), clip))
-                    log("  HzAnim clip: %d frames x %d joints @ %.0f fps", clip.nFrames, clip.nJoints, clip.fps);
-                else log("  HzAnim clip: parse FAILED (clip format unresolved)");
-                if (skel.ok() && clip.ok()) for (size_t mi=0; mi<meshes.size(); ++mi) {
-                    auto& md = meshes[mi];
+            // Extract a zip entry by INDEX (we walk every entry to find all skeletons).
+            auto extractIdx=[&](int fi, std::vector<u8>& out)->bool{
+                size_t sz=0; void* p=mz_zip_reader_extract_to_heap(&sceneZip, fi, &sz, 0);
+                if (p){ out.assign((u8*)p,(u8*)p+sz); mz_free(p); return true; } return false; };
+            // MULTI-RIG: enumerate EVERY skeleton (one per animated fbx: bat/owl/windmill/lantern...). For each,
+            // parse its skel + the matching anim under the SAME asset key (path up to ".../<name>.fbx" or
+            // "....skel/"), then bind every skinned mesh whose meshPath shares that key. The device
+            // AnimationSystem is PER-ENTITY, so each rig animates independently (was a single global skel/clip).
+            for (int si=0; si<nf; ++si) {
+                mz_zip_archive_file_stat st;
+                if (!mz_zip_reader_file_stat(&sceneZip, si, &st)) continue;
+                std::string sp = st.m_filename; bool cookedNaming=false; std::string zipKey;
+                size_t kp = sp.find("/__hzanim_skel_sub_targets__");
+                if (kp != std::string::npos) zipKey = sp.substr(0, kp);
+                else { kp = sp.find(".skel/skeleton"); if (kp!=std::string::npos){ zipKey=sp.substr(0,kp); cookedNaming=true; } }
+                if (zipKey.empty()) continue;                    // not a skeleton entry
+                // Zip entries carry a "content/" prefix that manifest/mesh paths (md.meshPath) do NOT — strip
+                // it for mesh matching (that prefix mismatch was binding 0 meshes to every rig).
+                std::string key = (zipKey.rfind("content/",0)==0) ? zipKey.substr(8) : zipKey;
+                std::vector<u8> sb; if (!extractIdx(si, sb)) continue;
+                AnimGroup g; if (!parseRendSkel(sb, g.skel)) continue;
+                // matching anim clip under the SAME asset key
+                std::vector<u8> ab; bool gotAnim=false;
+                for (int ai=0; ai<nf && !gotAnim; ++ai) {
+                    mz_zip_archive_file_stat at; if (!mz_zip_reader_file_stat(&sceneZip, ai, &at)) continue;
+                    std::string ap = at.m_filename;
+                    if (ap.size()<zipKey.size() || ap.compare(0,zipKey.size(),zipKey)!=0) continue;
+                    if (ap.find("__hzanim_anim_sub_targets__")==std::string::npos && ap.find(".anim/anim")==std::string::npos) continue;
+                    if (extractIdx(ai, ab) && parseRendClip(ab, (int)g.skel.joints.size(), g.clip)) gotAnim=true;
+                }
+                if (!gotAnim) { log("  HzAnim '%s': %zu joints but no clip", key.c_str(), g.skel.joints.size()); continue; }
+                // FAITHFUL slot->joint remap (the MAP libshell reads, NOT a DFS guess). The mesh's per-vertex
+                // boneIndices are SLOTS into the mesh's bone PALETTE (md.bonePalette, read from RENDMESH
+                // ROOT.f2[0].f0 = one MurmurHash3_x86_32(jointName,0) per slot). Each slot maps to the
+                // skeleton joint whose name-hash matches. Precompute each skeleton joint's name-hash once.
+                int nJ=(int)g.skel.joints.size();
+                std::vector<u32> jointHash(nJ);
+                for (int j=0;j<nJ;++j) jointHash[j]=murmur3_x86_32(g.skel.joints[j].name.data(), g.skel.joints[j].name.size(), 0);
+                // DFS order kept ONLY as a fallback for meshes whose RENDMESH carries no palette.
+                std::vector<int> dfs, stk;
+                for (int j=nJ-1;j>=0;--j) if (g.skel.joints[j].parent<0) stk.push_back(j);
+                while(!stk.empty()){int j=stk.back();stk.pop_back();dfs.push_back(j);for(int c=nJ-1;c>=0;--c) if(g.skel.joints[c].parent==j) stk.push_back(c);}
+                bool ident=((int)dfs.size()==nJ); for(int s=0;ident&&s<(int)dfs.size();++s) if(dfs[s]!=s) ident=false;
+                // bind every skinned mesh from THIS fbx (matched by shared asset path).
+                for (size_t mi=0; mi<meshes.size(); ++mi) {
+                    auto& md=meshes[mi];
+                    if (md.meshPath.size()<key.size() || md.meshPath.compare(0,key.size(),key)!=0) continue;
                     if (!md.hasBones || md.boneIndices.size() < md.positions.size()/3*4) continue;
-                    // Only genuine SKINNED-shader meshes bind sbSkinningMatrices in libshell. Many static meshes
-                    // carry stray sem7/8 data (false-positive hasBones); skinning those with the whale clip
-                    // explodes them. Gate on the skinned shader (unlitskinneddistancefade / unlitblendskinned).
-                    if (md.shaderPath.find("skinned") == std::string::npos) continue;
-                    // ── Bone-slot -> skel-joint REMAP (libshell fillBoneDataWithRemapping) ──────────────
-                    // The mesh's per-vertex bone indices are PALETTE slots, not skel-joint indices; libshell
-                    // writes skinMatrix[joint] into sbSkinningMatrices[remap[joint]]. The mesh stores no palette
-                    // we could find, but it's RECOVERABLE from the bind: the verts a slot rigidly drives cluster
-                    // at the joint it represents, so match each slot's high-weight centroid to the nearest skel
-                    // joint, then rewrite the vertex indices so skin[idx] addresses the correct joint.
-                    {
-                        int nJ = (int)skel.joints.size();
-                        // The skel file stores joints BREADTH-FIRST, but the mesh's bone SLOTS are in the
-                        // skeleton's DEPTH-FIRST traversal order (the FBX skin-cluster order). slot s addresses
-                        // sbSkinningMatrices[s], which libshell fills as skinMatrix[ dfsOrder[s] ]. So remap each
-                        // vertex slot -> its skel joint: boneIndex = dfsOrder[boneIndex]. (HSR_HZNOREMAP disables.)
-                        std::vector<int> dfs; std::vector<int> stk;
-                        for (int j=nJ-1;j>=0;--j) if (skel.joints[j].parent<0) stk.push_back(j);
-                        while (!stk.empty()) { int j=stk.back(); stk.pop_back(); dfs.push_back(j);
-                            for (int c=nJ-1;c>=0;--c) if (skel.joints[c].parent==j) stk.push_back(c); }
-                        bool ident=true; for(int s=0;s<(int)dfs.size();s++) if(dfs[s]!=s){ident=false;break;}
-                        if ((int)dfs.size()==nJ && !ident && !std::getenv("HSR_HZNOREMAP") && !cookedNaming)
-                            for (auto& bi : md.boneIndices) if (bi<nJ) bi=(u8)dfs[bi];
-                        if (std::getenv("HSR_HZBONE")) { std::string rs; for(size_t s=0;s<dfs.size();s++){rs+=std::to_string(dfs[s]);rs+=" ";} log("  [HZREMAP] %s ident=%d dfs(slot->joint): %s", md.name.c_str(),(int)ident,rs.c_str()); }
-                    }
-                    if (std::getenv("HSR_HZBONE")) {
-                        int maxIdx=0; float wmin=1e9f,wmax=-1e9f; size_t nv=md.positions.size()/3;
-                        for (size_t v=0; v<nv; ++v){ float ws=0; for(int k=0;k<4;k++){ size_t e=v*4+k; if(e<md.boneIndices.size()){ if(md.boneIndices[e]>maxIdx)maxIdx=md.boneIndices[e]; ws+=md.boneWeights[e]/255.f; } } if(ws<wmin)wmin=ws; if(ws>wmax)wmax=ws; }
-                        log("  [HZBONE] mesh%zu '%s' maxBoneIdx=%d wsum[%.2f,%.2f] (skel=%zu joints)", mi, md.name.c_str(), maxIdx, wmin, wmax, skel.joints.size());
+                    if (!md.bonePalette.empty() && !std::getenv("HSR_HZNOREMAP")) {
+                        // slot -> joint by the palette's name-hash (THE faithful map). Fixes the bird flock
+                        // (palette != DFS); the whale palette == its DFS so it's unchanged.
+                        std::vector<int> slotToJoint(md.bonePalette.size(), -1); int nMapped=0;
+                        for (size_t s=0;s<md.bonePalette.size();++s)
+                            for (int j=0;j<nJ;++j) if (jointHash[j]==md.bonePalette[s]) { slotToJoint[s]=j; ++nMapped; break; }
+                        for (auto& bi : md.boneIndices) if ((size_t)bi<slotToJoint.size() && slotToJoint[bi]>=0) bi=(u8)slotToJoint[bi];
+                        if (verbose) log("  [bonemap] '%s' palette %zu slots -> %d mapped by name-hash (faithful)", md.name.c_str(), md.bonePalette.size(), nMapped);
+                    } else if ((int)dfs.size()==nJ && !ident && !std::getenv("HSR_HZNOREMAP") && !cookedNaming) {
+                        for (auto& bi : md.boneIndices) if (bi<nJ) bi=(u8)dfs[bi];   // fallback: RENDMESH had no palette
                     }
                     SkinRec r; r.meshIdx=mi; r.basePos=md.positions; r.bIdx=md.boneIndices; r.bWgt=md.boneWeights;
-                    skinRecs.push_back(std::move(r)); md.dynamicVerts = true;
+                    g.skinRecs.push_back(std::move(r)); md.dynamicVerts=true;
                 }
-                log("  HzAnim: %zu skinned meshes -> CPU skin", skinRecs.size());
+                size_t slash=key.rfind('/');
+                log("  HzAnim rig '%s': %zu joints, %d frames, %zu skinned meshes",
+                    key.substr(slash==std::string::npos?0:slash+1).c_str(),
+                    g.skel.joints.size(), g.clip.nFrames, g.skinRecs.size());
+                if (verbose && g.clip.acl) {
+                    float dur = hzAclDuration(g.clip.acl);
+                    std::vector<float> s0, s1; sampleRendClip(g.skel, g.clip, 0.f, s0); sampleRendClip(g.skel, g.clip, dur*0.5f, s1);
+                    float maxd=0.f; for (size_t i=0;i<s0.size()&&i<s1.size();++i){ float dd=std::fabs(s0[i]-s1[i]); if(dd>maxd)maxd=dd; }
+                    log("    [ACL] dur=%.3fs aclJoints=%d fps=%.1f  skinDelta(t=0 vs %.2fs)=%.4f %s",
+                        dur, g.clip.aclJoints, g.clip.fps, dur*0.5f, maxd, maxd<1e-4f?"<<STATIC!":"(animates)");
+                }
+                if (!g.skinRecs.empty()) animGroups.push_back(std::move(g));
+            }
+            log("  HzAnim: %zu animation groups (multi-rig)", animGroups.size());
+            // ONLY meshes bound to a real rig may animate. Horror's static trees/ground carry false-positive
+            // sem7/8 "bone" bytes and envHasSkeleton flagged them skinned -> the skinner wiggled EVERY mesh
+            // (user caught it in wireframe). Clear bone/dynamic flags on every non-rig mesh = static.
+            {
+                std::vector<char> rigged(meshes.size(), 0);
+                for (auto& g : animGroups) for (auto& r : g.skinRecs) if (r.meshIdx < rigged.size()) rigged[r.meshIdx] = 1;
+                int cleared = 0;
+                for (size_t mi=0; mi<meshes.size(); ++mi) if (!rigged[mi]) {
+                    auto& md = meshes[mi];
+                    if (md.hasBones || md.dynamicVerts) ++cleared;
+                    md.hasBones = false; md.dynamicVerts = false;
+                    md.boneIndices.clear(); md.boneWeights.clear();
+                }
+                log("  HzAnim: cleared stray skinned flag on %d non-rig meshes (now static)", cleared);
             }
 
             // ── Player spawn points: parse home_spawn_points.hstf JSON -> facing-cone markers ──

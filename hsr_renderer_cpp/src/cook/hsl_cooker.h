@@ -128,10 +128,10 @@ inline std::vector<uint8_t> encodeRendMesh(const std::vector<float>& posXYZ, con
     uint8_t attr[12] = { 0,0x32,0,0, 5,0x21,0,0, 4,0x13,0,0 };   // POS f32x3@0, UV f16x2@12, NORMAL fmt0x13@16
     FB b(vb.size() + ib.size() + 512);
     int vbo = b.createByteVector(vb.data(), vb.size()), ibo = b.createByteVector(ib.data(), ib.size()), ao = b.createStructVector(attr, 4, 3, 4);
-    b.startObject(5); b.addStructSlot(0, VSF0, 12, 4); b.addScalar<uint32_t>(1, nv); b.addOffset(2, vbo); b.addOffset(3, ao); b.addStructSlot(4, vsf4, 12, 4); int vs = b.endObject();
+    b.startObject(5); b.addStructSlot(0, VSF0, 8, 8); b.addScalar<uint32_t>(1, nv); b.addOffset(2, vbo); b.addOffset(3, ao); b.addStructSlot(4, vsf4, 8, 8); int vs = b.endObject();
     int vsvec = b.createOffsetVector({ vs });
     int matEmb = embeddedMatl.empty() ? 0 : b.createByteVector(embeddedMatl.data(), embeddedMatl.size());  // part.field3 = embedded MATL
-    b.startObject(7); b.addOffset(0, vsvec); b.addOffset(1, ibo); b.addOffset(3, matEmb); b.addStructSlot(4, (const uint8_t*)aabb, 24, 4); b.addStructSlot(5, pf5, 12, 4); b.addScalar<uint32_t>(6, 52u); int part = b.endObject();
+    b.startObject(6); b.addOffset(0, vsvec); b.addOffset(1, ibo); b.addOffset(3, matEmb); b.addStructSlot(4, (const uint8_t*)aabb, 24, 4); b.addStructSlot(5, pf5, 8, 8); int part = b.endObject();   // ALIGNMENT FIX (IDA-proven, V205.2 verify @0xeba93c): part.f5 = murmur64A(IB) is an 8-byte 8-ALIGNED struct (line ~552: v158 & 7 == 0). vertexStream.f0/f4 same (lines 444/491: & 7). Cook emitted these 12B/align-4 -> when a hash field landed at a 4-but-not-8 offset the NEWLY-ADDED verifier rejected the whole mesh -> skinned crash. Old libshell never verified, so it "worked". (part.f6 also dropped: not in schema -> verifier skips voffset 16 (reads v155[6,7,9]); it was harmless either way.)
     int pv = b.createOffsetVector({ part });
     b.startObject(4); b.addOffset(0, pv); b.addScalar<float>(1, 0.2f); b.addStructSlot(3, (const uint8_t*)aabb, 24, 4); int lod = b.endObject();   // LOD screenSize MUST be non-zero: addScalar elides a 0.0 -> field omitted -> device MeshDefinition verifier REJECTS the mesh (all-dark). Size-cull is handled by HSR_NOCULL bounds, not this value.
     int lv = b.createOffsetVector({ lod });
@@ -437,23 +437,97 @@ inline std::string entityJson(const std::string& id, const std::string& name,
     std::string poseKv = poseAnimVal.empty() ? std::string() : (std::string(",\"poseAnimation\":") + poseAnimVal);
     return std::string("{\"id\":\"") + id + "\",\"name\":\"" + name + "\",\"components\":[" + comps + "]" + poseKv + ",\"attributes\":[]}";
 }
+// FAR BACKDROP -> the SKYBOX pass (depth-clamped, NO far-clip) so distant geometry the main camera would clip still draws —
+// exactly how official vistas avoid the far plane. SkyboxPlatformComponent{skyboxMesh,colorTexture}, NO Transform (the skybox
+// is camera-locked, fine for distant scenery), NO material/shader (the shell's built-in skybox shader renders it). Matches
+// the real vista recipe (com_meta_shell_env_vista_central → central_lighting.hstf). [[project_hsr_v205_culling_farplane]]
+// FULL vista recipe (extracted from com_meta_shell_env_vista_calming → calming_lighting.hstf "Skybox" entity): the
+// SkyboxPlatformComponent needs **colorTexture + reflectionMap** AND a sibling **MaterialPropertyOverridesPlatformComponent**
+// pinning `@runtime.lighting.ibl.reflection.max.adaption.factor` = 0 — WITHOUT the override + a real colorTexture the shell's
+// skybox shader renders BLACK (the skyBoxCubeMap path fails). skyboxMesh = our cooked backdrop mesh (loaded as the dome);
+// colorTexture/reflectionMap = its texture. NO Transform (the skybox is camera-locked by design — fine for km-distant scenery).
+// This is the ONLY device-proven way past the hard PortalStereoCamera far=5000 clip. [[project_hsr_eye_subcamera_farclip]]
+inline std::string skyboxEntityJson(const std::string& id, const std::string& name, const AssetKey3& meshRef, const AssetKey3& texRef) {
+    std::string sky = std::string("{\"skyboxMesh\":") + refJson(meshRef) +
+        ",\"colorTexture\":" + refJson(texRef) + ",\"reflectionMap\":" + refJson(texRef) + "}";
+    std::string mpo = "{\"constantParameters\":[{\"class\":\"horizon::renderer::ConstantMaterialParameter\",\"data\":{"
+        "\"parameterName\":\"@runtime.lighting.ibl.reflection.max.adaption.factor\",\"value\":{\"x\":0,\"y\":0,\"z\":0,\"w\":0}}}]}";
+    std::string comps = comp("SkyboxPlatformComponent", 1, sky) + "," +
+                        comp("MaterialPropertyOverridesPlatformComponent", 1, mpo);
+    return std::string("{\"id\":\"") + id + "\",\"name\":\"" + name + "\",\"components\":[" + comps + "],\"attributes\":[]}";
+}
 // Component wrapper with an EXPLICIT full class string (Shell-anim components are NOT under horizon::platform_api::).
 inline std::string compFull(const std::string& fullClass, int ver, const std::string& data) {
     return std::string("{\"data\":{\"class\":\"") + fullClass + "\",\"version\":" + std::to_string(ver) +
            ",\"data\":" + data + "},\"dataType\":\"horizon::DataDefinitionAsset\"}";
+}
+// EXTEND THE MAIN-VIEW FAR CLIP PLANE — the cooked-APK-only fix for distant geometry the shell's default far plane clips
+// (no root/patch/skybox). GROUND TRUTH from every official vista (com_meta_shell_env_vista_*.apk → space.hstf): the env
+// ships a **horizon::platform_api::ScenePlatformComponent version 3** carrying nearClippingPlane + farClippingPlane (+ fog).
+// (focused=150000, calming=20000, horror/oceanarium=2000.) That sets the internal ClippingPlanesComponent on the view.
+// fogDensity=0 → no fog (so the distant city isn't hazed out). One Scene entity per env.
+inline std::string sceneEntityJson(const std::string& id, float nearP, float farP) {
+    // ⛔ PLAIN DECIMAL, never %g: snprintf("%g",1e6) emits "1e+06" (scientific) and the device's HSTF JSON parser
+    // does NOT accept exponent form → farClippingPlane fails to parse → falls back to the shell's SMALL default far
+    // → distant geometry CLIPS (the "far plane still interferes" bug). %.3f forces "1000000.000" which parses.
+    // ⛔ FOG: every official env ships fogColor != black AND fogDensity != 0 (e.g. calming: {0.36,0.57,0.68},
+    // start=3000, density=1e-5). A BLACK fogColor + fogDensity=0 made the device fade distant geometry to a BLACK
+    // dome ("black circle blocking the view from afar") / treat the scene config as inert. Match the official: a
+    // subtle non-black haze + non-zero density, with fogStart pushed near the far so foreground geometry is unfogged.
+    // HSR_FOGCOLOR=r,g,b overrides the haze color. fogStart = 0.6*far → the room/city (well inside) stays crisp.
+    float fr=0.05f, fg=0.06f, fb=0.09f, fStart=farP*0.6f, fDens=1.0e-5f;
+    if (const char* fcc = std::getenv("HSR_FOGCOLOR")) { float a,b,c; if (sscanf(fcc,"%f,%f,%f",&a,&b,&c)==3){fr=a;fg=b;fb=c;} }
+    if (const char* fs = std::getenv("HSR_FOGSTART"))   { float v=(float)atof(fs); if (v>=0) fStart=v; }
+    if (const char* fd = std::getenv("HSR_FOGDENSITY")) { float v=(float)atof(fd); if (v>=0) fDens=v; }
+    char d[360]; snprintf(d, sizeof d,
+        "{\"nearClippingPlane\":%.4f,\"farClippingPlane\":%.3f,\"fogColor\":{\"r\":%.4f,\"g\":%.4f,\"b\":%.4f,\"a\":1},\"fogStart\":%.3f,\"fogDensity\":%.8f}",
+        nearP, farP, fr, fg, fb, fStart, fDens);
+    // ⛔ FAR-CLIP MECHANISM — CRACKED IN IDA (V205 libshell, 2026-06-18):
+    //   env `platform_api::ScenePlatformComponent.farClippingPlane`(struct@16)  --vtable slot-3 bridge
+    //   `ScenePlatformComponent_vf3` (0x21E499C)-->  `renderer::SceneComponent.far`(struct@48)  --> camera projection.
+    //   The SceneComponent default ctor (0x252A8DC) sets far = **500.0** (0x43FA0000); vf3 OVERWRITES it with our
+    //   value only if it parsed. near@44+far@48 sit together (fog is separate @96+), so far@48 IS the projection clip.
+    //   vf3 is a GENERIC component-lifecycle slot (shared `ChangeNotifierComponent` iface) → it runs for ANY loaded
+    //   ScenePlatformComponent (vista OR combined OR footprint) — there is no vista-only gate. So the ONLY way our
+    //   far doesn't apply is if the component never instantiates. ⇒ EMIT ScenePlatformComponent FIRST and ALONE so a
+    //   sibling-component parse failure can't take the whole Scene entity (and our far) down with it. If the entity
+    //   were dropped, far reverts to 500 = exactly the "head-locked black dome that clips the distance".
+    std::string comps = comp("ScenePlatformComponent", 3, d);
+    // The arrival-fog animation (horizon::hpi::FogTravelComponent v7, verbatim from calming) is OPTIONAL and a parse
+    // RISK (hand-written hpi AnimatedCurve JSON) — gate it behind HSR_FOGTRAVEL so the default cook keeps the far
+    // bulletproof. It is NOT needed for the far clip (the user confirmed: fog is not the issue).
+    if (std::getenv("HSR_FOGTRAVEL")) {
+        static const char* fogTravel =
+          "{\"data\":{\"class\":\"horizon::hpi::FogTravelComponent\",\"version\":7,\"data\":{"
+          "\"propSkyboxFogFadeStartMs\":1400.0,"
+          "\"propFogDistanceCurve\":{\"class\":\"horizon::hpi::AnimatedCurve\",\"data\":{\"keyframes\":["
+            "{\"class\":\"horizon::hpi::KeyFrame\",\"data\":{\"time\":375.0}},"
+            "{\"class\":\"horizon::hpi::KeyFrame\",\"data\":{\"time\":2000.0,\"value\":3000.0}}]}},"
+          "\"propFogDensityCurve\":{\"class\":\"horizon::hpi::AnimatedCurve\",\"data\":{\"keyframes\":["
+            "{\"class\":\"horizon::hpi::KeyFrame\",\"data\":{\"value\":1.0}},"
+            "{\"class\":\"horizon::hpi::KeyFrame\",\"data\":{\"time\":250.0,\"value\":0.10000000149011612}},"
+            "{\"class\":\"horizon::hpi::KeyFrame\",\"data\":{\"time\":500.0,\"value\":0.009999999776482582}},"
+            "{\"class\":\"horizon::hpi::KeyFrame\",\"data\":{\"time\":1000.0,\"value\":0.0010000000474974513}},"
+            "{\"class\":\"horizon::hpi::KeyFrame\",\"data\":{\"time\":2000.0,\"value\":9.999999747378752e-05}}]}}}},"
+          "\"dataType\":\"horizon::DataDefinitionAsset\"}";
+        comps += ","; comps += fogTravel;
+    }
+    return std::string("{\"id\":\"") + id + "\",\"name\":\"Scene\",\"components\":[" + comps + "],\"attributes\":[]}";
 }
 // Non-skeletal pose animation VALUE object. ⛔ IDA V205 (device build): EnvironmentEntitySystem (sub_1148BFC) registers
 // the pose animation under the TOP-LEVEL entity key **"poseAnimation"** — NOT as a horizon::platform_api:: component in
 // components[] (that's why every earlier cook's pose component was SILENTLY IGNORED -> static wisp -> the "fade"). The
 // handler -> loader sub_1162EF0 reads start/end Position/Orientation/Scale + start/end time and LERPS the entity pose over
 // [start,end]. The mesh keeps its normal (unlitblend) shader, so transparency is unaffected; only the transform scales.
-inline std::string poseAnimationValue(const float pos[3], const float startScale[3], const float endScale[3], float dur) {
+inline std::string poseAnimationValue(const float pos[3], const float startScale[3], const float endScale[3], float dur, const float* transDelta = nullptr) {
+    float ep[3] = { pos[0], pos[1], pos[2] };   // endPosition = pos (+ node-translation delta for cars/train)
+    if (transDelta) { ep[0]+=transDelta[0]; ep[1]+=transDelta[1]; ep[2]+=transDelta[2]; }
     char b[640]; snprintf(b, sizeof b,
         "{\"startPosition\":{\"x\":%g,\"y\":%g,\"z\":%g},\"startOrientation\":{\"x\":0,\"y\":0,\"z\":0,\"w\":1},\"startScale\":{\"x\":%g,\"y\":%g,\"z\":%g},"
         "\"endPosition\":{\"x\":%g,\"y\":%g,\"z\":%g},\"endOrientation\":{\"x\":0,\"y\":0,\"z\":0,\"w\":1},\"endScale\":{\"x\":%g,\"y\":%g,\"z\":%g},"
         "\"start\":0,\"end\":%g}",
         pos[0],pos[1],pos[2], startScale[0],startScale[1],startScale[2],
-        pos[0],pos[1],pos[2], endScale[0],endScale[1],endScale[2], dur);
+        ep[0],ep[1],ep[2], endScale[0],endScale[1],endScale[2], dur);
     return b;
 }
 // AnimatorPlatformComponent v4 (HZANIM): binds a skeleton (HZAN:SKEL) + an animation (HZAN:ANIM/ACL clip). Drives the
@@ -548,10 +622,27 @@ inline std::vector<std::array<float,6>> navmeshToBoxes(const std::vector<float>&
 // EXACT-FOLLOW variant: one thin box PER walkable triangle, tilted to that triangle's plane (so it follows the road's
 // real shape/height/tilt — REUSES the mesh triangles instead of a rebuilt grid). Each box carries a localRotationQuat
 // (the device Transform reads it @112, IDA sub_25383A0). Returns {cx,cy,cz, hx,hy,hz, qx,qy,qz,qw} per box.
-inline std::vector<std::array<float,10>> navmeshTrisToBoxes(const std::vector<float>& V, const std::vector<uint32_t>& I, float thick, float margin, float inflate) {
+inline std::vector<std::array<float,10>> navmeshTrisToBoxes(const std::vector<float>& V, const std::vector<uint32_t>& I, float thick, float margin, float inflate, bool smooth=false) {
     std::vector<std::array<float,10>> boxes;
     size_t nt = I.size()/3;
     auto dot=[](const float*a,const float*b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];};
+    // SMOOTH (HSR_NAVSMOOTH): per-vertex normals = area-weighted avg of adjacent face normals. Tilting each box to the
+    // averaged surface normal (instead of its own flat triangle) makes neighbouring boxes share a tilt -> the per-edge
+    // CREASES that make the box navmesh feel jaggedy on device blend out into a smooth slope. (Tops drift a hair off the
+    // exact verts, fine for a walkable collider.) Off by default = exact per-triangle follow.
+    std::vector<float> vn;
+    if (smooth) {
+        vn.assign(V.size(), 0.f);
+        for (size_t t=0;t<nt;t++){ uint32_t ia=I[t*3],ib=I[t*3+1],ic=I[t*3+2];
+            if((size_t)ia*3+2>=V.size()||(size_t)ib*3+2>=V.size()||(size_t)ic*3+2>=V.size()) continue;
+            const float*a=&V[ia*3];const float*b=&V[ib*3];const float*c=&V[ic*3];
+            float e1[3]={b[0]-a[0],b[1]-a[1],b[2]-a[2]},e2[3]={c[0]-a[0],c[1]-a[1],c[2]-a[2]};
+            float fn[3]={e1[1]*e2[2]-e1[2]*e2[1],e1[2]*e2[0]-e1[0]*e2[2],e1[0]*e2[1]-e1[1]*e2[0]};   // area-weighted (un-normalized)
+            if(fn[1]<0){fn[0]=-fn[0];fn[1]=-fn[1];fn[2]=-fn[2];}
+            for(uint32_t vi:{ia,ib,ic}) for(int k=0;k<3;k++) vn[(size_t)vi*3+k]+=fn[k];
+        }
+        for(size_t v=0;v+2<vn.size();v+=3){ float l=std::sqrt(vn[v]*vn[v]+vn[v+1]*vn[v+1]+vn[v+2]*vn[v+2]); if(l>1e-6f){vn[v]/=l;vn[v+1]/=l;vn[v+2]/=l;} else vn[v+1]=1.f; }
+    }
     for (size_t t=0;t<nt;t++){
         uint32_t ia=I[t*3], ib=I[t*3+1], ic=I[t*3+2];
         if ((size_t)ia*3+2>=V.size()||(size_t)ib*3+2>=V.size()||(size_t)ic*3+2>=V.size()) continue;
@@ -560,6 +651,10 @@ inline std::vector<std::array<float,10>> navmeshTrisToBoxes(const std::vector<fl
         float N[3]={e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]};
         float nl=std::sqrt(N[0]*N[0]+N[1]*N[1]+N[2]*N[2]); if(nl<1e-7f) continue;
         N[0]/=nl;N[1]/=nl;N[2]/=nl; if(N[1]<0){N[0]=-N[0];N[1]=-N[1];N[2]=-N[2];}   // box +Y (top) = surface normal, up
+        if (smooth) {   // replace the flat triangle tilt with the SMOOTHED (vertex-averaged) normal -> adjacent boxes blend
+            float sn[3]={ vn[(size_t)ia*3]+vn[(size_t)ib*3]+vn[(size_t)ic*3], vn[(size_t)ia*3+1]+vn[(size_t)ib*3+1]+vn[(size_t)ic*3+1], vn[(size_t)ia*3+2]+vn[(size_t)ib*3+2]+vn[(size_t)ic*3+2] };
+            float sl=std::sqrt(sn[0]*sn[0]+sn[1]*sn[1]+sn[2]*sn[2]); if(sl>1e-6f){ N[0]=sn[0]/sl;N[1]=sn[1]/sl;N[2]=sn[2]/sl; if(N[1]<0){N[0]=-N[0];N[1]=-N[1];N[2]=-N[2];} }
+        }
         float X[3]={e1[0],e1[1],e1[2]}; float xn=dot(X,N); X[0]-=xn*N[0];X[1]-=xn*N[1];X[2]-=xn*N[2];   // X = edge1 ⊥ N
         float xl=std::sqrt(dot(X,X)); if(xl<1e-6f) continue; X[0]/=xl;X[1]/=xl;X[2]/=xl;
         float Z[3]={N[1]*X[2]-N[2]*X[1], N[2]*X[0]-N[0]*X[2], N[0]*X[1]-N[1]*X[0]};   // Z = N × X
@@ -638,10 +733,30 @@ inline std::vector<std::array<float,10>> navmeshTiltedGrid(const std::vector<flo
 inline std::string templateJson(const std::string& entities, const std::string& relationships = std::string()) {
     return std::string("{\"version\":5,\"entities\":[") + entities + "],\"relationships\":[" + relationships + "]}";
 }
-// space.hstf = one entity whose `type` is the content-template AssetRef (the firstWorldAsset points here).
-inline std::string spaceJson(CookRng& r, const std::string& name, const AssetKey3& contentRef) {
-    std::string ent = std::string("{\"id\":\"") + makeUuid(r) + "\",\"name\":\"" + name + "\",\"type\":" + refJson(contentRef) + ",\"deltas\":[],\"attributes\":[]}";
-    return templateJson(ent);
+// space.hstf = the firstWorldAsset. One entity whose `type` is the content-template AssetRef, PLUS the Scene entity.
+// ⛔ GROUND TRUTH (every official vista: com_meta_shell_env_vista_* → content/meta/<env>/space.hstf): the
+// ScenePlatformComponent (the far-clip-plane config that drives the main-view projection) lives HERE in space.hstf,
+// as a sibling of the content-ref "Root" entity — NOT in content.hstf. Cooking it into content.hstf left it never
+// applied (far stayed at the shell default → distant geometry far-clipped = the "black dome"). farP<=0 disables.
+inline std::string spaceJson(CookRng& r, const std::string& name, const AssetKey3& contentRef, float farP) {
+    std::string rootId = makeUuid(r);
+    std::string contentEnt = std::string("{\"id\":\"") + rootId + "\",\"name\":\"" + name + "\",\"type\":" + refJson(contentRef) + ",\"deltas\":[],\"attributes\":[]}";
+    std::string ent, rels;
+    if (farP > 0.f) {
+        // ⛔ DEVICE-VERIFIED STRUCTURE (official calming space.hstf, 2026-06-18) — the head-locked far-clip-plane fix.
+        // The device reads the world's clip planes (ScenePlatformComponent) from **entity[0]** — the FIRST-LISTED
+        // entity, which is ALSO the parentless root. Calming: [0]="Calming" {FogTravel,ScenePlatform} (root) ; [1]=
+        // content type-ref, ChildOf Calming. Merely making Scene the parentless root was NOT enough — it must be the
+        // FIRST entity in the array. The old cook listed the content-ref first → device saw no ScenePlatformComponent
+        // on entity[0] → fell back to the shell's small DEFAULT far → a view-space (head-locked) far plane clipped all
+        // distant geometry to black. So: emit the Scene entity FIRST, then the content-ref as its child.
+        std::string sceneId = makeUuid(r);
+        ent  = sceneEntityJson(sceneId, 0.1f, farP) + "," + contentEnt;   // Scene = entity[0] = root (its ScenePlatformComponent IS applied)
+        rels = relChildOf(rootId, sceneId);                               // content-ref ChildOf Scene
+    } else {
+        ent = contentEnt;
+    }
+    return templateJson(ent, rels);
 }
 inline std::string shellConfigJson(const AssetKey3& spaceRef, bool locomotion) {
     return std::string("{\"firstWorldAssetId\":") + refJson(spaceRef) + ",\"supportsLocomotion\":" + (locomotion?"true":"false") + "}";
@@ -846,7 +961,8 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
                                                 int vatVertexCount = 0,
                                                 const std::vector<uint8_t>& boneIdx = {}, const std::vector<uint8_t>& boneWgt = {},
                                                 const std::vector<uint32_t>& jointIds = {},   // jointIds = murmur3(joint name) per skeleton joint
-                                                bool spinBoundsY = false) {   // Y-ROTATION mesh: bake the AABB as the swept cylinder so the device doesn't FRUSTUM-CULL the getTime()-rotated geometry (it can't see the shader's vertex spin)
+                                                bool spinBoundsY = false,    // Y-ROTATION mesh: bake the AABB as the swept cylinder so the device doesn't FRUSTUM-CULL the getTime()-rotated geometry (it can't see the shader's vertex spin)
+                                                const std::vector<uint8_t>& vertCol = {}) {   // per-ORIGINAL-vertex sem4 COLOR_0 RGBA (baked lightmap → shader does base×COLOR0); empty → white (neutral)
     struct Part { std::vector<uint8_t> vb, ib; uint32_t nv = 0; };
     std::vector<Part> parts;
     bool haveUv = uv.size() >= (pos.size() / 3) * 2;
@@ -895,7 +1011,9 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
                         // stores (255,255,255,255) here, and the source omnidroid's COLOR_0 is (1,1,1,1). The shader does
                         // baseColor * vertexColor0, so the old (0,0,127,0) "normal placeholder" multiplied the droid down to
                         // near-black (THE "full dark" bug). White = neutral = the texture (incl. the red strip) shows fully.
-                        uint8_t col0[4] = { 0xFF,0xFF,0xFF,0xFF }; pr.vb.insert(pr.vb.end(), col0, col0+4);   // vertexColor0 sem4 = white (source COLOR_0)
+                        uint8_t col0[4] = { 0xFF,0xFF,0xFF,0xFF };   // vertexColor0 sem4 (white=neutral, OR baked lightmap)
+                        if (vertCol.size() >= (size_t)(g+1)*4) { col0[0]=vertCol[(size_t)g*4]; col0[1]=vertCol[(size_t)g*4+1]; col0[2]=vertCol[(size_t)g*4+2]; col0[3]=vertCol[(size_t)g*4+3]; }
+                        pr.vb.insert(pr.vb.end(), col0, col0+4);
                         uint8_t bidx[4] = { boneRemap[boneIdx[(size_t)g*4]], boneRemap[boneIdx[(size_t)g*4+1]],
                                             boneRemap[boneIdx[(size_t)g*4+2]], boneRemap[boneIdx[(size_t)g*4+3]] };  // remap to dense palette slot
                         pr.vb.insert(pr.vb.end(), bidx, bidx+4);
@@ -909,7 +1027,9 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
                         uint16_t hx = f32_to_f16((float)g), hy = 0;
                         uint8_t cb[4] = { (uint8_t)hx, (uint8_t)(hx>>8), (uint8_t)hy, (uint8_t)(hy>>8) }; pr.vb.insert(pr.vb.end(),cb,cb+4);
                     } else {
-                        uint8_t nb[4] = { 0xFF,0xFF,0xFF,0xFF }; pr.vb.insert(pr.vb.end(),nb,nb+4);   // NORMAL fmt0x13 (stride 20)
+                        uint8_t nb[4] = { 0xFF,0xFF,0xFF,0xFF };   // sem4 COLOR_0 (white=neutral, OR baked lightmap → base×COLOR0)
+                        if (vertCol.size() >= (size_t)(g+1)*4) { nb[0]=vertCol[(size_t)g*4]; nb[1]=vertCol[(size_t)g*4+1]; nb[2]=vertCol[(size_t)g*4+2]; nb[3]=vertCol[(size_t)g*4+3]; }
+                        pr.vb.insert(pr.vb.end(),nb,nb+4);
                     }
                     pr.nv++;
                 } else l = it->second;
@@ -952,10 +1072,10 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, c
         int ao  = b.createStructVector(attr, 4, nattr, 4);
         uint64_t vbH = murmur64A(p.vb.data(), p.vb.size()), ibH = murmur64A(p.ib.data(), p.ib.size());
         uint8_t vsf4[12] = {0}; memcpy(vsf4, &vbH, 8); uint8_t pf5[12] = {0}; memcpy(pf5, &ibH, 8);
-        b.startObject(5); b.addStructSlot(0, VSF0, 12, 4); b.addScalar<uint32_t>(1, p.nv); b.addOffset(2, vbo); b.addOffset(3, ao); b.addStructSlot(4, vsf4, 12, 4); int vs = b.endObject();
+        b.startObject(5); b.addStructSlot(0, VSF0, 8, 8); b.addScalar<uint32_t>(1, p.nv); b.addOffset(2, vbo); b.addOffset(3, ao); b.addStructSlot(4, vsf4, 8, 8); int vs = b.endObject();
         int vsvec = b.createOffsetVector({ vs });
         int matEmb = embeddedMatl.empty() ? 0 : b.createByteVector(embeddedMatl.data(), embeddedMatl.size());
-        b.startObject(7); b.addOffset(0, vsvec); b.addOffset(1, ibo); b.addOffset(3, matEmb); b.addStructSlot(4, (const uint8_t*)aabb, 24, 4); b.addStructSlot(5, pf5, 12, 4); b.addScalar<uint32_t>(6, 52u); int part = b.endObject();
+        b.startObject(6); b.addOffset(0, vsvec); b.addOffset(1, ibo); b.addOffset(3, matEmb); b.addStructSlot(4, (const uint8_t*)aabb, 24, 4); b.addStructSlot(5, pf5, 8, 8); int part = b.endObject();   // ALIGNMENT FIX (IDA-proven, V205.2 verify @0xeba93c): part.f5 = murmur64A(IB) is an 8-byte 8-ALIGNED struct (line ~552: v158 & 7 == 0). vertexStream.f0/f4 same (lines 444/491: & 7). Cook emitted these 12B/align-4 -> when a hash field landed at a 4-but-not-8 offset the NEWLY-ADDED verifier rejected the whole mesh -> skinned crash. Old libshell never verified, so it "worked". (part.f6 also dropped: not in schema -> verifier skips voffset 16 (reads v155[6,7,9]); it was harmless either way.)
         partOffs.push_back(part);
     }
     int pv = b.createOffsetVector(partOffs);
@@ -1042,6 +1162,7 @@ struct ExportMesh {
     std::vector<float> vatOffsets;  // VAT vertex offsets, frames*vertexCount*3 (WORLD space) -> animated via VAT (non-skeletal)
     int vatFrames = 0;
     bool pulse = false;             // node-animated billboard (flame wisp) -> CUSTOM wisp_pulse.surface (unlitblend + getTime() brightness pulse)
+    bool skybox = false;            // user-marked far backdrop -> SkyboxPlatformComponent (depth-clamped, EXEMPT from the PortalStereoCamera far=5000 clip)
     // V79 node Y-ROTATION (Outer Wilds skybox/Interloper) -> getTime() Y-rotation shader cooker/rot_<periodms>_<p|m>.surface.
     bool rotAnim = false; float rotOmega = 0.f; float rotAxis[3] = {0,1,0}; float rotPivot[3] = {0,0,0};   // ARBITRARY-axis spin: signed rad/s about rotAxis around rotPivot (node WORLD origin; children orbit it)
     bool rotOsc = false; float rotAmp = 0.f; float rotPeriod = 0.f;   // OSCILLATION (sway): angle=(amp/2)(1-cos(2pi t/period)) about rotAxis — clips that swing out & back (Snake Way King Kai planet), NOT a spin
@@ -1050,6 +1171,7 @@ struct ExportMesh {
     // ticked by AnimationSystem, NO skeleton). Lerps the entity pose start->end; for a wisp = startScale<->endScale (V79 min/max).
     bool poseAnim = false;
     float poseStartScale[3] = {1,1,1}, poseEndScale[3] = {1,1,1};   // V79 node-SCALE per-component min / max
+    float poseTransDelta[3] = {0,0,0};   // V79 node-TRANSLATION net displacement (cars/train) -> pose end = centroid+delta
     float poseCentroid[3]  = {0,0,0};                               // wisp world centroid -> recenter geometry + entity pos (scale pivots in place)
     float poseDuration = 1.f;                                       // seconds, the start->end window (V79 anim period)
     // HZANIM (skeletal): hzFrames>1 -> skinned RENDMESH + HZAN:SKEL + ACL HZAN:ANIM + AnimatorPlatformComponent
@@ -1063,6 +1185,15 @@ struct ExportMesh {
     // SAME entity as the mesh+animator, so V205's kinematic system (KinematicPose/ShapeUpdateTask) drives it with the
     // SAME animation (skeleton for skinned, transform for node-anim) — the collider follows the animation.
     bool wantCollider = false;
+    // ── EXPOSE-ALL (user demand): decoded streams the cook must consume for a faithful V205 port. Populated from
+    //    MeshData in buildExportMeshes; the cook emits each in the V205 format. See project_hsl_cooker_expose_all_audit.
+    std::vector<float> uvs2;                                 // uv1 = lightmap unwrap -> TEXCOORD1
+    std::vector<uint8_t> lmRGBA; uint32_t lmW=0, lmH=0;      // baked lightmap -> lightingParams.lightMapTexture
+    bool hasLightmap=false, bakeLightmapVtx=false; float lightmapPower[3]={1,1,1};
+    std::vector<uint8_t> normalRGBA; uint32_t normalW=0, normalH=0; bool hasNormal=false;   // normal map
+    float albedoFactor[3]={1,1,1};                           // basecolor factor (metal/gem tint) -> matParams
+    float curTint[4]={1,1,1,1};                              // per-frame mat.sanim MaterialTint (fog/dust/foam opacity)
+    float vatInstTrackIndex=-1, vatInstRateFactor=-1, vatInstTimeOffset=-1, atlasCellIndex=-1;   // per-instance VAT -> `instance` UBO (set2 bind1)
 };
 inline std::vector<uint8_t> readFileBytes(const std::string& p) {
     { std::vector<uint8_t> e; if (embassets::get(p, e)) return e; }   // STANDALONE: cooker/*.bin templates are baked in
@@ -1152,6 +1283,7 @@ inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMe
         size_t ntri = m.indices.size() / 3, t = 0;
         while (t < ntri) {
             ExportMesh c; c.name = m.name; c.blend = m.blend; c.w = m.w; c.h = m.h; c.rgba = m.rgba;
+            c.skybox = m.skybox;   // split parts MUST inherit the skybox mark, else a big dome (>60k verts) loses it -> far-clipped/black
             for (int k = 0; k < 4; k++) c.matTint[k] = m.matTint[k];
             std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(cap + 16);
             while (t < ntri) {
@@ -1452,8 +1584,22 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     // Bundle the V203 render system's OWN shaders + materials: opaque -> unlit.surface (floor MATL), transparent ->
     // unlitblend.surface (dome MATL). V79 glTF envs are textured PBR (no custom GLSL), so these faithfully port the
     // shading AND fix the "black where transparent" bug (blend meshes were drawn opaque).
-    auto shad      = readFileBytes("cooker/nuxd_unlit_shader.bin");
+    // HSR_DEPTHCLAMP: ship the DEPTH-CLAMP unlit/unlitblend shaders (gl_Position.z clamped to [0,w]) so geometry past the
+    // shell's hard 5000 far-clip plane RENDERS instead of being culled — the UNROOTED, cooked-APK fix for the far dome
+    // (no Frida/system patch). Near geometry is unaffected (clamp is a no-op when z is already in range). [[project_hsr_eye_subcamera_farclip]]
+    bool dclamp = std::getenv("HSR_DEPTHCLAMP") != nullptr;
+    bool fit = std::getenv("HSR_FITCLIP") != nullptr;
+    // FAR-ONLY DEPTH-REMAP (HSR_DEPTHCLAMP): the GLOBAL remap broke near shading (it faked EVERY mesh's depth, desyncing the
+    // shell's depth-consuming passes — SSAO/fog/motion). FIX = per-mesh routing: near geometry keeps the NORMAL shaders
+    // (byte-exact depth -> correct shading); ONLY meshes whose farthest vertex exceeds the 5000 clip use the REMAP variant
+    // (infinite reversed-Z z=near/w) so they render past the clip, ordered among themselves; their depth-effects are wrong
+    // only in the far distance (invisible). camPos = the spawn. [[project_hsr_eye_subcamera_farclip]]
+    auto shad      = readFileBytes("cooker/nuxd_unlit_shader.bin");        // NORMAL (near) — byte-exact
     auto shadBlend = readFileBytes("cooker/nuxd_unlitblend_shader.bin");
+    auto shadDC      = dclamp ? readFileBytes("cooker/nuxd_unlit_depthclamp.bin")      : std::vector<uint8_t>{};   // REMAP (far only)
+    auto shadBlendDC = dclamp ? readFileBytes("cooker/nuxd_unlitblend_depthclamp.bin") : std::vector<uint8_t>{};
+    float farMargin = 4500.f; if (const char* fm = std::getenv("HSR_FARCLIP_R")) { float v=(float)atof(fm); if (v>1.f) farMargin=v; }
+    if (dclamp) fprintf(stderr, "[COOK] FAR-ONLY DEPTH-REMAP ON: meshes beyond %.0f from spawn use the remap shader; near byte-exact\n", farMargin);
     auto matTpl    = readFileBytes("cooker/realfloor_mat.bin");   // unlit.surface MATL template
     auto matBlend  = readFileBytes("cooker/realdome_mat.bin");    // unlitblend.surface MATL template
     auto shadVat   = readFileBytes("cooker/vat_shader.bin");      // vatunlitbasecolor (vertex-animation) shader — OPAQUE (fish/foliage)
@@ -1475,6 +1621,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     std::vector<uint8_t> matSkinB = matSkin2;
     if (matSkinB.size() >= 76) { matSkinB[72] = 2; matSkinB[73] = 0; matSkinB[18] = 40; matSkinB[19] = 0; }
     auto refSkinMesh = readFileBytes("cooker/ref_skinned_mesh.bin"); // Meta-shipped skinned RENDMESH = cook-verify schema oracle
+    auto refStaticMesh = readFileBytes("cooker/ref_static_mesh.bin"); // Meta-shipped STATIC RENDMESH = cook-verify oracle for non-skinned meshes (optional; drop in to verify static meshes too)
     if (shad.empty() || matTpl.size() < 176) return {};
     AssetKey3 shaderK = { 0x608B25CE5424598Dull, 0x78686234E7611EFCull, 0xA1767FE9u };
     assets.push_back({ "meta/renderer_module/shaders/unlit.surface/shader", shaderK.tgt, shad, shaderK });
@@ -1482,6 +1629,17 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     if (haveBlend) {
         AssetKey3 shaderBlendK = { 0x608B25CE5424598Dull, 0xFBFB67B966D4BA47ull, 0xA1767FE9u };
         assets.push_back({ "meta/renderer_module/shaders/unlitblend.surface/shader", shaderBlendK.tgt, shadBlend, shaderBlendK });
+    }
+    // FAR-ONLY remap shader variants — shipped under the env's OWN namespace; far meshes (below) repoint their material's
+    // field7 shader ref to these so ONLY they get the infinite-projection remap (near meshes keep unlit/unlitblend = exact).
+    AssetKey3 shaderDCK{}, shaderBlendDCK{};
+    if (dclamp && !shadDC.empty()) {
+        std::string pDC = MH + "/shaders/unlit_dc.surface/shader"; shaderDCK = keyForPath(pDC);
+        assets.push_back({ pDC, shaderDCK.tgt, shadDC, shaderDCK });
+        if (haveBlend && !shadBlendDC.empty()) {
+            std::string pBDC = MH + "/shaders/unlitblend_dc.surface/shader"; shaderBlendDCK = keyForPath(pBDC);
+            assets.push_back({ pBDC, shaderBlendDCK.tgt, shadBlendDC, shaderBlendDCK });
+        }
     }
     bool haveVat = !shadVat.empty() && matVat.size() >= 416;
     if (haveVat) {   // ship the shared VAT shader at its AssetRef
@@ -1530,22 +1688,65 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         assets.push_back({ pFlip, shaderFlipK.tgt, shadFlip, shaderFlipK });
     } else haveFlip = false;
     std::vector<uint8_t> whiteTex; { std::vector<uint8_t> w4((size_t)4*4*4, 255); whiteTex = encodeRendTxtr(w4.data(), 4, 4, 8, 8); }
-    std::string pWhite = MH + "/white.tex/tex"; AssetKey3 whiteK = keyForPath(pWhite); bool whiteUsed = false;
-    struct SharedRig { std::vector<uint8_t> skel, anim; AssetKey3 skelK, animK; };  // dedup skel+anim across meshes sharing one armature (like nuxd)
-    std::vector<SharedRig> rigs;
+    std::string pWhite = MH + "/white.tex/tex"; AssetKey3 whiteK = keyForPath(pWhite); bool whiteUsed = false; bool anySkybox = false;
+    // dedup skel + anim INDEPENDENTLY: the appliances share ONE animation clip but each has its OWN bind skeleton.
+    // The old (skel,anim)-PAIR dedup re-emitted the identical 286KB anim once PER mesh -> N duplicate large async
+    // loads -> device asset-loader RACE -> std::length_error crash-loop. Sharing the anim asset (1 copy, referenced
+    // by every animator, like nuxd's prism_wave+motes) removes the duplicates.
+    struct AssetPoolEntry { std::vector<uint8_t> bytes; AssetKey3 key; };
+    std::vector<AssetPoolEntry> skelPool, animPool;
     std::string rootId = makeUuid(rng);
     std::string entities = rootEntityJson(rootId), rels;
+    // Far-clip-plane extension (ScenePlatformComponent v3) is emitted into space.hstf below — NOT here in content.hstf.
+    // (Vista-proven: the shell only applies it from space.hstf. See spaceJson + the HSR_FARCLIP read at the spaceJson call.)
     float pos0[3]={0,0,0}, rot0[3]={0,0,0}, scl1[3]={1,1,1};
     const char* navE = getenv("HSR_NAVMESH"); int navIdx = navE ? atoi(navE) : -1;   // base navmesh on one mesh, else whole scene
     float smn[3]={1e30f,1e30f,1e30f}, smx[3]={-1e30f,-1e30f,-1e30f};
     // Split >60000-vert STATIC meshes into separate single-part meshes (multi-part static doesn't render on device).
     std::vector<ExportMesh> meshesV = splitLargeStaticMeshes(meshes);
+    // ── HSR_FITCLIP: scale EVERY mesh under the shell's fixed far-clip plane (default R=4500, margin under 5000) ──
+    // Per-mesh UNIFORM scale ABOUT THE SPAWN: each vertex keeps its DIRECTION (angular position) and the mesh keeps its
+    // apparent size (size/distance) from the spawn -> looks identical, textures untouched, internal depth scales with it
+    // (so the mesh keeps its OWN depth ordering = no z-fight overlay). Geometry op -> covers ANY shader incl. animated.
+    // Only meshes whose farthest vertex exceeds R are touched; everything already inside is left EXACT. [[project_hsr_eye_subcamera_farclip]]
+    if (fit) {
+        float MAXR = 4500.f; if (const char* fr = std::getenv("HSR_FITCLIP_R")) { MAXR = (float)atof(fr); if (MAXR < 1.f) MAXR = 4500.f; }
+        float o[3] = { camPos?camPos[0]:0.f, camPos?camPos[1]:1.6f, camPos?camPos[2]:0.f };
+        int nfit = 0;
+        for (size_t mi = 0; mi < meshesV.size(); ++mi) {
+            ExportMesh& m = meshesV[mi];
+            const std::vector<float>& gp = (!m.hzRestPos.empty() && m.hzRestPos.size()==m.positions.size()) ? m.hzRestPos : m.positions;
+            float maxD2 = 0.f;
+            for (size_t v=0; v+2<gp.size(); v+=3){ float dx=gp[v]-o[0],dy=gp[v+1]-o[1],dz=gp[v+2]-o[2]; float d=dx*dx+dy*dy+dz*dz; if(d>maxD2)maxD2=d; }
+            float maxD = sqrtf(maxD2);
+            if (maxD <= MAXR) continue;                 // already inside the clip -> exact, untouched
+            float f = MAXR / maxD;
+            auto scaleAbout = [&](std::vector<float>& P){ for (size_t v=0; v+2<P.size(); v+=3) for(int k=0;k<3;k++) P[v+k]=o[k]+(P[v+k]-o[k])*f; };
+            scaleAbout(m.positions);
+            if (!m.hzRestPos.empty())  scaleAbout(m.hzRestPos);
+            if (!m.hzJointPos.empty()) scaleAbout(m.hzJointPos);
+            for (int k=0;k<3;k++){ m.rotPivot[k]=o[k]+(m.rotPivot[k]-o[k])*f; m.poseCentroid[k]=o[k]+(m.poseCentroid[k]-o[k])*f; m.poseTransDelta[k]*=f; }
+            nfit++;
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FITCLIP d=%.0f->%.0f f=%.3f (under far clip; apparent size preserved)\n", mi, m.name.c_str(), maxD, MAXR, f);
+        }
+        fprintf(stderr, "[COOK] FITCLIP: scaled %d mesh(es) under R=%.0f about spawn (%.1f,%.1f,%.1f) — nothing exceeds the far clip\n", nfit, MAXR, o[0],o[1],o[2]);
+    }
     std::unordered_map<uint64_t, std::pair<AssetKey3, std::string>> texCache;  // rgba hash -> shared texture (split chunks share one)
     std::unordered_map<std::string, AssetKey3> rotShaders;  // rot shader filename -> shipped key (one per distinct period/dir Y-spin)
     for (size_t i = 0; i < meshesV.size(); ++i) {
         if (progress && (i % 8 == 0 || i + 1 == meshesV.size())) { char sb[64]; snprintf(sb, sizeof sb, "Cooking mesh %zu/%zu", i+1, meshesV.size()); prog(0.05f + 0.70f*(float)i/(float)meshesV.size(), sb); }
         const ExportMesh& m = meshesV[i];
         if (m.positions.size() < 9 || m.indices.size() < 3) continue;   // skip empty
+        // FAR-ONLY remap routing (HSR_DEPTHCLAMP): does this mesh poke past the 5000 clip from the spawn? If so it gets the
+        // remap shader (renders past the clip); near meshes stay byte-exact. camPos = spawn.
+        bool meshFar = false;
+        if (dclamp) {
+            float o[3] = { camPos?camPos[0]:0.f, camPos?camPos[1]:1.6f, camPos?camPos[2]:0.f };
+            float md2 = 0.f;
+            for (size_t v=0; v+2<m.positions.size(); v+=3){ float dx=m.positions[v]-o[0],dy=m.positions[v+1]-o[1],dz=m.positions[v+2]-o[2]; float d=dx*dx+dy*dy+dz*dz; if(d>md2)md2=d; }
+            meshFar = sqrtf(md2) > farMargin;
+            if (meshFar && std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FAR (>%.0f) -> remap shader\n", i, m.name.c_str(), farMargin);
+        }
         { // skip DEGENERATE meshes: all verts at one point (0-area). For a SKINNED mesh (e.g. the omnidroid's Shield) the
           // bind/rest pose is real geometry and only the ANIMATED rest collapses (Shield joint scale 0->1 pop); the cooked
           // skinned mesh uses hzRestPos (un-collapsed bind), so test THAT, not m.positions. Only a truly 0-area mesh
@@ -1590,12 +1791,22 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // ANIMATED (VAT) mesh -> bake the offset texture + the vatunlitbasecolor MATL (base tex + VAT tex); else
         // transparent -> unlitblend MATL, opaque -> floor MATL. Patch each to THIS mesh's texture(s).
         int vc = (int)(m.positions.size() / 3);
-        // HZANIM (skinned animation) gated behind HSR_HZANIM: the skin-marker fields trigger a device skinned-verify
-        // that rejects the mesh (WIP). Default OFF -> skinned meshes export as STATIC (visible, like the static port).
+        // HZANIM (skinned animation) gated behind HSR_HZANIM. The earlier "large skinned meshes crash the verifier"
+        // theory was WRONG (a 924-byte mesh failed too): the real cause was the vertexStream.f0/f4 + part.f5 8-byte
+        // hash structs being emitted 12B/align-4 when V205.2's NEW MeshDefinition verifier requires 8B/align-8
+        // (IDA @0xeba93c). Fixed in encodeRendMeshParts -> no size cap needed. HSR_HZMAXVERTS still overrides if set.
+        int hzMaxVerts = std::getenv("HSR_HZMAXVERTS") ? atoi(std::getenv("HSR_HZMAXVERTS")) : 0x7FFFFFFF;
         bool useHz  = std::getenv("HSR_HZANIM") && haveSkin && m.hzFrames > 1 && m.hzJointCount > 0
                     && m.hzBoneIdx.size() >= (size_t)vc*4 && m.hzBoneWgt.size() >= (size_t)vc*4
                     && m.hzTrsLocal.size() >= (size_t)m.hzFrames*m.hzJointCount*10
-                    && m.hzRestPos.size() == m.positions.size();   // centered rest positions present
+                    && m.hzRestPos.size() == m.positions.size()   // centered rest positions present
+                    && vc <= hzMaxVerts;                          // no longer a verifier guard; only the optional HSR_HZMAXVERTS override
+        if (std::getenv("HSR_VERBOSE") && haveSkin && m.hzJointCount>0)
+            fprintf(stderr, "[COOK] m%03zu useHz=%d HZANIM=%d frames=%d joints=%d boneIdx=%zu(need%d) boneWgt=%zu(need%d) trs=%zu(need%zu) rest=%zu(pos%zu)\n",
+                i, (int)useHz, std::getenv("HSR_HZANIM")?1:0, m.hzFrames, m.hzJointCount,
+                m.hzBoneIdx.size(), vc*4, m.hzBoneWgt.size(), vc*4,
+                m.hzTrsLocal.size(), (size_t)m.hzFrames*m.hzJointCount*10,
+                m.hzRestPos.size(), m.positions.size());
         bool useRot = !useHz && m.rotAnim && ((m.rotOmega > 1e-5f || m.rotOmega < -1e-5f) || (m.rotOsc && (m.rotAmp > 0.02f || m.rotAmp < -0.02f)));   // node spin OR sway (any axis) -> getTime() Rodrigues shader
         bool useUvScroll = !useHz && !useRot && m.uvScroll && (m.uvRate[0]!=0.f || m.uvRate[1]!=0.f);   // mat.sanim UV scroll (water/foam) -> getTime() uv-translate shader
         bool usePulse = !useHz && !useRot && !useUvScroll && m.pulse && havePulse;   // node-animated billboard -> custom getTime() pulse shader
@@ -1638,26 +1849,31 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             auto skelBytes = encodeHzSkel(joints);
             auto anim = hzAclEncode(m.hzTrsLocal.data(), m.hzParents.data(), m.hzJointCount, m.hzFrames, m.hzFps);
             if (!anim.empty()) {
-                int rigIdx = -1;
-                for (size_t r = 0; r < rigs.size(); ++r) if (rigs[r].skel == skelBytes && rigs[r].anim == anim) { rigIdx = (int)r; break; }
-                if (rigIdx < 0) {
-                    char rb[96]; snprintf(rb, sizeof rb, "%s/armature%zu", MH.c_str(), rigs.size());
-                    std::string pSkel = std::string(rb) + ".skel/skeleton", pAnim = std::string(rb) + ".anim/anim";
-                    AssetKey3 skK = keyForPath(pSkel), anK = keyForPath(pAnim);
-                    // HZAN:SKEL / HZAN:ANIM use a FIXED type targetId across ALL official envs (nuxd/calming/horror all
-                    // ship skel tgt=2292226755, anim tgt=1496459219 — NOT murmur3(subName)). The device animation system
-                    // keys on these; my murmur3 tgts (513515675/1177748882) left an inconsistent anim record that the
-                    // environment-unload/memory-compaction path choked on -> std::length_error crash-loop (stock envs on
-                    // the SAME compaction path don't crash). The loose loader still resolves by (pkg,ing,tgt) since the
-                    // manifest maps the overridden tgt -> subName, so it both animates AND matches the device's type id.
-                    skK.tgt = 2292226755u;  // HZAN:SKEL fixed type targetId
-                    anK.tgt = 1496459219u;  // HZAN:ANIM fixed type targetId
+                // ── SKEL pool: each mesh's own bind skeleton (dedup byte-identical). ──
+                AssetKey3 skK{};
+                int sIdx = -1;
+                for (size_t r = 0; r < skelPool.size(); ++r) if (skelPool[r].bytes == skelBytes) { sIdx = (int)r; break; }
+                if (sIdx >= 0) skK = skelPool[sIdx].key;
+                else {
+                    char rb[96]; snprintf(rb, sizeof rb, "%s/armature%zu", MH.c_str(), skelPool.size());
+                    std::string pSkel = std::string(rb) + ".skel/skeleton";
+                    skK = keyForPath(pSkel); skK.tgt = 2292226755u;  // HZAN:SKEL FIXED type targetId (all official envs)
                     assets.push_back({ pSkel, skK.tgt, skelBytes, skK, TYPE_HZAN, TYPE_SKEL });
-                    assets.push_back({ pAnim, anK.tgt, anim,      anK, TYPE_HZAN, TYPE_ANIM });
-                    rigs.push_back({ skelBytes, anim, skK, anK });
-                    rigIdx = (int)rigs.size() - 1;
+                    skelPool.push_back({ skelBytes, skK });
                 }
-                animatorComp = animatorComponentJson(rigs[rigIdx].skelK, rigs[rigIdx].animK);
+                // ── ANIM pool: shared clip emitted ONCE (THE crash fix — no duplicate large async loads). ──
+                AssetKey3 anK{};
+                int aIdx = -1;
+                for (size_t r = 0; r < animPool.size(); ++r) if (animPool[r].bytes == anim) { aIdx = (int)r; break; }
+                if (aIdx >= 0) anK = animPool[aIdx].key;
+                else {
+                    char rb[96]; snprintf(rb, sizeof rb, "%s/animclip%zu", MH.c_str(), animPool.size());
+                    std::string pAnim = std::string(rb) + ".anim/anim";
+                    anK = keyForPath(pAnim); anK.tgt = 1496459219u;  // HZAN:ANIM FIXED type targetId
+                    assets.push_back({ pAnim, anK.tgt, anim, anK, TYPE_HZAN, TYPE_ANIM });
+                    animPool.push_back({ anim, anK });
+                }
+                animatorComp = animatorComponentJson(skK, anK);
             }
         } else if (usePulse) {
             // FAITHFUL wisp SCALE breathe: unlitblend material pointed at our getTime() vertex-scale shader.
@@ -1680,19 +1896,19 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             long mv = m.rotOsc ? ((long)(m.rotAmp*100000) ^ ((long)(m.rotPeriod*1000)<<1)) : (long)(m.rotOmega*100000);
             uint32_t h = (uint32_t)(0x9E3779B9u*(uint32_t)ax ^ 0x85EBCA6Bu*(uint32_t)ay ^ 0xC2B2AE35u*(uint32_t)az ^ 0x27D4EB2Fu*(uint32_t)mv ^ (m.rotOsc?0x5BD1E995u:0u));
             const char* pfx = m.rotOsc ? "osc" : "rot";
-            char rfn[160]; snprintf(rfn, sizeof rfn, "cooker/%s_%08x%s.surface.bin", pfx, h, rblend ? "_b" : "");
+            char rfn[160]; snprintf(rfn, sizeof rfn, "cooker/%s_%08x%s%s.surface.bin", pfx, h, rblend ? "_b" : "", meshFar ? "_dc" : "");   // _dc (FAR mesh): rot generated from the remap base -> inherits infinite projection; separate cache
             AssetKey3 rotK{};
             auto it = rotShaders.find(rfn);
             if (it != rotShaders.end()) rotK = it->second;
             else {
                 auto rbytes = readFileBytes(rfn);
                 if (rbytes.empty()) {   // Rodrigues shader for this exact motion (continuous spin OR (1-cos) sway) — C++ generator
-                    const std::vector<uint8_t>& gbase = rblend ? shadBlend : shad;
+                    const std::vector<uint8_t>& gbase = meshFar ? (rblend ? shadBlendDC : shadDC) : (rblend ? shadBlend : shad);   // FAR -> remap base
                     if (m.rotOsc) rbytes = shadergen::generate(gbase, shadergen::OSCILLATE, m.rotAmp, m.rotPeriod, m.rotAxis[0], m.rotAxis[1], m.rotAxis[2]);
                     else          rbytes = shadergen::generate(gbase, shadergen::ROTATE,    m.rotOmega, 0.f,       m.rotAxis[0], m.rotAxis[1], m.rotAxis[2]);
                     if (!rbytes.empty()) writeFileBytes(rfn, rbytes);   // cache to disk (reused on re-cook + inspectable)
                 }
-                if (!rbytes.empty()) { char rp[160]; snprintf(rp, sizeof rp, "%s/shaders/%s_%08x%s.surface/shader", MH.c_str(), pfx, h, rblend ? "_b" : "");
+                if (!rbytes.empty()) { char rp[160]; snprintf(rp, sizeof rp, "%s/shaders/%s_%08x%s%s.surface/shader", MH.c_str(), pfx, h, rblend ? "_b" : "", meshFar ? "_dc" : "");
                     rotK = keyForPath(rp); assets.push_back({ rp, rotK.tgt, rbytes, rotK }); rotShaders[rfn] = rotK; } }
             matl = rblend ? matBlend : matTpl;                          // blend base for transparent billboards, else opaque unlit
             if (rotK.ing) { memcpy(matl.data() + 48, &rotK.pkg, 8); memcpy(matl.data() + 56, &rotK.ing, 8); }  // field7 -> rot shader (else static = safe fallback)
@@ -1705,18 +1921,18 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             bool ublend = m.blend && haveBlend;
             long ru=(long)(m.uvRate[0]*100000), rv=(long)(m.uvRate[1]*100000);
             uint32_t h = (uint32_t)(0x9E3779B9u*(uint32_t)ru ^ 0xC2B2AE35u*(uint32_t)rv ^ (ublend?0x68bc21ebu:0u));
-            char ufn[160]; snprintf(ufn, sizeof ufn, "cooker/uvscroll_%08x%s.surface.bin", h, ublend ? "_b" : "");
+            char ufn[160]; snprintf(ufn, sizeof ufn, "cooker/uvscroll_%08x%s%s.surface.bin", h, ublend ? "_b" : "", meshFar ? "_dc" : "");
             AssetKey3 uvK{};
             auto it = rotShaders.find(ufn);
             if (it != rotShaders.end()) uvK = it->second;
             else {
                 auto ubytes = readFileBytes(ufn);
                 if (ubytes.empty()) {   // getTime() uv += rate*time shader — C++ generator
-                    const std::vector<uint8_t>& gbase = ublend ? shadBlend : shad;
+                    const std::vector<uint8_t>& gbase = meshFar ? (ublend ? shadBlendDC : shadDC) : (ublend ? shadBlend : shad);   // FAR -> remap base
                     ubytes = shadergen::generate(gbase, shadergen::UVSCROLL, m.uvRate[0], m.uvRate[1]);
                     if (!ubytes.empty()) writeFileBytes(ufn, ubytes);
                 }
-                if (!ubytes.empty()) { char up[160]; snprintf(up, sizeof up, "%s/shaders/uvscroll_%08x%s.surface/shader", MH.c_str(), h, ublend ? "_b" : "");
+                if (!ubytes.empty()) { char up[160]; snprintf(up, sizeof up, "%s/shaders/uvscroll_%08x%s%s.surface/shader", MH.c_str(), h, ublend ? "_b" : "", meshFar ? "_dc" : "");
                     uvK = keyForPath(up); assets.push_back({ up, uvK.tgt, ubytes, uvK }); rotShaders[ufn] = uvK; } }
             matl = ublend ? matBlend : matTpl;
             if (uvK.ing) { memcpy(matl.data() + 48, &uvK.pkg, 8); memcpy(matl.data() + 56, &uvK.ing, 8); }   // field7 -> uvscroll shader
@@ -1753,6 +1969,8 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FLIPBOOK grid=%dx%d (collapsed to 1 quad)\n", i, m.name.c_str(), m.flipCols, m.flipRows);
         } else {
             matl = (m.blend && haveBlend) ? matBlend : matTpl;
+            if (meshFar) { AssetKey3 dck = (m.blend && haveBlend) ? shaderBlendDCK : shaderDCK;   // FAR -> remap shader (renders past the 5000 clip); near keeps unlit/unlitblend = byte-exact
+                           if (dck.ing) { memcpy(matl.data()+48,&dck.pkg,8); memcpy(matl.data()+56,&dck.ing,8); } }
             memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);
         }
         // Skinned: use the CENTERED rest positions (extractHzAnim centered mesh+skeleton+clip near origin so the
@@ -1805,16 +2023,84 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' CENTERED ctr=(%.2f,%.2f,%.2f) for %s\n",
                     i, m.name.c_str(), poseCtr[0],poseCtr[1],poseCtr[2], useRot ? "Y-rotation (pivot)" : usePulse ? "wispscale shader" : "poseAnimation");
         }
-        auto mesh = useHz ? encodeRendMeshParts(hzMeshPos, m.uvs, m.indices, matl, 0, m.hzBoneIdx, m.hzBoneWgt, jointIds)
-                          : encodeRendMeshParts(*staticPos, m.uvs, m.indices, matl, useVat ? vc : 0, {}, {}, {}, useRot);
+        // DIAGNOSTIC/FIX: HSR_PULLIN=<dist> pulls FAR static geometry toward the view origin (camPos) so its centroid
+        // lands within <dist>, PRESERVING its apparent size from the viewpoint. The shell's far clip plane is fixed and
+        // hard-capped at 1000 (IDA: ViewCameraManager sub_20BC124) and NOT env-expandable; this fits the distant city
+        // INSIDE it instead. Also a clean test: if the backdrop renders once pulled in, the "black dome" was the far clip.
+        std::vector<float> pulledPos;
+        if (const char* pe = std::getenv("HSR_PULLIN")) {
+            float thr = (float)atof(pe); if (thr < 1.f) thr = 1.f;
+            float o[3] = { camPos?camPos[0]:0.f, camPos?camPos[1]:1.6f, camPos?camPos[2]:0.f };
+            const std::vector<float>& src = *staticPos; size_t np = src.size()/3; double c[3]={0,0,0};
+            for (size_t v=0; v+2<src.size(); v+=3) for(int k=0;k<3;k++) c[k]+=src[v+k];
+            if (np) { float cx=(float)(c[0]/np)-o[0], cy=(float)(c[1]/np)-o[1], cz=(float)(c[2]/np)-o[2];
+                float d = sqrtf(cx*cx+cy*cy+cz*cz);
+                if (d > thr) { float f=(thr*0.9f)/d; pulledPos.resize(src.size());
+                    for (size_t v=0; v+2<src.size(); v+=3) for(int k=0;k<3;k++) pulledPos[v+k]=o[k]+(src[v+k]-o[k])*f;
+                    staticPos = &pulledPos;
+                    if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' PULLED IN d=%.0f->%.0f f=%.3f\n", i, m.name.c_str(), d, thr*0.9f, f); } }
+        }
+        // BAKED LIGHTMAP → sem4 COLOR_0: sample the EXPOSED lightmap (m.lmRGBA, already ACES-toned) at each vertex's
+        // uv1 (m.uvs2). The unlit/skinned shader does base×COLOR0, so the cooked mesh carries the baked room lighting
+        // with NO extra shader/texture/UV-stream — the whole point of exposing lmRGBA+uvs2 to the cook. (HSR_LMNOVFLIP
+        // if the V axis comes out inverted.) Skinned/animated meshes have no baked lightmap → empty → white (neutral).
+        // UNIFIED sem4 COLOR_0 bake = albedoFactor × curTint × (exposed lightmap × lightmapPower, else white). The
+        // unlit/skinned shader does base×COLOR0, so this single stream carries ALL the exposed shading: the baked
+        // room lighting (per-vertex, sampled at uv1), the basecolor/metal/gem factor, and the per-frame mat.sanim
+        // MaterialTint (fog/dust/foam opacity in alpha) — no new shader/texture/UV-stream. (HSR_LMNOVFLIP for V.)
+        std::vector<uint8_t> vertCol;
+        {
+            size_t nvc = m.positions.size()/3;
+            bool hasLm = m.hasLightmap && !m.lmRGBA.empty() && m.lmW>0 && m.lmH>0 && m.uvs2.size() >= nvc*2;
+            float fr=m.albedoFactor[0]*m.curTint[0], fg=m.albedoFactor[1]*m.curTint[1], fb=m.albedoFactor[2]*m.curTint[2], fa=m.curTint[3];
+            bool needCol = hasLm || fr!=1.f||fg!=1.f||fb!=1.f||fa!=1.f;
+            if (needCol && nvc>0) {
+                vertCol.resize(nvc*4);
+                bool vflip = !std::getenv("HSR_LMNOVFLIP");
+                auto c8=[](float x){ int i=(int)(x*255.f+0.5f); return (uint8_t)(i<0?0:i>255?255:i); };
+                for (size_t v=0; v<nvc; v++) {
+                    float lr=1.f,lg=1.f,lb=1.f;
+                    if (hasLm) {
+                        float u=m.uvs2[v*2], w=m.uvs2[v*2+1]; u-=std::floor(u); w-=std::floor(w); if(vflip) w=1.f-w;
+                        int px=(int)(u*(float)(m.lmW-1)+0.5f), py=(int)(w*(float)(m.lmH-1)+0.5f);
+                        px=px<0?0:(px>=(int)m.lmW?(int)m.lmW-1:px); py=py<0?0:(py>=(int)m.lmH?(int)m.lmH-1:py);
+                        const uint8_t* tx=&m.lmRGBA[((size_t)py*m.lmW+px)*4];
+                        lr=tx[0]/255.f*m.lightmapPower[0]; lg=tx[1]/255.f*m.lightmapPower[1]; lb=tx[2]/255.f*m.lightmapPower[2];
+                    }
+                    vertCol[v*4]=c8(fr*lr); vertCol[v*4+1]=c8(fg*lg); vertCol[v*4+2]=c8(fb*lb); vertCol[v*4+3]=c8(fa);
+                }
+            }
+        }
+        // SKYBOX meshes (camera-locked pass) need two cook-time fixes, else the dome is invisible:
+        //  (1) RE-CENTER verts at origin: the skybox is rendered centered on the camera (IDA: its transform is camera-
+        //      derived; calming's skybox entity has no Transform). V79 bakes geometry at WORLD coords, so an un-centered
+        //      dome renders offset by its centroid (thousands of units) -> off-screen. Subtract the centroid.
+        //  (2) DOUBLE-SIDED: a dome viewed from inside has outward (back) faces -> culled -> invisible. Append reversed tris.
+        std::vector<float> skyPos; const std::vector<float>* posPtr = staticPos;
+        std::vector<uint32_t> dsIdx;   const std::vector<uint32_t>* sIdx = &m.indices;
+        if (m.skybox && !useHz) {
+            skyPos = *staticPos; size_t nvp = skyPos.size()/3; double cc[3]={0,0,0};
+            for (size_t v=0; v<nvp; v++){ cc[0]+=skyPos[v*3]; cc[1]+=skyPos[v*3+1]; cc[2]+=skyPos[v*3+2]; }
+            if (nvp){ float cx=(float)(cc[0]/nvp), cy=(float)(cc[1]/nvp), cz=(float)(cc[2]/nvp);
+                      for (size_t v=0; v<nvp; v++){ skyPos[v*3]-=cx; skyPos[v*3+1]-=cy; skyPos[v*3+2]-=cz; } }
+            posPtr = &skyPos;
+            dsIdx = m.indices; dsIdx.reserve(m.indices.size()*2);
+            for (size_t t=0; t+2<m.indices.size(); t+=3) { dsIdx.push_back(m.indices[t]); dsIdx.push_back(m.indices[t+2]); dsIdx.push_back(m.indices[t+1]); }
+            sIdx = &dsIdx;
+        }
+        auto mesh = useHz ? encodeRendMeshParts(hzMeshPos, m.uvs, m.indices, matl, 0, m.hzBoneIdx, m.hzBoneWgt, jointIds, false, vertCol)
+                          : encodeRendMeshParts(*posPtr, m.uvs, *sIdx, matl, useVat ? vc : 0, {}, {}, {}, useRot, vertCol);
         // COOK-TIME VERIFY: check the just-cooked skinned RENDMESH against the Meta-shipped reference schema (the
         // device runs the stock flatbuffers verifier; this catches structural divergence — e.g. a field emitted as
         // an offset where the schema wants an inline scalar — BEFORE the asset ever ships to the headset).
-        if (useHz && refSkinMesh.size() >= 8) {
-            auto probs = fbVerifyAgainst(mesh, refSkinMesh);
-            if (probs.empty()) fprintf(stderr, "[COOK-VERIFY] %s : OK (matches Meta skinned-mesh schema)\n", pMesh.c_str());
-            else { fprintf(stderr, "[COOK-VERIFY] %s : %zu PROBLEM(S) vs device schema:\n", pMesh.c_str(), probs.size());
-                   for (auto& s : probs) fprintf(stderr, "    !! %s\n", s.c_str()); }
+        {   // verify BOTH from-scratch encoders (skinned + static) against the matching Meta RENDMESH oracle; crash-proof
+            const std::vector<uint8_t>& meshRef = useHz ? refSkinMesh : refStaticMesh;
+            if (meshRef.size() >= 8) {
+                auto probs = fbVerifyAgainst(mesh, meshRef);   // fbVerifyAgainst is bounds-checked (never crashes on bad input)
+                if (probs.empty()) fprintf(stderr, "[COOK-VERIFY] %s : OK (matches Meta %s schema)\n", pMesh.c_str(), useHz?"skinned-mesh":"static-mesh");
+                else { fprintf(stderr, "[COOK-VERIFY] %s : %zu PROBLEM(S) vs device schema (mesh format: lods->parts->vertexStreams{elements,vertexData}+bounds+indexData+materialDefinitionData):\n", pMesh.c_str(), probs.size());
+                       for (auto& s : probs) fprintf(stderr, "    !! %s\n", s.c_str()); }
+            }
         }
         assets.push_back({ pMesh, meshK.tgt, mesh, meshK });
         if (!tex.empty()) assets.push_back({ pTex, texK.tgt, tex, texK });
@@ -1851,14 +2137,75 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 } else fprintf(stderr, "[COOK] m%03zu '%s' animated-collider PhysX cook FAILED\n", i, m.name.c_str());
             }
         }
-        std::string poseKv = usePose ? poseAnimationValue(poseCtr, m.poseStartScale, m.poseEndScale, m.poseDuration) : std::string();
+        // ── PER-INSTANCE VAT (the vatunlit `instance` UBO set2 bind1): emit the source's atlasCellIndex/animTrackIndex/
+        //    animRateFactor/animTimeOffset as a MaterialPropertyOverridesPlatformComponent so each cooked VAT creature
+        //    plays its OWN track + phase (else all default to track 0 = the turtle-sync bug). Component class+version+
+        //    element format verified from official oceanarium foliagevats. ──
+        if (useVat && (m.atlasCellIndex>=0.f || m.vatInstTrackIndex>=0.f || m.vatInstRateFactor>=0.f || m.vatInstTimeOffset>=0.f)) {
+            auto cpv=[&](const char* pn, float v){ char b[220]; snprintf(b,sizeof b,
+                "{\"class\":\"horizon::renderer::ConstantMaterialParameter\",\"data\":{\"parameterName\":\"%s\",\"value\":{\"x\":%g,\"y\":0,\"z\":0,\"w\":0}}}", pn, v); return std::string(b); };
+            std::vector<std::string> cpl;
+            if (m.atlasCellIndex   >= 0.f) cpl.push_back(cpv("instance.atlasCellIndex", m.atlasCellIndex));
+            if (m.vatInstTrackIndex>= 0.f) cpl.push_back(cpv("instance.animTrackIndex", m.vatInstTrackIndex));
+            if (m.vatInstRateFactor>= 0.f) cpl.push_back(cpv("instance.animRateFactor", m.vatInstRateFactor));
+            if (m.vatInstTimeOffset>= 0.f) cpl.push_back(cpv("instance.animTimeOffset", m.vatInstTimeOffset));
+            if (!cpl.empty()) { std::string arr; for (size_t k=0;k<cpl.size();k++){ if(k)arr+=","; arr+=cpl[k]; }
+                if (!extraComp.empty()) extraComp += ",";
+                extraComp += comp("MaterialPropertyOverridesPlatformComponent", 1, std::string("{\"constantParameters\":[")+arr+"]}"); }
+        }
+        std::string poseKv = usePose ? poseAnimationValue(poseCtr, m.poseStartScale, m.poseEndScale, m.poseDuration, m.poseTransDelta) : std::string();
         // MeshPlatformComponent **v5** for ALL meshes (static AND skinned). GROUND TRUTH: the working calming butterfly
         // skinned entity uses Mesh v5 (extracted from calming_butterflies.hstf). v6 was a guess that contradicts it.
+        // FAR-BACKDROP -> skybox pass (no far-clip). The main camera far-clips distant geometry; routing far meshes through
+        // the skybox pass (like official vistas) makes them render. Heuristic: geometry centroid distance > HSR_SKYBOX_DIST
+        // (default 80m). Only plain STATIC meshes (animated/skinned keep their normal walkable path).
+        bool skybox = false;
+        if (!dclamp && !fit && !useHz && !usePose && !usePulse && !useRot) {   // depth-clamp/fitclip make far geometry render in place -> no skybox needed (and it's camera-locked/fragile)
+            // skyboxEntityJson now emits the FULL vista recipe (colorTexture+reflectionMap+MaterialPropertyOverrides) so the
+            // backdrop renders (no longer black). Enabled by the editor "Far backdrop -> skybox" toggle => HSR_SKYBOX_DIST=<m>.
+            // Far backdrop beyond this radius is drawn in the depth-clamped skybox pass, EXEMPT from the hard
+            // PortalStereoCamera far=5000 clip (device-proven the only escape — official homes skybox their distance, see
+            // [[project_hsr_eye_subcamera_farclip]]). Only plain STATIC meshes (animated/skinned keep the normal walkable path).
+            if (m.skybox) skybox = true;   // EXPLICIT per-mesh mark (editor right-click "Make skybox backdrop") — always wins
+            const char* sd = std::getenv("HSR_SKYBOX_DIST"); float thr = sd ? (float)atof(sd) : 0.f;
+            if (!skybox && thr > 0) { size_t np = m.positions.size()/3; double cc[3]={0,0,0};
+                for (size_t v=0; v+2<m.positions.size(); v+=3) for(int k=0;k<3;k++) cc[k]+=m.positions[v+k];
+                if (np){ float cx=(float)(cc[0]/np), cy=(float)(cc[1]/np), cz=(float)(cc[2]/np); skybox = sqrtf(cx*cx+cy*cy+cz*cz) > thr; } } }
+        // ── FAR-CLIP DIAGNOSTIC: the device's PortalStereoCamera hard-clips at far=5000m — geometry past it DISAPPEARS on
+        //    device unless it's a SkyboxPlatformComponent (far-clip-exempt) or depth-clamped. Warn the cooker so they KNOW a
+        //    far mesh will clip in the cook and can mark it (right-click "Make skybox backdrop") — see project_hsr_eye_subcamera_farclip.
+        if (!skybox && !dclamp && !fit && !useHz) {
+            float md=0.f;   // max vertex distance from origin (~the device camera/spawn)
+            for (size_t v=0; v+2<m.positions.size(); v+=3){ float dx=m.positions[v], dy=m.positions[v+1], dz=m.positions[v+2]; float d=dx*dx+dy*dy+dz*dz; if(d>md)md=d; }
+            // The device's SceneComponent DEFAULT far is 500m (IDA crack @0x252A8DC); the cook extends it via the
+            // ScenePlatformComponent (farClippingPlane). Geometry beyond 500m renders ONLY if that component applies on device.
+            if (md > 500.f*500.f) fprintf(stderr, "[COOK] far-clip note: mesh '%s' reaches %.0fm (> the device 500m DEFAULT far) -> renders only via the cook's ScenePlatformComponent far extension; if that fails to parse on device it CLIPS. Mark 'Make skybox backdrop' if it's a backdrop.\n", m.name.c_str(), sqrtf(md));
+        }
+        if (skybox) {
+            AssetKey3 stex = texK.tgt ? texK : whiteK; if (!texK.tgt) whiteUsed = true;
+            entities += "," + skyboxEntityJson(mid, nm, meshK, stex);
+            anySkybox = true;
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' -> SKYBOX (far backdrop, no far-clip)\n", i, m.name.c_str());
+        } else
         entities += "," + entityJson(mid, nm, hzPos, rot0, hzScl, meshK, { matK }, AssetKey3{0,0,0}, extraComp, 5, false, poseKv);
         rels += (rels.empty() ? std::string() : std::string(",")) + relChildOf(mid, rootId);
     }
     if (rels.empty()) return {};
     if (whiteUsed) assets.push_back({ pWhite, whiteK.tgt, whiteTex, whiteK });
+    // The SkyboxPlatformComponent makes the shell load its built-in skybox SURFACE shader + a texture from the SHELL package
+    // 30952996677677480 — which a STANDALONE cooked env can't reach (device: "Asset is missing ... ShaderAsset/TextureAsset"
+    // -> skybox draws BLACK). SHIP them in OUR scene.zip under the EXACT canonical keys the shell requests so they resolve
+    // from us. Shader bytes = the shell's own skyboxwithglobalfog.surface (extracted from a vista). [[project_hsr_eye_subcamera_farclip]]
+    if (anySkybox) {
+        auto skyShader = readFileBytes("cooker/skybox_surface.bin");
+        if (!skyShader.empty()) {
+            AssetKey3 skyShK{ 30952996677677480ull, 820840225639963422ull, TGT_SURFACE };
+            AssetKey3 skyTxK{ 30952996677677480ull, 414607546753497478ull, TGT_TEX };
+            assets.push_back({ "meta/skysys/skyboxfog.surface/shader", TGT_SURFACE, skyShader, skyShK });
+            assets.push_back({ "meta/skysys/skybox.tex/tex",           TGT_TEX,     whiteTex,  skyTxK });
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] shipped shell skybox surface shader (%zuB)+tex under canonical keys (fixes missing-asset BLACK skybox)\n", skyShader.size());
+        } else fprintf(stderr, "[COOK] WARN: cooker/skybox_surface.bin missing -> skybox will be BLACK (no surface shader). Extract it from a vista.\n");
+    }
     // FALLBACK nav bounds for TILE-BASED envs (sonic_schoolhouse = hundreds of 4-vert wall/floor quads, NONE >=100
     // verts -> the navCand heuristic bounded nothing -> no ground collider -> player FALLS THROUGH the floor). If no
     // nav candidate set the bounds, accumulate ALL non-sky geometry so the collider still covers the walkable area.
@@ -1870,12 +2217,22 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         }
         if (std::getenv("HSR_VERBOSE") && smx[0]>=smn[0]) fprintf(stderr, "[COOK] nav fallback (tile env): bounds (%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f)\n", smn[0],smn[1],smn[2],smx[0],smx[1],smx[2]);
     }
-    // auto-sized walkable ground collider: nuxd's flat ~12.8m PHSX:3MSH plane scaled to cover the nav bounds.
-    // Centre it UNDER the camera at the camera's FOOT level (eye - 1.6m) — a 3D env (OW planets curve) has no flat
-    // floor, so we drop a walkable plane right where the V79 view stands instead of at the terrain's lowest point.
-    float gx = camPos ? camPos[0] : (smn[0]+smx[0])*0.5f;
-    float gz = camPos ? camPos[2] : (smn[2]+smx[2])*0.5f;
-    float gy = camPos ? camPos[1] - 1.6f : smn[1];
+    // SPAWN/FLOOR ANCHOR — NOT the editor camera (it's an arbitrary VIEWING pose, never where the player belongs).
+    // The spawn is EITHER a user-placed Spawn Point (handled in the scene-items loop, takes priority) OR an automatic
+    // one HERE: the centroid of the user navmesh = a guaranteed point on the real walkable floor. No navmesh -> the
+    // scene-bounds center at the scene floor (min Y), refined by the smart-floor heightfield below. (No camera.)
+    float gx = (smn[0]+smx[0])*0.5f, gz = (smn[2]+smx[2])*0.5f, gy = smn[1];
+    { // anchor = a CENTRAL point on the navmesh FLOOR band. A plain centroid Y is wrong when the navmesh includes wall
+      // triangles (their height pulls it up off the floor), so: centroid XZ, then the nearest navmesh vert in the LOWEST
+      // 40% Y band (= floor, not walls/upper levels). This is a guaranteed walkable floor point — no camera involved.
+      double ax=0,az=0; size_t an=0; float nmin=1e30f, nmax=-1e30f;
+      for (const auto& si : sceneItems) if (si.type==sitem::NAVMESH)
+          for (size_t v=0; v+2<si.navVerts.size(); v+=3){ ax+=si.navVerts[v]; az+=si.navVerts[v+2]; ++an; float y=si.navVerts[v+1]; if(y<nmin)nmin=y; if(y>nmax)nmax=y; }
+      if (an){ float cx=(float)(ax/an), cz=(float)(az/an), band=nmin+(nmax-nmin)*0.4f, best=1e30f; bool got=false;
+        for (const auto& si : sceneItems) if (si.type==sitem::NAVMESH)
+            for (size_t v=0; v+2<si.navVerts.size(); v+=3){ float y=si.navVerts[v+1]; if (y>band) continue;   // floor band only (skip walls/upper)
+                float dx=si.navVerts[v]-cx, dz=si.navVerts[v+2]-cz, d=dx*dx+dz*dz; if (d<best){ best=d; gx=si.navVerts[v]; gy=y; gz=si.navVerts[v+2]; got=true; } }
+        if (!got){ gx=cx; gz=cz; gy=nmin; } } }
     float ex = smx[0]-smn[0], ez = smx[2]-smn[2], ext = ex > ez ? ex : ez;
     float gs = ext > 1.f ? (ext / 12.0f) * 2.0f : 8.0f;         // BIG invisible plane (nuxd circular floor ~12.8m x2 the scene)
     float spawnSurfY = gy;   // road/floor surface Y under the spawn (set from the heightfield) -> spawn ON it, not above
@@ -1894,8 +2251,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         //    is the fallback when nothing walkable is found (e.g. a fully-curved env). HSR_FLATFLOOR forces the disk. ──
         if (!flatFloor) {
             const float planeBase = 12.8f;                          // realfloor_phys.bin plane size
-            float camY = camPos ? camPos[1] : smx[1];
-            float headY = camY + 2.0f;                              // ignore surfaces above ~head (roofs, floating planet)
+            float headY = gy + 2.5f;                               // ignore surfaces above ~head ABOVE THE FLOOR (roofs/ceilings) — floor-relative, NOT the camera
             // PASS 1: collect the WALKABLE triangles + their own XZ bounds (the road footprint). Gridding THAT instead
             // of the inflated whole-scene nav bounds gives far finer cells that hug the road, not a coarse disk.
             struct WT { float pa[3],pb[3],pc[3]; };
@@ -1957,7 +2313,27 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 entities += "," + colliderGroundEntityJson(gid, gp, gsc, sfK);
                 rels += "," + relChildOf(gid, rootId); nTiles=1;
                 if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] smart floor: ONE merged collider %zuB SEBD (%zu walkable tris, footprint %.0fx%.0fm)\n", sfSebd.size(), wt.size(), ex2, ez2);
-            } else if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] smart floor SEBD cook FAILED -> disk fallback\n");
+            } else {
+                // SEBD unavailable (PhysX off / device-incompatible — the usual case). DON'T fall to the tiny origin disk
+                // (that's the "collision is outside the map" + "you spawn off the floor & fall" bug). Emit the PROVEN
+                // device-built ColliderBox GRID from the SAME walkable tris, so the floor covers the ACTUAL walkable
+                // footprint at the real surface heights. [[project_hsl_navmesh_colliderbox]]
+                int fbIdx = 600000;
+                auto emitFloorBox=[&](const float c[3],const float he[3]){
+                    sitem::Item bi; bi.type=sitem::BOXCOL; bi.name="FloorBox";
+                    bi.pos[0]=c[0]; bi.pos[1]=c[1]; bi.pos[2]=c[2];
+                    bi.half[0]=he[0]; bi.half[1]=he[1]; bi.half[2]=he[2];
+                    bi.scale[0]=bi.scale[1]=bi.scale[2]=1.f;
+                    std::string bid=sitem::uuid(fbIdx);
+                    entities += "," + sitem::itemEntityJson(bi, fbIdx); ++fbIdx;
+                    rels += "," + relChildOf(bid, rootId);
+                };
+                auto gb = navmeshToBoxes(nv, cell, 1.5f, 1500);     // grid the walkable verts -> one device box per occupied cell at its surface Y
+                for (auto& b : gb){ float c[3]={b[0],b[1],b[2]}, he[3]={b[3],b[4],b[5]}; emitFloorBox(c,he); }
+                if (!gb.empty()) { nTiles=1;
+                    if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] smart floor -> %zu ColliderBox grid (SEBD unavailable; covers the map, %zu walkable tris, footprint %.0fx%.0fm)\n", gb.size(), wt.size(), ex2, ez2);
+                } else if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] smart floor: no walkable boxes -> disk fallback\n");
+            }
             }
             floorFallback: ;
         }
@@ -1995,8 +2371,13 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         if (si.type == sitem::NAVMESH) continue;
         std::string iid = sitem::uuid(sidx);
         // HOTSPOT reuses the stolen icon mesh as its visible "dot"; pass its ref as meshAssetJson.
-        std::string ej = (si.type == sitem::HOTSPOT && iconOk) ? sitem::itemEntityJson(si, sidx, refJson(icMeshK))
-                                                               : sitem::itemEntityJson(si, sidx);
+        // SPAWN: the shell teleports the player's HEAD/EYE to the spawn transform (IDA: SpawnPointPlatformComponent is
+        // pure data + nativeTeleportToCoordinates passes the coords verbatim; device-proven the player ends up WITH HEAD
+        // at the spawn Y). The editor places/draws the spawn at FLOOR level, so raise the emitted Y by eye height (1.6,
+        // the same constant the editor preview uses: eye = pos + 1.6) → the player's feet land on the placed floor.
+        sitem::Item si2 = si; if (si.type == sitem::SPAWN) si2.pos[1] += 1.6f;
+        std::string ej = (si.type == sitem::HOTSPOT && iconOk) ? sitem::itemEntityJson(si2, sidx, refJson(icMeshK))
+                                                               : sitem::itemEntityJson(si2, sidx);
         if (ej.empty()) continue;
         ++sidx;
         entities += "," + ej; rels += "," + relChildOf(iid, rootId);
@@ -2016,7 +2397,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] item -> %s\n", sitem::metaName(si.type));
     }
     // spawn where the V79 camera/view is (XZ), at ground level — UNLESS the user placed their own local spawn.
-    float spawnPos[3] = { camPos ? camPos[0] : gx, spawnSurfY + 0.1f, camPos ? camPos[2] : gz };   // stand ON the detected floor/road surface
+    // AUTOMATIC spawn (only when the user placed NO Spawn Point): at the navmesh/scene ANCHOR (gx,gz), NOT the camera.
+    // Y = floor + EYE HEIGHT: the shell positions the player AT the spawn transform (head/eye ref), NOT the feet
+    // (device-proven: a floor-Y spawn → player UNDER the map), so +1.6 puts the FEET on the floor. (Matches the editor
+    // preview's eye = pos + 1.6.)
+    float spawnPos[3] = { gx, spawnSurfY + 1.6f, gz };
     if (userLocalSpawn == 0) {
         std::string spawnId = makeUuid(rng);
         entities += "," + spawnPointEntityJson(spawnId, spawnPos);
@@ -2027,19 +2412,25 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     for (const auto& si : sceneItems) {
         if (std::getenv("HSR_NONAV")) break;   // diag: skip custom navmesh colliders (test Meta's realfloor in isolation)
         if (si.type != sitem::NAVMESH || si.navVerts.size()<9) continue;
-        // OLD trimesh-SEBD path (kept behind HSR_NAVTRIMESH for when we can match the device's exact PhysX build):
+        // DEFAULT: device-safe ColliderBox floor (always works — built from halfExtents, no serialized struct to mismatch).
+        // The REAL trimesh (opt-in HSR_NAVTRIMESH) needs Meta's exact 4.1.64 PhysX libs OR the in-progress hand-roll —
+        // public 4.1.2 either crashes (native stamp) or loads-but-falls-through (4.1.64 stamp, geometry mis-read). So boxes
+        // are the default until the hand-rolled 4.1.64 SEBD lands.
         if (std::getenv("HSR_NAVTRIMESH") && si.navIdx.size()>=3) {
             prog(0.79f, "PhysX-cooking navmesh");
             auto sebd = cookNavmeshSEBD(si.navVerts.data(), (uint32_t)(si.navVerts.size()/3), si.navIdx.data(), (uint32_t)(si.navIdx.size()/3));
+            if (const char* dp=std::getenv("HSR_DUMP_PHYS")) { FILE* f=fopen(dp,"wb"); if(f){ fwrite(sebd.data(),1,sebd.size(),f); fclose(f); fprintf(stderr,"[COOK] dumped our navmesh SEBD (%zuB) -> %s\n", sebd.size(), dp); } }
             if (sebd.size()>64 && sebd[0]=='S'&&sebd[1]=='E'&&sebd[2]=='B'&&sebd[3]=='D') {
                 std::string pNav=MH+"/navmesh_"+std::to_string(sidx)+".phys/phys"; AssetKey3 navK=keyForPath(pNav);
                 assets.push_back({ pNav, navK.tgt, sebd, navK, TYPE_PHSX, TYPE_3MSH });
                 std::string nid=sitem::uuid(sidx); std::string ej=sitem::itemEntityJson(si, sidx, refJson(navK)); ++sidx;
                 entities += "," + ej; rels += "," + relChildOf(nid, rootId);
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] navmesh -> REAL SEBD trimesh collider (%zuB, %zu tris) — every triangle solid\n", sebd.size(), si.navIdx.size()/3);
+                continue;   // SEBD emitted -> skip the box fallback
             }
-            continue;
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] navmesh SEBD empty (PhysX off? build -DHSR_HAVE_PHYSX=ON) -> ColliderBox fallback\n");
         }
-        // DEFAULT: ColliderBox shapes (device-PhysX-built from halfExtents -> always compatible). PREFER one TILTED box
+        // FALLBACK: ColliderBox shapes (device-PhysX-built from halfExtents -> always compatible). PREFER one TILTED box
         // per walkable triangle (REUSES the real mesh tris -> exact shape/height/tilt). Fall back to the axis-aligned
         // height grid only if the mesh is too dense (or HSR_NAVGRID) to keep the box/entity count sane.
         prog(0.79f, "Building navmesh collision boxes");
@@ -2058,9 +2449,26 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         bool tilted = ntri>=1 && (int)ntri<=triCap && !std::getenv("HSR_NAVGRID");
         size_t emitted=0;
         if (tilted) {
-            auto tb = navmeshTrisToBoxes(si.navVerts, si.navIdx, 1.5f, 0.1f, inflate);   // thick tilted slab hugging each triangle (tight margin = less bump, tris share verts so still sealed)
-            tilted = !tb.empty();
-            for (auto& b : tb){ float c[3]={b[0],b[1],b[2]}, he[3]={b[3],b[4],b[5]}, q[4]={b[6],b[7],b[8],b[9]}; emitBox(c,he,q); ++emitted; }
+            bool navSmooth = std::getenv("HSR_NAVSMOOTH")!=nullptr;   // smoothed (vertex-averaged) tilts -> no per-edge creases
+            // SPLIT floor vs wall: up-facing FLOOR tris -> THICK boxes extending DOWN (stand on top); near-vertical WALL tris
+            // -> THIN slabs hugging the wall (no air-fill, no eject) so you can't phase through. (Device-safe stand-in for
+            // haven2025's cooked ColliderMeshes, until the full 4.1.64 trimesh hand-roll lands.)
+            std::vector<float> fv,wv; std::vector<uint32_t> fi,wi;
+            for (size_t t=0;t+2<si.navIdx.size();t+=3){ uint32_t a=si.navIdx[t],b=si.navIdx[t+1],c=si.navIdx[t+2];
+                if((size_t)a*3+2>=si.navVerts.size()||(size_t)b*3+2>=si.navVerts.size()||(size_t)c*3+2>=si.navVerts.size()) continue;
+                const float* pa=&si.navVerts[a*3]; const float* pb=&si.navVerts[b*3]; const float* pc=&si.navVerts[c*3];
+                float e1[3]={pb[0]-pa[0],pb[1]-pa[1],pb[2]-pa[2]}, e2[3]={pc[0]-pa[0],pc[1]-pa[1],pc[2]-pa[2]};
+                float ny=e1[2]*e2[0]-e1[0]*e2[2]; float nl=std::sqrt((e1[1]*e2[2]-e1[2]*e2[1])*(e1[1]*e2[2]-e1[2]*e2[1])+ny*ny+(e1[0]*e2[1]-e1[1]*e2[0])*(e1[0]*e2[1]-e1[1]*e2[0])); if(nl<1e-9f) continue;
+                bool floorT = (ny/nl > 0.5f);
+                std::vector<float>& dv = floorT?fv:wv; std::vector<uint32_t>& di = floorT?fi:wi;
+                uint32_t base=(uint32_t)(dv.size()/3); for(const float* p:{pa,pb,pc}){ dv.push_back(p[0]); dv.push_back(p[1]); dv.push_back(p[2]); } di.push_back(base); di.push_back(base+1); di.push_back(base+2);
+            }
+            auto fb = navmeshTrisToBoxes(fv, fi, 1.5f, navSmooth?0.05f:0.1f, inflate, navSmooth);   // FLOOR: thick, extends DOWN
+            auto wb = navmeshTrisToBoxes(wv, wi, 0.12f, 0.05f, inflate, false);                      // WALLS: THIN slab at the surface
+            tilted = !fb.empty() || !wb.empty();
+            for (auto& b : fb){ float c[3]={b[0],b[1],b[2]}, he[3]={b[3],b[4],b[5]}, q[4]={b[6],b[7],b[8],b[9]}; emitBox(c,he,q); ++emitted; }
+            for (auto& b : wb){ float c[3]={b[0],b[1],b[2]}, he[3]={b[3],b[4],b[5]}, q[4]={b[6],b[7],b[8],b[9]}; emitBox(c,he,q); ++emitted; }
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] collision: %zu floor boxes + %zu wall slabs\n", fb.size(), wb.size());
         }
         bool tiltGrid=false;
         if (!tilted) {
@@ -2072,6 +2480,42 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             else { auto gb = navmeshToBoxes(si.navVerts, bcell, 1.5f, 1500); for (auto& b : gb){ float c[3]={b[0],b[1],b[2]}, he[3]={b[3],b[4],b[5]}; emitBox(c,he,nullptr); ++emitted; } }
         }
         if (std::getenv("HSR_VERBOSE")||std::getenv("HSR_NAVDBG")) fprintf(stderr,"[COOK] navmesh -> %zu %s collision boxes (%zu source tris)\n", emitted, tilted?"TILTED per-triangle":(tiltGrid?"TILTED grid":"flat grid"), ntri);
+        // ── HSR_NAVDEBUG: clone the navmesh source tris as a VISIBLE slope-colored renderable so the navmesh shows
+        //    IN-HEADSET (debug on device, matching the editor's slope overlay). white-tex unlit material * per-vertex
+        //    slope vertexColor0 (the unlit shader does base*COLOR0). Compare against where you actually WALK (the boxes)
+        //    to spot collision jaggedness. Opt-in (HSR_NAVDEBUG) so normal cooks are unaffected. ──
+        if (std::getenv("HSR_NAVDEBUG") && si.navVerts.size()>=9 && si.navIdx.size()>=3) {
+            size_t nvv=si.navVerts.size()/3;
+            std::vector<float> upAcc(nvv,0.f); std::vector<int> upCnt(nvv,0);
+            for (size_t t=0;t+2<si.navIdx.size();t+=3){
+                uint32_t a=si.navIdx[t],b=si.navIdx[t+1],c=si.navIdx[t+2];
+                if(a>=nvv||b>=nvv||c>=nvv) continue;
+                const float* A=&si.navVerts[a*3]; const float* B=&si.navVerts[b*3]; const float* C=&si.navVerts[c*3];
+                float e1[3]={B[0]-A[0],B[1]-A[1],B[2]-A[2]}, e2[3]={C[0]-A[0],C[1]-A[1],C[2]-A[2]};
+                float nx=e1[1]*e2[2]-e1[2]*e2[1], ny=e1[2]*e2[0]-e1[0]*e2[2], nz=e1[0]*e2[1]-e1[1]*e2[0];
+                float nl=std::sqrt(nx*nx+ny*ny+nz*nz); float up= nl>1e-6f?std::fabs(ny)/nl:1.f;
+                for(uint32_t vi:{a,b,c}){ upAcc[vi]+=up; upCnt[vi]++; }
+            }
+            auto c8=[](float f){ int i=(int)(f*255.f+0.5f); return (uint8_t)(i<0?0:i>255?255:i); };
+            std::vector<uint8_t> vcol(nvv*4); std::vector<float> nuv(nvv*2,0.f);
+            for(size_t v=0;v<nvv;v++){ float up= upCnt[v]?upAcc[v]/upCnt[v]:1.f;
+                float rr= up>0.85f?(1.f-up)/0.15f:1.f, gg= up>0.5f?1.f:up/0.5f;
+                vcol[v*4]=c8(std::min(1.f,rr)); vcol[v*4+1]=c8(std::min(1.f,gg)); vcol[v*4+2]=40; vcol[v*4+3]=255; }
+            std::vector<uint8_t> dmat=matTpl;   // unlit material (field7 already = unlit shader); point its texture at white
+            std::string pdw=std::string("meta/navdebug/w")+std::to_string(sidx)+".tex/tex"; AssetKey3 dwK=keyForPath(pdw);
+            assets.push_back({ pdw, dwK.tgt, whiteTex, dwK });
+            if (dmat.size()>=136){ memcpy(dmat.data()+120,&dwK.pkg,8); memcpy(dmat.data()+128,&dwK.ing,8); }
+            auto dmesh = encodeRendMeshParts(si.navVerts, nuv, si.navIdx, dmat, 0, {}, {}, {}, false, vcol);
+            if (dmesh.size()>64) {
+                std::string pdm=std::string("meta/navdebug/m")+std::to_string(sidx)+".rendmesh/mesh"; AssetKey3 dmK=keyForPath(pdm);
+                std::string pdt=std::string("meta/navdebug/m")+std::to_string(sidx)+".matl/mat";     AssetKey3 dtK=keyForPath(pdt);
+                assets.push_back({ pdm, dmK.tgt, dmesh, dmK }); assets.push_back({ pdt, dtK.tgt, dmat, dtK });
+                std::string did=sitem::uuid(900000+sidx); float o0[3]={0,0,0}, r0[3]={0,0,0}, s1[3]={1,1,1};
+                entities += "," + entityJson(did, "NavDebug", o0, r0, s1, dmK, { dtK }, AssetKey3{0,0,0}, std::string(), 5, false, std::string());
+                rels += "," + relChildOf(did, rootId); ++sidx;
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] navmesh DEBUG clone mesh: %zu verts slope-colored -> VISIBLE on device (HSR_NAVDEBUG)\n", nvv);
+            }
+        }
     }
     // Background music: ship the V79 _BACKGROUND_LOOP.ogg RAW as a SoundAsset (FMOD:SND -> FMOD auto-detects ogg),
     // auto-started + looped by a SoundPlatformComponent. The global converter: ANY env with a loose .ogg gets its theme.
@@ -2088,7 +2532,19 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     std::string pContent = MH + "/content.hstf/template", pSpace = MH + "/space.hstf/template";
     AssetKey3 contentK = keyForPath(pContent), spaceK = keyForPath(pSpace);
     std::string content = templateJson(entities, rels);
-    std::string space   = spaceJson(rng, "home_c25", contentK);   // space display name = stock package (cosmetic)
+    // Far clip plane (ScenePlatformComponent v3) goes in space.hstf — vista-proven the shell only applies it there.
+    // V79 envs ship NO ScenePlatformComponent, so on V205 they fall back to the shell's SMALL default far and
+    // distant geometry clips (the cyberhome "far plane showing up"). We AUTO-SIZE the far to the scene's own
+    // extent (bounding-sphere radius from origin × 2.5 + 2000, floored at 40000) so no ported home can out-run
+    // its own far plane regardless of size (official focused=150000). HSR_FARCLIP overrides explicitly.
+    // FAR CLIP = MAX on EVERY bake (user demand: distant geometry must NEVER clip on device — V79 envs ship no
+    // ScenePlatformComponent so the shell's small default far clips them). 150000 = the official `focused` vista's
+    // far = the PROVEN device max (1e6 both (a) degenerates the projection AND (b) snprintf %g'd it to "1e+06"
+    // which the device JSON parser rejects → far defaulted small → STILL CLIPPED). HSR_FARCLIP overrides.
+    float farP = 150000.0f;
+    if (const char* fc = std::getenv("HSR_FARCLIP")) farP = (float)atof(fc);
+    fprintf(stderr, "[EXPORT] farClippingPlane=%.0f (MAX every bake; set HSR_FARCLIP to override)\n", farP);
+    std::string space   = spaceJson(rng, "home_c25", contentK, farP);   // space display name = stock package (cosmetic)
     auto shellcfg = jbytes(shellConfigJson(spaceK, locomotion));
     assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
     assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });

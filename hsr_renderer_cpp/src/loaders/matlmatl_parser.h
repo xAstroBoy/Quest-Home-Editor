@@ -28,6 +28,14 @@ struct MatlmatlInfo {
     // builder otherwise grabs the wrong/largest one). Collected loosely (all entry u32s); only real
     // sampler hashes will match a shader's sampler names.
     std::vector<u32> texSlots;
+    // `textureValues` (MATL root field 8 / vtidx10): the FAITHFUL texture bindings. Each entry pairs
+    // {samplerNameHash, textureIng} — device binds the texture to the shader sampler whose
+    // MurmurHash3_x86_32(samplerName,0) == samplerNameHash (PROVEN: MurmurHash3("baseColorTex")==0xe9c182de).
+    // Layout from MaterialDefinition::fix (0xeb6ad4) + MaterialDefinition__2232164 (0x2232164):
+    // entry field0 = AssetReference {pkg@0,ing@8,tgt@16}; entry field1 = u32 samplerNameHash.
+    // This replaces the old tgt-sentinel byte-scan, which picked the WRONG ing for USD-derived materials
+    // (the real diffuse fell into the "unreferenced" texture bucket -> the mesh rendered WHITE).
+    std::vector<std::pair<u32,u64>> samplerTex;  // {samplerNameHash, ing}, in file order
 };
 
 inline bool parseMatlmatl(const std::vector<u8>& data, MatlmatlInfo& info) {
@@ -145,6 +153,53 @@ inline bool parseMatlmatl(const std::vector<u8>& data, MatlmatlInfo& info) {
             i32 rsoff = rdi32(root); long long rvt = (long long)root - rsoff;
             if (rvt >= 0 && (size_t)rvt + 4 <= N) {
                 u16 rvts = rd16((size_t)rvt); u32 nfields = rvts >= 4 ? (rvts - 4) / 2 : 0;
+                // ── textureValues (root FIELD INDEX 8 / vtidx10): {AssetRef tex @ entry f0, u32 samplerNameHash @ entry f1}
+                {
+                    size_t tvp = fieldPos(root, 8);
+                    if (tvp) {
+                        u32 uoff = rd32(tvp); size_t vecPos = (size_t)tvp + uoff;
+                        if (vecPos + 4 <= N) {
+                            u32 cnt = rd32(vecPos);
+                            if (cnt && cnt <= 256) {
+                                size_t b2 = vecPos + 4;
+                                for (u32 i = 0; i < cnt; ++i) {
+                                    size_t slot = b2 + (size_t)i * 4; u32 eo = rd32(slot); if (!eo) continue;
+                                    size_t tbl = slot + eo;
+                                    size_t arPos = fieldPos(tbl, 0);   // entry f0 = AssetRef {pkg@0,ing@8,tgt@16}
+                                    size_t shPos = fieldPos(tbl, 1);   // entry f1 = samplerNameHash (u32)
+                                    if (!arPos || arPos + 16 > N) continue;
+                                    u64 ing = *reinterpret_cast<const u64*>(d + arPos + 8);
+                                    u32 hash = shPos ? rd32(shPos) : 0;
+                                    if (ing >= 0x100000000ULL) info.samplerTex.push_back({hash, ing});
+                                }
+                            }
+                        }
+                    }
+                }
+                // ── constantValues (root FIELD INDEX 3 / vtidx5): vector of {nameHash@f0, blobOffset@f1,
+                //    byteSize@f2}. DETERMINISTIC read — the heuristic "find a vector that tiles the blob"
+                //    (below) MISSES embedded USD materials (the static terrain) -> their matParams never
+                //    bound -> rgbmasked LayerRed/LayerBlue/Tint stayed at the 1.0 default = WHITE scene.
+                if (blobSz && info.constParams.empty()) {
+                    size_t cvp = fieldPos(root, 3);
+                    if (cvp) {
+                        u32 uoff = rd32(cvp); size_t vecPos = (size_t)cvp + uoff;
+                        if (vecPos + 4 <= N) {
+                            u32 cnt = rd32(vecPos);
+                            if (cnt && cnt <= 256) {
+                                size_t cb = vecPos + 4; std::vector<ConstParam> cps; bool ok = true;
+                                for (u32 i = 0; i < cnt && ok; ++i) {
+                                    size_t slot = cb + (size_t)i * 4; u32 eo = rd32(slot); if (!eo) { ok = false; break; }
+                                    size_t tbl = slot + eo;
+                                    u32 h = u32field(tbl, 0), off = u32field(tbl, 1), sz = u32field(tbl, 2);
+                                    if (!(sz == 4 || sz == 8 || sz == 12 || sz == 16) || (size_t)off + sz > blobSz) { ok = false; break; }
+                                    cps.push_back({h, off, sz});
+                                }
+                                if (ok && !cps.empty()) info.constParams = std::move(cps);
+                            }
+                        }
+                    }
+                }
                 for (u32 fi = 0; fi < nfields; ++fi) {
                     size_t fpos = fieldPos(root, fi);
                     if (!fpos) continue;
@@ -191,15 +246,25 @@ inline bool parseMatlmatl(const std::vector<u8>& data, MatlmatlInfo& info) {
     // resolving each ing's path and preferring "_basecolor"/"_basecolormetallic" over
     // normal("_onxrny")/AO("_rbaodir")/etc. Picking the wrong one rendered purple.
     static constexpr u32 TEX_TGT = 0x6E4CC522u;
-    for (u32 i = 72; i + 12 <= (u32)data.size(); i += 4) {
-        u32 val = *reinterpret_cast<const u32*>(data.data() + i);
-        if (val == TEX_TGT && i >= 8) {
-            u64 ing = *reinterpret_cast<const u64*>(data.data() + i - 8);
-            if (ing >= 0x100000000ULL) {
-                info.texIngs.push_back(ing);
-                info.texIng = ing;       // default = last (overridden by loader)
-                info.texTgt = TEX_TGT;
-                info.texPkg = 0;
+    if (!info.samplerTex.empty()) {
+        // FAITHFUL path: textureValues gave us the exact texture ings (in sampler order). Use them so the
+        // loader marks them "referenced" (decoded) + binds the right one per sampler. (Fixes USD-derived
+        // materials whose real diffuse otherwise fell into the unreferenced bucket -> white meshes.)
+        for (auto& st : info.samplerTex) info.texIngs.push_back(st.second);
+        info.texIng = info.texIngs.back();
+        info.texTgt = TEX_TGT;
+        info.texPkg = 0;
+    } else {
+        for (u32 i = 72; i + 12 <= (u32)data.size(); i += 4) {
+            u32 val = *reinterpret_cast<const u32*>(data.data() + i);
+            if (val == TEX_TGT && i >= 8) {
+                u64 ing = *reinterpret_cast<const u64*>(data.data() + i - 8);
+                if (ing >= 0x100000000ULL) {
+                    info.texIngs.push_back(ing);
+                    info.texIng = ing;       // default = last (overridden by loader)
+                    info.texTgt = TEX_TGT;
+                    info.texPkg = 0;
+                }
             }
         }
     }

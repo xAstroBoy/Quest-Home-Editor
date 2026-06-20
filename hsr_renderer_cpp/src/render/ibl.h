@@ -113,6 +113,52 @@ inline bool extractCubeRawRGBA16F(const uint8_t* data, size_t n, int& outSize, s
     return true;
 }
 
+// V203 IBL: the skybox reflectionMap/diffuseMap are EQUIRECT (lat-long) ASTC-HDR panoramas (verified:
+// *_refl_comp.hdr / panoramacapture / skydome, ~2:1). Convert an equirect RGB-float panorama to the existing
+// Cubemap (6 faces, `cubeSize` each) so the V79 SpecIbl per-vertex bake path consumes it unchanged.
+inline Cubemap equirectToCubemap(const float* eq, int ew, int eh, int cubeSize) {
+    Cubemap cm; cm.size = cubeSize;
+    const float PI = 3.14159265358979f;
+    auto sampleEq = [&](float dx, float dy, float dz, float o[3]) {
+        float l = std::sqrt(dx*dx+dy*dy+dz*dz); if (l < 1e-8f) l = 1; dx/=l; dy/=l; dz/=l;
+        float u = 0.5f + std::atan2(dz, dx) / (2*PI);
+        float v = 0.5f - std::asin(std::max(-1.f, std::min(1.f, dy))) / PI;
+        int x = std::min(ew-1, std::max(0, (int)(u*ew)));
+        int y = std::min(eh-1, std::max(0, (int)(v*eh)));
+        const float* p = eq + ((size_t)y*ew + x)*3; o[0]=p[0]; o[1]=p[1]; o[2]=p[2];
+    };
+    for (int f = 0; f < 6; ++f) {
+        cm.faces[f].resize((size_t)cubeSize*cubeSize*3);
+        for (int ty = 0; ty < cubeSize; ++ty) for (int tx = 0; tx < cubeSize; ++tx) {
+            float a = 2.f*(tx+0.5f)/cubeSize - 1.f, b = 2.f*(ty+0.5f)/cubeSize - 1.f;
+            float dx, dy, dz;
+            switch (f) { case 0: dx=1; dy=-b; dz=-a; break;  case 1: dx=-1; dy=-b; dz=a;  break;
+                         case 2: dx=a; dy=1;  dz=b;  break;  case 3: dx=a;  dy=-1; dz=-b; break;
+                         case 4: dx=a; dy=-b; dz=1;  break;  default: dx=-a; dy=-b; dz=-1; break; }
+            float o[3]; sampleEq(dx, dy, dz, o);
+            float* d = &cm.faces[f][((size_t)ty*cubeSize+tx)*3]; d[0]=o[0]; d[1]=o[1]; d[2]=o[2];
+        }
+    }
+    return cm;
+}
+
+// Build a low-frequency irradiance cube from a (already cube) radiance map by box-blurring each face — a crude
+// but faithful-enough diffuse irradiance for the per-vertex diffuse bake when no dedicated diffuseMap exists.
+inline Cubemap irradianceFromCube(const Cubemap& src, int outSize) {
+    Cubemap cm; if (!src.ok()) return cm; cm.size = outSize;
+    for (int f = 0; f < 6; ++f) {
+        cm.faces[f].assign((size_t)outSize*outSize*3, 0.f);
+        int S = src.size; float step = (float)S / outSize;
+        for (int ty = 0; ty < outSize; ++ty) for (int tx = 0; tx < outSize; ++tx) {
+            int sx0 = (int)(tx*step), sy0 = (int)(ty*step), sx1 = std::min(S, (int)((tx+1)*step)+1), sy1 = std::min(S, (int)((ty+1)*step)+1);
+            float acc[3]={0,0,0}; int cnt=0;
+            for (int y=sy0;y<sy1;++y) for (int x=sx0;x<sx1;++x){ const float* p=&src.faces[f][((size_t)y*S+x)*3]; acc[0]+=p[0];acc[1]+=p[1];acc[2]+=p[2];++cnt; }
+            float* d=&cm.faces[f][((size_t)ty*outSize+tx)*3]; if(cnt){d[0]=acc[0]/cnt;d[1]=acc[1]/cnt;d[2]=acc[2]/cnt;}
+        }
+    }
+    return cm;
+}
+
 // Sample the cubemap in direction d (need not be normalized). Bilinear within the selected face.
 // Standard GL cube face selection (faces +X,-X,+Y,-Y,+Z,-Z), top-left origin.
 inline void sample(const Cubemap& cm, float dx, float dy, float dz, float out[3]) {

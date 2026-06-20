@@ -312,6 +312,146 @@ public:
     bool hasAnimation() const { return (!animRecs.empty() || !skinRecs.empty() || !uvAnimRecs.empty() || !vatRecs.empty()) && (animMaxFrames > 1 || !vatRecs.empty()); }
     float animDuration() const { return animMaxFrames > 1 ? (float)animMaxFrames / animFps : 0.0f; }
 
+    // ── COOK: SKINNED HZANIM extraction (the V79 OPA→V205 port for ALL skinned meshes — was dropped, cook only
+    //    did rotation/UV). Builds a device-FAITHFUL HIERARCHICAL skeleton (NOT the flat world-bake): joints = the
+    //    clip joints, parents = clip.parents, per-frame trsLocal = clip.mats (already parent-LOCAL, the renderer
+    //    composes animWorld[j]=animWorld[parent]*mats[f][j]), bind = inverse(skin invBind) → composed jointBindWorld
+    //    (sr.invBind[b]=inverse(jointBindWorld[boneClip[b]]), proven from the renderer's skinning at sub animate()).
+    //    boneIdx remaps skin-bone→clip-joint via boneClip. The cook's useHz path (Incredibles-proven) emits HZAN:SKEL+
+    //    ACL HZAN:ANIM + AnimatorPlatformComponent. project_hsl_cooker_expose_all_audit.
+    struct OpaHzAnim {
+        std::vector<float> jointPos, jointQuat, jointScale; std::vector<int> parents;
+        std::vector<uint8_t> boneIdx, boneWgt; std::vector<float> trsLocal, restPos;
+        int jointCount=0, frameCount=0; float fps=0.f;
+        bool ok() const { return jointCount>0 && frameCount>1; }
+    };
+    OpaHzAnim extractHzAnim(int meshIdx) {
+        OpaHzAnim e;
+        const SkinRec* rec=nullptr; for (auto& r : skinRecs) if ((int)r.meshIdx==meshIdx) { rec=&r; break; }
+        if (!rec || rec->clipIdx<0 || rec->clipIdx>=(int)clips.size()) return e;
+        const AnimClip& clip = clips[rec->clipIdx];
+        int nj=clip.numJoints, nf=clip.numFrames;
+        if (nj<1 || nf<2 || (int)clip.mats.size() < nf*nj*16) return e;
+        // column-major float[16] helpers (match gltf_loader matTrs/mulM)
+        auto mul16=[](const float* a,const float* b,float* o){ for(int c=0;c<4;c++)for(int r=0;r<4;r++) o[c*4+r]=a[r]*b[c*4]+a[4+r]*b[c*4+1]+a[8+r]*b[c*4+2]+a[12+r]*b[c*4+3]; };
+        auto invAff=[](const float* m,float* o){
+            float M00=m[0],M01=m[4],M02=m[8], M10=m[1],M11=m[5],M12=m[9], M20=m[2],M21=m[6],M22=m[10];
+            float det=M00*(M11*M22-M12*M21)-M01*(M10*M22-M12*M20)+M02*(M10*M21-M11*M20);
+            float id=(det>1e-20f||det<-1e-20f)?1.f/det:0.f;
+            o[0]=(M11*M22-M12*M21)*id; o[1]=(M12*M20-M10*M22)*id; o[2]=(M10*M21-M11*M20)*id;
+            o[4]=(M02*M21-M01*M22)*id; o[5]=(M00*M22-M02*M20)*id; o[6]=(M01*M20-M00*M21)*id;
+            o[8]=(M01*M12-M02*M11)*id; o[9]=(M02*M10-M00*M12)*id; o[10]=(M00*M11-M01*M10)*id;
+            o[3]=o[7]=o[11]=0; o[15]=1;
+            float tx=m[12],ty=m[13],tz=m[14];
+            o[12]=-(o[0]*tx+o[4]*ty+o[8]*tz); o[13]=-(o[1]*tx+o[5]*ty+o[9]*tz); o[14]=-(o[2]*tx+o[6]*ty+o[10]*tz); };
+        auto matTrs=[](const float* m,float* q,float* t,float* s){
+            t[0]=m[12];t[1]=m[13];t[2]=m[14];
+            s[0]=std::sqrt(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]); s[1]=std::sqrt(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]); s[2]=std::sqrt(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]);
+            float ix=s[0]>1e-8f?1/s[0]:0, iy=s[1]>1e-8f?1/s[1]:0, iz=s[2]>1e-8f?1/s[2]:0;
+            float r0=m[0]*ix,r1=m[1]*ix,r2=m[2]*ix, r3=m[4]*iy,r4=m[5]*iy,r5=m[6]*iy, r6=m[8]*iz,r7=m[9]*iz,r8=m[10]*iz;
+            float tr=r0+r4+r8;
+            if(tr>0){float S=std::sqrt(tr+1)*2;q[3]=0.25f*S;q[0]=(r5-r7)/S;q[1]=(r6-r2)/S;q[2]=(r1-r3)/S;}
+            else if(r0>r4&&r0>r8){float S=std::sqrt(1+r0-r4-r8)*2;q[3]=(r5-r7)/S;q[0]=0.25f*S;q[1]=(r3+r1)/S;q[2]=(r6+r2)/S;}
+            else if(r4>r8){float S=std::sqrt(1+r4-r0-r8)*2;q[3]=(r6-r2)/S;q[0]=(r3+r1)/S;q[1]=0.25f*S;q[2]=(r7+r5)/S;}
+            else{float S=std::sqrt(1+r8-r0-r4)*2;q[3]=(r1-r3)/S;q[0]=(r6+r2)/S;q[1]=(r7+r5)/S;q[2]=0.25f*S;} };
+        e.jointCount=nj; e.frameCount=nf; e.fps = animFps>0.f?animFps:30.f;
+        e.parents=clip.parents; if((int)e.parents.size()<nj) e.parents.resize(nj,-1);
+        e.restPos=rec->basePos;
+        size_t nv=rec->basePos.size()/3;
+        // per-vertex bone idx (skin-bone→clip-joint) + normalized u8 weights
+        e.boneIdx.assign(nv*4,0); e.boneWgt.assign(nv*4,0);
+        for(size_t v=0;v<nv;v++){ float ws=0; for(int c=0;c<4;c++) ws+=rec->jw[v*4+c];
+            for(int c=0;c<4;c++){ int sb=rec->jidx[v*4+c]; int cj=(sb>=0&&sb<(int)rec->boneClip.size())?rec->boneClip[sb]:0; if(cj<0||cj>=nj)cj=0;
+                e.boneIdx[v*4+c]=(uint8_t)cj; float w=ws>1e-6f?rec->jw[v*4+c]/ws:(c==0?1.f:0.f); int iw=(int)(w*255.f+0.5f); e.boneWgt[v*4+c]=(uint8_t)(iw<0?0:iw>255?255:iw); } }
+        // jointBindWorld[j] = inverse(sr.invBind[bone mapping to j]); fallback identity for jointless joints
+        std::vector<float> bw((size_t)nj*16,0.f); std::vector<char> have(nj,0);
+        for(int b=0;b<rec->nJoints;b++){ int cj=(b<(int)rec->boneClip.size())?rec->boneClip[b]:-1;
+            if(cj<0||cj>=nj||have[cj]||(size_t)(b*16+16)>rec->invBind.size()) continue;
+            invAff(rec->invBind.data()+(size_t)b*16, bw.data()+(size_t)cj*16); have[cj]=1; }
+        for(int j=0;j<nj;j++) if(!have[j]){ float* m=bw.data()+(size_t)j*16; for(int k=0;k<16;k++)m[k]=0; m[0]=m[5]=m[10]=m[15]=1; }
+        // bind LOCAL (relative to parent joint) → jointPos/Quat(wxyz)/Scale
+        e.jointPos.resize(nj*3); e.jointQuat.resize(nj*4); e.jointScale.resize(nj);
+        for(int j=0;j<nj;j++){ float bl[16]; int p=e.parents[j];
+            if(p>=0&&p<nj){ float ip[16]; invAff(bw.data()+(size_t)p*16,ip); mul16(ip,bw.data()+(size_t)j*16,bl); }
+            else memcpy(bl,bw.data()+(size_t)j*16,64);
+            float q[4],t[3],s[3]; matTrs(bl,q,t,s);
+            e.jointPos[j*3]=t[0];e.jointPos[j*3+1]=t[1];e.jointPos[j*3+2]=t[2];
+            e.jointQuat[j*4]=q[3];e.jointQuat[j*4+1]=q[0];e.jointQuat[j*4+2]=q[1];e.jointQuat[j*4+3]=q[2];
+            e.jointScale[j]=(s[0]>1e-4f||s[0]<-1e-4f)?s[0]:1.f; }
+        // per-frame local TRS (clip.mats are already parent-local) → trsLocal {qx,qy,qz,qw, t3, s3}
+        e.trsLocal.resize((size_t)nf*nj*10);
+        for(int f=0;f<nf;f++)for(int j=0;j<nj;j++){ const float* m=clip.mats.data()+((size_t)f*nj+j)*16;
+            float q[4],t[3],s[3]; matTrs(m,q,t,s); float* o=e.trsLocal.data()+((size_t)f*nj+j)*10;
+            o[0]=q[0];o[1]=q[1];o[2]=q[2];o[3]=q[3]; o[4]=t[0];o[5]=t[1];o[6]=t[2]; o[7]=s[0];o[8]=s[1];o[9]=s[2]; }
+        return e;
+    }
+
+    // ── COOK: NON-skinned node-TRANSLATION (cars/train) → a 1-JOINT RIGID HZANIM clip. Reuses the cook's HZANIM
+    //    emitter so arbitrary node PATHS port faithfully (the rotation-fit only does pure spin/sway; translation was
+    //    DROPPED → cars static on device). joint0 = the node; clip[f] = nodeWorldAnim[node] sampled per frame (WORLD
+    //    transform); restPos = node-LOCAL basePos; bind = IDENTITY (invBind=identity → skinMatrix(f)=nodeWorldAnim(f)
+    //    → vertex(f)=nodeWorldAnim(f)*basePos = the renderer's node anim). Returns !ok() if the node doesn't TRANSLATE
+    //    (origin static) so pure spins keep the lighter getTime() Rodrigues path. project_hsl_opa_anim_port_plan.
+    OpaHzAnim extractNodeRigidHzAnim(int meshIdx) {
+        OpaHzAnim e;
+        if (animMaxFrames < 2) return e;
+        const AnimRec* ar=nullptr; for (auto& a : animRecs) if ((int)a.meshIdx==meshIdx){ ar=&a; break; }
+        if (!ar || ar->basePos.size() < 9) return e;
+        uint32_t node = ar->nodeIdx;
+        float clipDur = animDuration(); if (clipDur <= 0.f) return e;
+        int NF = animMaxFrames > 64 ? 64 : animMaxFrames; if (NF < 2) return e;
+        auto matTrs=[](const float* m,float* q,float* t,float* s){
+            t[0]=m[12];t[1]=m[13];t[2]=m[14];
+            s[0]=std::sqrt(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]); s[1]=std::sqrt(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]); s[2]=std::sqrt(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]);
+            float ix=s[0]>1e-8f?1/s[0]:0, iy=s[1]>1e-8f?1/s[1]:0, iz=s[2]>1e-8f?1/s[2]:0;
+            float r0=m[0]*ix,r1=m[1]*ix,r2=m[2]*ix, r3=m[4]*iy,r4=m[5]*iy,r5=m[6]*iy, r6=m[8]*iz,r7=m[9]*iz,r8=m[10]*iz;
+            float tr=r0+r4+r8;
+            if(tr>0){float S=std::sqrt(tr+1)*2;q[3]=0.25f*S;q[0]=(r5-r7)/S;q[1]=(r6-r2)/S;q[2]=(r1-r3)/S;}
+            else if(r0>r4&&r0>r8){float S=std::sqrt(1+r0-r4-r8)*2;q[3]=(r5-r7)/S;q[0]=0.25f*S;q[1]=(r3+r1)/S;q[2]=(r6+r2)/S;}
+            else if(r4>r8){float S=std::sqrt(1+r4-r0-r8)*2;q[3]=(r6-r2)/S;q[0]=(r3+r1)/S;q[1]=0.25f*S;q[2]=(r7+r5)/S;}
+            else{float S=std::sqrt(1+r8-r0-r4)*2;q[3]=(r1-r3)/S;q[0]=(r6+r2)/S;q[1]=(r7+r5)/S;q[2]=0.25f*S;} };
+        std::vector<float> trs((size_t)NF*10); float o0[3]={0,0,0}, maxd=0.f;
+        for (int f=0; f<NF; f++) { evalAnimNodes(clipDur * (float)f / (float)(NF-1));
+            Mat4 w = (node < nodeWorldAnim.size()) ? nodeWorldAnim[node] : identity();
+            float q[4],t[3],s[3]; matTrs(w.m, q, t, s);
+            float* p=trs.data()+(size_t)f*10; p[0]=q[0];p[1]=q[1];p[2]=q[2];p[3]=q[3]; p[4]=t[0];p[5]=t[1];p[6]=t[2]; p[7]=s[0];p[8]=s[1];p[9]=s[2];
+            if (f==0){ o0[0]=t[0];o0[1]=t[1];o0[2]=t[2]; }
+            else { float dx=t[0]-o0[0],dy=t[1]-o0[1],dz=t[2]-o0[2]; float d=std::sqrt(dx*dx+dy*dy+dz*dz); if(d>maxd)maxd=d; } }
+        animate(0.f);   // restore rest pose (geometry bake reads the renderer's GPU model, this just resets the loader)
+        if (maxd < 0.01f) return e;   // node doesn't TRANSLATE → leave pure spins to the getTime() Rodrigues path
+        size_t nv = ar->basePos.size()/3;
+        e.jointCount=1; e.frameCount=NF; e.fps = animFps>0.f?animFps:30.f;
+        e.parents={-1}; e.jointPos={0,0,0}; e.jointQuat={1,0,0,0}; e.jointScale={1};   // identity bind
+        e.restPos = ar->basePos;   // node-LOCAL verts (the clip's WORLD transform places them)
+        e.boneIdx.assign(nv*4,0); e.boneWgt.assign(nv*4,0); for (size_t v=0;v<nv;v++) e.boneWgt[v*4]=255;
+        e.trsLocal = std::move(trs);
+        return e;
+    }
+
+    // ── COOK: node TRANSLATION (cars/train) → the NET world displacement over the clip, for a ShellPoseAnimationComponent
+    //    (the FAITHFUL, device-proven V79→V205 node-anim port — NOT a 1-joint skin, which the device's MeshDefinition::fix
+    //    REJECTS as a degenerate maxBoneIdx=0 skin → "flatbuffer verification failed" → no render). Mesh stays STATIC
+    //    (valid), the entity pose lerps rest→rest+delta. Returns false if the node doesn't translate (pure spin keeps
+    //    the getTime() Rodrigues path). delta = the MAX origin displacement over the clip. ──
+    bool extractNodeTranslate(int meshIdx, float delta[3]) {
+        delta[0]=delta[1]=delta[2]=0.f;
+        if (animMaxFrames < 2) return false;
+        const AnimRec* ar=nullptr; for (auto& a : animRecs) if ((int)a.meshIdx==meshIdx){ ar=&a; break; }
+        if (!ar) return false;
+        uint32_t node=ar->nodeIdx; float cd=animDuration(); if (cd<=0.f) return false;
+        evalAnimNodes(0.f);
+        float o0[3]={0,0,0}; if (node<nodeWorldAnim.size()){ o0[0]=nodeWorldAnim[node].m[12]; o0[1]=nodeWorldAnim[node].m[13]; o0[2]=nodeWorldAnim[node].m[14]; }
+        float best[3]={0,0,0}, bestd=0.f; const int NS=24;
+        for (int f=1; f<=NS; f++) { evalAnimNodes(cd*(float)f/(float)NS);
+            if (node>=nodeWorldAnim.size()) continue;
+            float dx=nodeWorldAnim[node].m[12]-o0[0], dy=nodeWorldAnim[node].m[13]-o0[1], dz=nodeWorldAnim[node].m[14]-o0[2];
+            float d=dx*dx+dy*dy+dz*dz; if (d>bestd){ bestd=d; best[0]=dx;best[1]=dy;best[2]=dz; } }
+        animate(0.f);
+        if (bestd < 1e-4f) return false;
+        delta[0]=best[0]; delta[1]=best[1]; delta[2]=best[2];
+        return true;
+    }
+
     // ── COOK: batch-fit every node-animated mesh to a SPIN/SWAY about an axis (the V79->V203 port). Samples each
     //    animated mesh's WORLD positions across the clip via animate(t), runs the shared noderot::fit, and returns
     //    meshIdx -> Result. Leaves the meshes at REST (animate(0)) so the static geometry bake is the t=0 pose. The

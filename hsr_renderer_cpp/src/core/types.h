@@ -108,21 +108,56 @@ inline void mat4mul4(const float a[16], const float b[16], float out[16]) {
         }
 }
 
+// Generic captured component (every hstf component, even ones the typed pipeline ignores) so the EDITOR can
+// inspect/edit ALL of them + any extras. `fields` is the component's data flattened to name->display string
+// (nested objects flattened with dotted keys, e.g. "lightmapUvScale.x"). Layout truth: V203_COMPONENTS_IDA.md.
+struct EnvComponent {
+    std::string cls;                 // full class, e.g. "horizon::platform_api::ScenePlatformComponent"
+    std::string shortCls;            // trailing name, e.g. "ScenePlatformComponent"
+    int         version = 0;
+    std::vector<std::pair<std::string,std::string>> fields;   // (dotted key, value) in declaration order
+};
+
+// Global exposure applied to baked HDR lightmaps before the ACES tonemap (rendtxtr_parser). 2.6 is tuned for
+// DARK INTERIOR envs (horror/candle/chair) that came out too dim. Bright OUTDOOR VISTAS get over-exposed at 2.6
+// (the lightmapped ground/boulders clip toward white), so main.cpp lowers this for vista_* envs. HSR_LMEXP overrides.
+inline float g_lmExposure = 2.6f;
+
+// A single MaterialPropertyOverrides "constantParameter": the per-instance override of a shader matParams
+// member (e.g. "matParams.tint", "matParams.windIntensityMax") or an "instance.*" value. The device applies
+// these OVER the cooked material's constant block, so a grey butterfly gets its colour, plants get their wind,
+// props get their per-instance roughness/atlas cell. value is xyzw (most are scalar in .x).
+struct MatOverride { std::string name; float v[4] = {0.0f,0.0f,0.0f,0.0f}; };
+
 struct DrawableEntity {
     std::string name;
     Transform   transform;
+    std::vector<EnvComponent> components;   // ALL components on this entity (generic inspect/edit)
     AssetKey    meshRef;
     std::vector<AssetKey> matRefs;
     float worldMatrix[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}; // faithful 4×4 parent→child world matrix
     bool  hasWorldMatrix = false;
     bool  emptyTransform = false;   // had a TransformPlatformComponent but NO local pos/rot/scale (cook anomaly — resolve via level group offset)
     float atlasCellIndex = -1.0f;   // MaterialPropertyOverrides "instance.atlasCellIndex" (per-instance atlas variant; -1 = none)
+    // VAT per-instance anim (the `instance` UBO {atlasCellIndex,animTrackIndex,animRateFactor,animTimeOffset});
+    // each creature swims its own track/phase. -1/0 defaults if the entity has no override.
+    float vatTrackIndex = -1.0f, vatRateFactor = -1.0f, vatTimeOffset = -1.0f;
+    // ALL MaterialPropertyOverrides "matParams.*"/"instance.*" overrides for this entity (per-instance tint,
+    // wind/sway, roughness, atlas cell, anim variation). Applied OVER the cooked material block by the renderer.
+    std::vector<MatOverride> matOverrides;
+    // SkyboxPlatformComponent: skyboxMesh -> meshRef, colorTexture -> skyboxTex (a direct TextureAsset, NOT via a
+    // material). isSkybox routes the loader to bind skyboxTex as the base texture + mark the mesh as the sky dome.
+    AssetKey skyboxTex{}; bool isSkybox = false;
 };
 
 struct MeshData {
     std::string name;
+    std::vector<EnvComponent> components;   // all hstf components of the owning entity (generic editor inspect/edit)
+    bool isSkybox = false;                  // SkyboxPlatformComponent dome (colorTexture panorama; opaque, no far-clip)
     std::vector<float> positions;  // xyz * nVerts
     std::vector<float> uvs;        // uv * nVerts
+    std::vector<u8>    colors;     // sem4 per-vertex COLOR (u8x4 RGBA) = device vertexColor0 (animvege leaf bend-mask / butterfly wing colour); empty if the mesh has no colour attribute
+    std::vector<float> uvs3, uvs4; // sem5 idx2/idx3 (uv2/uv3): animvege packed per-vertex flutter phase/pivot
     std::vector<u32>    indices;   // triangle list (32-bit: large glTF meshes exceed 65535 verts)
     u32 nVerts = 0;
     u32 nIdx   = 0;
@@ -140,6 +175,7 @@ struct MeshData {
     //   lightmap-> baked lightmap slot
     std::vector<u8> normalRGBA;  u32 normalW = 1, normalH = 1; bool hasNormal = false;
     std::vector<u8> ormRGBA;     u32 ormW = 1, ormH = 1;       bool hasOrm = false;
+    std::string ormTexName;      // ORM/rbaodir texture path — carries the lightmap MERGE-GROUP (e.g. "merged_ceilingtrim"): the rbaodir + the lmhdr lightmap for a baked mesh-group share this stem, so a mesh whose own name misses (misspelled "cieling") can still find its lightmap via the ORM's group.
     std::vector<u8> emissiveRGBA; u32 emissiveW = 1, emissiveH = 1; bool hasEmissive = false;
     std::vector<u8> lmRGBA;      u32 lmW = 1, lmH = 1;         bool hasLightmap = false;
     // VAT (Vertex Animation Texture) offset texture: R16G16B16A16_SFLOAT, width=vertexCount, height=frameCount.
@@ -151,12 +187,21 @@ struct MeshData {
     // Per-instance atlas variant (unlitatlasinstance shader's instanceTag.atlasCellIndex) from the entity's
     // MaterialPropertyOverrides "instance.atlasCellIndex". -1 = none (all coral were sampling cell 0 -> one colour).
     float atlasCellIndex = -1.0f;
+    // VAT per-instance anim (vatunlit* `instance` UBO set2 bind1): animTrackIndex/animRateFactor/animTimeOffset.
+    // Without these every creature snaps to track 0 in sync (wrong pose → turtle clips the deck). -1 = unset.
+    float vatTrackIndex = -1.0f, vatRateFactor = -1.0f, vatTimeOffset = -1.0f;
+    // Per-instance MaterialPropertyOverrides for this mesh's entity: "matParams.*" override the cooked material
+    // constant block (tint/wind/roughness/normalGain), applied by name-hash in the renderer's matParams fill.
+    std::vector<MatOverride> matOverrides;
     // Ingestion id of the RENDSHAD this material references — the renderer picks the
     // matching shader pipeline per mesh (masked->discard, emissive->glow, etc.), as libshell does.
     u64 shaderIng = 0;
     // Resolved shader asset path (".../NAME.surface/shader...") — used to apply matParamsBlob only
     // when this material's shader matches the renderer's chosen global shader (same UBO layout).
     std::string shaderPath;
+    // Resolved mesh asset path (".../hero_bat_01.fbx/__mesh.../rootnode...") — used to match a skinned mesh
+    // to ITS skeleton (shared .fbx path) for the multi-rig AnimGroup binding.
+    std::string meshPath;
     // Material name carries "pbrlightmap_tiled" -> a genuinely TILED prop material (rugs etc.): unlike the
     // unwrap props (bowls/vases), it NEEDS its cooked matParams (Tint + GlobalTile) kept, like the room.
     bool tiled = false;
@@ -185,9 +230,13 @@ struct MeshData {
     bool  hasWorldMatrix = false;
 
     // Bone skinning data (for unlitblendskinned meshes, stride=28)
-    std::vector<u8> boneIndices;  // 4 u8 per vertex (bone indices)
+    std::vector<u8> boneIndices;  // 4 u8 per vertex (bone indices = SLOTS into bonePalette)
     std::vector<u8> boneWeights;  // 4 u8 per vertex (bone weights UNORM)
     bool hasBones = false;
+    // Bone PALETTE = the mesh's explicit slot->joint MAP (RENDMESH ROOT.f2[0].f0): one
+    // MurmurHash3_x86_32(jointName,0) per palette slot. Vertex boneIndices are SLOT indices; each slot
+    // maps to the skeleton joint whose name-hash matches. This is what libshell reads (NOT a DFS guess).
+    std::vector<u32> bonePalette;
 
     // Blend mode: true = SRC_ALPHA blend (dome/motes); false = opaque (floor/fallback)
     bool useBlend = false;

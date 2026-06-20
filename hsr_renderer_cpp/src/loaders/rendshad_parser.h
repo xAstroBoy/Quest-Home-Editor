@@ -72,7 +72,7 @@ inline bool scanSpirvModules(const std::vector<u8>& data, std::vector<SpirvBlob>
 // in-engine texture-visualiser variant (its frag is the LARGEST, which a "pick largest" heuristic wrongly
 // grabbed -> wrong/dark output). Stages are laid out 2-per-pass in pass order (vert, frag), so the
 // forward pass's modules are stages[2*fwdIdx] (vert) + stages[2*fwdIdx+1] (frag). Extract ONLY those.
-inline bool parseRendShadForward(const std::vector<u8>& data, std::vector<SpirvBlob>& out) {
+inline bool parseRendShadForward(const std::vector<u8>& data, std::vector<SpirvBlob>& out, bool* outTransparent=nullptr) {
     const u8* d = data.data(); const size_t N = data.size();
     auto rd16 = [&](size_t o)->u16{ return (o+2<=N)? *reinterpret_cast<const u16*>(d+o):0; };
     auto rdi32= [&](size_t o)->i32{ return (o+4<=N)? *reinterpret_cast<const i32*>(d+o):0; };
@@ -130,6 +130,37 @@ inline bool parseRendShadForward(const std::vector<u8>& data, std::vector<SpirvB
         }
         return false;
     };
+    // FAITHFUL transparent-pass detection (data-proven on calming, NOT a name heuristic): in the
+    // RENDSHAD forward pass table, field 4 is PRESENT (=0xFFFFFFFF) for every OPAQUE forward shader
+    // (isotropictiled*, unlit*, lightmap, rgbmasked, billboard, vegetation…) but OMITTED (default) for
+    // the special blended-pass shaders — animatedfog + mattepaintingalpha (the "white fog"/"broken matte").
+    // So f4-omitted = this surface's forward pass is alpha-blended. (Other transparents — wateroverlay/
+    // waterflipbook/unlitalpha — share the OPAQUE pass-state; their blend comes from the MATL render-queue,
+    // still handled by the name rules in scene_loader. This only ADDS blend, never removes it.)
+    {
+        size_t pe2 = passesBase + (size_t)fwdIdx*4; size_t pt2 = pe2 + rd32(pe2);
+        if (outTransparent) *outTransparent = (vtField(pt2,4) == 0);
+    }
+    if (std::getenv("HSR_SHADDBG")) {   // dump the forward pass table fields (find the blend/pipeline-state field)
+        size_t pe2 = passesBase + (size_t)fwdIdx*4; size_t pt2 = pe2 + rd32(pe2);
+        u32 nf = vtNFields(pt2);
+        fprintf(stderr, "    [SHADDBG] fwd pass tbl @%zu nFields=%u:", pt2, nf);
+        for (u32 ff=0; ff<nf; ++ff) {
+            size_t fp = vtField(pt2, ff);
+            if (!fp) { fprintf(stderr, " f%u=-", ff); continue; }
+            std::string s = strAt(fp); u32 vv = rd32(fp);
+            if (!s.empty()) fprintf(stderr, " f%u='%s'", ff, s.c_str());
+            else {
+                // maybe a sub-table (offset to a vtable within bounds): dump its scalar fields
+                size_t sub = fp + vv; u32 snf = (vv && sub<N) ? vtNFields(sub) : 0;
+                if (snf>0 && snf<=16) { fprintf(stderr, " f%u={", ff);
+                    for (u32 sf=0; sf<snf; ++sf){ size_t sfp=vtField(sub,sf); fprintf(stderr,"%s%u", sf?",":"", sfp?rd32(sfp):0u); }
+                    fprintf(stderr, "}"); }
+                else fprintf(stderr, " f%u=%u", ff, vv);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
     SpirvBlob v,f;
     if (!stageSpirv((u32)(2*fwdIdx), v) || !stageSpirv((u32)(2*fwdIdx+1), f)) return false;
     // order may be (vert,frag) or (frag,vert) — keep both, tagged by their own exec model

@@ -51,8 +51,18 @@ struct Editor {
     void selectOne(int i){ sel.clear(); if (i>=0) sel.push_back(i); selected=i; r->selectedMesh=i; }
     void toggleSel(int i){ if (i<0) return; for (size_t k=0;k<sel.size();++k) if (sel[k]==i){ sel.erase(sel.begin()+k); selected = sel.empty()?-1:sel.back(); r->selectedMesh=selected; return; } sel.push_back(i); selected=i; r->selectedMesh=i; }
     void deselectAll(){ sel.clear(); selected=-1; r->selectedMesh=-1; }
+    // ── per-mesh "skybox backdrop" marks: cooked as SkyboxPlatformComponent (far-clip-EXEMPT, escapes the PortalStereoCamera
+    //    far=5000 clip). Set via right-click; multi-select applies to the whole selection. [[project_hsr_eye_subcamera_farclip]]
+    std::vector<int> skyboxMeshes;
+    bool isSkyboxMesh(int i) const { for (int s:skyboxMeshes) if(s==i) return true; return false; }
+    void toggleSkybox(int i){ if(i<0)return; for(size_t k=0;k<skyboxMeshes.size();++k) if(skyboxMeshes[k]==i){ skyboxMeshes.erase(skyboxMeshes.begin()+k); return; } skyboxMeshes.push_back(i); }
+    // ── rubber-band box select (Ctrl/Shift + left-drag in the viewport; plain left-drag stays camera-look) ──
+    bool boxSel=false; float boxX0=0,boxY0=0;
+    int  outlinerDragRow=-1;       // outliner drag-select: row where the left-drag started (-1 = none)
+    bool outlinerDragAdd=false;    // drag-select adds (Ctrl/Shift) vs replaces
     static bool isBackdrop(const std::string& n){ auto h=n; for (auto& c:h) c=(char)tolower(c); return h.find("sky")!=std::string::npos||h.find("backdrop")!=std::string::npos||h.find("skybox")!=std::string::npos; }
     char search[96] = "";
+    bool prevKeyA=false, prevKeyC=false;   // Ctrl+A (select-all-filtered) / Ctrl+C (copy names) edge-detect
     float outlinerScroll = 0.f, propScroll = 0.f;
     bool  scrollToSel = false;
     bool  didAutoSel = false;      // auto-select a centered object once (frame 1)
@@ -69,6 +79,7 @@ struct Editor {
     std::vector<float> simV; std::vector<uint32_t> simI;   // cached walkable triangles for the sim
     int  selItem = -1;             // index into items (-1 = none; mesh selection active instead)
     bool showItems = true;         // item markers visible (the things you add are always shown)
+    bool showFarClip = false;      // viewport overlay: draw the device far-clip (PortalStereoCamera far=5000) boundary sphere
     bool showType[sitem::TYPE_COUNT] = { true,true,true,true,true,true,true };   // per-Meta-component visibility toggles
     // distinct marker colours (deliberately AVOID the gizmo's R/G/B axes): cyan / orange / magenta / teal / purple / yellow
     uint32_t typeColor(int t, bool seld) const {
@@ -83,11 +94,33 @@ struct Editor {
         } return ui::rgba(220,220,220);
     }
     bool addMenuOpen = false; float addMenuX = 0, addMenuY = 0;
+    // Raycast straight DOWN through the scene and snap pos.y onto the floor beneath it, so a freshly-added ground
+    // item (spawn/chair/box) lands ON the floor — not floating at the height an overview camera happened to be.
+    void dropToFloor(float pos[3]){
+        float bestY=-1e30f; bool hit=false;
+        for (int mi=0; mi<(int)r->gpuMeshes.size(); ++mi){
+            if (r->isHidden(mi) || isBackdrop(r->gpuMeshes[mi].name)) continue;
+            auto& gm=r->gpuMeshes[mi]; const auto& P=gm.pickPos; const auto& I=gm.pickIdx;
+            if (P.size()<9||I.size()<3) continue;
+            for (size_t k=0;k+2<I.size();k+=3){ uint32_t a=I[k],b=I[k+1],c=I[k+2];
+                if ((size_t)a*3+2>=P.size()||(size_t)b*3+2>=P.size()||(size_t)c*3+2>=P.size()) continue;
+                float pa[3],pb[3],pc[3]; xformPoint(gm.model,&P[a*3],pa); xformPoint(gm.model,&P[b*3],pb); xformPoint(gm.model,&P[c*3],pc);
+                float d=(pb[2]-pc[2])*(pa[0]-pc[0])+(pc[0]-pb[0])*(pa[2]-pc[2]); if (std::fabs(d)<1e-9f) continue;
+                float u=((pb[2]-pc[2])*(pos[0]-pc[0])+(pc[0]-pb[0])*(pos[2]-pc[2]))/d;
+                float v=((pc[2]-pa[2])*(pos[0]-pc[0])+(pa[0]-pc[0])*(pos[2]-pc[2]))/d;
+                float w=1.f-u-v; if (u<-0.02f||v<-0.02f||w<-0.02f) continue;        // pos XZ inside this tri
+                float y=u*pa[1]+v*pb[1]+w*pc[1];
+                if (y < pos[1]-0.3f && y>bestY){ bestY=y; hit=true; }                // highest surface BELOW the item (excludes a ceiling near/above it)
+            }
+        }
+        if (hit) pos[1]=bestY;
+    }
     void addItem(int type) {
         if (type==sitem::NAVMESH) { addNavmesh(sel.empty()?1:2); return; }   // navmesh has its own mode-aware path
         sitem::Item it; it.type=type; it.name=std::string(sitem::typeName(type))+" "+std::to_string(items.size()+1);
         float cp=std::cos(r->cam.pitch); float fwd[3]={std::sin(r->cam.yaw)*cp, std::sin(r->cam.pitch), -std::cos(r->cam.yaw)*cp};
         it.pos[0]=r->cam.pos[0]+fwd[0]*2.5f; it.pos[1]=r->cam.pos[1]+fwd[1]*2.5f; it.pos[2]=r->cam.pos[2]+fwd[2]*2.5f;
+        if (type==sitem::SPAWN||type==sitem::CHAIR||type==sitem::BOXCOL) dropToFloor(it.pos);   // land ground items ON the floor (not floating at overview-camera height)
         deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; tab=TAB_OBJECT;
     }
     void deleteSelItem() { if (selItem>=0 && selItem<(int)items.size()) { items.erase(items.begin()+selItem); selItem=-1; } }
@@ -145,13 +178,14 @@ struct Editor {
             fprintf(f,"\n");
         }
         if(!animColliders.empty()){ fprintf(f,"COLLIDERS %d", (int)animColliders.size()); for(int m:animColliders) fprintf(f," %d", m); fprintf(f,"\n"); }
+        if(!skyboxMeshes.empty()){ fprintf(f,"SKYBOX %d", (int)skyboxMeshes.size()); for(int m:skyboxMeshes) fprintf(f," %d", m); fprintf(f,"\n"); }   // persist far-backdrop skybox marks
         fclose(f);
         setStatus("Saved -> "+projectFile());
     }
     void loadProject(){
         FILE* f=fopen(projectFile().c_str(),"rb"); if(!f) return;
         std::string all; fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ all.resize(n); fread(&all[0],1,n,f);} fclose(f);
-        items.clear(); selItem=-1; deselectAll(); animColliders.clear();
+        items.clear(); selItem=-1; deselectAll(); animColliders.clear(); skyboxMeshes.clear();
         size_t p=0; int meshN=0, itemN=0;
         while(p<all.size()){
             size_t e=all.find('\n',p); std::string line=all.substr(p, e==std::string::npos?std::string::npos:e-p); p=(e==std::string::npos)?all.size():e+1;
@@ -174,6 +208,7 @@ struct Editor {
                 if(it.type==sitem::NAVMESH) bakeNavGeometry(it);
                 items.push_back(std::move(it)); itemN++; }
             else if(t[0]=="COLLIDERS"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) animColliders.push_back(atoi(t[2+k].c_str())); }
+            else if(t[0]=="SKYBOX"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) skyboxMeshes.push_back(atoi(t[2+k].c_str())); }   // restore far-backdrop skybox marks
         }
         didAutoSel = true;   // a session was restored -> don't let frame-1 auto-focus clobber the restored camera
         setStatus("Loaded "+std::to_string(meshN)+" mesh edits + "+std::to_string(itemN)+" items from "+projectFile());
@@ -218,24 +253,44 @@ struct Editor {
     int dragSplit = 0;           // 1=right border 2=outliner/props border 3=timeline border
 
     // ── properties tabs ──
-    enum { TAB_OBJECT, TAB_SCENE, TAB_MATERIAL, TAB_ANIM, TAB_PHYSICS, TAB_COOK };
+    enum { TAB_OBJECT, TAB_SCENE, TAB_MATERIAL, TAB_ANIM, TAB_PHYSICS, TAB_COOK, TAB_QUEST };
     int tab = TAB_OBJECT;
+    // ── Quest Control: live libshell toggles via the quest-bridge CLI (mirrors the in-headset debug UI) ──
+    std::string questBridge = "d:\\Quest Stuff\\Restore Old Envs\\_quest_bridge\\quest_mcp_server.py";
+    std::string questResult = "(idle) — connect the Quest, then click a toggle.";
+    std::mutex  questMx;
+    bool        questBusy = false;
 
     // ── cook (threaded) ──
     std::thread cookThread; std::atomic<bool> cooking{false}; std::atomic<float> cookProg{0.f};
     std::mutex statusMx; std::string cookStage = "idle", cookStatus;
     std::string cookPkg = "com.environment.outerwilds";
     bool autoSign = true, spoofHaven = true;
+    bool cookAudio = true;             // DEFAULT ON: bake the env's background audio loop into the cooked APK. Toggle off = silent home.
+    bool previewAudio = true;          // DEFAULT ON: play the env's background loop HERE on the PC while previewing. Toggle off = mute desktop playback (drives g_audioMuted).
+    bool solidCollision = true;        // DEFAULT ON: cook a REAL double-sided trimesh collider (floor+walls+columns, haven2025 SEBD format). Off = floor-only ColliderBox grid.
     bool installAfterCook = true;      // DEFAULT ON: cook -> sign -> install to the headset. The installer auto-detects
                                        // adb root: ROOT -> install the UNSPOOFED own-package APK (+ auto-select it);
                                        // NO root -> back up the real haven2025, then install the haven2025 SPOOF.
     std::string adbSerial, wifiIp;     // device serial ("" = default); wifiIp -> "adb connect" for wireless adb
     std::thread restoreThread; std::atomic<bool> restoring{false};   // "Restore original Haven 2025" button (runs off the UI thread)
-    bool animSkinned = false;  // HZANIM skinned clips (clouds/koi/droids). DEFAULT OFF: the clip cook still emits a malformed
-                               // string -> device std::length_error -> crash. Opt-in/experimental until the HZANIM clip is fixed.
+    bool animSkinned = true;   // HZANIM skinned + 1-joint rigid clips (door/discs/screens/cars/train/sphere). DEFAULT ON:
+                               // the incredibles fixed-type-targetId fix ([[project_hsr_skinned_rendmesh_skinblock]]) made
+                               // the clip cook stable on device (loads, no std::length_error). Opt-out: toggle / HSR_NOHZ.
     bool noCull = true;        // DEFAULT ON: emit scene-spanning bounds so V205's frustum/occlusion/CLOD/size culler never
                                // drops a mesh = V79-style "draw everything" (old homes had NO env culler). Fixes cooked-home
                                // clipping/disappearing; trades the Quest's culling perf for full visibility. -> HSR_NOCULL
+    bool skybox = false;       // DEFAULT OFF (camera-locked, fragile): route the FAR backdrop (centroid > skyboxDist) to the SkyboxPlatformComponent
+                               // pass — depth-clamped, EXEMPT from the shell's hard PortalStereoCamera far=5000 clip (device-
+                               // proven: official homes/vistas escape the 5000 clip ONLY this way, NOT via a bigger far). The
+                               // backdrop becomes camera-locked (fine at km range). -> HSR_SKYBOX_DIST. [[project_hsr_eye_subcamera_farclip]]
+    float skyboxDist = 1500.f; // meters: meshes whose centroid is farther than this from origin -> skybox (else normal walkable mesh)
+    // ── HSL render config: previewed live (WYSIWYG) AND emitted into the cook's ScenePlatformComponent ──
+    bool  cfgFog = false;             // distance fog: show in preview + ship in cook (fogColor/fogStart/fogDensity)
+    float cfgFogColor[3] = {0.05f, 0.06f, 0.09f};
+    float cfgFogStart = 20.f;         // meters where fog begins
+    float cfgFogDensity = 0.015f;     // distance-fog density
+    float cfgFar = 150000.f;          // ScenePlatformComponent farClippingPlane (device extends from its 500m default)
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  INIT / SHUTDOWN
@@ -299,17 +354,31 @@ struct Editor {
                     else if (!sel.empty()) { gizmoDrag=true; gizmoAxis=hit; gizmoSel=sel; gizmoBeforeV.clear(); for (int m:sel) gizmoBeforeV.push_back(captureX(r->gpuMeshes[m])); }
                 }
             }
+            // Ctrl/Shift + left-drag in empty viewport = rubber-band box multi-select (plain left-drag stays camera-look)
+            if (b==0 && in3D && !gizmoDrag && !exitDrag && (cx.in.ctrl||cx.in.shift)) { boxSel=true; boxX0=(float)cx.in.mx; boxY0=(float)cx.in.my; }
         } else if (action == GLFW_RELEASE) {
             cx.in.down[b] = false; cx.in.released[b] = true;
             bool wasExit = exitDrag; if (b==0) exitDrag=false;
+            bool wasBox = (b==0)&&boxSel; if (b==0) boxSel=false;
             if (b == 0 && gizmoDrag) { std::vector<Xform> after; for (int m:gizmoSel) after.push_back(captureX(r->gpuMeshes[m])); pushUndo(gizmoSel, gizmoBeforeV, after); gizmoDrag=false; gizmoAxis=-1; }
-            else if (b == 0 && in3D && !wasExit) {   // a click (not a look-drag) in the 3D area = pick (Shift = add)
+            else if (b == 0 && in3D && !wasExit) {   // a click (pick) OR a Ctrl/Shift box-drag (rubber-band multi-select)
                 float dx=cx.in.mx-(float)cx.in.pressX[0], dy=cx.in.my-(float)cx.in.pressY[0];
-                if (dx*dx+dy*dy < 25.f*uiScale*uiScale) pick(cx.in.mx, cx.in.my, cx.in.shift||cx.in.ctrl);   // Ctrl or Shift = add to multi-selection
+                if (wasBox && dx*dx+dy*dy >= 25.f*uiScale*uiScale) boxSelectRect(boxX0, boxY0, (float)cx.in.mx, (float)cx.in.my, cx.in.ctrl);   // Ctrl box = toggle/unpick, Shift box = add
+                else if (dx*dx+dy*dy < 25.f*uiScale*uiScale) pick(cx.in.mx, cx.in.my, cx.in.shift||cx.in.ctrl);   // Ctrl or Shift = add to multi-selection
             }
             else if (b == 1 && in3D) {   // right-click (no drag) = object context menu
                 float dx=cx.in.mx-(float)cx.in.pressX[1], dy=cx.in.my-(float)cx.in.pressY[1];
-                if (dx*dx+dy*dy < 25.f*uiScale*uiScale) { pick(cx.in.mx, cx.in.my, false); if (selected>=0){ ctxOpen=true; ctxX=cx.in.mx; ctxY=cx.in.my; ctxMesh=selected; } }
+                if (dx*dx+dy*dy < 25.f*uiScale*uiScale) {
+                    int it = pickItem(cx.in.mx, cx.in.my);
+                    if (it>=0) { selItem=it; deselectAll(); }                       // scene-item marker
+                    else { int hit = pickIndex(cx.in.mx, cx.in.my);
+                        if (hit>=0) {
+                            if (!inSel(hit)) selectOne(hit);                        // right-clicked an UNSELECTED mesh -> select just it;
+                            // ELSE: keep the existing multi-selection so the menu can act on ALL of them
+                            selItem=-1; ctxMesh=hit; ctxOpen=true; ctxX=cx.in.mx; ctxY=cx.in.my;
+                        }
+                    }
+                }
             }
         }
     }
@@ -332,7 +401,7 @@ struct Editor {
     int winW() const { int w=0,h=0; glfwGetWindowSize(win,&w,&h); return w; }
     int winH() const { int w=0,h=0; glfwGetWindowSize(win,&w,&h); return h; }
     // main gates camera/WASD on these
-    bool wantsMouse() const { return ctxOpen || cx.active!=0 || cx.kbFocus!=0 || gizmoDrag || exitDrag || dragSplit!=0 || !inRect(rcViewport, cx.in.mx, cx.in.my); }
+    bool wantsMouse() const { return ctxOpen || cx.active!=0 || cx.kbFocus!=0 || gizmoDrag || exitDrag || boxSel || dragSplit!=0 || !inRect(rcViewport, cx.in.mx, cx.in.my); }
     bool wantsKeyboard() const { return cx.kbFocus != 0; }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -341,6 +410,10 @@ struct Editor {
     void buildFrame() {
         if (!ready) return;
         fbW = (int)r->swapchainExtent.width; fbH = (int)r->swapchainExtent.height;
+        // Recompute the view matrix NOW (WASD already moved the camera this frame) so the overlay's worldToScreen
+        // matches the meshes the renderer draws later this frame. Without this the overlay uses last frame's view,
+        // so the selection wireframe drifts off the mesh during camera motion and snaps back when you stop.
+        if (r) r->cam.updateView();
         double now = glfwGetTime(); float dt=(float)(now-lastT); cx.t = (float)now; lastT = now;
         if (dt<0.f || dt>0.25f) dt=0.f;                              // ignore the first frame / hitches
         if (animScrub && animOverride && animDuration>0.f) {         // the editor drives playback -> LIVE playhead
@@ -378,6 +451,12 @@ struct Editor {
             if (screenToGround(cx.in.mx,cx.in.my,planeY,g)) { it.exitPos[0]=g[0]-it.pos[0]; it.exitPos[2]=g[2]-it.pos[2]; }
         }
         drawGizmo();
+        if (boxSel) {   // rubber-band selection rectangle (Ctrl/Shift + left-drag)
+            VkRect2D vp=rcViewport; dl.pushClip((float)vp.offset.x,(float)vp.offset.y,(float)vp.extent.width,(float)vp.extent.height);
+            float x0=std::min(boxX0,(float)cx.in.mx), y0=std::min(boxY0,(float)cx.in.my), x1=std::max(boxX0,(float)cx.in.mx), y1=std::max(boxY0,(float)cx.in.my);
+            dl.rect(x0,y0,x1-x0,y1-y0, ui::rgba(90,160,255,40)); dl.border(x0,y0,x1-x0,y1-y0, ui::rgba(120,180,255,220));
+            dl.popClip();
+        }
         drawHeader();
         drawOutliner();
         drawProperties();
@@ -453,12 +532,17 @@ struct Editor {
         if (ctxMesh<0 || ctxMesh>=(int)r->gpuMeshes.size()) { ctxOpen=false; return; }
         auto& th=cx.th; VkGpuMesh& gm=r->gpuMeshes[ctxMesh];
         bool soloed=(r->soloMesh==ctxMesh), hidden=r->isHidden(ctxMesh);
+        std::vector<int> tg = (inSel(ctxMesh) && sel.size()>1) ? sel : std::vector<int>{ctxMesh};   // context actions cover the WHOLE multi-selection
+        std::string suf = tg.size()>1 ? (" ("+std::to_string(tg.size())+")") : std::string();
+        int nHidden=0; for (int i=0;i<(int)r->gpuMeshes.size();++i) if (r->isHidden(i)) nHidden++;
         std::string colLbl = gm.dynamicVerts ? (isAnimCollider(ctxMesh) ? "Remove Animated Collider" : "Animated Collider (follows anim)")
-                                              : "Add Mesh Collider";
+                                              : (std::string("Add Mesh Collider")+suf);
         std::vector<std::pair<std::string,int>> items = {
             {gm.name, -1}, {"Focus / teleport",0}, {soloed?"Unsolo":"Solo only",1},
-            {hidden?"Unhide":"Hide",2}, {"Reset transform",3}, {"Copy name",4},
-            {colLbl,5} };   // static -> ColliderMesh entity; animated -> same-entity kinematic collider (follows anim)
+            {std::string(hidden?"Unhide":"Hide")+suf,2}, {std::string("Reset transform")+suf,3}, {"Copy name",4},
+            {colLbl,5},
+            {std::string(isSkyboxMesh(ctxMesh)?"Unmark skybox backdrop":"Make skybox backdrop")+suf, 6} };   // -> SkyboxPlatformComponent (far-clip-exempt)
+        if (nHidden>0) items.push_back({std::string("Unhide ALL (")+std::to_string(nHidden)+")", 7});
         float rh=th.rowH+2*uiScale, w=180*uiScale, h=items.size()*rh+6*uiScale;
         float x=ctxX, y=ctxY; if (x+w>fbW) x=fbW-w; if (y+h>fbH) y=fbH-h; if (x<0)x=0; if (y<0)y=0;
         ctxRX=x; ctxRY=y; ctxRW=w; ctxRH=h;
@@ -474,10 +558,19 @@ struct Editor {
                 int a=it.second;
                 if (a==0) focusMesh(gm);
                 else if (a==1) r->soloMesh = soloed?-1:ctxMesh;
-                else if (a==2) r->setHidden(ctxMesh, !hidden);
-                else if (a==3) { Xform b=captureX(gm); gm.editT[0]=gm.editT[1]=gm.editT[2]=0; gm.editR[0]=gm.editR[1]=gm.editR[2]=0; gm.editR[3]=1; gm.editS[0]=gm.editS[1]=gm.editS[2]=1; recomputeModel(gm); pushUndo(ctxMesh,b,captureX(gm)); }
+                else if (a==2) { for (int t:tg) r->setHidden(t, !hidden); }                       // hide/unhide ALL selected
+                else if (a==3) { std::vector<int> mm; std::vector<Xform> bb,aa;                    // reset ALL selected (single undo)
+                    for (int t:tg){ auto& g=r->gpuMeshes[t]; mm.push_back(t); bb.push_back(captureX(g));
+                        g.editT[0]=g.editT[1]=g.editT[2]=0; g.editR[0]=g.editR[1]=g.editR[2]=0; g.editR[3]=1; g.editS[0]=g.editS[1]=g.editS[2]=1; recomputeModel(g); aa.push_back(captureX(g)); }
+                    pushUndo(mm,bb,aa); }
                 else if (a==4) glfwSetClipboardString(win, gm.name.c_str());
-                else if (a==5) addMeshCollider(ctxMesh);
+                else if (a==5) { for (int t:tg) addMeshCollider(t); }                             // collider on ALL selected
+                else if (a==6) {   // mark/unmark skybox backdrop on ALL selected
+                    bool makeSky = !isSkyboxMesh(ctxMesh);   // base the whole batch on the clicked mesh's new state (consistent toggle)
+                    for (int t : tg) { if (isSkyboxMesh(t) != makeSky) toggleSkybox(t); }
+                    setStatus(std::string(makeSky?"Marked ":"Unmarked ")+std::to_string(tg.size())+" mesh(es) as skybox backdrop (far-clip-exempt)");
+                }
+                else if (a==7) { for (int i=0;i<(int)r->gpuMeshes.size();++i) r->setHidden(i,false); setStatus("Unhid ALL meshes"); }   // unhide everything
                 ctxOpen=false;
             }
             ry+=rh;
@@ -499,6 +592,7 @@ struct Editor {
         const char* menus[] = {"File","Edit","Object","View"};
         float mx = 220*uiScale;
         for (auto m : menus) { float w = dl.textW(m)+18*uiScale; cx.button(ui::hashId(m), mx, 3*uiScale, w, h-6*uiScale, m); mx += w+2*uiScale; }
+        { float w = dl.textW("Quest")+22*uiScale; if (cx.button(ui::hashId("hdrquest"), mx+8*uiScale, 3*uiScale, w, h-6*uiScale, "Quest", tab==TAB_QUEST)) tab=TAB_QUEST; mx += w+10*uiScale; }
         // right side: Save / Load (persist the session) + Cook quick-button + progress
         float bw = 96*uiScale, bh = h-8*uiScale, bx = W - bw - pad;
         if (cooking) { cx.progressBar(bx-150*uiScale, 4*uiScale, 150*uiScale+bw, bh, cookProg.load(), stageStr().c_str()); }
@@ -526,9 +620,9 @@ struct Editor {
         { cx.textAligned(px, v.offset.y, 34*uiScale, bh, "Spd", th.textDim, 0); cx.dragFloat(ui::hashId("camspd"), px+34*uiScale, v.offset.y+1*uiScale, 54*uiScale, bh-2*uiScale, r->cam.speed, 0.1f, "%.1f"); }
         if (playSim) cx.textAligned(v.offset.x+8*uiScale, v.offset.y+v.extent.height-40*uiScale, v.extent.width-16, 18*uiScale, "WALK MODE — WASD+mouse to walk the navmesh, P to exit", ui::rgba(120,230,140), 0);
         // overlay toggles (the navmesh/collider/spawn gizmos) — SEPARATE + all OFF by default, right of the header
-        const char* ov[3]={"Navmesh","Colliders","Spawn"}; bool* ovp[3]={&r->showNavmesh,&r->showCollision,&r->showSpawn};
+        const char* ov[4]={"Navmesh","Colliders","Spawn","Far-clip"}; bool* ovp[4]={&r->showNavmesh,&r->showCollision,&r->showSpawn,&showFarClip};
         float ox = v.offset.x + v.extent.width - 6*uiScale;
-        for (int i=2;i>=0;--i){ float ow=dl.textW(ov[i])+16*uiScale; ox-=ow+3*uiScale; if (cx.tab(ui::hashId(2100+i,9), ox, (float)v.offset.y, ow, bh, ov[i], *ovp[i])) *ovp[i]=!*ovp[i]; }
+        for (int i=3;i>=0;--i){ float ow=dl.textW(ov[i])+16*uiScale; ox-=ow+3*uiScale; if (cx.tab(ui::hashId(2100+i,9), ox, (float)v.offset.y, ow, bh, ov[i], *ovp[i])) *ovp[i]=!*ovp[i]; }
         // stats (bottom-left)
         char st[128]; snprintf(st,sizeof st,"%zu objects   sel: %s", r->gpuMeshes.size(), selected>=0?r->gpuMeshes[selected].name.c_str():"-");
         cx.textAligned(v.offset.x+8*uiScale, v.offset.y+v.extent.height-20*uiScale, v.extent.width-16, 18*uiScale, st, th.textDim, 0);
@@ -545,12 +639,34 @@ struct Editor {
         // "+ Add" -> the Meta-component menu (a way to spawn each entity)
         float addW=44*uiScale, addX=x+66*uiScale;
         if (cx.button(ui::hashId("oadd"), addX, y+3*uiScale, addW, hh-6*uiScale, "+ Add", true)) { addMenuOpen=true; ctxOpen=false; addMenuX=addX; addMenuY=y+hh; }
-        // search field
-        std::string sb = search; float fw = std::max(36.f*uiScale, std::min(110.f*uiScale, w-(addX+addW+14*uiScale-x)));
-        cx.textField(ui::hashId("osearch"), x+w-fw-6*uiScale, y+3*uiScale, fw, hh-6*uiScale, sb);
+        // ── dedicated, full-width SEARCH ROW (was a tiny unlabeled box in the header — easy to miss) ──
+        float sy = y+hh;
+        dl.rect(x, sy, w, hh, th.headerBg);
+        cx.textAligned(x+8*uiScale, sy, 46*uiScale, hh, "Search", th.textDim, 0);
+        std::string sb = search;
+        float sfx = x+52*uiScale, sfw = std::max(60.f*uiScale, w-52*uiScale-8*uiScale);
+        cx.textField(ui::hashId("osearch"), sfx, sy+3*uiScale, sfw, hh-6*uiScale, sb);
         strncpy(search, sb.c_str(), sizeof(search)-1); search[sizeof(search)-1]=0;
-        // scrollable content: SCENE ITEMS (the things you add) then MESHES
-        float listY = y+hh, listH = h-hh, rowH = th.rowH;
+        if (!search[0]) cx.textAligned(sfx+7*uiScale, sy, sfw, hh, "filter meshes by name...", ui::rgba(120,120,128), 0);
+        // Ctrl+A = select ALL meshes matching the current filter; Ctrl+C = copy the selected mesh names
+        // (one per line) to the system clipboard. Edge-detected so each fires once per keypress.
+        if (win) {
+            bool ctrl = glfwGetKey(win,GLFW_KEY_LEFT_CONTROL)==GLFW_PRESS || glfwGetKey(win,GLFW_KEY_RIGHT_CONTROL)==GLFW_PRESS;
+            bool kA = glfwGetKey(win,GLFW_KEY_A)==GLFW_PRESS, kC = glfwGetKey(win,GLFW_KEY_C)==GLFW_PRESS;
+            auto matchesFilter=[&](int i){ if(!search[0]) return true; std::string ln=r->gpuMeshes[i].name,ls=search; for(char&c:ln)c=(char)tolower((unsigned char)c); for(char&c:ls)c=(char)tolower((unsigned char)c); return ln.find(ls)!=std::string::npos; };
+            if (ctrl && kA && !prevKeyA) {
+                sel.clear();
+                for (int i=0;i<(int)r->gpuMeshes.size();++i) if (matchesFilter(i) && !r->isHidden(i)) sel.push_back(i);   // VISIBLE only (hidden meshes excluded)
+                selected = sel.empty()?-1:sel.back(); r->selectedMesh=selected; selItem=-1;
+            }
+            if (ctrl && kC && !prevKeyC && !sel.empty()) {
+                std::string clip; for (int m:sel) if (m>=0&&m<(int)r->gpuMeshes.size()) { clip+=r->gpuMeshes[m].name; clip+="  ["+std::to_string(m)+"]\n"; }
+                glfwSetClipboardString(win, clip.c_str());
+            }
+            prevKeyA=kA; prevKeyC=kC;
+        }
+        // scrollable content: SCENE ITEMS (the things you add) then MESHES  (header row + search row = 2*hh)
+        float listY = y+2*hh, listH = h-2*hh, rowH = th.rowH;
         dl.pushClip(x, listY, w, listH);
         if (cx.hover(x,listY,w,listH) && cx.in.wheel!=0) outlinerScroll -= cx.in.wheel*rowH*3;
         int nItems=(int)items.size(), nMesh=(int)r->gpuMeshes.size();
@@ -574,15 +690,25 @@ struct Editor {
         for (int i=0;i<nMesh;i++, ry+=rowH) {
             if (!onScreen(ry)) continue;
             auto& gm = r->gpuMeshes[i];
-            if (search[0] && gm.name.find(search)==std::string::npos) { ry-=rowH; continue; }
+            // CASE-INSENSITIVE substring match (mesh names are CamelCase; a lowercase query must still match —
+            // the old case-sensitive find made the search look broken / "no mesh search").
+            if (search[0]) {
+                std::string ln=gm.name, ls=search;
+                for(char&c:ln)c=(char)tolower((unsigned char)c); for(char&c:ls)c=(char)tolower((unsigned char)c);
+                if (ln.find(ls)==std::string::npos) { ry-=rowH; continue; }
+            }
             bool vis = !r->isHidden(i);
-            auto rr = cx.treeRow(ui::hashId(3000+i,11), x, ry, w, rowH, (gm.name+"  ["+std::to_string(i)+"]").c_str(), 0, false, false, inSel(i), vis);
+            auto rr = cx.treeRow(ui::hashId(3000+i,11), x, ry, w, rowH, (gm.name+"  ["+std::to_string(i)+"]"+(isSkyboxMesh(i)?"  *SKY*":"")).c_str(), 0, false, false, inSel(i), vis);
             if (addMenuOpen) rr = ui::Context::RowResult{};   // the Add menu overlays the list -> ignore row clicks under it
             if (rr.clicked) { selItem=-1; if (cx.in.shift||cx.in.ctrl) toggleSel(i); else selectOne(i); }   // Ctrl/Shift = add to multi-selection
             if (rr.toggledVis) r->setHidden(i, vis);
             if (rr.clicked && cx.in.pressed[0] && (cx.t - lastClickT < 0.3f) && lastClickIdx==i) focusMesh(gm);
             if (rr.clicked) { lastClickT = cx.t; lastClickIdx = i; }
+            // DRAG-PAINT multi-select: press a row, then drag over more rows (mouse held) to add them to the selection
+            if (cx.in.pressed[0] && cx.hover(x,ry,w,rowH)) outlinerDragRow=i;
+            else if (cx.in.down[0] && outlinerDragRow>=0 && i!=outlinerDragRow && cx.hover(x,ry,w,rowH) && !inSel(i)) { sel.push_back(i); selected=i; r->selectedMesh=i; selItem=-1; }
         }
+        if (!cx.in.down[0]) outlinerDragRow=-1;   // end the drag-paint when the button is released
         dl.popClip();
     }
     // Floating "Add Component" menu — each entry shows the FRIENDLY name + the REAL Meta component class; click = spawn it.
@@ -649,6 +775,12 @@ struct Editor {
                 else if (it.navMode!=2 && cx.button(ui::hashId("nvrb"), x, y, 180*uiScale, rh, "Rebuild preview")) bakeNavGeometry(it);
                 y+=rh+2*uiScale;
                 if (cx.button(ui::hashId("navsolo"), x, y, w, rh, r->hideAllGeom?"Show meshes again":"Solo view (hide all meshes)", r->hideAllGeom)) { r->hideAllGeom=!r->hideAllGeom; if(r->hideAllGeom) focusItem(selItem); }
+                y+=rh+2*uiScale;
+                if (cx.button(ui::hashId("navslope"),  x, y, w, rh, "Slope colors (flat green -> steep red)", navColorBySlope)) navColorBySlope=!navColorBySlope;
+                y+=rh+2*uiScale;
+                if (cx.button(ui::hashId("navsmooth"), x, y, w, rh, "Smooth collision (averaged normals)", navSmooth)) navSmooth=!navSmooth;
+                y+=rh+2*uiScale;
+                if (cx.button(ui::hashId("navdbgcl"),  x, y, w, rh, "Render navmesh on device (debug clone)", navDebugClone)) navDebugClone=!navDebugClone;
                 y+=rh+2*uiScale;
                 cx.label(x,y,w,rh*0.9f,"(toggle the Navmesh eye to view it)",th.textDim); y+=rh; break; }
           case sitem::HOTSPOT: break;
@@ -736,12 +868,13 @@ struct Editor {
         float x=(float)a.offset.x, y=(float)a.offset.y, w=(float)a.extent.width, h=(float)a.extent.height;
         dl.rect(x,y,w,h, th.panelBg);
         // tab strip
-        float th_h = 22*uiScale; const char* tabs[]={"Object","Scene","Material","Anim","Physics","Cook"};
-        float tx=x, tw=w/6.f;
-        for (int i=0;i<6;i++){ if (cx.tab(ui::hashId(4000+i,13), tx, y, tw, th_h, tabs[i], tab==i)) tab=i; tx+=tw; }
+        float th_h = 22*uiScale; const char* tabs[]={"Object","Scene","Material","Anim","Physics","Cook","Quest"};
+        float tx=x, tw=w/7.f;
+        for (int i=0;i<7;i++){ if (cx.tab(ui::hashId(4000+i,13), tx, y, tw, th_h, tabs[i], tab==i)) tab=i; tx+=tw; }
         dl.rect(x,y+th_h,w,1,th.splitLine);
         float cy = y+th_h+6*uiScale, cx0 = x+8*uiScale, cw = w-16*uiScale;
         dl.pushClip(x, y+th_h, w, h-th_h);
+        if (tab==TAB_QUEST) { drawQuestPanel(cx0, cy, cw); dl.popClip(); return; }    // libshell live toggles via the quest-bridge
         if (tab==TAB_SCENE) { drawScenePanel(cx0, cy, cw); dl.popClip(); return; }   // the Meta-component manager (toggles + Add)
         if (selItem>=0 && selItem<(int)items.size() && tab!=TAB_COOK) { drawItemProps(cx0, cy, cw); dl.popClip(); return; }
         if (selected<0 || selected>=(int)r->gpuMeshes.size()) {
@@ -790,7 +923,55 @@ struct Editor {
         char b[96]; snprintf(b,sizeof b,"indices: %u    centroid %.1f %.1f %.1f", gm.nIdx, gm.centroid[0],gm.centroid[1],gm.centroid[2]);
         cx.label(x,y,w,th.rowH,b,th.textDim); y+=th.rowH;
         snprintf(b,sizeof b,"skinned: %s   dynamic: %s", gm.isSkinned?"yes":"no", gm.dynamicVerts?"yes":"no");
-        cx.label(x,y,w,th.rowH,b,th.textDim);
+        cx.label(x,y,w,th.rowH,b,th.textDim); y+=th.rowH;
+        // Skybox backdrop toggle — cooks this mesh as a SkyboxPlatformComponent (far-clip-EXEMPT, escapes PortalStereoCamera
+        // far=5000). Reflects/sets the per-mesh mark; if several meshes are selected it applies to the whole selection.
+        { bool sky = isSkyboxMesh(selected);
+          cx.checkbox(ui::hashId("meshsky"), x, y, "Skybox backdrop (escapes 5000 far-clip)", sky);
+          if (sky != isSkyboxMesh(selected)) {
+              std::vector<int> tg=(sel.size()>1)?sel:std::vector<int>{selected};
+              for(int t:tg){ if(isSkyboxMesh(t)!=sky) toggleSkybox(t); }
+              setStatus(std::string(sky?"Marked ":"Unmarked ")+std::to_string(tg.size())+" mesh(es) as skybox backdrop");
+          }
+          y+=th.rowH+6*uiScale; }
+        drawComponentsSection(gm, x, y, w);   // generic inspect/edit of ALL hstf components on this entity
+    }
+    // GENERIC component inspector — lists EVERY hstf component on the selected entity + every field, editable.
+    // Covers all 30 v203 component classes (and any extras) with no per-component code. Field meanings:
+    // V203_COMPONENTS_IDA.md (IDA-decoded). bool->toggle, number->drag, else->text. Edits write the value back
+    // into the captured field (live inspector state; cook/export write-back is the next hop).
+    void drawComponentsSection(VkGpuMesh& gm, float x, float& y, float w) {
+        auto& th=cx.th;
+        if (gm.components.empty()) { cx.label(x,y,w,th.rowH,"(no components captured)",th.textDim); y+=th.rowH; return; }
+        char hb[64]; snprintf(hb,sizeof hb,"Components (%zu)", gm.components.size());
+        y += 6*uiScale; cx.label(x,y,w,th.rowH,hb,th.text); y+=th.rowH+2*uiScale;
+        float lw = 0.52f*w;
+        for (size_t ci=0; ci<gm.components.size(); ++ci) {
+            auto& ec = gm.components[ci];
+            char cb[160]; snprintf(cb,sizeof cb,"%s  v%d", ec.shortCls.c_str(), ec.version);
+            dl.rect(x, y, w, th.rowH, th.splitLine);
+            cx.label(x+4*uiScale,y,w,th.rowH,cb,th.text); y+=th.rowH+1*uiScale;
+            for (size_t fi=0; fi<ec.fields.size(); ++fi) {
+                auto& f = ec.fields[fi];
+                cx.label(x+10*uiScale, y, lw-10*uiScale, th.rowH, f.first.c_str(), th.textDim);
+                unsigned id = ui::hashId((unsigned)(ci*1009u+fi+90001u), 11u);
+                const std::string& s = f.second;
+                bool isBool = (s=="true"||s=="false");
+                bool isNum  = !s.empty() && s.find_first_not_of("0123456789.eE+-")==std::string::npos
+                              && s.find_first_of("0123456789")!=std::string::npos;
+                if (isBool) {
+                    bool bv = (s=="true");
+                    if (cx.checkbox(id, x+lw, y, "", bv)) f.second = bv?"true":"false";
+                } else if (isNum) {
+                    float fv=(float)atof(s.c_str());
+                    if (cx.dragFloat(id, x+lw, y, w-lw, th.rowH, fv, 0.01f, "%g")) { char nb[40]; snprintf(nb,sizeof nb,"%g",fv); f.second=nb; }
+                } else {
+                    cx.textField(id, x+lw, y, w-lw, th.rowH, f.second);
+                }
+                y += th.rowH+1*uiScale;
+            }
+            y += 3*uiScale;
+        }
     }
     void drawMaterialTab(VkGpuMesh& gm, float x, float y, float w) {
         auto& th=cx.th; char b[96];
@@ -836,6 +1017,59 @@ struct Editor {
     }
 
     // ── Cook / Export panel: package name, auto-sign + spoof toggles, Cook button, live progress, status ──
+    // Run a quest-bridge tool async (it shells out frida/adb, ~6-8s) and capture its output into questResult.
+    void runQuestTool(const std::string& tool, const std::string& args) {
+        { std::lock_guard<std::mutex> lk(questMx); if (questBusy) return; questBusy=true; questResult = "running "+tool+" ..."; }
+        std::string bridge=questBridge, t=tool, a=args;
+        std::thread([this,bridge,t,a]{
+            char cmd[2200];
+            snprintf(cmd, sizeof cmd, "python \"%s\" --cli %s %s 2>&1", bridge.c_str(), t.c_str(), a.c_str());
+            std::string out;
+#ifdef _WIN32
+            FILE* p=_popen(cmd,"r");
+#else
+            FILE* p=popen(cmd,"r");
+#endif
+            if (p) { char b[512]; size_t n; while ((n=fread(b,1,sizeof b,p))>0) out.append(b,n);
+#ifdef _WIN32
+                _pclose(p);
+#else
+                pclose(p);
+#endif
+            } else out="(failed to launch bridge — is python on PATH?)";
+            std::lock_guard<std::mutex> lk(questMx); questResult = out.empty()?"(no output)":out; questBusy=false;
+        }).detach();
+    }
+
+    void drawQuestPanel(float x, float y, float w) {
+        auto& th=cx.th; float rh=th.rowH;
+        cx.label(x,y,w,rh,"Quest Control — live libshell toggles (via the quest-bridge)",th.text); y+=rh+6*uiScale;
+        bool busy; { std::lock_guard<std::mutex> lk(questMx); busy=questBusy; }
+        auto full=[&](const char* id,const char* lbl,const char* tool,const char* args){
+            if (cx.button(ui::hashId(id), x, y, w, rh, lbl) && !busy) runQuestTool(tool,args); y+=rh+4*uiScale; };
+        full("qdbgui","Enable in-headset debug UI (ImGui + NetImgui :8888)","quest_enable_debug_ui","net_imgui_port=8888");
+        full("qjump","Unlimited air jump","quest_enable_unlim_jump","");
+        full("qlogs","Verbose logs (level 5 -> hidden DEBUG logs)","quest_enable_verbose_logs","");
+        full("qguard","Disable guardian","quest_debug_props","set_kv=persist.oculus.guardian_disable=1");
+        y+=4*uiScale; cx.label(x,y,w,rh,"Debug overlays (ON / OFF):",th.textDim); y+=rh+2*uiScale;
+        const char* dr[5]={"navmesh","charactercontroller","contactshape","movingplatform","fallbackrender"};
+        for (int i=0;i<5;i++){ float hw=w*0.5f-3*uiScale;
+            if (cx.button(ui::hashId(3300+i,4), x, y, hw, rh, (std::string("ON  ")+dr[i]).c_str()) && !busy) runQuestTool("quest_debug_draw", std::string("feature=")+dr[i]+" on=true");
+            if (cx.button(ui::hashId(3320+i,4), x+w*0.5f+3*uiScale, y, hw, rh, (std::string("OFF ")+dr[i]).c_str()) && !busy) runQuestTool("quest_debug_draw", std::string("feature=")+dr[i]+" on=false");
+            y+=rh+2*uiScale; }
+        y+=4*uiScale; float hw=w*0.5f-3*uiScale;
+        if (cx.button(ui::hashId("qreload"), x, y, hw, rh, "Reload shell") && !busy) runQuestTool("quest_reload_vrshell","");
+        if (cx.button(ui::hashId("qstatus"), x+w*0.5f+3*uiScale, y, hw, rh, "Status / connect") && !busy) runQuestTool("quest_status","");
+        y+=rh+8*uiScale;
+        cx.label(x,y,w,rh, busy?"Result  (running...):":"Result:", th.textDim); y+=rh;
+        std::string res; { std::lock_guard<std::mutex> lk(questMx); res=questResult; }
+        size_t pos=0; int ln=0;
+        while (pos<res.size() && ln<12){ size_t nl=res.find('\n',pos);
+            std::string line = res.substr(pos, nl==std::string::npos?std::string::npos:nl-pos);
+            cx.label(x,y,w,rh, line.c_str(), th.textDim); y+=rh; ln++;
+            if (nl==std::string::npos) break; pos=nl+1; }
+    }
+
     void drawCookPanel(float x, float y, float w) {
         auto& th=cx.th;
         float y0;
@@ -851,6 +1085,44 @@ struct Editor {
         cx.tip(x,y0,w,th.rowH,"Emit skeletal animation for skinned meshes (clouds/koi/\ndroids). EXPERIMENTAL: the clip cook can still crash the\nenvironment on the device. Leave OFF unless testing."); y+=th.rowH+6*uiScale;
         y0=y; cx.checkbox(ui::hashId("nocull"), x, y, "Draw everything — disable culling (fixes clipping, V79-style)", noCull);
         cx.tip(x,y0,w,th.rowH,"Emit scene-spanning bounds so the V205 shell NEVER culls/clips\nyour meshes (frustum + Hi-Z occlusion + distance + CLOD budget).\nThe old V79 shell had NO environment culler, so this matches how\nold homes looked. Geometry still sits at its real position; only\nculling is defeated. Trades the Quest's culling perf for full\nvisibility. Keep ON if cooked homes clip / disappear at distance."); y+=th.rowH+6*uiScale;
+        y0=y; cx.checkbox(ui::hashId("cookaudio"), x, y, "Ship background audio loop", cookAudio);
+        cx.tip(x,y0,w,th.rowH,"Bake the environment's background audio loop into the cooked APK\n(FMOD asset placed at the spawn). Turn OFF for a silent home."); y+=th.rowH+2*uiScale;
+        y0=y; cx.checkbox(ui::hashId("prevaudio"), x, y, "Play preview audio (PC)", previewAudio);
+        cx.tip(x,y0,w,th.rowH,"Play the env's background loop HERE on the desktop while you preview.\nToggle off to MUTE the PC playback live — does not affect what ships."); y+=th.rowH+6*uiScale;
+        y0=y; cx.checkbox(ui::hashId("solidcol"), x, y, "Solid wall collision (trimesh)", solidCollision);
+        cx.tip(x,y0,w,th.rowH,"Cook a REAL double-sided triangle-mesh collider for the whole env —\nwalk on floors AND get blocked by walls/columns, enter rooms through\ndoorways (haven2025's cooked-PhysX SEBD format, device-verified).\nOFF = a floor-only ColliderBox grid (walkable but you phase walls)."); y+=th.rowH+6*uiScale;
+        g_audioMuted.store(!previewAudio, std::memory_order_relaxed);   // bind the toggle to the live audio-callback mute flag
+        y0=y; cx.checkbox(ui::hashId("skybox"), x, y, "Far backdrop -> skybox (escapes the 5000 far-clip dome)", skybox);
+        cx.tip(x,y0,w,th.rowH,"Route distant geometry (centroid > the meters below) to the\nSkyboxPlatformComponent pass, which is EXEMPT from the shell's\nhard PortalStereoCamera far=5000 clip (the black dome locked to\nyour head). This is the ONLY way official homes/vistas show km-\ndistant scenery — they skybox it, they do NOT use a bigger far.\nThe backdrop becomes camera-locked (no walk-up parallax), which\nis imperceptible at km range. Near/mid geometry stays walkable."); y+=th.rowH+2*uiScale;
+        if (skybox) { y0=y; cx.label(x,y,150*uiScale,th.rowH,"  skybox distance (m)",th.textDim);
+            char sdb[32]; snprintf(sdb,sizeof sdb,"%.0f",skyboxDist); std::string sds=sdb;
+            cx.textField(ui::hashId("skyboxdist"), x+152*uiScale, y, w-152*uiScale, th.rowH, sds);
+            skyboxDist=(float)atof(sds.c_str()); if(skyboxDist<1.f)skyboxDist=1500.f;
+            cx.tip(x,y0,w,th.rowH,"Meshes whose centroid is farther than this from the origin are\ndrawn as skybox (camera-locked, far-clip-exempt). Lower = more\ngeometry skyboxed. cyberhome's city skyline sits ~3-7 km out."); y+=th.rowH+6*uiScale; }
+        else y+=4*uiScale;
+        // ── HSL render config (distance fog + far clip): WYSIWYG — the preview applies the SAME values the cook ships ──
+        y0=y; cx.checkbox(ui::hashId("cfgfog"), x, y, "Distance fog (preview + cook)", cfgFog);
+        cx.tip(x,y0,w,th.rowH,"Emit a ScenePlatformComponent distance fog AND show it live in the\npreview. Tune by eye; the preview matches what ships on device."); y+=th.rowH+2*uiScale;
+        if (cfgFog) {
+            char fb[48];
+            y0=y; cx.label(x,y,150*uiScale,th.rowH,"  fog color r,g,b",th.textDim);
+            snprintf(fb,sizeof fb,"%.3f,%.3f,%.3f",cfgFogColor[0],cfgFogColor[1],cfgFogColor[2]); std::string fcs=fb;
+            cx.textField(ui::hashId("fogcol"), x+152*uiScale, y, w-152*uiScale, th.rowH, fcs);
+            { float a,b,c; if (sscanf(fcs.c_str(),"%f,%f,%f",&a,&b,&c)==3){cfgFogColor[0]=a;cfgFogColor[1]=b;cfgFogColor[2]=c;} } y+=th.rowH+2*uiScale;
+            y0=y; cx.label(x,y,150*uiScale,th.rowH,"  fog start (m)",th.textDim);
+            snprintf(fb,sizeof fb,"%.1f",cfgFogStart); std::string fss=fb;
+            cx.textField(ui::hashId("fogstart"), x+152*uiScale, y, w-152*uiScale, th.rowH, fss); cfgFogStart=(float)atof(fss.c_str()); if(cfgFogStart<0)cfgFogStart=0; y+=th.rowH+2*uiScale;
+            y0=y; cx.label(x,y,150*uiScale,th.rowH,"  fog density",th.textDim);
+            snprintf(fb,sizeof fb,"%.4f",cfgFogDensity); std::string fds=fb;
+            cx.textField(ui::hashId("fogdens"), x+152*uiScale, y, w-152*uiScale, th.rowH, fds); cfgFogDensity=(float)atof(fds.c_str()); if(cfgFogDensity<0)cfgFogDensity=0; y+=th.rowH+6*uiScale;
+        }
+        { y0=y; cx.label(x,y,150*uiScale,th.rowH,"Far clip (m)",th.textDim);
+          char fcb[32]; snprintf(fcb,sizeof fcb,"%.0f",cfgFar); std::string fcss=fcb;
+          cx.textField(ui::hashId("cfgfar"), x+152*uiScale, y, w-152*uiScale, th.rowH, fcss); cfgFar=(float)atof(fcss.c_str()); if(cfgFar<1.f)cfgFar=150000.f;
+          cx.tip(x,y0,w,th.rowH,"ScenePlatformComponent farClippingPlane. The device default is 500m;\nthe cook extends it to this. Use the viewport 'Far-clip' overlay to\nsee the 500m default boundary."); y+=th.rowH+6*uiScale; }
+        // Live WYSIWYG: push the fog config into the renderer so the preview matches the cooked look (density 0 when off).
+        if (r) { float fcol[4]={cfgFogColor[0],cfgFogColor[1],cfgFogColor[2],1.f};
+                 r->setSceneFog(fcol, cfgFogStart, cfgFog?cfgFogDensity:0.f, 0.f, 1500.f); }
         // ── Install to headset (USB or Wi-Fi adb); the installer auto-detects root and picks spoofed vs unspoofed ──
         y0=y; cx.checkbox(ui::hashId("install"), x, y, "Install to headset after cook (auto)", installAfterCook);
         cx.tip(x,y0,w,th.rowH,"After cooking, install over adb. The installer detects root:\n  ROOT  -> install the UNSPOOFED APK + auto-select it.\n  NO root-> back up the real haven2025, install the SPOOF,\n           and relaunch the shell. The spoof REPLACES Haven 2025\n           in place (unrooted Quests can't switch envs).\nNeeds adb bundled beside the exe or on PATH."); y+=th.rowH+2*uiScale;
@@ -905,30 +1177,67 @@ struct Editor {
         sy = rcViewport.offset.y + (ndcy*0.5f+0.5f)*rcViewport.extent.height;
         return true;
     }
+    // Rubber-band: collect visible meshes whose projected centroid is inside the rect.
+    //  Shift+box = ADD them.  Ctrl+box = SMART TOGGLE: if the whole boxed set is already selected, DESELECT it
+    //  (re-box a range to unpick it); otherwise add the missing ones.
+    void boxSelectRect(float ax, float ay, float bx, float by, bool ctrlToggle) {
+        if (!r) return;
+        float x0=std::min(ax,bx), x1=std::max(ax,bx), y0=std::min(ay,by), y1=std::max(ay,by);
+        std::vector<int> hits;
+        for (int i=0;i<(int)r->gpuMeshes.size();++i) {
+            if (r->isHidden(i)) continue;
+            VkGpuMesh& gm=r->gpuMeshes[i]; const auto& P=gm.pickPos; if (P.size()<3) continue;
+            double c[3]={0,0,0}; size_t nv=P.size()/3, step=nv>512?nv/512:1, cnt=0;
+            for (size_t v=0; v<nv; v+=step){ float w[3]; xformPoint(gm.model,&P[v*3],w); c[0]+=w[0];c[1]+=w[1];c[2]+=w[2]; cnt++; }
+            if(!cnt) continue;
+            float wc[3]={(float)(c[0]/cnt),(float)(c[1]/cnt),(float)(c[2]/cnt)}, s[2];
+            if (!worldToScreen(wc,s[0],s[1])) continue;
+            if (s[0]>=x0&&s[0]<=x1&&s[1]>=y0&&s[1]<=y1) hits.push_back(i);
+        }
+        int delta=0;
+        bool allSel = !hits.empty(); for (int h:hits) if (!inSel(h)) { allSel=false; break; }
+        if (ctrlToggle && allSel) { for (int h:hits) { toggleSel(h); delta--; } }   // re-boxed an already-selected range -> unpick it
+        else { for (int h:hits) if (!inSel(h)) { sel.push_back(h); delta++; } }       // add the ones not yet selected
+        selected = sel.empty()?-1:sel.back(); r->selectedMesh=selected; selItem=-1;
+        setStatus("Box "+std::string(delta<0?"-":"+")+std::to_string(delta<0?-delta:delta)+" ("+std::to_string(sel.size())+" selected). Right-click -> Make skybox backdrop.");
+    }
+    // Draw a world-space line into the overlay, NEAR-CLIPPED in clip space. Without this, an edge with ONE endpoint
+    // behind the camera was dropped entirely (worldToScreen returned false) -> when a camera tilt/rotation put part of
+    // a surrounding mesh behind the eye, whole wireframe edges vanished. Now we clip the edge to the near plane and
+    // still draw its visible part. vp = proj*view (computed once per mesh).
+    void wireLine(const float vp[16], const float* wa, const float* wb, uint32_t col, float th) {
+        float ax=vp[0]*wa[0]+vp[4]*wa[1]+vp[8]*wa[2]+vp[12], ay=vp[1]*wa[0]+vp[5]*wa[1]+vp[9]*wa[2]+vp[13], aw=vp[3]*wa[0]+vp[7]*wa[1]+vp[11]*wa[2]+vp[15];
+        float bx=vp[0]*wb[0]+vp[4]*wb[1]+vp[8]*wb[2]+vp[12], by=vp[1]*wb[0]+vp[5]*wb[1]+vp[9]*wb[2]+vp[13], bw=vp[3]*wb[0]+vp[7]*wb[1]+vp[11]*wb[2]+vp[15];
+        const float eps=1e-4f;
+        if (aw<=eps && bw<=eps) return;                                         // both behind near -> nothing visible
+        if (aw<=eps) { float t=(eps-aw)/(bw-aw); ax+=(bx-ax)*t; ay+=(by-ay)*t; aw=eps; }   // clip endpoint A to the near plane
+        else if (bw<=eps) { float t=(eps-bw)/(aw-bw); bx+=(ax-bx)*t; by+=(ay-by)*t; bw=eps; }  // clip endpoint B
+        float sax=rcViewport.offset.x+((ax/aw)*0.5f+0.5f)*rcViewport.extent.width, say=rcViewport.offset.y+((ay/aw)*0.5f+0.5f)*rcViewport.extent.height;
+        float sbx=rcViewport.offset.x+((bx/bw)*0.5f+0.5f)*rcViewport.extent.width, sby=rcViewport.offset.y+((by/bw)*0.5f+0.5f)*rcViewport.extent.height;
+        dl.line(sax,say,sbx,sby,col,th);
+    }
     // Highlight the selected mesh's actual TRIANGLES (projected edges). Capped/sampled so huge meshes stay cheap.
     void drawWireframe(VkGpuMesh& gm){
         const auto& P=gm.pickPos; const auto& I=gm.pickIdx;
         if (P.empty() || I.size()<3) { drawAabbBox(gm); return; }            // no CPU geometry -> fall back to a box
         size_t ntri=I.size()/3, maxTri=2500, stride = ntri>maxTri ? ntri/maxTri : 1;
         uint32_t c=ui::rgba(255,170,60,70);
+        float vp[16]; mat4mul(r->cam.proj, r->cam.view, vp);
         for (size_t t=0; t<ntri; t+=stride){
             uint32_t a=I[t*3],b=I[t*3+1],d=I[t*3+2];
             if ((size_t)a*3+2>=P.size()||(size_t)b*3+2>=P.size()||(size_t)d*3+2>=P.size()) continue;
-            float wa[3],wb[3],wd[3],sa[2],sb[2],sd[2];
+            float wa[3],wb[3],wd[3];
             xformPoint(gm.model,&P[a*3],wa); xformPoint(gm.model,&P[b*3],wb); xformPoint(gm.model,&P[d*3],wd);
-            bool oa=worldToScreen(wa,sa[0],sa[1]),ob=worldToScreen(wb,sb[0],sb[1]),od=worldToScreen(wd,sd[0],sd[1]);
-            if (oa&&ob) dl.line(sa[0],sa[1],sb[0],sb[1],c,0.7f);
-            if (ob&&od) dl.line(sb[0],sb[1],sd[0],sd[1],c,0.7f);
-            if (od&&oa) dl.line(sd[0],sd[1],sa[0],sa[1],c,0.7f);
+            wireLine(vp,wa,wb,c,0.7f); wireLine(vp,wb,wd,c,0.7f); wireLine(vp,wd,wa,c,0.7f);
         }
     }
     void drawAabbBox(VkGpuMesh& gm){
         float mn[3],mx[3]; worldAabb(gm,mn,mx);
-        float s[8][2]; bool ok[8];
-        for (int c=0;c<8;c++){ float p[3]={ (c&1)?mx[0]:mn[0], (c&2)?mx[1]:mn[1], (c&4)?mx[2]:mn[2] }; ok[c]=worldToScreen(p,s[c][0],s[c][1]); }
+        float w[8][3]; for (int c=0;c<8;c++){ w[c][0]=(c&1)?mx[0]:mn[0]; w[c][1]=(c&2)?mx[1]:mn[1]; w[c][2]=(c&4)?mx[2]:mn[2]; }
         static const int E[12][2]={{0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7}};
         uint32_t c=ui::rgba(255,150,40,160);
-        for (auto& e:E) if (ok[e[0]]&&ok[e[1]]) dl.line(s[e[0]][0],s[e[0]][1],s[e[1]][0],s[e[1]][1],c,1.f);
+        float vp[16]; mat4mul(r->cam.proj, r->cam.view, vp);
+        for (auto& e:E) wireLine(vp, w[e[0]], w[e[1]], c, 1.f);   // near-clipped (don't vanish when a corner is behind the camera)
     }
     // oriented wireframe box (pos + R*half corners) — colliders / chairs / wall-placement zones
     void drawBox(const float pos[3], const float half[3], const float q[4], uint32_t col, float thick){
@@ -952,6 +1261,17 @@ struct Editor {
     bool exitHVis=false; float exitHS[2]={0,0}; bool exitDrag=false;   // chair exit-position smart handle
     bool editExit=false;   // when a chair is selected: retarget the MAIN gizmo to its exit point (full X/Y/Z gizmo, not a square)
     void drawItems(){
+        if (showFarClip) {   // FAR-CLIP boundary on camera (HSL view): the device's SceneComponent DEFAULT far is 500m — geometry
+            // beyond this red sphere renders ONLY if the cook's ScenePlatformComponent far-extension applies on device (else it
+            // clips here). Backdrops past it -> mark SkyboxPlatformComponent (far-exempt). 3 great circles @ origin (~spawn).
+            VkRect2D vf=rcViewport; dl.pushClip((float)vf.offset.x,(float)vf.offset.y,(float)vf.extent.width,(float)vf.extent.height);
+            const float R=500.f; uint32_t fcc=ui::rgba(255,95,60,190);
+            for (int pl=0;pl<3;pl++){ float pv[2]={0,0}; bool pk=false;
+                for (int a=0;a<=64;a++){ float an=a/64.f*6.2831853f, cc=cosf(an)*R, sn=sinf(an)*R, wp[3];
+                    if(pl==0){wp[0]=cc;wp[1]=sn;wp[2]=0;} else if(pl==1){wp[0]=cc;wp[1]=0;wp[2]=sn;} else {wp[0]=0;wp[1]=cc;wp[2]=sn;}
+                    float sp[2]; bool ok=worldToScreen(wp,sp[0],sp[1]); if(pk&&ok) dl.line(pv[0],pv[1],sp[0],sp[1],fcc,1.4f); pv[0]=sp[0];pv[1]=sp[1];pk=ok; } }
+            dl.popClip();
+        }
         if (!showItems || items.empty()) return;
         exitHVis=false;
         VkRect2D v=rcViewport; dl.pushClip((float)v.offset.x,(float)v.offset.y,(float)v.extent.width,(float)v.extent.height);
@@ -971,7 +1291,16 @@ struct Editor {
                     cx.textAligned(s[0]+10*uiScale,s[1]-8*uiScale,150*uiScale,16*uiScale, it.allowStart&&it.isLocal?"Spawn (local)":it.name.c_str(), col, 0);
                 } break; }
               case sitem::BOXCOL: { float h[3]={it.half[0]*it.scale[0],it.half[1]*it.scale[1],it.half[2]*it.scale[2]}; drawBox(it.pos,h,q,col,th); break; }
-              case sitem::CHAIR: { float h[3]={0.24f*it.scale[0],0.24f*it.scale[1],0.24f*it.scale[2]}; drawBox(it.pos,h,q,col,th); drawFacingArrow(it.pos,q,col,th,0.55f);
+              case sitem::CHAIR: {   // CHAIR icon = seat quad + backrest (oriented to the sit facing) — a recognizable chair, not a tiny dot
+                float sz=0.42f*((it.scale[0]+it.scale[2])*0.5f); if(sz<0.20f)sz=0.20f;
+                auto lp=[&](float lx,float ly,float lz,float o[3]){ float vv[3]={lx,ly,lz},rr[3]; quatRotVec(q,vv,rr); o[0]=it.pos[0]+rr[0]; o[1]=it.pos[1]+rr[1]; o[2]=it.pos[2]+rr[2]; };
+                auto ln=[&](const float* a,const float* b){ float as[2],bs[2]; if(worldToScreen(a,as[0],as[1])&&worldToScreen(b,bs[0],bs[1])) dl.line(as[0],as[1],bs[0],bs[1],col,th); };
+                float c0[3],c1[3],c2[3],c3[3]; lp(-sz,0,-sz,c0); lp(sz,0,-sz,c1); lp(sz,0,sz,c2); lp(-sz,0,sz,c3);
+                ln(c0,c1); ln(c1,c2); ln(c2,c3); ln(c3,c0);                 // seat (sit surface)
+                float k0[3],k1[3],k2[3],k3[3]; lp(-sz,0,sz,k0); lp(sz,0,sz,k1); lp(sz,sz*1.7f,sz,k2); lp(-sz,sz*1.7f,sz,k3);
+                ln(k0,k3); ln(k1,k2); ln(k2,k3);                            // backrest (rear uprights + top bar)
+                drawFacingArrow(it.pos,q,col,th,0.6f);
+                if (on) cx.textAligned(s[0]+10*uiScale,s[1]-8*uiScale,150*uiScale,16*uiScale, it.name.empty()?"Chair":it.name.c_str(), col, 0);
                 float ep[3]={it.pos[0]+it.exitPos[0], it.pos[1]+it.exitPos[1], it.pos[2]+it.exitPos[2]}, es[2];   // draggable exit handle (ground)
                 if (worldToScreen(ep,es[0],es[1])){ float hs=(seld?5:3)*uiScale; dl.rect(es[0]-hs,es[1]-hs,hs*2,hs*2,col); dl.border(es[0]-hs,es[1]-hs,hs*2,hs*2,ui::rgba(20,20,20),1);
                     if (on) dl.line(s[0],s[1],es[0],es[1],ui::withA(col,130),1.f);
@@ -1137,7 +1466,16 @@ struct Editor {
             for (size_t v=0;v<nv;v++){ float p[3]={md.positions[v*3],md.positions[v*3+1],md.positions[v*3+2]},o[3]; xformPoint(gm.model,p,o); em.positions[v*3]=o[0]; em.positions[v*3+1]=o[1]; em.positions[v*3+2]=o[2]; }
             em.uvs=md.uvs; em.indices=md.indices; em.blend = gm.useBlend||gm.additive;
             em.wantCollider = isAnimCollider((int)i);   // user marked this animated mesh -> same-entity kinematic collider
+            em.skybox = isSkyboxMesh((int)i);            // user marked this as far backdrop -> SkyboxPlatformComponent (far-clip-exempt)
             for (int k=0;k<4;k++) em.matTint[k]=md.tint[k];
+            // EXPOSE-ALL: forward every decoded stream the cook can use (was dropped -> cooked envs lost lightmaps/
+            // normals/uv1/per-instance-VAT/per-frame-tint). project_hsl_cooker_expose_all_audit.
+            em.uvs2 = md.uvs2; em.bakeLightmapVtx = md.bakeLightmapVtx;
+            for (int k=0;k<3;k++){ em.lightmapPower[k]=md.lightmapPower[k]; em.albedoFactor[k]=md.albedoFactor[k]; }
+            for (int k=0;k<4;k++) em.curTint[k]=md.curTint[k];
+            if (md.hasLightmap && !md.lmRGBA.empty()){ em.lmRGBA=md.lmRGBA; em.lmW=md.lmW; em.lmH=md.lmH; em.hasLightmap=true; }
+            if (md.hasNormal && !md.normalRGBA.empty()){ em.normalRGBA=md.normalRGBA; em.normalW=md.normalW; em.normalH=md.normalH; em.hasNormal=true; }
+            em.vatInstTrackIndex=md.vatTrackIndex; em.vatInstRateFactor=md.vatRateFactor; em.vatInstTimeOffset=md.vatTimeOffset; em.atlasCellIndex=md.atlasCellIndex;
             int fcols=0,frows=0;
             if (detectAndCollapseFlipbook(em.positions, em.uvs, em.indices, fcols, frows)) { em.flipbook=true; em.flipCols=fcols; em.flipRows=frows; em.blend=true; }
             else { if (vatBaker){ int bnv=0; auto off=vatBaker((int)i,64,bnv); if(!off.empty()&&bnv==(int)nv){ em.vatOffsets=std::move(off); em.vatFrames=64; } }
@@ -1165,6 +1503,9 @@ struct Editor {
     void runCook(std::vector<hslcook::ExportMesh> ems, std::array<float,3> camSpawn, std::string pkg, bool sign, bool spoof, bool terminalBar, std::vector<sitem::Item> sceneItems) {
         using namespace hslcook;
         if (ems.empty()) { setStatus("ERROR: no exportable meshes"); cooking.store(false); return; }
+        // Navmesh options are UI TOGGLES (navmesh panel), not env flags — push them to the cook here so hsl_cooker.h reads them.
+        setenv_("HSR_NAVSMOOTH", navSmooth ? "1" : "");
+        setenv_("HSR_NAVDEBUG",  navDebugClone ? "1" : "");
         std::string nuxd=cookShellPath(), out=cookOutPath();
         std::string outDir; { size_t sl=out.find_last_of("/\\"); outDir = (sl==std::string::npos)? std::string(".") : out.substr(0,sl); }
         // CLEAR, self-describing final names (the tester found "_cooked_signed / _cooked_haven2025" confusing):
@@ -1180,10 +1521,27 @@ struct Editor {
         setenv_("HSR_COOK_PKG", pkg.c_str());
         setenv_("HSR_HZANIM", animSkinned ? "1" : "");   // emit skeletal HZANIM clips so skinned meshes ANIMATE on device (clouds/koi/droids)
         setenv_("HSR_NOCULL", noCull ? "1" : "");         // scene-spanning bounds -> V205 never culls our meshes (V79-style draw-everything); fixes cooked-home clipping
+        setenv_("HSR_NAVTRIMESH", solidCollision ? "1" : "");  // real double-sided trimesh collider (haven2025 SEBD: 16-align manifest + 128-align RTree + count-shift); off -> ColliderBox grid
+        setenv_("HSR_NAVSLOPE", solidCollision ? "0" : "");    // trimesh: include EVERY face (walls+columns+floor) so the CCT capsule blocks horizontally, not just the floor
+        // HSL render config -> cook's ScenePlatformComponent (the SAME values the live preview applies = WYSIWYG)
+        if (cfgFog) { char fc[64]; snprintf(fc,sizeof fc,"%.4f,%.4f,%.4f",cfgFogColor[0],cfgFogColor[1],cfgFogColor[2]); setenv_("HSR_FOGCOLOR",fc);
+            char fs[24]; snprintf(fs,sizeof fs,"%.3f",cfgFogStart); setenv_("HSR_FOGSTART",fs);
+            char fd[24]; snprintf(fd,sizeof fd,"%.6f",cfgFogDensity); setenv_("HSR_FOGDENSITY",fd); }
+        else setenv_("HSR_FOGDENSITY","0");               // fog disabled -> ship no visible distance fog
+        { char fcl[24]; snprintf(fcl,sizeof fcl,"%.0f",cfgFar); setenv_("HSR_FARCLIP",fcl); }
+        { char sd[32]; snprintf(sd,sizeof sd,"%.0f",skyboxDist); setenv_("HSR_SKYBOX_DIST", skybox ? sd : ""); }  // far backdrop -> skybox pass (escapes PortalStereoCamera far=5000)
         std::vector<uint8_t> vspv, fspv;
-        auto apk = exportSceneAPK(ems, nuxd, vspv, fspv, true, &ok, spawn, &sceneZip, bgOgg, progress, sceneItems);
+        auto apk = exportSceneAPK(ems, nuxd, vspv, fspv, true, &ok, spawn, &sceneZip, (cookAudio ? bgOgg : std::vector<uint8_t>{}), progress, sceneItems);
         if (!ok || apk.empty()) { setStatus("ERROR: cook failed (shell: "+nuxd+")"); cooking.store(false); return; }
         if (!writeFile(out, apk)) { setStatus("ERROR: cannot write "+out); cooking.store(false); return; }
+        // ── ONE-CLICK COOK→PREVIEW (HSR_COOK_PREVIEW=1): spawn a fresh renderer on the just-cooked V205 APK, so the
+        //    cooked result (skinned + car HZANIM animation, max far-clip, materials) is validated FIRST-HAND IN THE
+        //    RENDERER's V205 path — no device, no manual reload. The new window IS the HSL-mode preview. ──
+        if (std::getenv("HSR_COOK_PREVIEW")) {
+            char exe[MAX_PATH]={0}; GetModuleFileNameA(NULL, exe, MAX_PATH);
+            if (exe[0]) { std::string c = std::string("start \"HSL preview\" \"") + exe + "\" \"" + out + "\"";
+                          system(c.c_str()); setStatus("Cooked + launched HSL preview: " + out); }
+        }
         std::string finalSystem, finalSpoof, msg = "Cooked "+std::to_string(ems.size())+" meshes ("+std::to_string(apk.size()/1024)+"KB)";
         // ── own-package APK (sign -> <env>_Rooted-System.apk; drop the unsigned intermediate on success) ──
         if (sign) {
@@ -1395,6 +1753,7 @@ struct Editor {
     // headless / CLI entry (replaces HSR_EXPORT path): synchronous, with a terminal progress bar.
     void exportAPKSync() {
         if (std::getenv("HSR_NOHZ")) animSkinned=false;   // diag: cook with skinned anim OFF (isolate the HZANIM crash)
+        if (std::getenv("HSR_NOAUDIO")) cookAudio=false;  // headless/CLI: cook a silent home (no background audio loop)
         if (std::getenv("HSR_NOINSTALL")) installAfterCook=false;   // batch/CLI: cook the APK files only, don't touch the device
         auto ems = buildExportMeshes();
         std::array<float,3> spawn{ r->cam.pos[0], r->cam.pos[1], r->cam.pos[2] };
@@ -1440,18 +1799,26 @@ struct Editor {
                 float wa[3],wb[3],wc[3]; xformPoint(gm.model,&P[a*3],wa); xformPoint(gm.model,&P[b*3],wb); xformPoint(gm.model,&P[c*3],wc);
                 float e1[3]={wb[0]-wa[0],wb[1]-wa[1],wb[2]-wa[2]}, e2[3]={wc[0]-wa[0],wc[1]-wa[1],wc[2]-wa[2]};
                 float nx=e1[1]*e2[2]-e1[2]*e2[1], ny=e1[2]*e2[0]-e1[0]*e2[2], nz=e1[0]*e2[1]-e1[1]*e2[0];
-                // SLOPE FILTER — controls how many triangles become collision. Curved/hilly envs (Outer Wilds) have a
-                // LOT of steep ground; the old hard 0.5 (drop >60deg) carved holes -> "colander". navMode 2 (explicit
-                // selection / auto-ground): include EVERY triangle (slope 0) -> you picked these meshes as the ground,
-                // so cover all of them incl. cliffs/curves. navMode 1 (smart, scans the whole scene): keep a filter to
-                // skip near-vertical walls but loosen it to 0.15 (keeps up to ~81deg). HSR_NAVSLOPE overrides both.
-                float slopeMin = (si.navMode==2) ? 0.0f : 0.15f;
+                // SLOPE FILTER. SOLID COLLISION (trimesh, default): slopeMin=0 keeps the FLOOR + vertical WALLS/columns
+                // (drops only ceilings) -> the cooked DOUBLE-SIDED trimesh blocks you horizontally too (DEVICE-VERIFIED:
+                // walk floors, hit walls, enter rooms). Box fallback (toggle OFF): floor-only (0.05/0.15) since box walls
+                // made roof/air junk. navMode 2 = 0.05, navMode 1 = 0.15. HSR_NAVSLOPE overrides for diag.
+                float slopeMin = (si.navMode==2) ? 0.05f : 0.15f;
+                if (solidCollision) slopeMin = 0.0f;   // include the vertical walls (the trimesh handles them cleanly; boxes didn't)
                 if(const char* e=std::getenv("HSR_NAVSLOPE")){ float s=(float)atof(e); if(s>=0.0f) slopeMin=s; }
-                float nl=std::sqrt(nx*nx+ny*ny+nz*nz); if(nl<1e-9f || (slopeMin>0.0f && std::fabs(ny)/nl < slopeMin)) continue;
+                float nl=std::sqrt(nx*nx+ny*ny+nz*nz); if(nl<1e-9f || ny/nl < slopeMin) continue;   // signed -> floor + walls, drop ceilings
                 tb.push_back(TB{wa[0],wa[1],wa[2], wb[0],wb[1],wb[2], wc[0],wc[1],wc[2]});
                 for (const float* w : {wa,wb,wc}){ mn[0]=std::min(mn[0],w[0]); mx[0]=std::max(mx[0],w[0]); mn[2]=std::min(mn[2],w[2]); mx[2]=std::max(mx[2],w[2]); } }
         }
         if (tb.empty()) return;
+        if (std::getenv("HSR_NAVDBG")) {   // DIAGNOSTIC: what's actually in the navmesh? up-facing(floor)/down(ceiling)/vertical(wall) + their Y spans
+            int up=0,dn=0,vt=0; float uyl=1e30f,uyh=-1e30f,dyl=1e30f,dyh=-1e30f;
+            for (const TB& t : tb){ float e1[3]={t.bx-t.ax,t.by-t.ay,t.bz-t.az},e2[3]={t.cx-t.ax,t.cy-t.ay,t.cz-t.az};
+                float ny=e1[2]*e2[0]-e1[0]*e2[2]; float nl=std::sqrt((e1[1]*e2[2]-e1[2]*e2[1])*(e1[1]*e2[2]-e1[2]*e2[1])+ny*ny+(e1[0]*e2[1]-e1[1]*e2[0])*(e1[0]*e2[1]-e1[1]*e2[0])); if(nl<1e-9f)continue;
+                float s=ny/nl, cy=(t.ay+t.by+t.cy)/3.f;
+                if(s>0.3f){up++; uyl=std::min(uyl,cy); uyh=std::max(uyh,cy);} else if(s<-0.3f){dn++; dyl=std::min(dyl,cy); dyh=std::max(dyh,cy);} else vt++; }
+            fprintf(stderr,"[NAVDBG] navmesh tris: UP(floor)=%d Y[%.2f..%.2f]  DOWN(ceiling)=%d Y[%.2f..%.2f]  VERTICAL(wall)=%d  (total %zu)\n", up,uyl,uyh, dn,dyl,dyh, vt, tb.size());
+        }
         // REUSE the actual walkable triangles (NO rebuilt grid) -> the cook makes one TILTED collision box per triangle,
         // so the collision follows the road's exact shape/height/tilt. (Very dense meshes: the cook falls back to a height
         // grid; the editor caps the stored count for preview sanity.)
@@ -1545,14 +1912,28 @@ struct Editor {
             uint32_t a=I[t*3],b=I[t*3+1],d=I[t*3+2];
             if ((size_t)a*3+2>=V.size()||(size_t)b*3+2>=V.size()||(size_t)d*3+2>=V.size()) continue;
             float wa[3],wb[3],wd[3]; xformPoint(M,&V[a*3],wa); xformPoint(M,&V[b*3],wb); xformPoint(M,&V[d*3],wd);
+            uint32_t fc=fillCol, ec=edgeCol;
+            if (navColorBySlope) {   // DEBUG: colorize each triangle by SLOPE so the non-smoothness is visible —
+                // flat/up (smooth & walkable) = green, gentle slope = yellow, steep (bumpy/unwalkable) = red.
+                float e1[3]={wb[0]-wa[0],wb[1]-wa[1],wb[2]-wa[2]}, e2[3]={wd[0]-wa[0],wd[1]-wa[1],wd[2]-wa[2]};
+                float nx=e1[1]*e2[2]-e1[2]*e2[1], ny=e1[2]*e2[0]-e1[0]*e2[2], nz=e1[0]*e2[1]-e1[1]*e2[0];
+                float nl=std::sqrt(nx*nx+ny*ny+nz*nz); float up = nl>1e-6f ? std::fabs(ny)/nl : 1.f;   // 1=flat .. 0=vertical
+                float rr = up>0.85f ? (1.f-up)/0.15f : 1.f;             // red rises as it steepens below 0.85
+                float gg = up>0.5f  ? 1.f : up/0.5f;                    // green falls off below 0.5
+                int R=(int)(255*std::min(1.f,std::max(0.f,rr))), G=(int)(255*std::min(1.f,std::max(0.f,gg)));
+                fc=ui::rgba(R,G,40,72); ec=ui::rgba(R,G,40,205);
+            }
             float sa[2],sb[2],sd[2];
             bool oa=worldToScreen(wa,sa[0],sa[1]), ob=worldToScreen(wb,sb[0],sb[1]), od=worldToScreen(wd,sd[0],sd[1]);
-            if(oa&&ob&&od) dl.triangle(sa[0],sa[1],sb[0],sb[1],sd[0],sd[1], fillCol);   // walkable surface fill
-            if(oa&&ob) dl.line(sa[0],sa[1],sb[0],sb[1],edgeCol,0.7f);
-            if(ob&&od) dl.line(sb[0],sb[1],sd[0],sd[1],edgeCol,0.7f);
-            if(od&&oa) dl.line(sd[0],sd[1],sa[0],sa[1],edgeCol,0.7f);
+            if(oa&&ob&&od) dl.triangle(sa[0],sa[1],sb[0],sb[1],sd[0],sd[1], fc);   // walkable surface fill (slope-colored)
+            if(oa&&ob) dl.line(sa[0],sa[1],sb[0],sb[1],ec,0.7f);
+            if(ob&&od) dl.line(sb[0],sb[1],sd[0],sd[1],ec,0.7f);
+            if(od&&oa) dl.line(sd[0],sd[1],sa[0],sa[1],ec,0.7f);
         }
     }
+    bool navColorBySlope = true;   // navmesh debug: colorize triangles by slope (flat=green .. steep=red) to see smoothness
+    bool navSmooth = false;        // cook navmesh collision with averaged (smoothed) normals -> no per-edge creases (UI toggle, drives the cook)
+    bool navDebugClone = false;    // cook a visible slope-colored clone of the navmesh so it renders ON DEVICE (UI toggle, drives the cook)
     static void printBar(float f, const char* s){
         int W=28, n=(int)(f*W); char bar[64]; for(int i=0;i<W;i++) bar[i]=i<n?'#':' '; bar[W]=0;
         fprintf(stderr, "\r[%s] %3d%%  %-22s", bar, (int)(f*100), s); fflush(stderr);

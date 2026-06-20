@@ -17,7 +17,11 @@ inline bool parseRendMesh(const std::vector<u8>& data,
                           std::vector<u8>* boneIndices = nullptr,
                           std::vector<u8>* boneWeights = nullptr,
                           const char* label = nullptr,
-                          std::vector<float>* uvs2 = nullptr) {   // uvs2 = TEXCOORD1 (lightmap unwrap) — the rgmask/AO UV
+                          std::vector<float>* uvs2 = nullptr,
+                          std::vector<u32>* bonePalette = nullptr,   // bonePalette = ROOT.f2[0].f0 slot->joint name-hash MAP
+                          std::vector<u8>* colors = nullptr,          // sem4 per-vertex COLOR (u8x4) = device vertexColor0 (animvege leaf bend-mask, butterfly wing colour)
+                          std::vector<float>* uvs3 = nullptr,         // sem5 idx2 (uv2): animvege packed per-vertex flutter phase/pivot
+                          std::vector<float>* uvs4 = nullptr) {       // sem5 idx3 (uv3): animvege packed per-vertex flutter data
     if (data.size() < 14 || memcmp(data.data() + 4, "MESH", 4) != 0)
         return false;
 
@@ -69,6 +73,28 @@ inline bool parseRendMesh(const std::vector<u8>& data,
         startOut = vecPos + 4;
         return true;
     };
+
+    // Bone PALETTE (the slot->joint MAP libshell reads, NOT a DFS guess): RENDMESH ROOT field[2] is a
+    // vector of skins; skin[0].field[0] is a vector of u32 = MurmurHash3_x86_32(jointName,0), one per
+    // palette slot. A vertex's bone INDEX is a slot into this; the slot's hash identifies the skeleton
+    // joint by name. (Verified: bird palette=[mover,head,l_wing_01,l_wing_02,r_wing_01,r_wing_02,tail_01]
+    // = joints 1,2,3,6,4,7,5; whale palette = its working DFS order. So reading this fixes the bird AND
+    // keeps the whale.) The whole skin section is OPTIONAL (static meshes have no f2).
+    if (bonePalette) {
+        u32 skinBase, skinCount;
+        if (followVec(rootOff, 2, skinBase, skinCount) && skinCount) {
+            u32 skinTable;
+            if (followElem(skinBase, 0, skinTable)) {
+                u32 palBase, palCount;
+                if (followVec(skinTable, 0, palBase, palCount) && palCount && palCount < 1024
+                    && palBase + (size_t)palCount*4 <= data.size()) {
+                    bonePalette->resize(palCount);
+                    for (u32 i = 0; i < palCount; ++i)
+                        (*bonePalette)[i] = *reinterpret_cast<const u32*>(data.data() + palBase + i*4);
+                }
+            }
+        }
+    }
 
     // Root -> LOD[0] (root field[1] = lod_uoff)
     u32 lodBase, lodCount;
@@ -143,6 +169,8 @@ inline bool parseRendMesh(const std::vector<u8>& data,
     // f16x3 normal), and the 4-byte-aligned scan only tried 12/16/20/24. (semantic: 0=POSITION
     // 1=NORMAL 5=TEXCOORD; format byte high-nibble≈type 3=f32/2=f16/1=u8, decoded by size below.)
     u32 fmtUv0 = 0xFFFFFFFF, fmtUv1 = 0xFFFFFFFF; u8 uv1FmtByte = 0;
+    u32 fmtColor = 0xFFFFFFFF;                              // VS-attr-table sem 4 = per-vertex COLOR (u8x4) offset
+    u32 fmtUv2 = 0xFFFFFFFF, fmtUv3 = 0xFFFFFFFF; u8 uv2FmtByte = 0, uv3FmtByte = 0;  // sem5 idx2/idx3 (animvege packed uvs)
     u32 fmtBoneIdx = 0xFFFFFFFF, fmtBoneWgt = 0xFFFFFFFF;   // VS-attr-table bone offsets (sem 8=indices, 7=weights)
     {
         u32 fb2, fc2;
@@ -162,6 +190,9 @@ inline bool parseRendMesh(const std::vector<u8>& data,
                 u8 sem = a[0], fmt = a[1], idx = a[2];
                 if (sem == 5 && idx == 0 && fmtUv0 == 0xFFFFFFFF) fmtUv0 = aoff;
                 if (sem == 5 && idx == 1 && fmtUv1 == 0xFFFFFFFF) { fmtUv1 = aoff; uv1FmtByte = fmt; }
+                if (sem == 4 && fmtColor == 0xFFFFFFFF) fmtColor = aoff;   // per-vertex COLOR (vertexColor0)
+                if (sem == 5 && idx == 2 && fmtUv2 == 0xFFFFFFFF) { fmtUv2 = aoff; uv2FmtByte = fmt; }  // animvege uv2
+                if (sem == 5 && idx == 3 && fmtUv3 == 0xFFFFFFFF) { fmtUv3 = aoff; uv3FmtByte = fmt; }  // animvege uv3
                 // Skinning bones by SEMANTIC (the whale: sem 7 = weights @16, sem 8 = indices @20, stride 24).
                 // The fixed stride-28 layout (idx@20/wgt@24, stride>=28) misses these -> skinned=0. (sem 6 is
                 // also seen as indices in some streams.)
@@ -174,7 +205,11 @@ inline bool parseRendMesh(const std::vector<u8>& data,
                 for (u32 ai=0; ai<fc2; ++ai){ const u8* a=data.data()+fb2+ai*4; fprintf(stderr," [sem%u fmt0x%02x idx%u @%u]", a[0],a[1],a[2],ao); ao+=fmtSize(a[1]); }
                 fprintf(stderr, "  boneIdx@%d boneWgt@%d\n", (int)fmtBoneIdx, (int)fmtBoneWgt);
             }
-            else if (std::getenv("HSR_RMSTRUCT")) fprintf(stderr, "[RMFMT] %u attrs uv0@%d uv1@%d\n", fc2, (int)fmtUv0, (int)fmtUv1);
+            else if (std::getenv("HSR_RMSTRUCT")) {
+                fprintf(stderr, "[RMFMT] %u attrs:", fc2); u32 ao=0;
+                for (u32 ai=0; ai<fc2; ++ai){ const u8* a=data.data()+fb2+ai*4; fprintf(stderr," [sem%u fmt0x%02x idx%u @%u]", a[0],a[1],a[2],ao); ao+=fmtSize(a[1]); }
+                fprintf(stderr, " uv0@%d uv1@%d\n", (int)fmtUv0, (int)fmtUv1);
+            }
         }
     }
 
@@ -291,6 +326,33 @@ inline bool parseRendMesh(const std::vector<u8>& data,
                 (*uvs2)[(base+i)*2+0] = u; (*uvs2)[(base+i)*2+1] = w;
             }
         }
+
+        // sem4 per-vertex COLOR (u8x4) = the device shader's vertexColor0. libshell multiplies base·vertexColor0;
+        // the renderer's VBO was writing WHITE into role 4, so the GREYSCALE butterfly texture stayed white and
+        // the animvege leaf bend-mask (packed in the colour) was lost. Extract the real per-vertex colour.
+        if (colors && fmtColor != 0xFFFFFFFF && fmtColor + 4 <= stride) {
+            colors->resize((base + nVerts) * 4);
+            for (u32 i = 0; i < nVerts; ++i) {
+                const u8* v = data.data() + vbStart + i * stride + fmtColor;
+                (*colors)[(base+i)*4+0] = v[0]; (*colors)[(base+i)*4+1] = v[1];
+                (*colors)[(base+i)*4+2] = v[2]; (*colors)[(base+i)*4+3] = v[3];
+            }
+        }
+        // sem5 idx2/idx3 (uv2/uv3): animvege packs per-vertex flutter phase/pivot here. The vertex shader bends
+        // each leaf using these; without them (mapped to uv0 before) the plants don't flutter as authored.
+        auto decExtraUV = [&](std::vector<float>* out, u32 foff, u8 fb){
+            if (!out || foff == 0xFFFFFFFF || foff + 4 > stride) return;
+            out->resize((base + nVerts) * 2);
+            for (u32 i = 0; i < nVerts; ++i) {
+                const u8* v = data.data() + vbStart + i * stride + foff; float u, w;
+                if      (fb == 0x27) { u = *reinterpret_cast<const u16*>(v)/65535.0f; w = *reinterpret_cast<const u16*>(v+2)/65535.0f; }
+                else if (fb == 0x31) { u = *reinterpret_cast<const float*>(v);        w = *reinterpret_cast<const float*>(v+4); }
+                else                 { u = f16tof32(*reinterpret_cast<const u16*>(v)); w = f16tof32(*reinterpret_cast<const u16*>(v+2)); }
+                (*out)[(base+i)*2+0] = u; (*out)[(base+i)*2+1] = w;
+            }
+        };
+        decExtraUV(uvs3, fmtUv2, uv2FmtByte);
+        decExtraUV(uvs4, fmtUv3, uv3FmtByte);
 
         // Bone indices + weights. VERIFIED stride==28 layout: pos@0(12) + uv@12(4 f16x2) +
         // color@16(4 u8) + boneIdx@20(4 u8) + boneWgt@24(4 u8). Non-skinned parts (stride<28)

@@ -10,6 +10,52 @@
 //
 // Parses Horizon Scene Template Format JSON, extracting DrawableEntity list.
 
+// Flatten a component's `data` JSON to (dotted-key, display-string) pairs so the editor can inspect/edit ANY
+// component generically (nested objects -> "a.b.x", arrays -> "a[0].x"). Truth for field meaning: V203_COMPONENTS_IDA.md.
+inline void flattenHstfJson(const tinyjson::Value& v, const std::string& prefix,
+                            std::vector<std::pair<std::string,std::string>>& out, int depth = 0) {
+    if (depth > 8) return;
+    if (v.isObject()) {
+        for (const auto& kv : v.objVal) {
+            std::string key = prefix.empty() ? kv.first : prefix + "." + kv.first;
+            flattenHstfJson(kv.second, key, out, depth + 1);
+        }
+    } else if (v.isArray()) {
+        for (size_t i = 0; i < v.arrVal.size(); ++i)
+            flattenHstfJson(v.arrVal[i], prefix + "[" + std::to_string(i) + "]", out, depth + 1);
+    } else {
+        char buf[64]; std::string s;
+        if (v.isBool())        s = v.asBool() ? "true" : "false";
+        else if (v.isInt())  { snprintf(buf, sizeof buf, "%lld", (long long)v.asInt()); s = buf; }
+        else if (v.isFloat()){ snprintf(buf, sizeof buf, "%g", v.asFloat()); s = buf; }
+        else if (v.isString()) s = v.asString();
+        else s = "null";
+        out.push_back({ prefix, s });
+    }
+}
+
+// Capture EVERY component on an entity (class/version/flattened fields) for the generic editor inspector — even
+// components the typed render pipeline ignores (sound, locomotion, lightprobes, sittable, colliders, extras...).
+inline void captureHstfComponents(const tinyjson::Value& ent, DrawableEntity& draw) {
+    if (!ent.has("components") || !ent["components"].isArray()) return;
+    const auto& comps = ent["components"];
+    for (size_t ci = 0; ci < comps.size(); ++ci) {
+        const auto& comp = comps[ci];
+        if (!comp.has("data")) continue;
+        const auto& cd = comp["data"];
+        EnvComponent ec;
+        ec.cls = cd.has("class") ? cd["class"].asString() : "";
+        size_t p = ec.cls.rfind("::");
+        ec.shortCls = (p == std::string::npos) ? ec.cls : ec.cls.substr(p + 2);
+        ec.version = cd.has("version") ? (int)cd["version"].asInt() : 0;
+        if (cd.has("data")) flattenHstfJson(cd["data"], "", ec.fields);
+        if (std::getenv("HSR_COMPDUMP"))
+            fprintf(stderr, "[COMP] %-40s v%d  %zu fields  (entity '%s')\n",
+                    ec.shortCls.c_str(), ec.version, ec.fields.size(), draw.name.c_str());
+        draw.components.push_back(std::move(ec));
+    }
+}
+
 // Extract an entity's local TransformPlatformComponent (pos / rot[euler→quat or quat] / scale).
 inline Transform parseHstfEntityTransform(const tinyjson::Value& ent) {
     Transform t;
@@ -96,6 +142,7 @@ inline bool parseHstf(const std::string& jsonStr, std::vector<DrawableEntity>& o
             DrawableEntity draw;
             draw.name = ent.has("name") ? ent["name"].asString() : eid;
             if (verbose) fprintf(stderr, "[HSTF]   Entity '%s' (id=%s)\n", draw.name.c_str(), eid.c_str());
+            captureHstfComponents(ent, draw);   // generic capture of ALL components for the editor inspector
 
             bool hasMesh = false;
             const auto& comps = ent.has("components") ? ent["components"] : tinyjson::Value();
@@ -209,11 +256,46 @@ inline bool parseHstf(const std::string& jsonStr, std::vector<DrawableEntity>& o
                             const auto& cps = dat["constantParameters"];
                             for (size_t ci = 0; ci < cps.size(); ++ci) {
                                 const auto& cp = cps[ci].has("data") ? cps[ci]["data"] : tinyjson::Value();
-                                if (cp.has("parameterName") &&
-                                    cp["parameterName"].asString().find("atlasCellIndex") != std::string::npos &&
-                                    cp.has("value") && cp["value"].has("x"))
-                                    draw.atlasCellIndex = (float)cp["value"]["x"].asFloat();
+                                if (!cp.has("parameterName") || !cp.has("value") || !cp["value"].has("x")) continue;
+                                const std::string pn = cp["parameterName"].asString();
+                                const float vx = (float)cp["value"]["x"].asFloat();
+                                // VAT per-instance "instance" UBO {atlasCellIndex,animTrackIndex,animRateFactor,
+                                // animTimeOffset} — each creature swims its OWN track/phase (else all snap to
+                                // track 0 in sync → wrong pose → clip). Reversed from vatunlit* shader set2 bind1.
+                                if      (pn.find("atlasCellIndex") != std::string::npos) draw.atlasCellIndex = vx;
+                                else if (pn.find("animTrackIndex") != std::string::npos) draw.vatTrackIndex  = vx;
+                                else if (pn.find("animRateFactor") != std::string::npos) draw.vatRateFactor  = vx;
+                                else if (pn.find("animTimeOffset") != std::string::npos) draw.vatTimeOffset  = vx;
+                                // Capture the FULL override (xyzw) for the renderer to apply over the cooked
+                                // material block: matParams.tint (per-instance colour), matParams.windIntensityMax/
+                                // ampMax/windSpeedMax/leafAmt/windDir (plant sway), RoughnessMultiplier/NormalGain,
+                                // etc. Without these, grey butterflies stay grey + plants don't sway as authored.
+                                MatOverride ov; ov.name = pn;
+                                ov.v[0] = vx;
+                                ov.v[1] = cp["value"].has("y") ? (float)cp["value"]["y"].asFloat() : 0.0f;
+                                ov.v[2] = cp["value"].has("z") ? (float)cp["value"]["z"].asFloat() : 0.0f;
+                                ov.v[3] = cp["value"].has("w") ? (float)cp["value"]["w"].asFloat() : 0.0f;
+                                draw.matOverrides.push_back(ov);
+                                if (verbose) fprintf(stderr, "[HSTF]     override %s = (%.3f,%.3f,%.3f,%.3f)\n",
+                                    pn.c_str(), ov.v[0], ov.v[1], ov.v[2], ov.v[3]);
                             }
+                        }
+                    }
+                    else if (cls.find("SkyboxPlatformComponent") != std::string::npos) {
+                        // The sky dome: its geometry is `skyboxMesh` and its texture is `colorTexture` — NOT a
+                        // MeshPlatformComponent, so without this the skybox entity was dropped (hasMesh=false) =
+                        // "No skybox support". Extract them so the dome renders with the panorama.
+                        auto readRef = [&](const char* k) -> AssetKey {
+                            if (!dat.has(k)) return {}; const auto& m = dat[k];
+                            return { (u64)(m.has("packageOrRemoteId") ? std::stoull(m["packageOrRemoteId"].asString()) : 0),
+                                     (u64)(m.has("ingestionId")      ? std::stoull(m["ingestionId"].asString()) : 0),
+                                     (u32)(m.has("targetId")         ? (u32)m["targetId"].asInt() : 0) };
+                        };
+                        AssetKey sm = readRef("skyboxMesh");
+                        if (sm.ing != 0) {
+                            draw.meshRef = sm; draw.skyboxTex = readRef("colorTexture"); draw.isSkybox = true; hasMesh = true;
+                            if (verbose) fprintf(stderr, "[HSTF]     SKYBOX mesh ing=%016llX colorTex ing=%016llX\n",
+                                (unsigned long long)sm.ing, (unsigned long long)draw.skyboxTex.ing);
                         }
                     }
                 }

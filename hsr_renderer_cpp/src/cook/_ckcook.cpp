@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
     std::string root    = rootEntityJson(rootId);
     std::string rels    = relChildOf(floorId, rootId) + "," + relChildOf(spawnId, rootId);
     std::string content = templateJson(root + "," + ent + "," + spawn, rels);
-    std::string space   = spaceJson(rng, "myhome", contentK);
+    std::string space   = spaceJson(rng, "myhome", contentK, 40000.f);  // far clip plane in space.hstf (vista-proven)
     auto shellcfg = jbytes(shellConfigJson(spaceK, /*locomotion*/true));
 
     // ── manifest paths (relative to content/) ──

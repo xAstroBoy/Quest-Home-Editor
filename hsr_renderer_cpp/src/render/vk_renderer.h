@@ -50,6 +50,7 @@
 //   +0  uvScaleOffset  vec4  (default {1,1,0,0})
 
 struct VkGpuMesh {
+    std::vector<EnvComponent> components;   // all hstf components of the owning entity (generic editor inspect/edit)
     VkBuffer vbo = VK_NULL_HANDLE;
     VkDeviceMemory vboMem = VK_NULL_HANDLE;
     VkBuffer ibo = VK_NULL_HANDLE;
@@ -125,6 +126,8 @@ struct VkGpuMesh {
     bool alphaTest = false;      // cutout: opaque pass, depth-write ON, shader discards (libshell AlphaTest)
     bool cullBack = false;       // single-sided material (glTF doubleSided=false) -> back-face cull
     bool additive = false;       // Additive material (god-rays/glow) -> ADD blend instead of alpha
+    bool isSkybox = false;       // SkyboxPlatformComponent dome/cube: camera-locked + far-scaled each frame (a 1-unit cube at origin otherwise = invisible)
+    bool culled = false;         // per-frame: V205 frustum+distance cull result (HSR_CLIP). false unless culling ON.
     std::string name;
     std::string info;  // "texWxH blend=N"
 };
@@ -255,7 +258,10 @@ public:
     VkSampler shadowSampler = VK_NULL_HANDLE;
     // Neutral ambient radiance used for synthesized IBL + lightprobe SH (warm white).
     // The shell normally provides this from the room; we approximate a bright interior.
-    float ambientRGB[3] = {0.95f, 0.90f, 0.83f};
+    float ambientRGB[3] = {0.95f, 0.90f, 0.83f};   // synth default (used when the env has NO real lightprobes)
+    bool  hasEnvAmbient = false;                    // set by main when the env's REAL ambient was parsed from its
+                                                    // LightprobesPlatformComponent .lprb (field2 L00/3.5449). When true,
+                                                    // ambientRGB IS that faithful value -> SKIP the synthetic boost.
 
     VkCommandPool commandPool = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> commandBuffers;
@@ -283,6 +289,13 @@ public:
         sceneFogStart = dStart; sceneFogDensity = dEnd;   // distanceFog [start,end] -> UBO fogStart/fogDensity
         sceneHeightFog[0]=hStart; sceneHeightFog[1]=hEnd;
     }
+    // Device-faithful FINITE clip planes from the env's space.hstf (ScenePlatformComponent farClippingPlane/
+    // nearClippingPlane — horror/oceanarium far=2000, calming far=20000, near=0.1). The DEVICE projects with
+    // these, so geometry beyond farClippingPlane is GPU-clipped (vanishes). HSR_CLIP toggles them ON (use the
+    // env's finite far → far geometry clips, like the device) vs OFF (fit far to scene → draw everything),
+    // so we can check whether a cooked home's geometry survives the device's far-clip.
+    float sceneNearClip = 0.f, sceneFarClip = 0.f;
+    void setSceneClip(float n, float f) { sceneNearClip = n; sceneFarClip = f; }
     std::vector<std::pair<float,size_t>> blendOrder;  // reused scratch: (distance², meshIdx) for back-to-front blend sort
 
     std::vector<u32> vertSpirv;
@@ -487,7 +500,18 @@ public:
         std::string surfLower = surfaceName(md.shaderPath); for (char& c : surfLower) c = (char)tolower((unsigned char)c);
         bool unlitSurface = surfLower.find("unlit") != std::string::npos;
         bool tiledRealAlbedo = md.tiled && md.texW > 64 && md.texH > 64 && !unlitSurface;
-        gm.progIdx = (perMat && !md.overlayKind && !tiledRealAlbedo) ? programForSurface(surfaceName(md.shaderPath), &md.texSlots) : -1;
+        // MASKED materials (rgbmasked/rgmasked) render GRAY/WRONG on the global shader: their base texture
+        // is a MASK and the real colors live in the cooked LayerRed/LayerBlue/Tint matParams that the global
+        // path SKIPS (the shader-match gate at ~908). They bind correctly BY NAME on their OWN program
+        // (proven: the candle's amber wax, the fgPockets garden/pot/pebbles — 15-24/N members from the
+        // cooked block). So route masked materials to the per-material path BY DEFAULT — this is the
+        // candle "not right texture", BGgroundC, and sofaCushions color fix. EXCLUDE tiledRealAlbedo (the
+        // floor/wall megascans parquet, whose real albedo the masked shader would wash) + overlays.
+        // HSR_NOMASKMAT reverts to the old global-shader behaviour for A/B.
+        bool maskedSurface = (surfLower.find("rgbmasked") != std::string::npos || surfLower.find("rgmasked") != std::string::npos)
+                             && !std::getenv("HSR_NOMASKMAT");
+        bool routePerMat = perMat || (maskedSurface && !tiledRealAlbedo);
+        gm.progIdx = (routePerMat && !md.overlayKind && !tiledRealAlbedo) ? programForSurface(surfaceName(md.shaderPath), &md.texSlots) : -1;
         if (std::getenv("HSR_MATDBG")) log("  ROUTE '%s' progIdx=%d tiled=%d texW=%u unlit=%d", md.name.c_str(), gm.progIdx, (int)md.tiled, md.texW, (int)unlitSurface);
         // Skinned meshes (prism_wave_a_01) MUST use the "skinned" program variant: it has the boneIdx/boneWgt
         // vertex inputs (vstride 32) + the sbSkinningMatrices buffer. programForSurface can resolve the mesh
@@ -496,7 +520,15 @@ public:
         // BUT a VAT mesh (md.hasVat) is NOT skinned — its stride-28/44 vertex stream has the VAT vertexCol,
         // not boneIdx/boneWgt. parseRendMesh's stride>=28 bone heuristic mis-flags it as skinned; forcing it
         // to the skinned program here overrode its vatlitbubble/vatunlit program -> the bubbles stayed broken.
-        if (perMat && md.hasBones && !md.hasVat) { int sp = programForSkinned(); if (sp >= 0) gm.progIdx = sp; }
+        // Prefer the mesh's OWN cooked skinned shader (unlitskinned/unlitskinnedwindmill/isotropicskinned*).
+        // The old code overrode EVERY bone mesh with one generic programForSkinned() -> the bats/owl got the
+        // wrong skinned shader (e.g. an isotropicskinned* PBR one sampling an unbound normal/mask -> MAGENTA/
+        // purple + misaligned verts). Only fall back to the generic skinned program if the mesh's own shader
+        // isn't a skinned variant (false-positive hasBones, or unresolved).
+        if (routePerMat && md.hasBones && !md.hasVat) {
+            bool ownIsSkinned = gm.progIdx >= 0 && programs[gm.progIdx].surface.find("skinned") != std::string::npos;
+            if (!ownIsSkinned) { int sp = programForSkinned(); if (sp >= 0) gm.progIdx = sp; }
+        }
 
         // Build the VBO to MATCH the (per-mesh or global) shader's introspected vertex inputs: each
         // attribute is written at its role-derived offset (pos/normal/uv/lightmapUv/color/bone…).
@@ -575,8 +607,13 @@ public:
                         const std::vector<float>& u1 = !md.uvs2.empty() ? md.uvs2 : md.uvs;
                         float uv[2]={(i*2<u1.size())?u1[i*2]:0.f,(i*2+1<u1.size())?u1[i*2+1]:0.f}; memcpy(dst,uv,8);} break;
                     case 4: {
-                        // rgb = baked IBL lighting (specibl) or white (others); a = iblLit flag.
+                        // rgb = the real per-vertex COLOR (device vertexColor0) when the mesh has one, else white;
+                        // a = iblLit flag. libshell multiplies base·vertexColor0 — the butterfly's wing colour and
+                        // the animvege leaf bend-mask live here. Writing white discarded them (grey butterfly stayed
+                        // white; leaves didn't bend). HSR_NOVCOL forces the old white behaviour.
                         u8 col[4]={255,255,255, (u8)(md.iblLit?255:0)};
+                        bool haveVC = !std::getenv("HSR_NOVCOL") && (size_t)i*4+3 < md.colors.size();
+                        if (haveVC) { col[0]=md.colors[i*4]; col[1]=md.colors[i*4+1]; col[2]=md.colors[i*4+2]; col[3]=md.colors[i*4+3]; }
                         auto cl=[](float x){ x = x<0?0:(x>1?1:x); return (u8)(x*255.0f+0.5f); };
                         if (md.bakeLightmapVtx && !md.lmRGBA.empty() && (size_t)i*2+1 < md.uvs2.size()) {
                             // TEXTURED ShellEnv shell: bake lightmap(uv1)·lightmappower into the vertex
@@ -628,12 +665,24 @@ public:
                                 // non-specibl couch/merged shells): albedo lives in the 1x1 tex / real tex.
                                 col[0]=cl(irr[0]*ambientIBLTint[0]); col[1]=cl(irr[1]*ambientIBLTint[1]); col[2]=cl(irr[2]*ambientIBLTint[2]);
                             }
+                        } else if (!md.hasLightmap && !haveVC && !std::getenv("HSR_NOHEMI")) {
+                            // Meshes with NO baked lightmap (the merge-grouped ones whose lightmap mapping is
+                            // absent from the standalone APK: cieling/rugB/slats/woodPlanks/... + footprint
+                            // floors) get a soft HEMISPHERIC ambient baked into vColor (shader does base·vColor)
+                            // so they read as LIT, not flat — warm from above, dimmer below (approximates the
+                            // lightprobe SH the device bakes). NOT a faked lightmap match — an honest ambient.
+                            float ny = nrm[i*3+1];                       // -1 down .. +1 up
+                            float t  = ny*0.5f+0.5f;
+                            float amb = 0.55f + 0.45f*t;                 // ceiling/down 0.55 .. floor/up 1.0
+                            col[0]=cl(amb); col[1]=cl(amb*0.98f); col[2]=cl(amb*0.93f);   // gently warm
                         }
                         memcpy(dst,col,4);
                     } break;
                     case 5: { u8 bi[4]={0,0,0,0}; if(i*4+3<bIdx.size()){bi[0]=bIdx[i*4];bi[1]=bIdx[i*4+1];bi[2]=bIdx[i*4+2];bi[3]=bIdx[i*4+3];} memcpy(dst,bi,4);} break;
                     case 6: { u8 bw[4]={0,0,0,0}; if(i*4+3<bWgt.size()){bw[0]=bWgt[i*4];bw[1]=bWgt[i*4+1];bw[2]=bWgt[i*4+2];bw[3]=bWgt[i*4+3];} memcpy(dst,bw,4);} break;
                     case 7: { float tg[4]={0,0,1,1}; memcpy(dst,tg,16);} break;
+                    case 9: { float uv[2]={(i*2<md.uvs3.size())?md.uvs3[i*2]:0.f,(i*2+1<md.uvs3.size())?md.uvs3[i*2+1]:0.f}; memcpy(dst,uv,8);} break;  // animvege uv2
+                    case 10:{ float uv[2]={(i*2<md.uvs4.size())?md.uvs4[i*2]:0.f,(i*2+1<md.uvs4.size())?md.uvs4[i*2+1]:0.f}; memcpy(dst,uv,8);} break;  // animvege uv3
                     default: break;  // unknown -> zeros
                 }
             }
@@ -854,6 +903,11 @@ public:
                 if (nm.find("uvscaleoffset") != std::string::npos)      { S(0,1); S(1,1); S(2,0); S(3,0); }
                 else if (nm.find("offset") != std::string::npos)        { S(0,0); S(1,0); S(2,0); S(3,0); }
                 else if (nm.find("scale") != std::string::npos || nm.find("tile") != std::string::npos) { S(0,1); S(1,1); }
+                // PBR defaults (device shader-declared; renderer's blanket 1.0 was the WHITE: a dark base went
+                // fully-metallic (all specular IBL = white) + additive subsurface (white). Standard defaults:
+                else if (nm.find("subsurface") != std::string::npos)   { S(0,0); S(1,0); S(2,0); S(3,0); }  // no SSS (additive -> white at 1)
+                else if (nm.find("metallic") != std::string::npos || nm.find("metalness") != std::string::npos) S(0,0.0f);  // non-metal (1 = all-spec IBL = white)
+                else if (nm.find("flicker") != std::string::npos)      S(0,0.0f);  // no flicker by default
                 else if (nm.find("tint") != std::string::npos || nm.find("color") != std::string::npos || nm.find("colour") != std::string::npos) { S(0,1); S(1,1); S(2,1); S(3,1); }
                 else if (nm.find("f0") != std::string::npos || nm.find("reflectivity") != std::string::npos || nm.find("incident") != std::string::npos) S(0,0.04f);
                 else if (nm.find("roughnessmin") != std::string::npos || nm.find("reflectoverride") != std::string::npos) S(0,0.0f);
@@ -916,6 +970,16 @@ public:
                                 float one = 1.0f; memcpy((u8*)fp + m.off, &one, 4);   // neutralize GlobalTile for unwraps
                             } else {
                                 memcpy((u8*)fp + m.off, md.matParamsBlob.data() + cp.blobOffset, cp.byteSize);
+                                // Vulkan clip-space Y is flipped vs the device, which REVERSES a per-material
+                                // shader's VERTICAL UV-pan (the device SPIR-V scrolls in the device's V space).
+                                // A water overlay panning DOWN on-device (overlayPanSpeed<0) therefore scrolls
+                                // UP here ("waterfall_overlay SINCE WHEN THEY GO UP"). Negate the VERTICAL pan
+                                // speed to restore on-device flow. Horizontal pan (…X / …U) is left alone.
+                                if (cp.byteSize==4 && mn.find("panspeed")!=std::string::npos
+                                    && !mn.empty() && mn.back()!='x' && mn.back()!='u'
+                                    && !std::getenv("HSR_NOVPANFLIP")) {
+                                    float pv; memcpy(&pv,(u8*)fp+m.off,4); pv=-pv; memcpy((u8*)fp+m.off,&pv,4);
+                                }
                             }
                             ++bound; break;
                         }
@@ -951,6 +1015,24 @@ public:
                 } else if (!propUnwrap) {
                     size_t n = std::min((size_t)MAT_UBO_SIZE, md.matParamsBlob.size());
                     memcpy(fp, md.matParamsBlob.data(), n);
+                }
+                // Per-instance MaterialPropertyOverrides ("matParams.*") applied OVER whatever the cooked block /
+                // fallback wrote — the device entity override ALWAYS wins. This MUST run for every path, including
+                // shaders with NO cooked constant block: the waterfall FLIPBOOK takes its animationSpeed/
+                // flipbookParams/transparency/baseColorMult ENTIRELY from the entity override, so gating this behind
+                // a cooked block left the flipbook frozen on a garbage frame (faint, non-flowing water). Also covers
+                // plant wind, fog opacity/colour, prop roughness regardless of whether the mesh has a cooked block.
+                if (!md.matOverrides.empty()) {
+                    for (const auto& ov : md.matOverrides) {
+                        if (ov.name.rfind("matParams.", 0) != 0) continue;
+                        const std::string member = ov.name.substr(10);
+                        for (auto& m : mpmembers) {
+                            if (m.name != member) continue;
+                            u32 nn = m.vsize > 16 ? 16u : m.vsize;
+                            if (m.off + nn <= (u32)MAT_UBO_SIZE) memcpy((u8*)fp + m.off, ov.v, nn);
+                            break;
+                        }
+                    }
                 }
             }
             vkUnmapMemory(device, gm.matUboMem);
@@ -1049,13 +1131,21 @@ public:
                     } else if (n.find("lightbaker") != std::string::npos) {
                         f[0]=1.0f; f[1]=1.0f;   // uvScale
                         f[2]=0.0f; f[3]=0.0f;   // uvOffset
-                    } else if (n.find("instance") != std::string::npos && md.atlasCellIndex >= 0.0f) {
-                        // unlitatlasinstance "instanceTag" UBO = { float atlasCellIndex @offset 0 } (verified in
-                        // the shader's member layout). It selects WHICH atlas cell (col=cell%subDivX,
-                        // row=cell/subDivX) = which baked colour variant for THIS instance. Was zeroed → every
-                        // coral sampled cell 0 (one colour: coral_22 rendered blue; its real cell 21 = pink).
+                    } else if (n.find("instance") != std::string::npos &&
+                               (md.atlasCellIndex >= 0.0f || md.vatTrackIndex >= 0.0f ||
+                                md.vatRateFactor >= 0.0f  || md.vatTimeOffset >= 0.0f)) {
+                        // Per-instance "instance" UBO = { atlasCellIndex@0, animTrackIndex@4, animRateFactor@8,
+                        // animTimeOffset@12 } — reversed from the vatunlit*/unlitatlasinstance shader (set2 bind1).
+                        // atlasCellIndex = which baked atlas cell (coral colour variant). The VAT trio gives each
+                        // creature its OWN swim track + speed + phase; without them every turtle snapped to track 0
+                        // in sync (wrong pose → the turtle clipped the deck). Was zeroed.
                         memset(f, 0, USZ);
-                        f[0] = md.atlasCellIndex;
+                        f[0] = md.atlasCellIndex >= 0.0f ? md.atlasCellIndex : 0.0f;
+                        if (USZ >= 16) {
+                            f[1] = md.vatTrackIndex >= 0.0f ? md.vatTrackIndex : 0.0f;
+                            f[2] = md.vatRateFactor >= 0.0f ? md.vatRateFactor : 1.0f;  // default rate 1 = normal speed
+                            f[3] = md.vatTimeOffset >= 0.0f ? md.vatTimeOffset : 0.0f;
+                        }
                     } else {
                         // Unknown per-material UBO: zero = neutral (keeps base albedo; 1.0f washed to gray).
                         memset(f, 0, USZ);
@@ -1099,11 +1189,18 @@ public:
                              (n.find("vat") != std::string::npos && n.find("anim") != std::string::npos);
                 if (isVat)           v = (gm.vatView ? gm.vatView : blackView);  // VAT offset tex (decoded .exr) or zero-offset rest pose
                 else if (isCube)     v = (iblSpecView ? iblSpecView : whiteView);   // specular reflection cube
-                else if (isEmissive) v = (gm.emissiveView ? gm.emissiveView : whiteView);  // emissiveTex (glow)
+                else if (isEmissive) v = (gm.emissiveView ? gm.emissiveView : blackView);  // emissiveTex (glow): ADDITIVE -> no-tex fallback MUST be BLACK (white added base+white=WHITE; was washing the whole scene). base decodes dark; emissive=0 = no glow.
                 else if (isNorm) v = (gm.normalView ? gm.normalView : (gm.ormView ? gm.ormView : flatNormalView));
-                else if (isLm)   v = (gm.lmView ? gm.lmView : whiteView);   // missing lightmap -> white
+                // missing lightmap -> white (neutral "fully lit"). HSR_LMBLACK = bind black instead (the lightprobe
+                // SH + IBL cube then light it) for lightprobe-lit PBR meshes that ship no baked lightmap.
+                else if (isLm)   v = (gm.lmView ? gm.lmView : (std::getenv("HSR_LMBLACK") ? blackView : whiteView));
                 else if (isBase || (int)d.binding == s2base) v = gm.texView;
                 else if (isOrm)  v = (gm.ormView ? gm.ormView : (gm.normalView ? gm.normalView : whiteView));
+                // animatedfog samples ONE noise texture TWICE (noiseTexture1 @base + noiseTexture2): its alpha
+                // = combinedNoise(noise1*noise2) * edgeMask * opacity. Binding noiseTexture2 to white made
+                // combinedNoise = noise*1 (too high) -> opacity 2.5 clamps it OPAQUE = the "fog too bright".
+                // Bind the 2nd noise sampler to the same noise texture so noise1*noise2 (<1) stays subtle.
+                else if (n.find("noise") != std::string::npos) v = (gm.texView ? gm.texView : whiteView);
                 else             v = whiteView;
                 imgInfos.push_back({VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
                 w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -1211,6 +1308,8 @@ public:
         if (gm.isSkinned && std::getenv("HSR_SKINOPAQUE")) gm.useBlend = false;
         gm.cullBack = !md.doubleSided && !gm.isSkinned;   // OPA prism/motes material = DoubleSided -> no cull
         gm.additive = md.additive;       // god-rays/glow -> ADD blend pipeline
+        gm.isSkybox = md.isSkybox;       // skybox dome: camera-locked + far-scaled each frame (see render())
+        if (gm.isSkybox) gm.cullBack = false;   // camera is INSIDE the skybox cube -> draw inward faces (no back-cull)
         gm.overlayKind = md.overlayKind; // editor navmesh/collision overlay
         if (gm.overlayKind) {            // translucent, double-sided, flat-colour overlay
             gm.useBlend = true; gm.cullBack = false;
@@ -1218,6 +1317,14 @@ public:
             else if (gm.overlayKind == 2) { gm.curTint[0]=1.00f; gm.curTint[1]=0.28f; gm.curTint[2]=0.22f; gm.curTint[3]=0.45f; } // collision red
             else if (gm.overlayKind == 4) { gm.curTint[0]=0.20f; gm.curTint[1]=0.95f; gm.curTint[2]=1.00f; gm.curTint[3]=0.85f; } // spawn cyan
             else                          { gm.curTint[0]=1.00f; gm.curTint[1]=0.65f; gm.curTint[2]=0.10f; gm.curTint[3]=0.45f; } // phys orange
+        }
+        // Per-instance colour from MaterialPropertyOverrides "matParams.tint": the cooked butterfly/leaf texture
+        // is GREYSCALE (luminance detail) and the device MULTIPLIES it by this entity tint. Feed it into curTint
+        // -> push-constant[16..19] (honoured by the unlit/global shader: frag = texture * tint). Without it the
+        // grey butterfly stayed white. Only when a real (non-white) tint exists and this isn't an editor overlay.
+        else if (md.tint[0]!=1.0f || md.tint[1]!=1.0f || md.tint[2]!=1.0f) {
+            gm.curTint[0]=md.tint[0]; gm.curTint[1]=md.tint[1]; gm.curTint[2]=md.tint[2];
+            gm.curTint[3]=(md.tint[3]>0.0f)?md.tint[3]:1.0f;
         }
         // World-space centroid (avg of positions) for back-to-front blend sorting. OPA positions are
         // baked into world space (identity model), so this is already world-space; good enough for a
@@ -1247,6 +1354,7 @@ public:
         gm.pickPos = md.positions;
         gm.pickIdx = md.indices;
         gm.name = md.name;
+        gm.components = md.components;   // carry the entity's components through to the editor inspector
         gm.info = std::to_string(md.texW) + "x" + std::to_string(md.texH)
                 + (md.useBlend ? " blend" : " opaque")
                 + (gm.isSkinned ? " skinned" : "");
@@ -1262,7 +1370,16 @@ public:
           // (min alpha 255) has nothing to blend — the no-depth-write blend pass made it see-through
           // (King Kai / snakeway: his front didn't occlude his back -> scrambled black blob). Treat it
           // as opaque so it WRITES depth = solid. Skip additive glow + editor overlays (truly translucent).
-          if (gm.useBlend && taN>0 && taMin>=255 && !gm.additive && !gm.overlayKind) gm.useBlend = false;
+          // EXEMPT shaders that compute their OWN alpha (mist/smoke/water/lakesurf/fade): their texture is
+          // alpha-255 but the fragment derives transparency from noise×opacity, so the "opaque texture ->
+          // opaque" heuristic wrongly forced them solid (mist_plane_CR rendered as a teal BLOCK).
+          bool computesAlpha = md.shaderPath.find("mist")!=std::string::npos || md.shaderPath.find("smoke")!=std::string::npos ||
+                               md.shaderPath.find("lakesurf")!=std::string::npos || md.shaderPath.find("water")!=std::string::npos ||
+                               md.shaderPath.find("fade")!=std::string::npos ||
+                               // animatedfog (atmospheric_fog/waterfallSplash): opaque base tex (alpha=255) but the
+                               // fragment derives fog density/alpha from noise×time — keep its alpha blend (was a WHITE block).
+                               md.shaderPath.find("animatedfog")!=std::string::npos;
+          if (gm.useBlend && taN>0 && taMin>=255 && !gm.additive && !gm.overlayKind && !computesAlpha) gm.useBlend = false;
           log("  GPU mesh uploaded: [%zu] '%s' nVerts=%u nIdx=%u tex=%ux%u mdBlend=%d gmBlend=%d add=%d skinned=%d stride=%u uvOff=%u texA[%d/%.0f/%d] worldC=(%.2f,%.2f,%.2f)",
             gpuMeshes.size(), gm.name.c_str(), nVerts, gm.nIdx, md.texW, md.texH,
             (int)md.useBlend, (int)gm.useBlend, (int)gm.additive, (int)gm.isSkinned, gm.vboStride, gm.uvOffset,
@@ -1290,6 +1407,19 @@ public:
         vkResetCommandBuffer(commandBuffers[imageIndex], 0);
         updateUniforms();
         updateSkinning();
+        // SKYBOX camera-lock: the SkyboxPlatformComponent dome is a UNIT cube at the origin (±0.5) — a
+        // 1-unit speck the camera never sees ("NO SKYBOX"). Centre it on the camera and scale it to ~0.4*far
+        // each frame so it becomes a surrounding sky well beyond the vista but inside the frustum; all scene
+        // geometry (closer) draws in front of it. Camera is INSIDE (cullBack already off at upload).
+        {
+            float S = cam.farZ * 0.4f; if (S < 100.0f) S = 5000.0f;
+            for (auto& gm : gpuMeshes) {
+                if (!gm.isSkybox) continue;
+                float* m = gm.model;
+                m[0]=S; m[1]=0; m[2]=0; m[3]=0;  m[4]=0; m[5]=S; m[6]=0; m[7]=0;
+                m[8]=0; m[9]=0; m[10]=S; m[11]=0; m[12]=cam.pos[0]; m[13]=cam.pos[1]; m[14]=cam.pos[2]; m[15]=1;
+            }
+        }
         static int noUI = -1; if (noUI < 0) noUI = std::getenv("HSR_NOUI") ? 1 : 0;
         if (overlayBegin && !noUI) overlayBegin();   // ImGui NewFrame + build editor UI (CPU); HSR_NOUI hides it
 
@@ -1363,6 +1493,7 @@ public:
                 if (isHidden(mi)) continue;
                 if (!hideMat.empty() && gm.name.find(hideMat) != std::string::npos) continue;
                 if (!soloMat.empty() && gm.name.find(soloMat) == std::string::npos) continue;
+                if (gm.culled) continue;     // V205 frustum+far cull (HSR_CLIP) — false unless culling toggled ON
                 if (gm.useBlend) continue;   // blend handled in pass 2
                 VkPipeline want;
                 if (gm.progIdx >= 0) {  // per-material program pipeline (its OWN layout matches descSet2)
@@ -1397,6 +1528,7 @@ public:
                 if (isHidden(mi)) continue;
                 if (!hideMat.empty() && gm.name.find(hideMat) != std::string::npos) continue;
                 if (!soloMat.empty() && gm.name.find(soloMat) == std::string::npos) continue;
+                if (gm.culled) continue;     // V205 frustum+far cull (HSR_CLIP)
                 if (!gm.useBlend) continue;
                 float dx=gm.centroid[0]-cam.pos[0], dy=gm.centroid[1]-cam.pos[1], dz=gm.centroid[2]-cam.pos[2];
                 blendOrder.emplace_back(dx*dx+dy*dy+dz*dz, mi);
@@ -1968,6 +2100,18 @@ private:
 public:
     // Build the GPU SPECULAR cubemap (RGBA16F, 6 faces, mip0) from the raw *_specular.dds.opa bytes.
     // Call after the device exists and BEFORE uploadMesh (so descriptors can bind iblSpecView).
+    // V203 IBL: build the CPU diffuse+specular irradiance cubes from an EQUIRECT panorama (the skybox
+    // reflectionMap, ASTC-HDR decoded to RGBA8). The existing per-vertex SpecIbl bake (uploadMesh) then consumes
+    // iblDiffuse/iblSpecular for meshes with md.iblLit. Caller gates with HSR_SKYIBL (off by default → no regression).
+    void setIblEquirectRGBA8(const uint8_t* rgba, int w, int h) {
+        if (!rgba || w <= 0 || h <= 0) return;
+        std::vector<float> rgb((size_t)w * h * 3);
+        for (size_t i = 0; i < (size_t)w * h; ++i)
+            for (int c = 0; c < 3; ++c) { float s = rgba[i*4+c] / 255.f; rgb[i*3+c] = s <= 0.04045f ? s/12.92f : std::pow((s+0.055f)/1.055f, 2.4f); }
+        iblSpecular = ibl::equirectToCubemap(rgb.data(), w, h, 64);
+        iblDiffuse  = ibl::irradianceFromCube(iblSpecular, 16);
+        log("  [SKYIBL] equirect %dx%d -> IBL cubes (spec 64, diff 16) ok=%d", w, h, (int)iblDiffuse.ok());
+    }
     void setSpecularCubemap(const std::vector<uint8_t>& raw) {
         int S = 0; std::vector<uint8_t> faces;   // 6 faces of S*S*RGBA16F, contiguous
         if (raw.empty() || !ibl::extractCubeRawRGBA16F(raw.data(), raw.size(), S, faces) || S <= 0) return;
@@ -2135,10 +2279,15 @@ public:
         // Scale the neutral ambient up (tunable via HSR_AMBIENT; default brightens noticeably)
         // so interiors read properly. Applied once -> both the IBL cubemaps and lightprobe SH
         // (which reads ambientRGB) get the boost.
-        {
+        // ONLY boost the SYNTHESIZED ambient. When the env's REAL lightprobe ambient was loaded (hasEnvAmbient),
+        // ambientRGB already IS the device's value (.lprb field2 L00/3.5449, e.g. calming (0.40,0.27,0.23)) —
+        // boosting it would re-introduce the 4x over-bright wash that made the ground white instead of green.
+        if (!hasEnvAmbient) {
             float amb = 1.8f;
             if (const char* e = std::getenv("HSR_AMBIENT")) { float v = (float)atof(e); if (v > 0.0f) amb = v; }
             ambientRGB[0] *= amb; ambientRGB[1] *= amb; ambientRGB[2] *= amb;
+        } else if (const char* e = std::getenv("HSR_AMBIENT")) {
+            float v=(float)atof(e); if(v>0.0f){ ambientRGB[0]*=v; ambientRGB[1]*=v; ambientRGB[2]*=v; }  // manual tweak still honored
         }
         // lightUniforms UBO (generous fixed size; we set only the fields that matter to
         // avoid a black image: neutral IBL tints, no shadows, identity shadow MVP, 0 lights).
@@ -2150,9 +2299,22 @@ public:
             float* f = (float*)buf.data(); u32* u = (u32*)buf.data();
             // identity shadowmapMVP @0
             f[0]=1; f[5]=1; f[10]=1; f[15]=1;
-            // counts: no realtime lights (rely on IBL + lightprobe SH)
-            u[24]=0; u[25]=0; u[26]=0;          // numLights/Static/Dynamic @96/100/104
-            u[60]=0;                             // numDistantLights @240
+            // Directional SUN/key = the DISTANT light. CONFIRMED from the lightUniforms SPIR-V reflection:
+            // the "...directional..." PBR shaders read distantLightDir@80 + distantLightRadiantIntensity@64
+            // (+ numDistantLights@240), NOT sbLightItems (those are LOCAL/punctual). This is why the candle/
+            // haven PBR was BLACK — no distant light was set.
+            u[24]=0; u[25]=0; u[26]=0;           // numLights/Static/Dynamic (LOCAL punctual) @96/100/104 = none
+            {
+                float keyI = 2.5f; if (const char* e=std::getenv("HSR_KEYLIGHT")) { float v=(float)atof(e); if (v>=0) keyI=v; }
+                float kd[3] = {0.38f, 0.86f, 0.34f};                 // direction (tunable via HSR_KEYDIR)
+                if (const char* e=std::getenv("HSR_KEYDIR")) sscanf(e,"%f,%f,%f",&kd[0],&kd[1],&kd[2]);
+                { float l=std::sqrt(kd[0]*kd[0]+kd[1]*kd[1]+kd[2]*kd[2]); if (l>1e-6f){kd[0]/=l;kd[1]/=l;kd[2]/=l;} }
+                f[16]=keyI; f[17]=keyI*0.97f; f[18]=keyI*0.90f;      // distantLightRadiantIntensity @64 (warm key)
+                f[20]=kd[0]; f[21]=kd[1]; f[22]=kd[2];               // distantLightDir @80
+                u[60]=1;                                              // numDistantLights @240
+                f[64]=keyI; f[65]=keyI*0.97f; f[66]=keyI*0.90f;      // distantLightIntensities[0] @256 (array form)
+                f[80]=kd[0]; f[81]=kd[1]; f[82]=kd[2];               // distantLightDirections[0]  @320
+            }
             // iblReflectionTint @112, iblDiffuseTint @128
             f[28]=1; f[29]=1; f[30]=1; f[31]=1;
             f[32]=1; f[33]=1; f[34]=1; f[35]=1;
@@ -2160,11 +2322,24 @@ public:
             f[42]=1; f[43]=1;                    // iblReflectionMaxAdaptationFactor @168, LuminanceInverse @172
             void* p; vkMapMemory(device, lightUboMem, 0, LU, 0, &p); memcpy(p, buf.data(), LU); vkUnmapMemory(device, lightUboMem);
         }
-        // sbLightItems SSBO (empty list — numLights=0 so never indexed).
+        // sbLightItems SSBO — one directional KEY light. Item = 28 B scalar-packed, IDA-proven from
+        // ForwardLightProcessor__1762134: color.rgb @0, direction.xyz @12 (NORMALIZED, points TOWARD the
+        // light), shadowIndex(i32) @24 (=-1 none). The cooked PBR frag does Σ color·max(N·dir,0).
         const u32 LI = 4096;
         createBuffer(LI, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, lightItemsSsbo, lightItemsMem);
-        { void* p; vkMapMemory(device, lightItemsMem, 0, LI, 0, &p); memset(p, 0, LI); vkUnmapMemory(device, lightItemsMem); }
+        {
+            float keyI = 1.6f; if (const char* e=std::getenv("HSR_KEYLIGHT")) { float v=(float)atof(e); if (v>=0) keyI=v; }
+            float kd[3] = {0.38f, 0.86f, 0.34f};                 // toward light: above + slightly front-right
+            if (const char* e=std::getenv("HSR_KEYDIR")) sscanf(e,"%f,%f,%f",&kd[0],&kd[1],&kd[2]);
+            { float l=std::sqrt(kd[0]*kd[0]+kd[1]*kd[1]+kd[2]*kd[2]); if (l>1e-6f){kd[0]/=l;kd[1]/=l;kd[2]/=l;} }
+            std::vector<u8> li(LI, 0);
+            float* lf=(float*)li.data(); int* lii=(int*)li.data();
+            lf[0]=keyI;        lf[1]=keyI*0.97f;  lf[2]=keyI*0.90f;   // warm-white key color @0
+            lf[3]=kd[0];       lf[4]=kd[1];        lf[5]=kd[2];        // direction @12
+            lii[6]=-1;                                                // shadowIndex @24 = none
+            void* p; vkMapMemory(device, lightItemsMem, 0, LI, 0, &p); memcpy(p, li.data(), LI); vkUnmapMemory(device, lightItemsMem);
+        }
 
         // Neutral IBL cubemaps (diffuse irradiance + reflection). Mid neutral so the PBR
         // shader's ambient/specular terms light the scene rather than reading nothing.
@@ -2176,12 +2351,24 @@ public:
         createSolidCubemap(ambientRGB[0]*0.95f, ambientRGB[1]*0.92f, ambientRGB[2]*0.88f, iblReflImage, iblReflMem, iblReflView,
                            ambientRGB[0]*0.40f, ambientRGB[1]*0.37f, ambientRGB[2]*0.32f);
 
-        // 1x1 shadow map (depth=1.0 -> fully lit) + comparison-less sampler.
+        // 1x1 shadow map + a COMPARISON sampler with compareOp=ALWAYS. The PBR frag samples the shadowmap
+        // with OpImageSampleDref (sampler2DShadow) and MULTIPLIES the distant/punctual light by the result.
+        // IDA+SPIR-V proven: the candle lit frag does 6 shadow-compares; with a non-comparison sampler the
+        // Dref returned 0 (=shadowed) -> distant light × 0 = BLACK. We don't compute real shadows, so make
+        // every compare pass (=fully lit) via VK_COMPARE_OP_ALWAYS -> the distant key light reaches PBR mats.
         {
             u8 white[4] = {255,255,255,255};
             createTextureImage(white, 1, 1, shadowImage, shadowMem);
             shadowView = createImageView(shadowImage, VK_FORMAT_R8G8B8A8_SRGB);
-            shadowSampler = createTextureSampler();
+            VkSamplerCreateInfo si = {};
+            si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+            si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            si.compareEnable = VK_TRUE; si.compareOp = VK_COMPARE_OP_ALWAYS;   // always "lit"
+            si.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+            if (vkCreateSampler(device, &si, nullptr, &shadowSampler) != VK_SUCCESS)
+                shadowSampler = createTextureSampler();
         }
 
         // Allocate + write the shared set1 descriptor set, binding each resource BY NAME.
@@ -2320,6 +2507,10 @@ public:
             else if (ln.find("tangent") != std::string::npos)    F(7, VK_FORMAT_R32G32B32A32_SFLOAT, 16);
             else if (ln.find("lightmap") != std::string::npos || ln.find("uv1") != std::string::npos)
                                                                  F(3, VK_FORMAT_R32G32_SFLOAT, 8);
+            // animvege packs per-vertex flutter phase/pivot in uv2/uv3 — give them their OWN roles (9/10) so they
+            // don't collapse into uv0 (role 2). MUST precede the generic "uv" match below.
+            else if (ln.find("uv2") != std::string::npos)        F(9,  VK_FORMAT_R32G32_SFLOAT, 8);
+            else if (ln.find("uv3") != std::string::npos)        F(10, VK_FORMAT_R32G32_SFLOAT, 8);
             else if (ln.find("uv") != std::string::npos || ln.find("texcoord") != std::string::npos)
                                                                  F(2, VK_FORMAT_R32G32_SFLOAT, 8);
             else if (ln.find("boneind") != std::string::npos || ln.find("joint") != std::string::npos || ln.find("indices") != std::string::npos)
@@ -2422,6 +2613,21 @@ public:
                             if (vcIt != vecCount.end()) mvsz = vcIt->second * 4;   // vecN -> N*4 bytes (scalar stays 4)
                         }
                         matParamsMembers.push_back({nIt->second, off, mvsz});
+                    }
+                    break;
+                }
+            }
+            // One-time: dump lightUniforms (set1) member name@offset — to confirm numLights's TRUE offset
+            // (the createLightingResources hardcode was a guess). HSR_LIGHTDBG=1.
+            if (std::getenv("HSR_LIGHTDBG")) {
+                for (auto& [vid, ptrTypeId] : varType) {
+                    if (strOf(vid) != "lightUniforms") continue;
+                    auto pit = ptr.find(ptrTypeId); if (pit == ptr.end()) continue;
+                    u32 structId = pit->second.second;
+                    for (u32 m = 0; m < 96; ++m) {
+                        auto nIt = memName.find({structId,m}); if (nIt == memName.end()) break;
+                        u32 off = memOff.count({structId,m}) ? memOff[{structId,m}] : 0;
+                        log("  [LIGHTUBO] m%u %s @ %u", m, nIt->second.c_str(), off);
                     }
                     break;
                 }
@@ -2738,8 +2944,12 @@ public:
                 for (u32 h : fragSamplerHashes(ls.frag))
                     if (std::find(texSlots->begin(), texSlots->end(), h) != texSlots->end()) ++sc;
             }
+            // Prefer the LIT (forward) variant now that we FEED real lighting (distant key light +
+            // distantLightDir/RadiantIntensity in lightUniforms + IBL). Previously this preferred UNLIT
+            // because lighting wasn't fed → candle/PBR rendered flat/unlit. (HSR_UNLITVARIANT reverts.)
+            bool preferUnlit = std::getenv("HSR_UNLITVARIANT") != nullptr;
             long score = (long)sc * 100000000L
-                       + (fragHasLighting(ls.frag) ? 0L : 50000000L)
+                       + ((fragHasLighting(ls.frag) != preferUnlit) ? 50000000L : 0L)
                        + (long)ls.frag.size();
             if (score > bestScore) { bestScore=score; bestLs=li; }
         }
@@ -3500,6 +3710,16 @@ public:
     void fitFarToScene() {
         if (farFitDone || gpuMeshes.empty()) return;
         farFitDone = true;
+        // HSR_CLIP: use the DEVICE's finite far/near clip planes (from space.hstf) instead of fitting to scene.
+        // Geometry beyond farClippingPlane is then GPU-clipped exactly as on-device — toggle off to draw all.
+        if (std::getenv("HSR_CLIP") && sceneFarClip > 0.f) {
+            cam.farZ = sceneFarClip;
+            if (sceneNearClip > 0.f) cam.nearZ = sceneNearClip;
+            if (const char* e = std::getenv("HSR_CLIPFAR")) { float v=(float)atof(e); if (v>0) cam.farZ=v; }
+            log("  [CLIP] device far-clip ON: near=%.3f far=%.0f (geometry beyond far is CLIPPED; HSR_CLIP off = draw all)",
+                cam.nearZ, cam.farZ);
+            return;
+        }
         float r2 = 0.0f;
         for (auto& gm : gpuMeshes) {
             for (int c = 0; c < 8; ++c) {
@@ -3511,6 +3731,56 @@ public:
         float fit = radius * 2.0f + 200.0f;
         if (fit > cam.farZ) { cam.farZ = fit; log("  far plane fit to scenery: radius=%.0f -> farZ=%.0f", radius, cam.farZ); }
     }
+
+    // ── V205 device culling replica (RenderableCullJob__9BA420 — IDA-read): per renderable, (1) frustum side
+    // planes vs world AABB, (2) DISTANCE cull = squared dist from camera to CLOSEST AABB point > maxDist² (the
+    // device's `a2[33]` test). TOGGLEABLE via HSR_CLIP so we can verify whether a cooked home's bounds bypass
+    // the culler: ON → meshes outside the frustum/beyond far are dropped (= what the device would clip); OFF
+    // (default) → nothing culled (draw everything). HSR_CLIPFAR overrides the cull distance (default = farZ).
+    // HSR_CLIP_TINT keeps culled meshes visible but the count is logged, so you SEE what would vanish on-device.
+    void computeCull(const float* vp) {
+        bool on = std::getenv("HSR_CULL") != nullptr;   // SEPARATE from HSR_CLIP (the projection clip plane)
+        float pl[4][4];                       // L,R,B,T side planes (near/far handled by the distance test)
+        auto row = [&](int r, int k){ return vp[k*4 + r]; };
+        for (int i = 0; i < 4; ++i) { float s = (i & 1) ? -1.f : 1.f; int rr = i >> 1;
+            for (int k = 0; k < 4; ++k) pl[i][k] = row(3, k) + s * row(rr, k); }
+        float maxD = cam.farZ; if (const char* e = std::getenv("HSR_CLIPFAR")) { float v=(float)atof(e); if (v>0) maxD=v; }
+        float far2 = maxD * maxD;
+        int culled = 0, total = 0;
+        for (auto& gm : gpuMeshes) {
+            gm.culled = false;
+            if (!on || gm.nIdx == 0) continue;
+            ++total;
+            float wmin[3] = {1e30f,1e30f,1e30f}, wmax[3] = {-1e30f,-1e30f,-1e30f};
+            for (int c = 0; c < 8; ++c) {
+                float x=(c&1)?gm.bbMax[0]:gm.bbMin[0], y=(c&2)?gm.bbMax[1]:gm.bbMin[1], z=(c&4)?gm.bbMax[2]:gm.bbMin[2];
+                float wx=gm.model[0]*x+gm.model[4]*y+gm.model[8]*z+gm.model[12];
+                float wy=gm.model[1]*x+gm.model[5]*y+gm.model[9]*z+gm.model[13];
+                float wz=gm.model[2]*x+gm.model[6]*y+gm.model[10]*z+gm.model[14];
+                wmin[0]=std::min(wmin[0],wx); wmax[0]=std::max(wmax[0],wx);
+                wmin[1]=std::min(wmin[1],wy); wmax[1]=std::max(wmax[1],wy);
+                wmin[2]=std::min(wmin[2],wz); wmax[2]=std::max(wmax[2],wz);
+            }
+            float ctr[3]={(wmin[0]+wmax[0])*.5f,(wmin[1]+wmax[1])*.5f,(wmin[2]+wmax[2])*.5f};
+            float ext[3]={(wmax[0]-wmin[0])*.5f,(wmax[1]-wmin[1])*.5f,(wmax[2]-wmin[2])*.5f};
+            bool out = false;
+            for (int i = 0; i < 4 && !out; ++i) {
+                float d = pl[i][0]*ctr[0]+pl[i][1]*ctr[1]+pl[i][2]*ctr[2]+pl[i][3];
+                float r = ext[0]*std::fabs(pl[i][0])+ext[1]*std::fabs(pl[i][1])+ext[2]*std::fabs(pl[i][2]);
+                if (d < -r) out = true;
+            }
+            if (!out) {                       // distance cull = device closest-AABB-point > maxDist²
+                float dx=std::max(0.f,std::max(wmin[0]-cam.pos[0],cam.pos[0]-wmax[0]));
+                float dy=std::max(0.f,std::max(wmin[1]-cam.pos[1],cam.pos[1]-wmax[1]));
+                float dz=std::max(0.f,std::max(wmin[2]-cam.pos[2],cam.pos[2]-wmax[2]));
+                if (dx*dx+dy*dy+dz*dz > far2) out = true;
+            }
+            gm.culled = out; if (out) ++culled;
+        }
+        if (on) { static int last=-1; if (culled!=last){ last=culled;
+            log("  [CULL] V205 frustum+far cull ON (maxD=%.0f): %d/%d meshes would be CULLED. (HSR_CULL off = draw all)", maxD, culled, total); } }
+    }
+
     void updateUniforms() {
         fitFarToScene();
         bool paned = uiViewportRect.extent.width > 0 && uiViewportRect.extent.height > 0;
@@ -3524,6 +3794,7 @@ public:
         float vp[16];
         mat4mul(cam.proj, cam.view, vp);
         memcpy(cachedVP, vp, 64);  // cache for push constant computation in render()
+        computeCull(vp);           // V205 frustum+far cull (HSR_CLIP) — marks gm.culled; draw loops skip them
 
         float W = (float)swapchainExtent.width;
         float H = (float)swapchainExtent.height;

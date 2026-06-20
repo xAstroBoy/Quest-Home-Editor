@@ -28,7 +28,7 @@ where cmake
 echo.
 
 echo Configuring with CMake ^(Ninja^)...
-cmake -S "%SDIR%." -B "%BDIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake -S "%SDIR%." -B "%BDIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DHSR_HAVE_PHYSX=ON
 if %ERRORLEVEL% neq 0 (
     echo CMake configure FAILED
     exit /b 1

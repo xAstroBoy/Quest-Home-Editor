@@ -84,6 +84,7 @@ static LONG WINAPI hsrCrashHandler(EXCEPTION_POINTERS* ep) {
 struct LiveCmd { std::string text, result; std::atomic<bool> done{false}; };
 static std::mutex          g_liveMx;
 static std::deque<LiveCmd*> g_liveQ;
+std::atomic<bool>          g_audioMuted{false};   // PC preview-audio mute: the editor's "Play preview audio" toggle binds here; audio.h's data callback reads it (defined non-static so editor.h/audio.h externs resolve)
 static void hsrHttpServer(int port) {
     WSADATA w; if (WSAStartup(MAKEWORD(2,2), &w) != 0) { fprintf(stderr, "[HTTP] WSAStartup failed\n"); return; }
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -139,6 +140,7 @@ static void hsrHttpServer(int port) {
 #include "loaders/rendshad_parser.h"
 #include "render/universal_shader.h"
 #include "core/audio.h"
+#include "core/audio_convert.h"
 #include "render/v79_shader.h"
 #include "render/vk_renderer.h"
 #include "loaders/scene_loader.h"
@@ -379,6 +381,10 @@ int main(int argc, char** argv) {
         if (!got) { glfwTerminate(); return 0; }  // closed without dropping anything
     }
     fprintf(stderr, "[MAIN] APK: %s\n\n", apkPath.c_str());
+    // NOTE: a single per-env lightmap exposure is WRONG for calming — it mixes INTERIOR home meshes (floor/walls,
+    // need ~2.6) with OUTDOOR vista meshes (ground/boulders, want ~1.4). Lowering it globally under-exposed the
+    // home floor/walls (dark/wrong). Keep the interior-tuned default (g_lmExposure=2.6); a faithful per-MESH
+    // exposure (home vs vista) is the real fix. HSR_LMEXP still overrides globally for manual A/B.
 
     // ── Step A: Load scene ─────────────────────────────────────
     // Detect format: a raw V79 env ships a *.gltf.ovrscene (glTF 2.0 + ASTC KTX); the new
@@ -399,6 +405,19 @@ int main(int argc, char** argv) {
         size_t sl = apkPath.find_last_of("/\\");
         companionPath = (sl == std::string::npos ? std::string() : apkPath.substr(0, sl + 1)) + "haven2025.apk";
         fprintf(stderr, "[MAIN] vista_ env -> auto-companion home: %s\n", companionPath.c_str());
+    }
+    else if (apkPath.find("haven2025") != std::string::npos && !std::getenv("HSR_NOVISTA")) {
+        // haven2025 is the HOME ONLY (levels = home_3d_props/staticarch_shell; NO vista level). On device
+        // it is LIT + backdropped BY a vista (the dark void = the missing vista). Loaded alone it's flat
+        // with a void sky. Auto-companion a default vista so it renders as intended ("lit from the vista").
+        // Pick the first com_meta_shell_env_vista_*.apk that exists next to it (prefer calming). HSR_BACKDROP
+        // overrides the vista; HSR_NOVISTA forces the bare home.
+        size_t sl = apkPath.find_last_of("/\\");
+        std::string dir = (sl == std::string::npos ? std::string() : apkPath.substr(0, sl + 1));
+        const char* vistas[] = {"com_meta_shell_env_vista_calming.apk","com_meta_shell_env_vista_central.apk",
+                                "com_meta_shell_env_vista_focused.apk","com_meta_shell_env_vista_oceanarium.apk"};
+        for (const char* v : vistas) { std::string p = dir + v; FILE* f = fopen(p.c_str(),"rb"); if (f) { fclose(f); companionPath = p; break; } }
+        if (!companionPath.empty()) fprintf(stderr, "[MAIN] haven2025 home -> auto-companion vista: %s\n", companionPath.c_str());
     }
     bool isV79 = gltf.load(apkPath);
     bool isOpa = false;
@@ -424,8 +443,13 @@ int main(int argc, char** argv) {
                 for (auto& m : companion.meshes) loader.meshes.push_back(std::move(m));
                 fprintf(stderr, "[MAIN] Companion merged: +%zu meshes (total %zu)\n",
                         loader.meshes.size() - before, loader.meshes.size());
+                // FAITHFUL CROSS-LOADER LIGHTMAPS: the vista ships the override HSTFs (GUID->lightmap); the
+                // home ships the USD templates (GUID->mesh name) + the room meshes. Combine via the GUID chain
+                // so each mesh gets its REAL baked lightmap (incl shared merge-group atlases) = the device look.
+                loader.applyLightmapOverrides(loader.meshes, &companion);
             } else fprintf(stderr, "[MAIN] Companion load FAILED: %s\n", companionPath.c_str());
         }
+        if (companionPath.empty()) loader.applyLightmapOverrides(loader.meshes);   // single env (no companion)
         sceneMeshes = &loader.meshes;
     }
 
@@ -811,6 +835,60 @@ int main(int argc, char** argv) {
                 envShippedRendShad ? " [auto: V203 env ships RENDSHAD]" : " [HSR_PERMAT]");
     }
 
+    // ── Load the env's REAL lightprobe ambient from its .lprb (FlatBuffer, magic "LPRB"). field2 = the merged
+    // global SH; field2[0..2] = L00 RGB. The PBR shaders' lightprobesParams DC = ambientRGB*3.5449, so the
+    // device ambient radiance = L00/3.5449. Using it (instead of the synthesized warm-white + 1.8x boost) stops
+    // the ~4x over-bright wash that turned the greenish ground white. Reversed from libshell LightprobeNetwork /
+    // the lightprobesParamsTag(L00..L22) shader layout. Must run BEFORE vkRenderer.init() (it uses ambientRGB).
+    if (!std::getenv("HSR_NOENVAMB")) {
+        mz_zip_archive aZ; memset(&aZ,0,sizeof aZ);
+        if (mz_zip_reader_init_file(&aZ, apkPath.c_str(), 0)) {
+            int si = mz_zip_reader_locate_file(&aZ, "assets/scene.zip", nullptr, 0);
+            size_t szSz=0; void* szD = si>=0 ? mz_zip_reader_extract_to_heap(&aZ, si, &szSz, 0) : nullptr;
+            mz_zip_reader_end(&aZ);
+            if (szD) {
+                mz_zip_archive sZ; memset(&sZ,0,sizeof sZ);
+                if (mz_zip_reader_init_mem(&sZ, szD, szSz, 0)) {
+                    mz_uint nf = mz_zip_reader_get_num_files(&sZ);
+                    for (mz_uint i=0;i<nf;i++){
+                        mz_zip_archive_file_stat st; if(!mz_zip_reader_file_stat(&sZ,i,&st)) continue;
+                        if (!strstr(st.m_filename, "lightprobes_merged.lprb")) continue;
+                        size_t fsz=0; void* fd = mz_zip_reader_extract_to_heap(&sZ, i, &fsz, 0);
+                        if (fd && fsz>80) {
+                            const unsigned char* d=(const unsigned char*)fd;
+                            if (memcmp(d+4,"LPRB",4)==0) {
+                                uint32_t root=*(const uint32_t*)d;
+                                if ((size_t)root+4<=fsz) {
+                                    uint32_t vt=root-(uint32_t)(*(const int32_t*)(d+root));
+                                    if ((size_t)vt+10<=fsz && *(const uint16_t*)(d+vt)>=10) {
+                                        uint16_t f2voff=*(const uint16_t*)(d+vt+8);   // field2 = vtable slot 2
+                                        if (f2voff && (size_t)root+f2voff+4<=fsz) {
+                                            uint32_t f2abs=root+f2voff;
+                                            uint32_t vecPos=f2abs + *(const uint32_t*)(d+f2abs);
+                                            if ((size_t)vecPos+16<=fsz && *(const uint32_t*)(d+vecPos)>=3) {
+                                                const float* sh=(const float*)(d+vecPos+4);
+                                                vkRenderer.ambientRGB[0]=sh[0]/3.5449f;
+                                                vkRenderer.ambientRGB[1]=sh[1]/3.5449f;
+                                                vkRenderer.ambientRGB[2]=sh[2]/3.5449f;
+                                                vkRenderer.hasEnvAmbient=true;
+                                                fprintf(stderr, "[MAIN] env lightprobe ambient = (%.3f,%.3f,%.3f) from %s\n",
+                                                        vkRenderer.ambientRGB[0],vkRenderer.ambientRGB[1],vkRenderer.ambientRGB[2], st.m_filename);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            mz_free(fd);
+                        }
+                        break;
+                    }
+                    mz_zip_reader_end(&sZ);
+                }
+                mz_free(szD);
+            }
+        }
+    }
+
     if (!vkRenderer.init(g_window, vertSpirv, fragSpirv, skinnedVertSpirv, skinnedFragSpirv)) {
         fprintf(stderr, "[MAIN] FATAL: Vulkan init failed\n");
         glfwDestroyWindow(g_window);
@@ -830,8 +908,15 @@ int main(int argc, char** argv) {
     // (Legacy GPU cube upload path — unused by the faithful CPU bake; kept behind HSR_SPECULAR.)
     if (isOpa && !opa.iblSpecularRaw.empty() && std::getenv("HSR_SPECULAR")) vkRenderer.setSpecularCubemap(opa.iblSpecularRaw);
     if (isV79 || isOpa) vkRenderer.ensureSpecCube();   // valid cube view for the V79 shader's cube slot
+    // V203 skybox-IBL (gated HSR_SKYIBL): feed the captured EQUIRECT reflectionMap panorama into the SpecIbl
+    // per-vertex bake (equirect -> cube via ibl::equirectToCubemap). Off by default -> no regression to envs
+    // that already render via baked lightmaps. Must precede the mesh upload (the bake runs in uploadMesh).
+    if (std::getenv("HSR_SKYIBL") && !loader.iblEquirectRGBA8.empty())
+        vkRenderer.setIblEquirectRGBA8(loader.iblEquirectRGBA8.data(), loader.iblEqW, loader.iblEqH);
 
     // Upload meshes (HSR_MAXMESH / HSR_MINMESH env limit the range for crash bisection)
+    // Device-faithful clip planes from the env's space.hstf (HSR_CLIP toggles them on in fitFarToScene).
+    vkRenderer.setSceneClip(loader.sceneNearClip, loader.sceneFarClip);
     fprintf(stderr, "\n[MAIN] Uploading %zu meshes to GPU...\n", sceneMeshes->size());
     int minMesh = 0, maxMesh = (int)sceneMeshes->size();
     if (const char* e = std::getenv("HSR_MINMESH")) minMesh = atoi(e);
@@ -936,10 +1021,13 @@ int main(int argc, char** argv) {
     const char* animTimeEnv = std::getenv("HSR_ANIMTIME");
     float fixedAnimTime = animTimeEnv ? (float)atof(animTimeEnv) : -1.0f;
 
-    // ── Ambient audio: loop the env's *.ogg (e.g. _BACKGROUND_LOOP.ogg) from the APK ──
+    // ── Ambient audio: loop the env's theme from the APK. Accepts ANY common container (ogg/wav/mp3/flac): the
+    //    desktop preview decodes it universally (audioconv) and the cook ships it as a SoundAsset — FMOD-native
+    //    containers raw, anything else transcoded to WAV. This is the "audio conversion" path. ──
     AudioPlayer g_audio;
-    std::vector<u8> ogg;   // the env's background .ogg — desktop playback AND the cooked FMOD SoundAsset (always extracted)
+    std::vector<u8> audioRaw;   // the env's theme as found in the APK, raw bytes (whatever container)
     {
+        static const char* AUD_EXT[] = { ".ogg", ".wav", ".mp3", ".flac" };
         mz_zip_archive az; memset(&az, 0, sizeof(az));
         if (mz_zip_reader_init_file(&az, apkPath.c_str(), 0)) {
             int si = mz_zip_reader_locate_file(&az, "assets/scene.zip", nullptr, 0);
@@ -949,13 +1037,16 @@ int main(int argc, char** argv) {
                     mz_zip_archive sz; memset(&sz, 0, sizeof(sz));
                     if (mz_zip_reader_init_mem(&sz, szD, szN, 0)) {
                         u32 nf = mz_zip_reader_get_num_files(&sz);
-                        for (u32 i = 0; i < nf; ++i) { mz_zip_archive_file_stat st;
+                        for (u32 i = 0; i < nf && audioRaw.empty(); ++i) { mz_zip_archive_file_stat st;
                             if (!mz_zip_reader_file_stat(&sz, i, &st)) continue;
                             std::string fn(st.m_filename);
-                            if (fn.size() >= 4 && fn.compare(fn.size()-4, 4, ".ogg") == 0) {
-                                size_t on = 0; void* od = mz_zip_reader_extract_to_heap(&sz, i, &on, 0);
-                                if (od) { ogg.assign((u8*)od, (u8*)od + on); mz_free(od); }
-                                break; }
+                            for (const char* ext : AUD_EXT) {
+                                size_t el = strlen(ext);
+                                if (fn.size() >= el && fn.compare(fn.size()-el, el, ext) == 0) {
+                                    size_t on = 0; void* od = mz_zip_reader_extract_to_heap(&sz, i, &on, 0);
+                                    if (od) { audioRaw.assign((u8*)od, (u8*)od + on); mz_free(od); }
+                                    break; }
+                            }
                         }
                         mz_zip_reader_end(&sz);
                     }
@@ -965,11 +1056,31 @@ int main(int argc, char** argv) {
             mz_zip_reader_end(&az);
         }
     }
-    if (!ogg.empty() && !std::getenv("HSR_NOAUDIO")) g_audio.start(ogg.data(), ogg.size());
-    else if (ogg.empty()) fprintf(stderr, "[AUDIO] no .ogg in this env\n");
+    std::vector<u8> ogg;   // the bytes the cook actually ships (FMOD-native container raw, or transcoded WAV)
+    if (!audioRaw.empty()) {
+        const char* fmt = audioconv::sniff(audioRaw.data(), audioRaw.size());
+        audioconv::Pcm pcm; std::string aerr;
+        bool dec = audioconv::decode(audioRaw.data(), audioRaw.size(), pcm, &aerr);
+        if (dec && !std::getenv("HSR_NOAUDIO")) g_audio.startPCM(pcm.samples.data(), pcm.frames(), pcm.channels, pcm.sampleRate);
+        else if (!dec) fprintf(stderr, "[AUDIO] decode failed (%s): %s\n", fmt, aerr.c_str());
+        if (audioconv::fmodNative(fmt)) {
+            ogg = audioRaw;   // FMOD reads ogg/wav/mp3 directly -> ship raw (compact)
+            fprintf(stderr, "[AUDIO] theme '%s' (%d Hz %d ch) -> shipped raw\n", fmt, pcm.sampleRate, pcm.channels);
+        } else if (dec) {
+            ogg = audioconv::toWav(pcm);   // e.g. flac -> WAV for the device's FMOD
+            fprintf(stderr, "[AUDIO] theme '%s' (%d Hz %d ch) -> converted to WAV for cook (%zu KB)\n", fmt, pcm.sampleRate, pcm.channels, ogg.size()/1024);
+        }
+    } else {
+        fprintf(stderr, "[AUDIO] no audio (ogg/wav/mp3/flac) in this env\n");
+    }
 
     // ── Editor UI (Dear ImGui): outliner, move, focus, anim/audio control, save ──
-    float animDur = isOpa ? opa.animDuration() : (isV79 ? gltf.animDuration : 0.0f);
+    // V203 envs animate via getTime()-driven shaders (VAT creatures, UV scroll, material/flipbook anims) + HZANIM
+    // clips — all continuous, no single global clip duration. animDur=0 froze the editor timeline (playhead never
+    // advances -> *animScrub stuck at 0 -> every time-driven anim FROZEN at t=0 in the editor). Give v203 a 60s
+    // looping timeline so the playhead advances + the anims play/scrub (headless render uses real elapsed time, so
+    // it's unaffected). OPA/V79 keep their real clip duration.
+    float animDur = isOpa ? opa.animDuration() : (isV79 ? gltf.animDuration : 60.0f);
     Editor editor;
     g_editor = &editor;            // expose to the GLFW input callbacks
     editor.r = &vkRenderer;             // bind the renderer up-front so Export works even when the UI is skipped (HSR_NOUI)
@@ -1029,8 +1140,45 @@ int main(int argc, char** argv) {
         opa.cookExtractRotations(g_opaRot);
         opa.cookExtractUVScroll(g_opaUv);   // mat.sanim water/foam UV scrolls
         fprintf(stderr, "[OPA] cook anim: %zu spin/sway + %zu uv-scroll (of %zu meshes)\n", g_opaRot.size(), g_opaUv.size(), opa.meshes.size());
-        editor.hzAnimExtractor = [&g_opaRot,&g_opaUv](int meshIdx, int frames, hslcook::ExportMesh& em){
-            (void)frames; auto it = g_opaRot.find((size_t)meshIdx);
+        editor.hzAnimExtractor = [&g_opaRot,&g_opaUv,&opa](int meshIdx, int frames, hslcook::ExportMesh& em){
+            (void)frames;
+            // OPA skeletal/rigid HZANIM port — DEFAULT ON (faithful animation). Was gated after an early cooked APK
+            // crashed, but the incredibles skinned fix ([[project_hsr_skinned_rendmesh_skinblock]]) made HZANIM stable
+            // on device (cyberhome: loads, no crash, ErrorNotReady only transient). Opt-out via HSR_NOOPAHZ.
+            if (!std::getenv("HSR_NOOPAHZ")) {
+            // SKINNED HZANIM (door/discs/screens — ALL skinned meshes). Faithful hierarchical → HZAN:SKEL + ACL clip.
+            auto e = opa.extractHzAnim(meshIdx);
+            if (e.ok()) {
+                em.hzJointPos=std::move(e.jointPos); em.hzJointQuat=std::move(e.jointQuat); em.hzJointScale=std::move(e.jointScale);
+                em.hzParents=std::move(e.parents); em.hzBoneIdx=std::move(e.boneIdx); em.hzBoneWgt=std::move(e.boneWgt);
+                em.hzTrsLocal=std::move(e.trsLocal); em.hzRestPos=std::move(e.restPos);
+                em.hzJointCount=e.jointCount; em.hzFrames=e.frameCount; em.hzFps=e.fps;
+                em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
+                return;
+            }
+            // NON-skinned node TRANSLATION (cars/train) -> 1-joint RIGID HZANIM (faithful arbitrary path). Returns
+            // !ok() for pure spins (no translation), which fall through to the lighter getTime() Rodrigues path.
+            auto rg = opa.extractNodeRigidHzAnim(meshIdx);
+            if (rg.ok()) {
+                em.hzJointPos=std::move(rg.jointPos); em.hzJointQuat=std::move(rg.jointQuat); em.hzJointScale=std::move(rg.jointScale);
+                em.hzParents=std::move(rg.parents); em.hzBoneIdx=std::move(rg.boneIdx); em.hzBoneWgt=std::move(rg.boneWgt);
+                em.hzTrsLocal=std::move(rg.trsLocal); em.hzRestPos=std::move(rg.restPos);
+                em.hzJointCount=rg.jointCount; em.hzFrames=rg.frameCount; em.hzFps=rg.fps;
+                em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
+                return;
+            }
+            }   // end HSR_OPAHZ gate
+            // CARS/TRAIN: node TRANSLATION -> ShellPoseAnimationComponent (the FAITHFUL, device-proven node-anim port;
+            // NO skin, so MeshDefinition::fix can't reject it like the 1-joint rigid did). Mesh stays static; the entity
+            // pose lerps rest -> rest+delta over the clip. Pure spins (no translation) fall through to the spin shader.
+            { float tdelta[3];
+              if (opa.extractNodeTranslate(meshIdx, tdelta)) {
+                  em.poseAnim=true; em.poseDuration = opa.animDuration()>0.f ? opa.animDuration() : 2.f;
+                  em.poseTransDelta[0]=tdelta[0]; em.poseTransDelta[1]=tdelta[1]; em.poseTransDelta[2]=tdelta[2];
+                  em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
+                  return;
+              } }
+            auto it = g_opaRot.find((size_t)meshIdx);
             if (it != g_opaRot.end()) { const noderot::Result& r = it->second;
                 em.rotAnim=true; em.rotOmega=r.omega; em.rotOsc=r.isOsc; em.rotAmp=r.amp; em.rotPeriod=r.period;
                 em.rotAxis[0]=r.axis[0]; em.rotAxis[1]=r.axis[1]; em.rotAxis[2]=r.axis[2];
@@ -1107,6 +1255,34 @@ int main(int argc, char** argv) {
                         if (sscanf(ln + 9, "%d,%f,%f,%f", &mi, &dx, &dy, &dz) == 4 && mi >= 0 && mi < (int)vkRenderer.gpuMeshes.size()) {
                             vkRenderer.gpuMeshes[mi].model[12] += dx; vkRenderer.gpuMeshes[mi].model[13] += dy; vkRenderer.gpuMeshes[mi].model[14] += dz;
                             snprintf(tmp, sizeof tmp, "moved mesh %d by (%.2f,%.2f,%.2f)\n", mi, dx, dy, dz); out += tmp;
+                        }
+                    }
+                    else if (strncmp(ln, "frame=", 6) == 0) {   // auto-frame the camera on mesh idx's world AABB (same as HSR_SOLO auto-frame)
+                        int mi = atoi(ln + 6);
+                        if (mi >= 0 && mi < (int)sceneMeshes->size() && mi < (int)vkRenderer.gpuMeshes.size()) {
+                            const auto& md = (*sceneMeshes)[mi]; const float* M = vkRenderer.gpuMeshes[mi].model;
+                            float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f}; size_t nv=md.positions.size()/3;
+                            for (size_t i=0;i<nv;i++){
+                                float lx=md.positions[i*3],ly=md.positions[i*3+1],lz=md.positions[i*3+2];
+                                float wx=M[0]*lx+M[4]*ly+M[8]*lz+M[12], wy=M[1]*lx+M[5]*ly+M[9]*lz+M[13], wz=M[2]*lx+M[6]*ly+M[10]*lz+M[14];
+                                if(wx<mn[0])mn[0]=wx; if(wx>mx[0])mx[0]=wx; if(wy<mn[1])mn[1]=wy; if(wy>mx[1])mx[1]=wy; if(wz<mn[2])mn[2]=wz; if(wz>mx[2])mx[2]=wz;
+                            }
+                            if (nv>0){
+                                float cx=(mn[0]+mx[0])*0.5f, cy=(mn[1]+mx[1])*0.5f, cz=(mn[2]+mx[2])*0.5f;
+                                float rx=mx[0]-mn[0],ry=mx[1]-mn[1],rz=mx[2]-mn[2]; float radius=0.5f*sqrtf(rx*rx+ry*ry+rz*rz); if(radius<0.01f)radius=0.5f;
+                                float fov=C.fovDeg*3.14159265f/180.0f; float dist=radius/tanf(fov*0.5f)*1.5f;
+                                C.pos[0]=cx; C.pos[1]=cy; C.pos[2]=cz+dist; C.yaw=0.0f; C.pitch=0.0f;
+                                snprintf(tmp,sizeof tmp,"framed mesh %d c=(%.2f,%.2f,%.2f) r=%.2f dist=%.2f\n", mi,cx,cy,cz,radius,dist); out+=tmp;
+                            } else { snprintf(tmp,sizeof tmp,"mesh %d has no verts\n", mi); out+=tmp; }
+                        }
+                    }
+                    else if (strncmp(ln, "matinfo=", 8) == 0) {   // dump a mesh's shader + VAT/bones/blend flags (diagnose fog/waterfall/plant/flock)
+                        int mi = atoi(ln + 8);
+                        if (mi >= 0 && mi < (int)sceneMeshes->size() && mi < (int)vkRenderer.gpuMeshes.size()) {
+                            const auto& md = (*sceneMeshes)[mi]; const auto& gm = vkRenderer.gpuMeshes[mi];
+                            snprintf(tmp,sizeof tmp,"[MATINFO %d] '%s' shader=%s\n", mi, md.name.c_str(), md.shaderPath.c_str()); out += tmp;
+                            snprintf(tmp,sizeof tmp,"  hasVat=%d hasBones=%d isSkinned=%d tiled=%d tex=%dx%d mdBlend=%d gmBlend=%d add=%d progIdx=%d stride=%u uvOff=%u\n",
+                                (int)md.hasVat,(int)md.hasBones,(int)gm.isSkinned,(int)md.tiled,md.texW,md.texH,(int)md.useBlend,(int)gm.useBlend,(int)gm.additive,gm.progIdx,gm.vboStride,gm.uvOffset); out += tmp;
                         }
                     }
                     else if (strncmp(ln, "hidemat=", 8) == 0)     vkRenderer.hideMat = ln + 8;   // std::string; empty = none (checked via .empty())

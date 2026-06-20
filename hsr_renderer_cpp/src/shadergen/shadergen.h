@@ -26,6 +26,7 @@ namespace shadergen {
 enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2 };
 
 struct Inst { int op; std::vector<uint32_t> w; };   // w[0] = header word (recomputed on emit), w[1..] = operands
+struct VStage { int64_t slot, spvOff; uint32_t spvLen; };   // one vertex stage: FlatBuffer uoffset slot, SPIR-V magic, len
 
 // ── little-endian + FlatBuffer (signed soffset) readers over the source bytes ──
 namespace detail {
@@ -95,19 +96,47 @@ inline bool findFwdVertSpv(const uint8_t* d, size_t N, int64_t& slot, int64_t& s
 }
 } // namespace detail
 
-// Generate an animated shader from a stock RENDSHAD `src`. Returns the new .surface.bin bytes (empty on failure).
-//   ROTATE   : p0 = omega (rad/s, signed)            ax,ay,az = axis
-//   OSCILLATE: p0 = amp (rad, signed), p1 = period s  ax,ay,az = axis
-//   UVSCROLL : p0 = rateU, p1 = rateV                (axis unused)
-inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode, float p0, float p1=0, float ax=0, float ay=1, float az=0){
+// Collect ALL vertex stages across ALL passes (forward + depth/shadow/motion). Mirrors findFwdVertSpv's pass/stage
+// discovery but returns EVERY Vertex-execution-model stage as {slot,spvOff,spvLen}, so the cook can animate them all.
+inline void collectVertStages(const uint8_t* d, size_t N, std::vector<VStage>& out){
     using namespace detail;
-    if (mode != UVSCROLL){ float l=std::sqrt(ax*ax+ay*ay+az*az); if (l<=0.f) l=1.f; ax/=l; ay/=l; az/=l; }  // axis -> unit (as the .py does)
-    const uint8_t* d = src.data(); size_t N = src.size();
-    int64_t slot=0, spvOff=0; uint32_t spvLen=0;
-    if (!findFwdVertSpv(d,N,slot,spvOff,spvLen)) return {};
+    int64_t root=u32(d,N,0); int64_t stagesBase=0; int nPasses=0,nStages=0;
+    for (int fi=0,nf=vt_nf(d,N,root); fi<nf; ++fi){
+        int64_t fp=vt_field(d,N,root,fi); if(!fp||!u32(d,N,fp)) continue;
+        int64_t vec=fp+u32(d,N,fp); if(vec+4>(int64_t)N) continue;
+        uint32_t cnt=u32(d,N,vec); if(!(cnt>0&&cnt<=64)) continue;
+        int64_t base=vec+4; if(base+(int64_t)cnt*4>(int64_t)N) continue;
+        int64_t e0=base+u32(d,N,base);
+        for(int ef=0,m=std::min(vt_nf(d,N,e0),4);ef<m;++ef)
+            if(str_at(d,N,vt_field(d,N,e0,ef)).rfind("forward",0)==0) nPasses=(int)cnt;
+        for(int ef=0,m=std::min(vt_nf(d,N,e0),4);ef<m;++ef){
+            int64_t sp=vt_field(d,N,e0,ef); if(!sp) continue;
+            int64_t sv=sp+u32(d,N,sp); if(sv+4>(int64_t)N) continue;
+            uint32_t L=u32(d,N,sv); if(L>500&&L<2000000&&sv+4+(int64_t)L<=(int64_t)N){ stagesBase=base; nStages=(int)cnt; }
+        }
+    }
+    if(!stagesBase||nPasses==0||nStages!=2*nPasses) return;
+    for(int si=0; si<nStages; ++si){
+        int64_t se=stagesBase+(int64_t)si*4; int64_t st=se+u32(d,N,se);
+        for(int ef=0,mm=std::min(vt_nf(d,N,st),6);ef<mm;++ef){
+            int64_t sp=vt_field(d,N,st,ef); if(!sp) continue;
+            int64_t vv=sp+u32(d,N,sp); if(vv+4>(int64_t)N) continue;
+            uint32_t L=u32(d,N,vv);
+            if(L>500&&vv+4+(int64_t)L<=(int64_t)N&&L%4==0&&u32(d,N,vv+4)==0x07230203){
+                const uint8_t* sd=d+vv+4; int em=-1; size_t nw2=L/4,i=5;
+                while(i<nw2){ uint32_t ins=u32(sd,L,(int64_t)i*4); uint32_t op=ins&0xffff,wc=ins>>16; if(!wc)break; if(op==15){em=(int)u32(sd,L,(int64_t)(i+1)*4);break;} i+=wc; }
+                if(em==0) out.push_back({sp, vv+4, L});
+                break;
+            }
+        }
+    }
+}
 
-    // parse the SPIR-V module into instructions
-    const uint8_t* sd = d + spvOff; size_t nw = spvLen/4;
+// Inject the getTime() animation into ONE vertex SPIR-V module (sd -> the 0x07230203 magic word, spvLen bytes).
+// Returns the grown module bytes, or {} if this stage can't be animated for this mode (lacks inPos/inUv — safe to skip).
+inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, Mode mode, float p0, float p1, float ax, float ay, float az){
+    using namespace detail;
+    size_t nw = spvLen/4;
     auto W=[&](size_t k){ return u32(sd,spvLen,(int64_t)k*4); };
     uint32_t version=W(1), generator=W(2), bound=W(3);
     std::vector<Inst> insts;
@@ -216,14 +245,33 @@ inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode,
     for (auto& t : out){ uint32_t hdr=((uint32_t)t.w.size()<<16)|(uint32_t)t.op; words.push_back(hdr); for (size_t j=1;j<t.w.size();++j) words.push_back(t.w[j]); }
     std::vector<uint8_t> mod(words.size()*4); memcpy(mod.data(), words.data(), mod.size());
 
-    // repack: append [u32 len][module] at EOF (4-aligned) and repoint the stage uoffset at `slot`
-    std::vector<uint8_t> o = src;
-    while (o.size()%4) o.push_back(0);
-    uint32_t nv = (uint32_t)o.size(), modLen=(uint32_t)mod.size();
-    o.insert(o.end(), (uint8_t*)&modLen, (uint8_t*)&modLen+4);
-    o.insert(o.end(), mod.begin(), mod.end());
-    uint32_t rel = nv - (uint32_t)slot; memcpy(o.data()+slot, &rel, 4);
-    return o;
+    return mod;
+}
+
+// Generate an animated shader from a stock RENDSHAD `src`. Returns the new .surface.bin bytes (empty on failure).
+//   ROTATE: p0=omega(rad/s), axis | OSCILLATE: p0=amp(rad), p1=period(s), axis | UVSCROLL: p0=rateU, p1=rateV
+// Animates EVERY vertex stage (all passes) so geometry/UV is consistent across the V205 multi-pass RenderGraph
+// (forward + depth + shadow + motion-vector). Editing only the forward stage left depth/motion using the un-animated
+// vertex on device -> depth-test/cull/motion mismatch = "animated meshes/textures don't render on device". (UV-scroll's
+// depth-only stages lack inUv -> editVertModule returns {} -> harmlessly skipped, so only real position stages grow.)
+inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode, float p0, float p1=0, float ax=0, float ay=1, float az=0){
+    using namespace detail;
+    if (mode != UVSCROLL){ float l=std::sqrt(ax*ax+ay*ay+az*az); if (l<=0.f) l=1.f; ax/=l; ay/=l; az/=l; }  // axis -> unit
+    const uint8_t* d = src.data(); size_t N = src.size();
+    std::vector<VStage> stages; collectVertStages(d, N, stages);
+    if (stages.empty()) return {};
+    std::vector<uint8_t> o = src; int edited = 0;
+    for (const auto& st : stages){
+        std::vector<uint8_t> mod = editVertModule(d + st.spvOff, st.spvLen, mode, p0, p1, ax, ay, az);
+        if (mod.empty()) continue;     // this vertex stage lacks the needed input for this mode -> skip (harmless)
+        while (o.size()%4) o.push_back(0);
+        uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
+        o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
+        o.insert(o.end(),mod.begin(),mod.end());
+        uint32_t rel=nv-(uint32_t)st.slot; memcpy(o.data()+st.slot,&rel,4);   // FlatBuffer uoffset is self-relative
+        ++edited;
+    }
+    return edited ? o : std::vector<uint8_t>();
 }
 
 } // namespace shadergen

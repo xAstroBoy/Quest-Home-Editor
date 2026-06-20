@@ -143,8 +143,29 @@ inline bool parseRendtxtrHeader(const std::vector<u8>& data, RendtxtrInfo& info)
 
 namespace astc {
 
+// IEEE half -> float (local copy so the parser has no dependency on ibl.h).
+inline float astcHalf2Float(uint16_t h) {
+    uint32_t s=(h&0x8000u)<<16, e=(h>>10)&0x1F, m=h&0x3FF, bits;
+    if (e==0){ if(m==0) bits=s; else { e=127-15+1; while(!(m&0x400)){m<<=1;--e;} m&=0x3FF; bits=s|(e<<23)|(m<<13);} }
+    else if (e==31) bits=s|0x7F800000u|(m<<13);
+    else bits=s|((e+(127-15))<<23)|(m<<13);
+    float f; std::memcpy(&f,&bits,4); return f;
+}
+
 inline bool decodeASTC(const u8* rawMips, u32 rawLen, u32 width, u32 height,
                        u32 bw, u32 bh, std::vector<u8>& outRGBA, bool hdr = false) {
+    // ⛔ UNCOMPRESSED RENDTXTR payloads (NOT ASTC): some maps are cooked raw — esp. tiny VAT placeholders like
+    // horror's `t_vat_blackblack` (1x1, formatCode 1, 8 bytes = one RGBA16F texel). astcenc rejects them
+    // (8 < a 16-byte ASTC block) -> "ASTC decode failed" + the texture was SKIPPED. Detect by exact byte-count
+    // (rawLen == w*h*8 -> RGBA16F half-float; == w*h*4 -> RGBA8) and decode directly. Generalizes to any env.
+    if (rawLen == (u32)((u64)width * height * 8)) {
+        outRGBA.resize((size_t)width * height * 4);
+        for (size_t i = 0; i < (size_t)width * height; ++i)
+            for (int c = 0; c < 4; ++c) { uint16_t h; std::memcpy(&h, rawMips + i*8 + c*2, 2);
+                float f = astcHalf2Float(h); int v = (int)(std::max(0.f, std::min(1.f, f)) * 255.f + 0.5f); outRGBA[i*4+c] = (u8)v; }
+        return true;
+    }
+    if (rawLen == (u32)((u64)width * height * 4)) { outRGBA.assign(rawMips, rawMips + (size_t)width*height*4); return true; }
     // Clamp to exactly the first mip's block data — extra mip tails make astcenc reject.
     u32 cols = (width  + bw - 1) / bw;
     u32 rows = (height + bh - 1) / bh;
@@ -195,7 +216,16 @@ inline bool decodeASTC(const u8* rawMips, u32 rawLen, u32 width, u32 height,
         err = runMT(&fimg);
         astcenc_context_free(ctx);
         if (err != ASTCENC_SUCCESS) return false;
-        for (size_t i = 0; i < fbuf.size(); ++i) { float v = fbuf[i]; v = v < 0 ? 0 : (v > 1 ? 1 : v); outRGBA[i] = (u8)(v * 255.0f + 0.5f); }
+        // Baked HDR lightmaps are RADIANCE. The device EXPOSES + ACES-tonemaps them; a raw [0,1] clamp leaves
+        // the baked lighting TOO DARK (chair/horror/candle). Apply exposure + ACES filmic to RGB so it reads
+        // naturally; alpha passes through linearly. HSR_LMEXP tunes the exposure.
+        float lmExp = g_lmExposure; if (const char* e = std::getenv("HSR_LMEXP")) { float ev=(float)atof(e); if (ev>0) lmExp=ev; }
+        for (size_t i = 0; i < fbuf.size(); ++i) {
+            float v = fbuf[i]; if (v < 0) v = 0;
+            if ((i & 3) != 3) { v *= lmExp; v = (v*(2.51f*v+0.03f))/(v*(2.43f*v+0.59f)+0.14f); }
+            v = v < 0 ? 0 : (v > 1 ? 1 : v);
+            outRGBA[i] = (u8)(v * 255.0f + 0.5f);
+        }
         return true;
     }
 
