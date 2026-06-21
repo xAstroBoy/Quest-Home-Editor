@@ -139,7 +139,7 @@ if(WIN32)
     # volk loads Vulkan at runtime — no vulkan-1.lib needed
     # miniaudio WASAPI backend needs COM (ole32) + winmm ; dbghelp = symbolized crash stack traces ;
     # ws2_32 = the HSR_LIVE HTTP control server (Winsock)
-    target_link_libraries(hsr_renderer PRIVATE ole32 winmm dbghelp ws2_32)
+    target_link_libraries(hsr_renderer PRIVATE ole32 winmm dbghelp ws2_32 opengl32)   # opengl32 = the pre-load "drop an .apk" window draws a simple GL splash
 elseif(APPLE)
     find_library(COCOA_LIBRARY Cocoa REQUIRED)
     find_library(IOKIT_LIBRARY IOKit REQUIRED)

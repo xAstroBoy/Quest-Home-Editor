@@ -151,6 +151,7 @@ static void hsrHttpServer(int port) {
 #include "miniz.h"
 #ifdef _WIN32
 #include <windows.h>
+#include <GL/gl.h>   // legacy GL for the pre-load "drop an .apk here" splash window
 #endif
 
 // Global state
@@ -365,19 +366,62 @@ int main(int argc, char** argv) {
         // GLFW window and wait for the user to DRAG an environment .apk onto it. Whatever they drop
         // is loaded and rendered from scratch (parse -> meshes -> textures -> shaders -> GPU -> render).
         if (!glfwInit()) { fprintf(stderr, "GLFW init failed\n"); return 1; }
+        bool got = false;
+#ifdef _WIN32
+        // A small CENTERED, NOT-always-on-top GL splash (the old window was GLFW_FLOATING = stole top focus, and a
+        // NO_API window draws undefined garbage). Renders a gradient + a dashed drop-zone with a gently bobbing arrow.
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
+        glfwWindowHint(GLFW_FLOATING, GLFW_FALSE);
+        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+        const int dw = 720, dh = 380;
+        GLFWwindow* dropWin = glfwCreateWindow(dw, dh, "HSR Renderer   —   drag an environment .apk here", nullptr, nullptr);
+        if (!dropWin) { fprintf(stderr, "GLFW window failed\n"); glfwTerminate(); return 1; }
+        if (GLFWmonitor* mon = glfwGetPrimaryMonitor()) { if (const GLFWvidmode* vm = glfwGetVideoMode(mon)) {
+            int mxp = 0, myp = 0; glfwGetMonitorPos(mon, &mxp, &myp);
+            glfwSetWindowPos(dropWin, mxp + (vm->width - dw) / 2, myp + (vm->height - dh) / 2); } }   // center
+        glfwMakeContextCurrent(dropWin); glfwSwapInterval(1);
+        glfwSetDropCallback(dropWin, dropCb);
+        glClearColor(0.06f, 0.07f, 0.11f, 1.f);
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glEnable(GL_LINE_SMOOTH);
+        g_doReload = false; g_dropPath.clear();
+        while (!glfwWindowShouldClose(dropWin) && !g_doReload) {
+            int fw, fh; glfwGetFramebufferSize(dropWin, &fw, &fh); glViewport(0, 0, fw, fh);
+            float asp = fh > 0 ? (float)fw / (float)fh : 1.f;
+            glClear(GL_COLOR_BUFFER_BIT);
+            glMatrixMode(GL_PROJECTION); glLoadIdentity(); glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+            glBegin(GL_QUADS);                                                   // vertical gradient backdrop
+              glColor3f(0.13f, 0.15f, 0.21f); glVertex2f(-1.f, 1.f); glVertex2f(1.f, 1.f);
+              glColor3f(0.05f, 0.06f, 0.09f); glVertex2f(1.f, -1.f); glVertex2f(-1.f, -1.f);
+            glEnd();
+            float bh = 0.60f, bx = 0.66f / asp;                                  // dashed drop-zone box (un-stretched)
+            glLineWidth(2.f); glEnable(GL_LINE_STIPPLE); glLineStipple(2, (GLushort)0x00FF);
+            glColor3f(0.30f, 0.52f, 0.68f);
+            glBegin(GL_LINE_LOOP); glVertex2f(-bx, bh); glVertex2f(bx, bh); glVertex2f(bx, -bh); glVertex2f(-bx, -bh); glEnd();
+            glDisable(GL_LINE_STIPPLE);
+            float bob = 0.05f * (float)std::sin(glfwGetTime() * 2.2);            // gentle bob
+            float ay = 0.18f + bob, ah = 0.24f, aw = 0.17f / asp;
+            glColor3f(0.46f, 0.80f, 0.96f); glLineWidth(6.f);
+            glBegin(GL_LINE_STRIP); glVertex2f(-aw, ay); glVertex2f(0.f, ay - ah); glVertex2f(aw, ay); glEnd();   // chevron
+            glBegin(GL_LINES); glVertex2f(0.f, ay - ah); glVertex2f(0.f, ay + ah); glEnd();                       // stem
+            glLineWidth(3.f); glColor3f(0.30f, 0.52f, 0.68f);                    // little tray line under the arrow
+            glBegin(GL_LINES); glVertex2f(-0.22f / asp, -0.34f); glVertex2f(0.22f / asp, -0.34f); glEnd();
+            glfwSwapBuffers(dropWin);
+            glfwWaitEventsTimeout(0.03);
+        }
+        got = g_doReload && !g_dropPath.empty();
+        apkPath = g_dropPath; g_doReload = false; g_dropPath.clear();
+        glfwDestroyWindow(dropWin);
+#else
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);   // on top so the drop target is easy to hit
-        GLFWwindow* dropWin = glfwCreateWindow(760, 300,
-            "HSR Renderer   —   drag an environment .apk onto this window", nullptr, nullptr);
+        GLFWwindow* dropWin = glfwCreateWindow(760, 300, "HSR Renderer — drag an environment .apk onto this window", nullptr, nullptr);
         if (!dropWin) { fprintf(stderr, "GLFW window failed\n"); glfwTerminate(); return 1; }
         glfwSetDropCallback(dropWin, dropCb);
         g_doReload = false; g_dropPath.clear();
-        // Block until something is dropped (g_doReload set by dropCb) or the window is closed.
         while (!glfwWindowShouldClose(dropWin) && !g_doReload) glfwWaitEvents();
-        bool got = g_doReload && !g_dropPath.empty();
-        apkPath = g_dropPath;
-        g_doReload = false; g_dropPath.clear();   // reset so the live render loop's drop handling is clean
+        got = g_doReload && !g_dropPath.empty();
+        apkPath = g_dropPath; g_doReload = false; g_dropPath.clear();
         glfwDestroyWindow(dropWin);
+#endif
         if (!got) { glfwTerminate(); return 0; }  // closed without dropping anything
     }
     fprintf(stderr, "[MAIN] APK: %s\n\n", apkPath.c_str());
@@ -791,6 +835,7 @@ int main(int argc, char** argv) {
     // ── Step B: Init GLFW + Vulkan ─────────────────────────────
     glfwSetErrorCallback(errorCb);
     if (!glfwInit()) { fprintf(stderr, "GLFW init failed\n"); return 1; }
+    glfwDefaultWindowHints();   // reset any sticky hints from the pre-load drop window (GL/floating/resizable) before the real Vulkan window
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     // COOKING MODE (HSR_EXPORT) = console-only: hide the window so it doesn't pop a white "frozen" window with no
     // feedback. The cook prints [GLTF]/[COOK]/[EXPORT] progress to the console; HSR_EXPORT_QUIT exits when done.

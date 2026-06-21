@@ -193,15 +193,38 @@ struct Editor {
         return added;
     }
     // ── PROJECT SAVE / LOAD — persist every editor change so a session survives a close/rebuild ──
-    // The .hsledit session file lives in a dedicated SAVE FOLDER (saved/<env>.hsledit), NOT scattered next to the
-    // source env. (Old saves next to the env still LOAD via the legacy fallback below, so nothing is lost.)
+    // The .hsledit session lives in a "saved/" folder. It must be found no matter the working directory / how the exe
+    // was launched (the old CWD-relative "saved/" broke when launched from the taskbar). So we look in a "saved/" subfolder
+    // at EVERY ancestor of the env (nearest first) — finds the repo-level saved/ that already holds your sessions.
+    std::string sessionPath;   // the .hsledit path load/save actually used this session (so save round-trips to it)
     std::string projectBase() const {
         if (projectPath.empty()) return "editor_project";
         size_t sl=projectPath.find_last_of("/\\"); std::string n=(sl==std::string::npos)?projectPath:projectPath.substr(sl+1);
         return n;
     }
-    std::string projectFile() const { std::error_code ec; std::filesystem::create_directories("saved", ec); return "saved/" + projectBase() + ".hsledit"; }
-    std::string projectFileLegacy() const { return projectPath.empty() ? std::string("editor_project.hsledit") : projectPath + ".hsledit"; }
+    // Candidate session-FILE paths, nearest-to-the-env first. NOTE: pure path math — no directory is created here (the old
+    // create_directories side-effect made an empty co-located saved/ that then SHADOWED the real repo-level one).
+    std::vector<std::string> projectCandidates() const {
+        std::vector<std::string> c; namespace fs = std::filesystem; std::error_code ec;
+        std::string base = projectBase() + ".hsledit";
+        if (!projectPath.empty()) {
+            fs::path env = fs::absolute(fs::path(projectPath), ec);
+            for (fs::path d = env.parent_path(); ; ) { c.push_back((d / "saved" / base).string());
+                fs::path up = d.parent_path(); if (up == d || up.empty()) break; d = up; }
+            c.push_back(projectPath + ".hsledit");          // legacy: next to the env file
+        }
+        c.push_back("saved/" + base);                       // legacy: CWD-relative saved/
+        return c;
+    }
+    // Where saveProject writes: the file we loaded (round-trip), else the first EXISTING saved/ folder up the tree, else
+    // co-locate a new saved/ next to the env (created here, on demand).
+    std::string saveTargetFile() {
+        if (!sessionPath.empty()) return sessionPath;
+        namespace fs = std::filesystem; std::error_code ec; auto cands = projectCandidates();
+        for (auto& c : cands) { if (fs::is_directory(fs::path(c).parent_path(), ec)) return c; }
+        if (!cands.empty()) { fs::create_directories(fs::path(cands[0]).parent_path(), ec); return cands[0]; }
+        std::filesystem::create_directories("saved", ec); return "saved/" + projectBase() + ".hsledit";
+    }
     static std::string qstr(const std::string& s){ std::string o="\""; for(char c:s){ if(c=='"'||c=='\\') o+='\\'; o+=c; } o+='"'; return o; }
     static std::vector<std::string> tokenize(const std::string& line){
         std::vector<std::string> t; size_t i=0;
@@ -214,7 +237,9 @@ struct Editor {
         return t;
     }
     void saveProject(){
-        FILE* f=fopen(projectFile().c_str(),"wb"); if(!f){ setStatus("SAVE FAILED: "+projectFile()); return; }
+        std::string target=saveTargetFile();
+        FILE* f=fopen(target.c_str(),"wb"); if(!f){ setStatus("SAVE FAILED: "+target); return; }
+        sessionPath=target;   // future saves/loads round-trip to here
         fprintf(f,"HSLEDIT 2\n");
         fprintf(f,"CAM %.4f %.4f %.4f %.5f %.5f\n", r->cam.pos[0],r->cam.pos[1],r->cam.pos[2], r->cam.yaw, r->cam.pitch);
         // HSL render + cook config (fog / far / skybox / cull / collision / audio) — persisted with the session so it
@@ -239,12 +264,16 @@ struct Editor {
         if(!skyboxMeshes.empty()){ fprintf(f,"SKYBOX %d", (int)skyboxMeshes.size()); for(int m:skyboxMeshes) fprintf(f," %d", m); fprintf(f,"\n"); }   // persist far-backdrop skybox marks
         { int n=0; for(auto& it:items) if(it.hidden) n++; if(n){ fprintf(f,"IHIDE %d",n); for(int i=0;i<(int)items.size();++i) if(items[i].hidden) fprintf(f," %d",i); fprintf(f,"\n"); } }  // per-item visibility eyes
         fclose(f);
-        setStatus("Saved -> "+projectFile());
+        setStatus("Saved -> "+target);
     }
     void loadProject(){
-        FILE* f=fopen(projectFile().c_str(),"rb");
-        if(!f) f=fopen(projectFileLegacy().c_str(),"rb");   // MIGRATE: load old saves that lived next to the env
-        if(!f) return;
+        // Try every "saved/<env>.hsledit" up the env's directory tree (nearest first) — checks the FILE itself, so an
+        // empty co-located saved/ never shadows the real one. First hit wins and becomes the round-trip target.
+        FILE* f=nullptr; std::string used;
+        for (auto& c : projectCandidates()) { f=fopen(c.c_str(),"rb"); if(f){ used=c; break; } }
+        if(!f){ fprintf(stderr,"[EDIT] no saved session found for this env (none of the saved/<env>.hsledit candidates exist)\n"); return; }
+        sessionPath=used;
+        fprintf(stderr,"[EDIT] loaded session: %s\n", used.c_str());
         std::string all; fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ all.resize(n); fread(&all[0],1,n,f);} fclose(f);
         items.clear(); selItem=-1; deselectAll(); animColliders.clear(); skyboxMeshes.clear();
         size_t p=0; int meshN=0, itemN=0;
@@ -274,7 +303,7 @@ struct Editor {
             else if(t[0]=="IHIDE"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k){ int idx=atoi(t[2+k].c_str()); if(idx>=0&&idx<(int)items.size()) items[idx].hidden=true; } }   // restore per-item visibility eyes
         }
         didAutoSel = true;   // a session was restored -> don't let frame-1 auto-focus clobber the restored camera
-        setStatus("Loaded "+std::to_string(meshN)+" mesh edits + "+std::to_string(itemN)+" items from "+projectFile());
+        setStatus("Loaded "+std::to_string(meshN)+" mesh edits + "+std::to_string(itemN)+" items from "+sessionPath);
     }
     // V79 stores NO navmesh file — the LocomotionSystem generates it from the walkable ground geometry at runtime.
     // So auto-add a NAVMESH item sourced from the env's ground/floor/terrain meshes (the faithful re-creation; the
