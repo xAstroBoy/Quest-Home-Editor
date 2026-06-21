@@ -81,6 +81,7 @@ struct Editor {
     bool showItems = true;         // item markers visible (the things you add are always shown)
     bool showFarClip = false;      // viewport overlay: draw the device far-clip (PortalStereoCamera far=5000) boundary sphere
     bool showType[sitem::TYPE_COUNT] = { true,true,true,true,true,true,true };   // per-Meta-component visibility toggles
+    bool showMeshCol = true;       // DEDICATED viewport toggle for ADDED mesh colliders (markers + gizmo). Off = hide them so you can edit meshes.
     // distinct marker colours (deliberately AVOID the gizmo's R/G/B axes): cyan / orange / magenta / teal / purple / yellow
     uint32_t typeColor(int t, bool seld) const {
         switch (t) {
@@ -147,8 +148,15 @@ struct Editor {
         return added;
     }
     // ── PROJECT SAVE / LOAD — persist every editor change so a session survives a close/rebuild ──
-    // Sidecar text file next to the env (<env>.hsledit): camera + per-mesh transform/visibility/RENAME + all scene items.
-    std::string projectFile() const { return projectPath.empty() ? std::string("editor_project.hsledit") : projectPath + ".hsledit"; }
+    // The .hsledit session file lives in a dedicated SAVE FOLDER (saved/<env>.hsledit), NOT scattered next to the
+    // source env. (Old saves next to the env still LOAD via the legacy fallback below, so nothing is lost.)
+    std::string projectBase() const {
+        if (projectPath.empty()) return "editor_project";
+        size_t sl=projectPath.find_last_of("/\\"); std::string n=(sl==std::string::npos)?projectPath:projectPath.substr(sl+1);
+        return n;
+    }
+    std::string projectFile() const { std::error_code ec; std::filesystem::create_directories("saved", ec); return "saved/" + projectBase() + ".hsledit"; }
+    std::string projectFileLegacy() const { return projectPath.empty() ? std::string("editor_project.hsledit") : projectPath + ".hsledit"; }
     static std::string qstr(const std::string& s){ std::string o="\""; for(char c:s){ if(c=='"'||c=='\\') o+='\\'; o+=c; } o+='"'; return o; }
     static std::vector<std::string> tokenize(const std::string& line){
         std::vector<std::string> t; size_t i=0;
@@ -164,6 +172,11 @@ struct Editor {
         FILE* f=fopen(projectFile().c_str(),"wb"); if(!f){ setStatus("SAVE FAILED: "+projectFile()); return; }
         fprintf(f,"HSLEDIT 2\n");
         fprintf(f,"CAM %.4f %.4f %.4f %.5f %.5f\n", r->cam.pos[0],r->cam.pos[1],r->cam.pos[2], r->cam.yaw, r->cam.pitch);
+        // HSL render + cook config (fog / far / skybox / cull / collision / audio) — persisted with the session so it
+        // survives a reload (was lost before). Saved in the same .hsledit save folder, not a separate scattered file.
+        fprintf(f,"CFG %d %.3f %.3f %.3f %.1f %.4f %.0f %d %.0f %d %d %d %d %d\n",
+            cfgFog?1:0, cfgFogColor[0],cfgFogColor[1],cfgFogColor[2], cfgFogStart, cfgFogDensity, cfgFar,
+            skybox?1:0, skyboxDist, noCull?1:0, solidCollision?1:0, animSkinned?1:0, cookAudio?1:0, previewAudio?1:0);
         for(int i=0;i<(int)r->gpuMeshes.size();++i){ auto& gm=r->gpuMeshes[i];
             fprintf(f,"MESH %d %s %.5f %.5f %.5f %.6f %.6f %.6f %.6f %.5f %.5f %.5f %d\n", i, qstr(gm.name).c_str(),
                 gm.editT[0],gm.editT[1],gm.editT[2], gm.editR[0],gm.editR[1],gm.editR[2],gm.editR[3],
@@ -179,11 +192,14 @@ struct Editor {
         }
         if(!animColliders.empty()){ fprintf(f,"COLLIDERS %d", (int)animColliders.size()); for(int m:animColliders) fprintf(f," %d", m); fprintf(f,"\n"); }
         if(!skyboxMeshes.empty()){ fprintf(f,"SKYBOX %d", (int)skyboxMeshes.size()); for(int m:skyboxMeshes) fprintf(f," %d", m); fprintf(f,"\n"); }   // persist far-backdrop skybox marks
+        { int n=0; for(auto& it:items) if(it.hidden) n++; if(n){ fprintf(f,"IHIDE %d",n); for(int i=0;i<(int)items.size();++i) if(items[i].hidden) fprintf(f," %d",i); fprintf(f,"\n"); } }  // per-item visibility eyes
         fclose(f);
         setStatus("Saved -> "+projectFile());
     }
     void loadProject(){
-        FILE* f=fopen(projectFile().c_str(),"rb"); if(!f) return;
+        FILE* f=fopen(projectFile().c_str(),"rb");
+        if(!f) f=fopen(projectFileLegacy().c_str(),"rb");   // MIGRATE: load old saves that lived next to the env
+        if(!f) return;
         std::string all; fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ all.resize(n); fread(&all[0],1,n,f);} fclose(f);
         items.clear(); selItem=-1; deselectAll(); animColliders.clear(); skyboxMeshes.clear();
         size_t p=0; int meshN=0, itemN=0;
@@ -191,6 +207,7 @@ struct Editor {
             size_t e=all.find('\n',p); std::string line=all.substr(p, e==std::string::npos?std::string::npos:e-p); p=(e==std::string::npos)?all.size():e+1;
             auto t=tokenize(line); if(t.empty()) continue;
             if(t[0]=="CAM" && t.size()>=6){ r->cam.pos[0]=(float)atof(t[1].c_str()); r->cam.pos[1]=(float)atof(t[2].c_str()); r->cam.pos[2]=(float)atof(t[3].c_str()); r->cam.yaw=(float)atof(t[4].c_str()); r->cam.pitch=(float)atof(t[5].c_str()); }
+            else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
             else if(t[0]=="MESH" && t.size()>=14){ int idx=atoi(t[1].c_str()); if(idx>=0&&idx<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[idx];
                 gm.name=t[2]; gm.editT[0]=(float)atof(t[3].c_str()); gm.editT[1]=(float)atof(t[4].c_str()); gm.editT[2]=(float)atof(t[5].c_str());
                 gm.editR[0]=(float)atof(t[6].c_str()); gm.editR[1]=(float)atof(t[7].c_str()); gm.editR[2]=(float)atof(t[8].c_str()); gm.editR[3]=(float)atof(t[9].c_str());
@@ -209,6 +226,7 @@ struct Editor {
                 items.push_back(std::move(it)); itemN++; }
             else if(t[0]=="COLLIDERS"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) animColliders.push_back(atoi(t[2+k].c_str())); }
             else if(t[0]=="SKYBOX"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) skyboxMeshes.push_back(atoi(t[2+k].c_str())); }   // restore far-backdrop skybox marks
+            else if(t[0]=="IHIDE"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k){ int idx=atoi(t[2+k].c_str()); if(idx>=0&&idx<(int)items.size()) items[idx].hidden=true; } }   // restore per-item visibility eyes
         }
         didAutoSel = true;   // a session was restored -> don't let frame-1 auto-focus clobber the restored camera
         setStatus("Loaded "+std::to_string(meshN)+" mesh edits + "+std::to_string(itemN)+" items from "+projectFile());
@@ -269,6 +287,7 @@ struct Editor {
     bool cookAudio = true;             // DEFAULT ON: bake the env's background audio loop into the cooked APK. Toggle off = silent home.
     bool previewAudio = true;          // DEFAULT ON: play the env's background loop HERE on the PC while previewing. Toggle off = mute desktop playback (drives g_audioMuted).
     bool solidCollision = true;        // DEFAULT ON: cook a REAL double-sided trimesh collider (floor+walls+columns, haven2025 SEBD format). Off = floor-only ColliderBox grid.
+    bool prevSolidCol = true;          // tracks solidCollision so the navmesh gizmo re-bakes (walls appear/vanish in the preview) when it's toggled.
     bool installAfterCook = true;      // DEFAULT ON: cook -> sign -> install to the headset. The installer auto-detects
                                        // adb root: ROOT -> install the UNSPOOFED own-package APK (+ auto-select it);
                                        // NO root -> back up the real haven2025, then install the haven2025 SPOOF.
@@ -617,12 +636,15 @@ struct Editor {
         { const char* s = gizmoLocal?"Local":"World"; float w=dl.textW(s)+14*uiScale; if (cx.tab(ui::hashId("axspace"), px+6*uiScale, v.offset.y, w, bh, s, false)) gizmoLocal=!gizmoLocal; px+=w+6*uiScale; }
         { const char* s = playSim?"Stop (P)":"Walk (P)"; float w=dl.textW(s)+16*uiScale; if (cx.tab(ui::hashId("walksim"), px+10*uiScale, v.offset.y, w, bh, s, playSim)) { if(playSim) stopSim(); else startSim(); } px+=w+16*uiScale; }
         // camera fly speed (drag or type) — in the header strip so it never fires a viewport pick
-        { cx.textAligned(px, v.offset.y, 34*uiScale, bh, "Spd", th.textDim, 0); cx.dragFloat(ui::hashId("camspd"), px+34*uiScale, v.offset.y+1*uiScale, 54*uiScale, bh-2*uiScale, r->cam.speed, 0.1f, "%.1f"); }
+        { cx.textAligned(px, v.offset.y, 34*uiScale, bh, "Spd", th.textDim, 0); cx.dragFloat(ui::hashId("camspd"), px+34*uiScale, v.offset.y+1*uiScale, 54*uiScale, bh-2*uiScale, r->cam.speed, 0.1f, "%.1f"); px+=92*uiScale; }
+        // PC PREVIEW AUDIO — front-and-center toggle (was buried in cook options). Mutes/unmutes the desktop background loop.
+        { const char* s = previewAudio?"\xF0\x9F\x94\x8A Audio On":"\xF0\x9F\x94\x87 Audio Off"; float w=dl.textW(s)+16*uiScale;
+          if (cx.tab(ui::hashId("hdraudio"), px+8*uiScale, v.offset.y, w, bh, s, previewAudio)) { previewAudio=!previewAudio; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); } px+=w+8*uiScale; }
         if (playSim) cx.textAligned(v.offset.x+8*uiScale, v.offset.y+v.extent.height-40*uiScale, v.extent.width-16, 18*uiScale, "WALK MODE — WASD+mouse to walk the navmesh, P to exit", ui::rgba(120,230,140), 0);
         // overlay toggles (the navmesh/collider/spawn gizmos) — SEPARATE + all OFF by default, right of the header
-        const char* ov[4]={"Navmesh","Colliders","Spawn","Far-clip"}; bool* ovp[4]={&r->showNavmesh,&r->showCollision,&r->showSpawn,&showFarClip};
+        const char* ov[5]={"Navmesh","Colliders","Spawn","Far-clip","Collision"}; bool* ovp[5]={&r->showNavmesh,&r->showCollision,&r->showSpawn,&showFarClip,&showMeshCol};
         float ox = v.offset.x + v.extent.width - 6*uiScale;
-        for (int i=3;i>=0;--i){ float ow=dl.textW(ov[i])+16*uiScale; ox-=ow+3*uiScale; if (cx.tab(ui::hashId(2100+i,9), ox, (float)v.offset.y, ow, bh, ov[i], *ovp[i])) *ovp[i]=!*ovp[i]; }
+        for (int i=4;i>=0;--i){ float ow=dl.textW(ov[i])+16*uiScale; ox-=ow+3*uiScale; if (cx.tab(ui::hashId(2100+i,9), ox, (float)v.offset.y, ow, bh, ov[i], *ovp[i])) *ovp[i]=!*ovp[i]; }
         // stats (bottom-left)
         char st[128]; snprintf(st,sizeof st,"%zu objects   sel: %s", r->gpuMeshes.size(), selected>=0?r->gpuMeshes[selected].name.c_str():"-");
         cx.textAligned(v.offset.x+8*uiScale, v.offset.y+v.extent.height-20*uiScale, v.extent.width-16, 18*uiScale, st, th.textDim, 0);
@@ -679,11 +701,13 @@ struct Editor {
             for (int i=0;i<nItems;++i, ry+=rowH) { if (!onScreen(ry)) continue;
                 auto& it=items[i]; bool seld=(i==selItem);
                 if (seld) dl.rect(x,ry,w,rowH,th.rowSel); else if (cx.hover(x,ry,w,rowH)) dl.rect(x,ry,w,rowH,th.rowHover);
+                // VISIBILITY EYE (same as the mesh rows) — hides this item's marker + gizmo. Was missing: scene items only had the 'x' delete.
+                bool vis=!it.hidden; bool eyeClicked = eyeToggle(x+12*uiScale, ry+rowH*0.5f, vis); if (eyeClicked) it.hidden=!vis;
                 char lbl[180]; snprintf(lbl,sizeof lbl,"%s   %s", it.name.c_str(), sitem::typeName(it.type));
-                cx.textAligned(x+16*uiScale,ry,w-36*uiScale,rowH,lbl, seld?th.textSel:th.text, 0);
+                cx.textAligned(x+28*uiScale,ry,w-48*uiScale,rowH,lbl, it.hidden?th.textDim:(seld?th.textSel:th.text), 0);
                 float ex=x+w-15*uiScale; bool dh=cx.hover(ex-3*uiScale,ry,18*uiScale,rowH);
                 cx.textAligned(ex,ry,14*uiScale,rowH,"x", dh?ui::rgba(255,120,120):th.textDim, 0);
-                if (!addMenuOpen && cx.hover(x,ry,w,rowH) && cx.in.pressed[0]) { if (dh) { items.erase(items.begin()+i); selItem=-1; dl.popClip(); return; } selItem=i; deselectAll(); focusItem(i); }   // pick -> focus on it
+                if (!addMenuOpen && !eyeClicked && cx.hover(x,ry,w,rowH) && cx.in.pressed[0]) { if (dh) { items.erase(items.begin()+i); selItem=-1; dl.popClip(); return; } selItem=i; deselectAll(); focusItem(i); }   // pick -> focus on it
             }
         }
         if (onScreen(ry)) cx.textAligned(x+6*uiScale,ry,w,rowH,"MESHES",th.textDim,0); ry+=rowH;
@@ -1010,7 +1034,8 @@ struct Editor {
         char hb[48]; snprintf(hb,sizeof hb,"Navmeshes in scene: %d", n); cx.label(x,y,w,rh,hb,th.text); y+=rh+3*uiScale;
         for (int i=0;i<(int)items.size();++i){ auto& it=items[i]; if(it.type!=sitem::NAVMESH) continue;
             bool seld=(i==selItem); char b[110]; snprintf(b,sizeof b,"%s  [%d tris]", it.name.c_str(), (int)(it.navIdx.size()/3));
-            if (cx.button(ui::hashId(7800u+(unsigned)i, 5u), x, y, w-58*uiScale, rh, b, seld)) { deselectAll(); selItem=i; tab=TAB_OBJECT; }
+            bool vis=!it.hidden; if (eyeToggle(x+9*uiScale, y+rh*0.5f, vis)) it.hidden=!vis;   // per-item visibility eye (marker + gizmo)
+            if (cx.button(ui::hashId(7800u+(unsigned)i, 5u), x+22*uiScale, y, w-80*uiScale, rh, b, seld)) { deselectAll(); selItem=i; tab=TAB_OBJECT; }
             if (cx.button(ui::hashId(7900u+(unsigned)i, 5u), x+w-56*uiScale, y, 54*uiScale, rh, "Delete")) { items.erase(items.begin()+i); if(selItem==i)selItem=-1; else if(selItem>i)selItem--; --i; }
             y+=rh+2*uiScale;
         }
@@ -1087,10 +1112,10 @@ struct Editor {
         cx.tip(x,y0,w,th.rowH,"Emit scene-spanning bounds so the V205 shell NEVER culls/clips\nyour meshes (frustum + Hi-Z occlusion + distance + CLOD budget).\nThe old V79 shell had NO environment culler, so this matches how\nold homes looked. Geometry still sits at its real position; only\nculling is defeated. Trades the Quest's culling perf for full\nvisibility. Keep ON if cooked homes clip / disappear at distance."); y+=th.rowH+6*uiScale;
         y0=y; cx.checkbox(ui::hashId("cookaudio"), x, y, "Ship background audio loop", cookAudio);
         cx.tip(x,y0,w,th.rowH,"Bake the environment's background audio loop into the cooked APK\n(FMOD asset placed at the spawn). Turn OFF for a silent home."); y+=th.rowH+2*uiScale;
-        y0=y; cx.checkbox(ui::hashId("prevaudio"), x, y, "Play preview audio (PC)", previewAudio);
-        cx.tip(x,y0,w,th.rowH,"Play the env's background loop HERE on the desktop while you preview.\nToggle off to MUTE the PC playback live — does not affect what ships."); y+=th.rowH+6*uiScale;
+        // (PC preview-audio toggle moved to the viewport header strip — always visible, not buried here.)
         y0=y; cx.checkbox(ui::hashId("solidcol"), x, y, "Solid wall collision (trimesh)", solidCollision);
         cx.tip(x,y0,w,th.rowH,"Cook a REAL double-sided triangle-mesh collider for the whole env —\nwalk on floors AND get blocked by walls/columns, enter rooms through\ndoorways (haven2025's cooked-PhysX SEBD format, device-verified).\nOFF = a floor-only ColliderBox grid (walkable but you phase walls)."); y+=th.rowH+6*uiScale;
+        if (solidCollision != prevSolidCol) { prevSolidCol = solidCollision; bakeNavmeshes(items); }   // re-bake so the gizmo shows floor+walls (on) / floor-only (off)
         g_audioMuted.store(!previewAudio, std::memory_order_relaxed);   // bind the toggle to the live audio-callback mute flag
         y0=y; cx.checkbox(ui::hashId("skybox"), x, y, "Far backdrop -> skybox (escapes the 5000 far-clip dome)", skybox);
         cx.tip(x,y0,w,th.rowH,"Route distant geometry (centroid > the meters below) to the\nSkyboxPlatformComponent pass, which is EXEMPT from the shell's\nhard PortalStereoCamera far=5000 clip (the black dome locked to\nyour head). This is the ONLY way official homes/vistas show km-\ndistant scenery — they skybox it, they do NOT use a bigger far.\nThe backdrop becomes camera-locked (no walk-up parallax), which\nis imperceptible at km range. Near/mid geometry stays walkable."); y+=th.rowH+2*uiScale;
@@ -1276,7 +1301,7 @@ struct Editor {
         exitHVis=false;
         VkRect2D v=rcViewport; dl.pushClip((float)v.offset.x,(float)v.offset.y,(float)v.extent.width,(float)v.extent.height);
         for (int i=0;i<(int)items.size();++i){
-            auto& it=items[i]; if (!showType[it.type]) continue;
+            auto& it=items[i]; if (!itemShown(it)) continue;
             bool seld=(i==selItem); float th=seld?2.6f:1.5f; uint32_t col=typeColor(it.type, seld);
             float q[4]; eulerToQuat(it.rot,q);
             float s[2]; bool on=worldToScreen(it.pos,s[0],s[1]);
@@ -1334,7 +1359,7 @@ struct Editor {
     }
     int pickItem(double mx, double my){
         if (!showItems) return -1; int best=-1; float bd=20*uiScale*20*uiScale;
-        for (int i=0;i<(int)items.size();++i){ if (!showType[items[i].type]) continue; float p[3]; itemMarkerPos(items[i],p); float s[2]; if (!worldToScreen(p,s[0],s[1])) continue; float d=(s[0]-mx)*(s[0]-mx)+(s[1]-my)*(s[1]-my); if (d<bd){bd=d;best=i;} }
+        for (int i=0;i<(int)items.size();++i){ if (!itemShown(items[i])) continue; float p[3]; itemMarkerPos(items[i],p); float s[2]; if (!worldToScreen(p,s[0],s[1])) continue; float d=(s[0]-mx)*(s[0]-mx)+(s[1]-my)*(s[1]-my); if (d<bd){bd=d;best=i;} }
         return best;
     }
     int gizmoHitTest(float mx, float my) {
@@ -1356,6 +1381,11 @@ struct Editor {
     void drawGizmo() {
         gzVisible = false;
         bool itemMode = selItem>=0 && selItem<(int)items.size();
+        // A HIDDEN item must hide its GIZMO too, not just the marker overlay — else the gizmo stays on top of the mesh
+        // and keeps intercepting clicks (gizmoHitTest), so you can't select/edit meshes again. For NAVMESH items (mesh
+        // colliders / navmeshes) "hidden" = the TOP header toggle ("Colliders"/"Navmesh") is off — that's the toggle
+        // the user clicks to hide a collider and edit more. Hidden -> gizmo drops -> clicks fall through to mesh pick.
+        if (itemMode && !itemShown(items[selItem])) itemMode = false;
         if (!itemMode && (selected<0 || selected>=(int)r->gpuMeshes.size())) return;
         float origin[3], gizQuat[4]={0,0,0,1};
         if (itemMode) { auto& it=items[selItem];
@@ -1486,14 +1516,14 @@ struct Editor {
         return ems;
     }
     static std::string cookShellPath() { const char* v=std::getenv("HSR_COOK_SHELL"); return v?v:"(embedded shell)"; }   // donor is baked in; path is a label only
-    std::string cookOutPath() {   // STANDALONE: write next to the loaded env (always writable), not a fixed cooker/out
-        if (const char* v=std::getenv("HSR_COOK_OUT")) return v;
+    std::string cookOutPath() {   // ALL cooked APKs land in a single `cooked/` folder next to `cooker/` (cwd = project root,
+        if (const char* v=std::getenv("HSR_COOK_OUT")) return v;             // where the cook already reads/writes cooker/*).
+        std::string base = "edited_export";
         if (!projectPath.empty()) { size_t sl=projectPath.find_last_of("/\\");
-            std::string dir = (sl==std::string::npos)? std::string(".") : projectPath.substr(0,sl);
-            std::string base = (sl==std::string::npos)? projectPath : projectPath.substr(sl+1);
-            size_t dot=base.rfind('.'); if(dot!=std::string::npos) base=base.substr(0,dot);
-            return dir + "/" + base + "_cooked.apk"; }
-        return "cooker/out/edited_export.apk";
+            base = (sl==std::string::npos)? projectPath : projectPath.substr(sl+1);
+            size_t dot=base.rfind('.'); if(dot!=std::string::npos) base=base.substr(0,dot); }
+        std::error_code ec; std::filesystem::create_directories("cooked", ec);   // make the output dir (no-op if it exists)
+        return "cooked/" + base + "_cooked.apk";
     }
 
     void setStage(float f, const char* s){ cookProg.store(f); std::lock_guard<std::mutex> l(statusMx); cookStage=s; }
@@ -1822,7 +1852,7 @@ struct Editor {
         // REUSE the actual walkable triangles (NO rebuilt grid) -> the cook makes one TILTED collision box per triangle,
         // so the collision follows the road's exact shape/height/tilt. (Very dense meshes: the cook falls back to a height
         // grid; the editor caps the stored count for preview sanity.)
-        int keep = 1; while ((int)(tb.size()/keep) > 80000) keep++;   // safety cap for the previewed/stored tri count
+        int keep = 1; while ((int)(tb.size()/keep) > 500000) keep++;   // store the FULL walkable surface (the cook + preview read this); only decimate absurdly dense meshes
         for (size_t i=0;i<tb.size(); i+=keep){ const TB& t=tb[i];
             uint32_t b=(uint32_t)(si.navVerts.size()/3);
             float v[9]={t.ax,t.ay,t.az, t.bx,t.by,t.bz, t.cx,t.cy,t.cz}; for(float f:v) si.navVerts.push_back(f);
@@ -1856,9 +1886,19 @@ struct Editor {
         sitem::Item it; it.type=sitem::NAVMESH; it.navMode=2; it.srcMeshes={m};   // STATIC mesh -> separate ColliderMesh entity
         it.name="Collider ("+gm.name+")";
         bakeNavGeometry(it);
-        deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; showType[sitem::NAVMESH]=true; tab=TAB_OBJECT;
+        deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; showType[sitem::NAVMESH]=true; showMeshCol=true; tab=TAB_OBJECT;
     }
     bool isAnimCollider(int m) const { return std::find(animColliders.begin(),animColliders.end(),m)!=animColliders.end(); }
+    // A NAVMESH editor item is a MESH COLLIDER (added via "Add Mesh Collider") vs a walkable navmesh, by its name.
+    bool isMeshColliderItem(const sitem::Item& it) const { return it.type==sitem::NAVMESH && it.name.rfind("Collider",0)==0; }
+    // Whether a scene item's marker + GIZMO are shown. Mesh colliders get their OWN dedicated viewport toggle
+    // (showMeshCol) on top of the Meta-Components eye — that's the quick "hide the collider so I can edit meshes"
+    // control. When hidden, drawGizmo/pickItem skip it so the gizmo stops intercepting clicks.
+    bool itemShown(const sitem::Item& it) const {
+        if (it.hidden) return false;                                   // per-item eye (Scene Items list / navmesh list)
+        if (it.type==sitem::NAVMESH) return showMeshCol && showType[sitem::NAVMESH];   // "Collision" header hides ALL navmesh+collider overlays
+        return showType[it.type];
+    }
 
     // ── PLAYER SIMULATOR: glue the fly-cam to the walkable surface so you can WALK the env in-editor (test the
     //    navmesh / floor / spawn / colliders without cooking). Steer with the normal WASD+mouse fly controls;
@@ -1906,15 +1946,17 @@ struct Editor {
         const auto& V=it.navVerts; const auto& I=it.navIdx;
         if (V.size()<9 || I.size()<3){ for (int m:it.srcMeshes) if (m>=0&&m<(int)r->gpuMeshes.size()) drawAabbBox(r->gpuMeshes[m]); return; }
         float M[16]; itemTRS(it,M);   // apply the item's T·R·S (the gizmo edits this) so moving the gizmo moves the navmesh
-        size_t ntri=I.size()/3, maxTri=12000, stride = ntri>maxTri ? ntri/maxTri : 1;
+        // Draw the FULL collision surface (was capped at 12000 tris -> a misleading "colander" of sparse triangles even
+        // though the cooked collider is solid). 120k keeps it solid-looking for big multi-mesh selections at editor FPS.
+        size_t ntri=I.size()/3, maxTri=120000, stride = ntri>maxTri ? ntri/maxTri : 1;
         uint32_t fillCol=ui::withA(col,60), edgeCol=ui::withA(col,180);   // FILLED translucent green surface + edges (haven2025 look)
         for (size_t t=0;t<ntri;t+=stride){
             uint32_t a=I[t*3],b=I[t*3+1],d=I[t*3+2];
             if ((size_t)a*3+2>=V.size()||(size_t)b*3+2>=V.size()||(size_t)d*3+2>=V.size()) continue;
             float wa[3],wb[3],wd[3]; xformPoint(M,&V[a*3],wa); xformPoint(M,&V[b*3],wb); xformPoint(M,&V[d*3],wd);
             uint32_t fc=fillCol, ec=edgeCol;
-            if (navColorBySlope) {   // DEBUG: colorize each triangle by SLOPE so the non-smoothness is visible —
-                // flat/up (smooth & walkable) = green, gentle slope = yellow, steep (bumpy/unwalkable) = red.
+            if (navColorBySlope || solidCollision) {   // SOLID COLLISION (or debug): color each triangle by SLOPE so you SEE the real collider —
+                // walkable floor = GREEN, vertical WALLS/columns = RED (the solid surfaces you'll be blocked by). Matches haven2025's nav/wall gizmo convention.
                 float e1[3]={wb[0]-wa[0],wb[1]-wa[1],wb[2]-wa[2]}, e2[3]={wd[0]-wa[0],wd[1]-wa[1],wd[2]-wa[2]};
                 float nx=e1[1]*e2[2]-e1[2]*e2[1], ny=e1[2]*e2[0]-e1[0]*e2[2], nz=e1[0]*e2[1]-e1[1]*e2[0];
                 float nl=std::sqrt(nx*nx+ny*ny+nz*nz); float up = nl>1e-6f ? std::fabs(ny)/nl : 1.f;   // 1=flat .. 0=vertical

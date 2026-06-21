@@ -1127,6 +1127,19 @@ int main(int argc, char** argv) {
             else em.pulse = true;
         }
         if (gltf.isNodeAnimated(meshIdx) && std::getenv("HSR_VERBOSE")) gltf.dumpNodeAnimTrack(meshIdx);
+        // FRAME COUNT must track the clip DURATION, not a fixed 64: snakeway's dragon "Action" is 31.2s — 64 frames =
+        // ~2fps → the body-undulation is massively undersampled → "moves but not the original animation". Sample at a
+        // real rate (~30fps) so the wave is captured. ACL compresses the extra frames cheaply. HSR_HZFPS overrides.
+        // The HZAN clip has a HARD device size limit: a ~22 KB clip (256 frames) LOADS, ~65 KB (935 frames) throws
+        // std::length_error on load (the device reads the clip block size into a SIGNED 16-bit field → >32767 goes
+        // negative → bad string/vector resize). So CAP the frame count (not a fixed 64 — that under-samples a 31 s clip
+        // to ~2 fps = "moves but not the original animation"). 256 frames is device-confirmed safe; for snakeway's 31 s
+        // dragon that's ~8 fps (4× smoother than 64). HSR_HZFPS / HSR_HZMAXFRAMES override.
+        { float hzfps = 30.f; if (const char* e2 = std::getenv("HSR_HZFPS")) { float v = (float)atof(e2); if (v >= 1.f) hzfps = v; }
+          int cap = 256; if (const char* e3 = std::getenv("HSR_HZMAXFRAMES")) { int v = atoi(e3); if (v >= 8) cap = v; }
+          int nf = (gltf.animDuration > 0.f) ? (int)(gltf.animDuration * hzfps + 0.5f) : frames;
+          if (nf < 64) nf = 64; if (nf > cap) nf = cap;   // floor 64 (short clips); cap to keep the ACL clip under the device size limit
+          frames = nf; }
         auto e = gltf.extractHzAnim(meshIdx, frames);
         if (e.ok()) { em.hzJointPos=std::move(e.jointPos); em.hzJointQuat=std::move(e.jointQuat); em.hzJointScale=std::move(e.jointScale);
                       em.hzParents=std::move(e.parents); em.hzBoneIdx=std::move(e.boneIdx); em.hzBoneWgt=std::move(e.boneWgt);
