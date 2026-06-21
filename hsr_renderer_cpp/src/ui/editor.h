@@ -126,10 +126,15 @@ struct Editor {
         if (type==sitem::NAVMESH) { addNavmesh(sel.empty()?1:2); return; }   // navmesh has its own mode-aware path
         pushItemUndo(items);   // undoable add
         sitem::Item it; it.type=type; it.name=std::string(sitem::typeName(type))+" "+std::to_string(items.size()+1);
-        float hp[3];
-        if (cameraForwardHit(hp)) { it.pos[0]=hp[0]; it.pos[1]=hp[1]; it.pos[2]=hp[2]; }   // drop it where you're LOOKING (on a surface)
+        float hp[3]; bool closeHit=false;
+        // Drop it where you're LOOKING only if that surface is reasonably CLOSE. A far hit (you were looking at the
+        // vista/backdrop) or nothing in view -> a SET distance ahead, so objects never land out in the void
+        // (ToastConcern: a chair spawned at z=-92 because the forward ray hit a distant mesh).
+        if (cameraForwardHit(hp)) { float dx=hp[0]-r->cam.pos[0],dy=hp[1]-r->cam.pos[1],dz=hp[2]-r->cam.pos[2];
+                                    closeHit = (dx*dx+dy*dy+dz*dz) <= 15.f*15.f; }
+        if (closeHit) { it.pos[0]=hp[0]; it.pos[1]=hp[1]; it.pos[2]=hp[2]; }
         else { float cp=std::cos(r->cam.pitch); float fwd[3]={std::sin(r->cam.yaw)*cp, std::sin(r->cam.pitch), -std::cos(r->cam.yaw)*cp};
-               it.pos[0]=r->cam.pos[0]+fwd[0]*2.5f; it.pos[1]=r->cam.pos[1]+fwd[1]*2.5f; it.pos[2]=r->cam.pos[2]+fwd[2]*2.5f; }  // nothing in view -> 2.5 m ahead
+               it.pos[0]=r->cam.pos[0]+fwd[0]*3.f; it.pos[1]=r->cam.pos[1]+fwd[1]*3.f; it.pos[2]=r->cam.pos[2]+fwd[2]*3.f; }  // 3 m ahead of the camera
         if (type==sitem::SPAWN||type==sitem::CHAIR||type==sitem::BOXCOL) dropToFloor(it.pos);   // land ground items ON the floor (not floating at overview-camera height)
         deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; tab=TAB_OBJECT;
     }
@@ -146,21 +151,27 @@ struct Editor {
         switch(type){
           case sitem::BOXCOL:                                       // a box collider that wraps the whole mesh
             it.half[0]=H[0]; it.half[1]=H[1]; it.half[2]=H[2]; break;
-          case sitem::WALLPLACE: {                                  // a flat wall ON the clicked face, TILTED to the real surface
-            // IDA (V205.2): horizon::hpi::WallPlacementComponent is a UserComponent with only propRank/propMaxWidth/
-            // propMaxHeight — its facing is purely the ENTITY TRANSFORM. So orient the transform to the MESH SURFACE
-            // NORMAL at the right-clicked face (tilt and all), not just a flat yaw. forward(-Z) = normal toward you.
-            float P[3],N[3];
-            if (screenRayHitMesh(ctxX, ctxY, meshIdx, P, N)) {
-                it.pos[0]=P[0]; it.pos[1]=P[1]; it.pos[2]=P[2];     // sit exactly on the clicked surface point
-                forwardToEuler(N, it.rot);                          // wall normal = surface normal (TILTED to match the face)
-                it.propW=std::max(0.2f, std::max(2*H[0],2*H[2])); it.propH=std::max(0.2f, 2*H[1]);
-            } else {                                                // not on a face -> flat wall facing the camera (yaw only)
-                float dx=r->cam.pos[0]-C[0], dz=r->cam.pos[2]-C[2]; float L=std::sqrt(dx*dx+dz*dz); if(L<1e-4f){dx=0;dz=1;L=1;} dx/=L; dz/=L;
-                it.rot[1]=std::atan2(dx,-dz)*57.29578f;
-                it.propW=std::max(0.2f, std::fabs(2*H[0]*dz)+std::fabs(2*H[2]*dx)); it.propH=std::max(0.2f, 2*H[1]);
-                float depth=std::fabs(2*H[0]*dx)+std::fabs(2*H[2]*dz); it.pos[0]=C[0]+dx*depth*0.5f; it.pos[2]=C[2]+dz*depth*0.5f;
-            } break; }
+          case sitem::WALLPLACE: {
+            // FIT THE WALL SNUGLY TO THE MESH ITSELF — never move it to the camera. IDA (V205.2):
+            // horizon::hpi::WallPlacementComponent is a UserComponent with only propRank/propMaxWidth/propMaxHeight; its
+            // facing is purely the ENTITY TRANSFORM. Walls stand vertical, so keep world-up and solve the horizontal
+            // orientation from a 2D PCA of the mesh's footprint in XZ: the major axis = the wall's LENGTH, its
+            // perpendicular = the facing normal. pos = mesh CENTER, propW/H = the mesh's OWN extents. (The camera only
+            // picks WHICH of the two faces the props live on — the position never leaves the mesh.)
+            auto& gm=r->gpuMeshes[meshIdx]; const auto& Pv=gm.pickPos; int nv=0; double sx=0,sz=0;
+            for(size_t k=0;k+2<Pv.size();k+=3){ float w[3]; xformPoint(gm.model,&Pv[k],w); sx+=w[0]; sz+=w[2]; ++nv; }
+            if(nv>0){
+                double mxc=sx/nv, mzc=sz/nv, a=0,b=0,cc=0;
+                for(size_t k=0;k+2<Pv.size();k+=3){ float w[3]; xformPoint(gm.model,&Pv[k],w); double dx=w[0]-mxc,dz=w[2]-mzc; a+=dx*dx; b+=dx*dz; cc+=dz*dz; }
+                double theta=0.5*std::atan2(2.0*b, a-cc);              // major-axis (wall length) angle in XZ
+                double ux=std::cos(theta), uz=std::sin(theta), nx=-uz, nz=ux;   // length dir u, facing normal n (perp)
+                double hl=0; for(size_t k=0;k+2<Pv.size();k+=3){ float w[3]; xformPoint(gm.model,&Pv[k],w); double dx=w[0]-mxc,dz=w[2]-mzc; double pl=std::fabs(dx*ux+dz*uz); if(pl>hl)hl=pl; }
+                double cdx=r->cam.pos[0]-mxc, cdz=r->cam.pos[2]-mzc; if(nx*cdx+nz*cdz<0){ nx=-nx; nz=-nz; }   // props face the player; pos unchanged
+                it.pos[0]=(float)mxc; it.pos[1]=C[1]; it.pos[2]=(float)mzc;       // SNUG: dead-center of the mesh
+                it.rot[0]=0.f; it.rot[1]=(float)(std::atan2(nx,-nz)*57.29577951); it.rot[2]=0.f;
+                it.propW=std::max(0.2f,(float)(2.0*hl)); it.propH=std::max(0.2f,2*H[1]);
+            } else { it.propW=std::max(0.2f,std::max(2*H[0],2*H[2])); it.propH=std::max(0.2f,2*H[1]); }   // no verts -> AABB fallback
+            break; }
           case sitem::SPAWN:   it.pos[1]=mx[1]; it.allowStart=true; it.isLocal=true; break;   // stand on top of the mesh
           case sitem::CHAIR:   it.pos[1]=mx[1]; break;                                        // seat on top
           case sitem::BOUNDARY:it.pos[1]=mn[1]; break;                                        // kill-floor plane at the mesh base
@@ -786,6 +797,10 @@ struct Editor {
         if (win) {
             bool ctrl = glfwGetKey(win,GLFW_KEY_LEFT_CONTROL)==GLFW_PRESS || glfwGetKey(win,GLFW_KEY_RIGHT_CONTROL)==GLFW_PRESS;
             bool kA = glfwGetKey(win,GLFW_KEY_A)==GLFW_PRESS, kC = glfwGetKey(win,GLFW_KEY_C)==GLFW_PRESS;
+            // ⛔ When ANY input field has keyboard focus, Ctrl+A / Ctrl+C belong to the TEXT (handled in ui_core editKeys),
+            // never the scene select-all/copy. (Keep prevKey* fresh so there's no stray edge-trigger when the field blurs.)
+            if (cx.kbFocus) { prevKeyA=kA; prevKeyC=kC; }
+            else {
             auto matchesFilter=[&](int i){ if(!search[0]) return true; std::string ln=r->gpuMeshes[i].name,ls=search; for(char&c:ln)c=(char)tolower((unsigned char)c); for(char&c:ls)c=(char)tolower((unsigned char)c); return ln.find(ls)!=std::string::npos; };
             if (ctrl && kA && !prevKeyA) {
                 sel.clear();
@@ -797,6 +812,7 @@ struct Editor {
                 glfwSetClipboardString(win, clip.c_str());
             }
             prevKeyA=kA; prevKeyC=kC;
+            }
         }
         // scrollable content: SCENE ITEMS (the things you add) then MESHES  (header row + search row = 2*hh)
         float listY = y+2*hh, listH = h-2*hh, rowH = th.rowH;
@@ -1380,12 +1396,33 @@ struct Editor {
         float vp[16]; mat4mul(r->cam.proj, r->cam.view, vp);
         for (auto& e:E) wireLine(vp, w[e[0]], w[e[1]], c, 1.f);   // near-clipped (don't vanish when a corner is behind the camera)
     }
-    // oriented wireframe box (pos + R*half corners) — colliders / chairs / wall-placement zones
-    void drawBox(const float pos[3], const float half[3], const float q[4], uint32_t col, float thick){
-        float s[8][2]; bool ok[8];
-        for (int c=0;c<8;c++){ float lc[3]={ (c&1)?half[0]:-half[0], (c&2)?half[1]:-half[1], (c&4)?half[2]:-half[2] }, w[3]; quatRotVec(q,lc,w); w[0]+=pos[0];w[1]+=pos[1];w[2]+=pos[2]; ok[c]=worldToScreen(w,s[c][0],s[c][1]); }
+    // True if a world point is HIDDEN behind scene geometry from the camera (CPU ray test — the 2D overlay has no GPU
+    // depth buffer to test against). Used to dim collider/wall edges that sit behind a mesh so depth reads correctly.
+    bool occludedPoint(const float wp[3]){
+        if(!r||r->gpuMeshes.empty()) return false;
+        float O[3]={r->cam.pos[0],r->cam.pos[1],r->cam.pos[2]};
+        float D[3]={wp[0]-O[0],wp[1]-O[1],wp[2]-O[2]}; float dist=std::sqrt(D[0]*D[0]+D[1]*D[1]+D[2]*D[2]); if(dist<1e-3f) return false;
+        D[0]/=dist;D[1]/=dist;D[2]/=dist; float lim=dist-0.06f;   // bias so the box's own contact surface doesn't self-occlude
+        for(int i=0;i<(int)r->gpuMeshes.size();++i){ if(r->isHidden(i))continue; auto&gm=r->gpuMeshes[i]; if(isBackdrop(gm.name))continue;
+            float mn[3],mx[3]; worldAabb(gm,mn,mx); float ta; if(!rayAabb(O,D,mn,mx,ta))continue; if(ta>lim)continue;
+            const auto&P=gm.pickPos; const auto&I=gm.pickIdx; if(P.empty()||I.size()<3)continue;
+            for(size_t k=0;k+2<I.size();k+=3){ uint32_t a=I[k],b=I[k+1],c=I[k+2];
+                if((size_t)a*3+2>=P.size()||(size_t)b*3+2>=P.size()||(size_t)c*3+2>=P.size())continue;
+                float w0[3],w1[3],w2[3]; xformPoint(gm.model,&P[a*3],w0);xformPoint(gm.model,&P[b*3],w1);xformPoint(gm.model,&P[c*3],w2);
+                float t; if(rayTri(O,D,w0,w1,w2,t)&&t<lim) return true; } }
+        return false;
+    }
+    // oriented wireframe box (pos + R*half corners) — colliders / chairs / wall-placement zones. Edges are NEAR-CLIPPED
+    // (wireLine) so the box never vanishes when you get close and a corner crosses behind the eye. occludeAware (the
+    // SELECTED item only — the CPU ray test is too costly for every box) dims edges hidden behind geometry as a depth cue.
+    void drawBox(const float pos[3], const float half[3], const float q[4], uint32_t col, float thick, bool occludeAware=false){
+        float w[8][3]; bool occ[8]={};
+        for (int c=0;c<8;c++){ float lc[3]={ (c&1)?half[0]:-half[0], (c&2)?half[1]:-half[1], (c&4)?half[2]:-half[2] }, wl[3]; quatRotVec(q,lc,wl);
+            w[c][0]=wl[0]+pos[0]; w[c][1]=wl[1]+pos[1]; w[c][2]=wl[2]+pos[2]; if(occludeAware) occ[c]=occludedPoint(w[c]); }
         static const int E[12][2]={{0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7}};
-        for (auto& e:E) if (ok[e[0]]&&ok[e[1]]) dl.line(s[e[0]][0],s[e[0]][1],s[e[1]][0],s[e[1]][1],col,thick);
+        float vp[16]; mat4mul(r->cam.proj, r->cam.view, vp);
+        uint32_t dim=ui::withA(col,70);                                        // hidden behind geometry -> faint
+        for (auto& e:E){ uint32_t c=(occludeAware&&occ[e[0]]&&occ[e[1]])?dim:col; wireLine(vp, w[e[0]], w[e[1]], c, thick); }
     }
     // forward (-Z) facing arrow — shows an item's orientation so ROTATING any component is visible (not just spawns)
     void drawFacingArrow(const float pos[3], const float q[4], uint32_t col, float thick, float lenW){
@@ -1431,7 +1468,7 @@ struct Editor {
                         float dx=ts2[0]-s[0],dy=ts2[1]-s[1],l=std::sqrt(dx*dx+dy*dy); if(l>1e-3f){dx/=l;dy/=l; float px=-dy,py=dx,al=9*uiScale; dl.line(ts2[0],ts2[1], ts2[0]-dx*al+px*al*0.5f, ts2[1]-dy*al+py*al*0.5f,col,th); dl.line(ts2[0],ts2[1], ts2[0]-dx*al-px*al*0.5f, ts2[1]-dy*al-py*al*0.5f,col,th); } }
                     cx.textAligned(s[0]+10*uiScale,s[1]-8*uiScale,150*uiScale,16*uiScale, it.allowStart&&it.isLocal?"Spawn (local)":it.name.c_str(), col, 0);
                 } break; }
-              case sitem::BOXCOL: { float h[3]={it.half[0]*it.scale[0],it.half[1]*it.scale[1],it.half[2]*it.scale[2]}; drawBox(it.pos,h,q,col,th); break; }
+              case sitem::BOXCOL: { float h[3]={it.half[0]*it.scale[0],it.half[1]*it.scale[1],it.half[2]*it.scale[2]}; drawBox(it.pos,h,q,col,th,seld); break; }
               case sitem::CHAIR: {   // CHAIR icon = seat quad + backrest (oriented to the sit facing) — a recognizable chair, not a tiny dot
                 float sz=0.42f*((it.scale[0]+it.scale[2])*0.5f); if(sz<0.20f)sz=0.20f;
                 auto lp=[&](float lx,float ly,float lz,float o[3]){ float vv[3]={lx,ly,lz},rr[3]; quatRotVec(q,vv,rr); o[0]=it.pos[0]+rr[0]; o[1]=it.pos[1]+rr[1]; o[2]=it.pos[2]+rr[2]; };
@@ -1446,7 +1483,7 @@ struct Editor {
                 if (worldToScreen(ep,es[0],es[1])){ float hs=(seld?5:3)*uiScale; dl.rect(es[0]-hs,es[1]-hs,hs*2,hs*2,col); dl.border(es[0]-hs,es[1]-hs,hs*2,hs*2,ui::rgba(20,20,20),1);
                     if (on) dl.line(s[0],s[1],es[0],es[1],ui::withA(col,130),1.f);
                     if (seld){ exitHVis=true; exitHS[0]=es[0]; exitHS[1]=es[1]; cx.textAligned(es[0]+8*uiScale,es[1]-8*uiScale,80*uiScale,16*uiScale,"exit",col,0); } } break; }
-              case sitem::WALLPLACE: { float h[3]={it.propW*0.5f,it.propH*0.5f,0.02f}; drawBox(it.pos,h,q,col,th); break; }
+              case sitem::WALLPLACE: { float h[3]={it.propW*0.5f,it.propH*0.5f,0.02f}; drawBox(it.pos,h,q,col,th,seld); break; }
               case sitem::HOTSPOT: { if (on){ float rr=16*uiScale; for (int a=0;a<16;a++){ float a0=a/16.f*6.2831853f,a1=(a+1)/16.f*6.2831853f; dl.line(s[0]+cosf(a0)*rr,s[1]+sinf(a0)*rr, s[0]+cosf(a1)*rr,s[1]+sinf(a1)*rr, col,th); } drawFacingArrow(it.pos,q,col,th,0.6f); } break; }
               case sitem::NAVMESH: { drawNavWire(it, ui::withA(col, seld?210:120)); float mp[3]; itemMarkerPos(it,mp); float ms[2]; if (worldToScreen(mp,ms[0],ms[1])) { dl.rect(ms[0]-3*uiScale,ms[1]-3*uiScale,6*uiScale,6*uiScale,col); cx.textAligned(ms[0]+8*uiScale,ms[1]-8*uiScale,180*uiScale,16*uiScale,it.name.c_str(),col,0); } break; }
               case sitem::BOUNDARY: {   // kill-floor plane: a grid at it.pos + a normal arrow along the UnitAxis direction

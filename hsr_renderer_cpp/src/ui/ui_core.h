@@ -100,6 +100,32 @@ struct Context {
         textAligned(x+b+5,y,lw,h,s,th.text,0);                    // width = the measured label -> never clipped
         return clicked;
     }
+    // Shared single-line edit-key handling for EVERY focused input field (numeric + text), so Ctrl+A / Delete / Home /
+    // End / Shift-select / highlight behave the same everywhere. Mutates editBuf/editCur/editSel. numeric=true filters
+    // typed chars to digits . - + e E. Returns true the frame Enter is pressed (the caller commits/blurs).
+    bool editKeys(bool numeric){
+        auto delSel=[&]()->bool{ if(editSel<0||editSel==editCur){ editSel=-1; return false; }
+            int a=editSel<editCur?editSel:editCur, b=editSel<editCur?editCur:editSel; editBuf.erase(a,b-a); editCur=a; editSel=-1; return true; };
+        auto moveTo=[&](int np){ if(np<0)np=0; if(np>(int)editBuf.size())np=(int)editBuf.size();
+            if(in.shift){ if(editSel<0) editSel=editCur; } else editSel=-1; editCur=np; };   // Shift = extend the selection
+        if(in.ctrl && in.keyRepeat[KEY_A]){ editSel=0; editCur=(int)editBuf.size(); }         // Ctrl+A = select all (highlight)
+        if(!in.text.empty()){ std::string ins; for(char c:in.text){ if(!numeric || (c>='0'&&c<='9')||c=='.'||c=='-'||c=='+'||c=='e'||c=='E') ins.push_back(c); }
+            if(!ins.empty()){ delSel(); editBuf.insert(editCur,ins); editCur+=(int)ins.size(); } }
+        if(in.keyRepeat[KEY_BACKSPACE]){ if(!delSel() && editCur>0){ editBuf.erase(editCur-1,1); editCur--; } }
+        if(in.keyRepeat[KEY_DELETE]){ if(!delSel() && editCur<(int)editBuf.size()){ editBuf.erase(editCur,1); } }   // forward delete
+        if(in.keyRepeat[KEY_LEFT])  moveTo(editCur-1);
+        if(in.keyRepeat[KEY_RIGHT]) moveTo(editCur+1);
+        if(in.keyRepeat[KEY_HOME])  moveTo(0);
+        if(in.keyRepeat[KEY_END])   moveTo((int)editBuf.size());
+        return in.keyRepeat[KEY_ENTER];
+    }
+    // Draw the current selection highlight + caret for a focused field (editBuf/editCur/editSel), scrolled by `scr`.
+    void editDecorate(float x,float y,float w,float h,Font* fnt,float scr){
+        if(!fnt) return; float pad=4.f;
+        if(editSel>=0 && editSel!=editCur){ int a=editSel<editCur?editSel:editCur, b=editSel<editCur?editCur:editSel;
+            float sa=fnt->textWidth(editBuf.c_str(),a), sb=fnt->textWidth(editBuf.c_str(),b);
+            dl->rect(x+pad-scr+sa, y+3, sb-sa, h-6, th.accent); }
+    }
     // Drag-to-edit numeric field (Blender-style). Returns true if value changed.
     // Numeric field: DRAG to scrub, or CLICK to type a value with the keyboard (Enter/Tab/click-away commits, Esc cancels).
     bool dragFloat(uint32_t id,float x,float y,float w,float h,float& v,float speed=0.01f,const char* fmt="%.3f"){
@@ -107,11 +133,8 @@ struct Context {
         bool changed=false;
         // ── keyboard entry mode (this field is focused) ──
         if(kbFocus==id){
-            for(char c:in.text) if((c>='0'&&c<='9')||c=='.'||c=='-'||c=='+'||c=='e'||c=='E'){ editBuf.insert(editBuf.begin()+editCur,c); editCur++; }
-            if(in.keyRepeat[KEY_BACKSPACE]&&editCur>0){ editBuf.erase(editCur-1,1); editCur--; }
-            if(in.keyRepeat[KEY_LEFT]&&editCur>0)editCur--;
-            if(in.keyRepeat[KEY_RIGHT]&&editCur<(int)editBuf.size())editCur++;
-            bool commit = in.keyRepeat[KEY_ENTER]||in.keyRepeat[KEY_TAB]||(in.pressed[0]&&!hv);
+            bool enter = editKeys(true);                              // Ctrl+A/Del/Home/End/select all share editKeys now
+            bool commit = enter||in.keyRepeat[KEY_TAB]||(in.pressed[0]&&!hv);
             bool cancel = in.keyRepeat[KEY_ESCAPE];
             if(commit){ try{ v=std::stof(editBuf); changed=true; }catch(...){} kbFocus=0; }
             else if(cancel) kbFocus=0;
@@ -119,6 +142,7 @@ struct Context {
             Font* fnt=mono?mono:font;
             if(fnt){ float pad=4.f, avail=w-2*pad, cw=fnt->textWidth(editBuf.c_str(),editCur), scr=(cw>avail)?cw-avail:0.f;
                 dl->pushClip(x,y,w,h); Font* of=dl->font; dl->font=fnt; float ty=y+(h-(fnt->ascent-fnt->descent))*0.5f;
+                editDecorate(x,y,w,h,fnt,scr);                        // selection highlight
                 dl->text(x+pad-scr,ty,editBuf.c_str(),th.text);
                 if(((int)(t*2))&1) dl->rect(x+pad-scr+cw,y+3,1,h-6,th.text);
                 dl->font=of; dl->popClip(); }
@@ -194,18 +218,7 @@ struct Context {
         if(in.pressed[0]&&!hv&&kbFocus==id){ kbFocus=0; s=editBuf; }
         bool committed=false;
         if(kbFocus==id){
-            // delete the active selection (returns true if it deleted something) — shared by typing/backspace/delete
-            auto delSel=[&]()->bool{ if(editSel<0||editSel==editCur){ editSel=-1; return false; }
-                int a=editSel<editCur?editSel:editCur, b=editSel<editCur?editCur:editSel; editBuf.erase(a,b-a); editCur=a; editSel=-1; return true; };
-            if(in.ctrl && in.keyRepeat[KEY_A]){ editSel=0; editCur=(int)editBuf.size(); }   // Ctrl+A = select all
-            if(!in.text.empty()){ delSel(); editBuf.insert(editCur,in.text); editCur+=(int)in.text.size(); }
-            if(in.keyRepeat[KEY_BACKSPACE]){ if(!delSel() && editCur>0){ editBuf.erase(editCur-1,1); editCur--; } }
-            if(in.keyRepeat[KEY_DELETE]){ if(!delSel() && editCur<(int)editBuf.size()){ editBuf.erase(editCur,1); } }   // forward delete
-            if(in.keyRepeat[KEY_LEFT]){ editSel=-1; if(editCur>0)editCur--; }
-            if(in.keyRepeat[KEY_RIGHT]){ editSel=-1; if(editCur<(int)editBuf.size())editCur++; }
-            if(in.keyRepeat[KEY_HOME]){ editSel=-1; editCur=0; }
-            if(in.keyRepeat[KEY_END]){ editSel=-1; editCur=(int)editBuf.size(); }
-            if(in.keyRepeat[KEY_ENTER]){ s=editBuf; kbFocus=0; committed=true; }
+            if(editKeys(false)){ s=editBuf; kbFocus=0; committed=true; }   // Enter commits; Ctrl+A/Del/Home/End/select shared
             if(in.keyRepeat[KEY_ESCAPE]){ kbFocus=0; }
         }
         const std::string& shown = (kbFocus==id)?editBuf:s;
