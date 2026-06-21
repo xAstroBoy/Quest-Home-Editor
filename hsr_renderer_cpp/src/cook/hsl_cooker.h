@@ -1158,7 +1158,9 @@ struct ExportMesh {
     bool blend = false;             // alpha-blended (transparent) -> route to unlitblend.surface
     bool doubleSided = false;       // glTF doubleSided material -> cook appends REVERSED tris so the single-sided unlit shader still draws back faces (else flat/open meshes back-face-cull on device = see-through HOLES; renderer honors doubleSided so its preview looked fine)
     bool flipbook = false;          // animated flat material -> route to unlitspritesheetflipbookadditive.surface (GPU getTime() spritesheet cycle, NO skeleton)
-    int flipCols = 0, flipRows = 0; // spritesheet grid (0 -> use the template's 11x11)
+    int flipCols = 0, flipRows = 0; // spritesheet grid (cols x rows)
+    int flipFrames = 0;             // total cells cycled (0 -> cols*rows)
+    float flipFps = 0.f;            // playback rate (0 -> default 5fps); cook auto-generates the shadergen::FLIPBOOK shader for this grid/fps
     float matTint[4] = {1,1,1,1};   // the mesh's OWN base-color tint (glTF baseColorFactor) for its material params
     std::vector<float> vatOffsets;  // VAT vertex offsets, frames*vertexCount*3 (WORLD space) -> animated via VAT (non-skeletal)
     int vatFrames = 0;
@@ -1205,11 +1207,12 @@ inline std::vector<uint8_t> readFileBytes(const std::string& p) {
 inline bool writeFileBytes(const std::string& p, const std::vector<uint8_t>& b) {
     FILE* f = fopen(p.c_str(), "wb"); if (!f) return false; if (!b.empty()) fwrite(b.data(), 1, b.size(), f); fclose(f); return true;
 }
-// Detect a V79 "spritesheet flipbook" mesh (sonic_schoolhouse Sprite_3x3): K fully-OVERLAPPING quads whose UVs
-// tile a cols x rows grid — each quad is one frame, skinned to a bone the armature scale-toggles on/off (the V79
-// way to flipbook a flat sprite). If it's a clean 3x3 (the sonic posters) COLLAPSE to ONE quad with UV 0..1 and
-// return true (cols=rows=3); the getTime() flipbook.surface shader then cycles the 9 cells. Only 3x3 is matched
-// because that shader hardcodes the grid. Runs on the WORLD-baked export geometry (overlap survives the xform).
+// Detect a V79 "spritesheet flipbook" mesh (sonic_schoolhouse Sprite_3x3, Rick&Morty animated TV 10x10): K quads
+// whose UVs tile a cols x rows grid — each quad is one frame, skinned to a bone the armature scale-toggles on/off
+// (the V79 way to flipbook a flat sprite). At the streamed ANIMATED frame exactly ONE cell is full-area at the
+// screen and the rest are collapsed (degenerate) — so they overlap there. COLLAPSE to ONE quad with UV 0..1 and
+// return cols/rows for ANY grid; the cook then AUTO-GENERATES a getTime() shadergen::FLIPBOOK shader sized to that
+// grid (no longer 3x3-only). Runs on the WORLD-baked export geometry (the screen overlap survives the xform).
 inline bool detectAndCollapseFlipbook(std::vector<float>& pos, std::vector<float>& uvs,
                                       std::vector<uint32_t>& idx, int& cols, int& rows) {
     size_t nv = pos.size()/3;
@@ -1254,7 +1257,7 @@ inline bool detectAndCollapseFlipbook(std::vector<float>& pos, std::vector<float
         fprintf(stderr, "[FLIPDBG] nv=%zu nq=%zu cols=%d rows=%d flipShape=%d refQ=%d maxArea=%.3f\n",
             nv, nq, cols, rows, (int)flipShape, refQ, maxArea);
     if (!flipShape) return false;
-    if (cols*rows != (int)nq || cols!=3 || rows!=3) return false;   // shader hardcodes 3x3
+    if (cols*rows != (int)nq || cols<1 || rows<1 || cols>32 || rows>32) return false;   // ANY C×R grid (was 3x3-only): the flipbook shader is now auto-generated per-grid (shadergen::FLIPBOOK). Rick&Morty TV = 10x10/100 cells.
     int q0=refQ; float um=ru0, vm=rv0;          // collapse to the visible (max-area) quad; remap ITS cell -> 0..1
     float cw=1.f/cols, ch=1.f/rows;
     std::vector<float> p2(12), u2(8);
@@ -1672,8 +1675,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     auto shadVat   = readFileBytes("cooker/vat_shader.bin");      // vatunlitbasecolor (vertex-animation) shader — OPAQUE (fish/foliage)
     auto shadVatBlend = readFileBytes("cooker/vatunlitblend.surface.bin"); // vatunlitbasecolor made TRANSPARENT alpha-blend (cooker/make_vat_blend_shader.py): the faithful V79 wisp port (alphaMode=BLEND sparkle). Identical VAT vertex morph + descriptor layout as vatunlitbasecolor; only pass render-state fields f2,f3 are dropped to match the SHIPPED vatlitbubble's proven transparent state. ⛔ ALSO dropping f4 (doubleSided) = a combo NO shipped shader has → broke the pipeline → INVISIBLE sparkles on device (device-proven). Kept single-sided; the wisp billboards face the player.
     auto matVat    = readFileBytes("cooker/vat_mat.bin");         // VAT MATL template (416B, shader@48/56/64 + base@152/160 + VAT@192/200)
-    auto shadFlip  = readFileBytes("cooker/flipbook.surface.bin"); // ALPHA-BLEND getTime() 3x3 spritesheet flipbook (unlitblend + UV cell-cycle in the forward vertex) — sonic_schoolhouse Sprite_3x3. Grid/9frames/5fps hardcoded in the shader.
-    auto matFlip   = readFileBytes("cooker/flipbook_mat.bin");    // (legacy additive template; unused by the blend flipbook which reuses matBlend)
+    // (flipbook shaders are auto-generated per-grid via shadergen::FLIPBOOK from the unlitblend base, below)
     auto shadSkin  = readFileBytes("cooker/unlitdoublesidedskinned.bin");  // OPAQUE skinned (butterflies) — for opaque skinned meshes (droid body). matParams = uvScaleOffset.
     auto shadSkinB = readFileBytes("cooker/unlitblendskinned.bin");        // BLEND skinned (Nuxd renderer_module) — alpha-blends transparent skinned meshes (the omnidroid SHIELD force-field). SAME matParams layout (uvScaleOffset) as unlitdoublesidedskinned, so the SAME field-7 material template works; only the shader ref differs.
     auto matSkin   = readFileBytes("cooker/skinned_mat.bin");     // OLD motes MATL template (176B, NO field7 — fails device skinned path)
@@ -1747,13 +1749,8 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         }
     }
     // FLIPBOOK shader (animated flat material, no skeleton): ship env-local when any mesh is a flipbook.
-    bool haveFlip = false; for (auto& mm : meshes) if (mm.flipbook) { haveFlip = true; break; }
-    AssetKey3 shaderFlipK{};
-    if (haveFlip && !shadFlip.empty() && haveBlend) {
-        std::string pFlip = MH + "/shaders/flipbook.surface/shader";
-        shaderFlipK = keyForPath(pFlip);
-        assets.push_back({ pFlip, shaderFlipK.tgt, shadFlip, shaderFlipK });
-    } else haveFlip = false;
+    // (Flipbook shaders are now AUTO-GENERATED per grid/fps in the per-mesh loop via shadergen::FLIPBOOK from the
+    // unlitblend base — no static 3x3 flipbook.surface asset is shipped anymore.)
     std::vector<uint8_t> whiteTex; { std::vector<uint8_t> w4((size_t)4*4*4, 255); whiteTex = encodeRendTxtr(w4.data(), 4, 4, 8, 8); }
     std::string pWhite = MH + "/white.tex/tex"; AssetKey3 whiteK = keyForPath(pWhite); bool whiteUsed = false; bool anySkybox = false;
     // dedup skel + anim INDEPENDENTLY: the appliances share ONE animation clip but each has its OWN bind skeleton.
@@ -2028,14 +2025,33 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             if (matl.size() >= 92) { uint32_t one = 1; memcpy(matl.data()+80,&one,4); memcpy(matl.data()+84,&one,4); memcpy(matl.data()+88,&one,4); }
             assets.push_back({ pVatTex, vatTexK.tgt, vatTex, vatTexK });
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' VAT frames=%d verts=%u (atlas 1x1)%s\n", i, m.name.c_str(), m.vatFrames, vc, vatBlend ? " BLEND" : " opaque");
-        } else if (haveFlip && m.flipbook) {
-            // FLIPBOOK (sonic_schoolhouse Sprite_3x3): unlitblend (ALPHA-BLEND) material -> our getTime() 3x3 cell-cycling
-            // VERTEX shader. The 9 overlapping cell-quads were collapsed to ONE quad (UV 0..1) in detectAndCollapseFlipbook;
-            // the shader offsets inUv to the current cell from globalUniforms.time (3x3/9frames/5fps hardcoded). Loops forever.
+        } else if (m.flipbook && haveBlend && std::getenv("HSR_FLIPSTATIC")) {
+            // DIAGNOSTIC: cook the flipbook as a PLAIN static unlit quad (NO generated shader) to isolate whether the
+            // generated getTime flipbook shader is what breaks the device env render.
+            matl = matTpl; memcpy(matl.data()+120,&texK.pkg,8); memcpy(matl.data()+128,&texK.ing,8);
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FLIPBOOK -> STATIC unlit (HSR_FLIPSTATIC, no gen shader)\n", i, m.name.c_str());
+        } else if (m.flipbook && haveBlend) {
+            // FLIPBOOK (sonic_schoolhouse 3x3, Rick&Morty animated TV 10x10): the overlapping cell-quads were collapsed
+            // to ONE quad (UV 0..1) in detectAndCollapseFlipbook. AUTO-GENERATE a getTime() shadergen::FLIPBOOK VERTEX
+            // shader sized to THIS grid/fps that offsets inUv to the current cell — no skeleton (no device crash), loops
+            // forever from globalUniforms.time. On-demand per (cols,rows,frames,fps); no pre-baked per-grid shaders.
+            int fcols=m.flipCols>0?m.flipCols:3, frows=m.flipRows>0?m.flipRows:3;
+            int fframes=m.flipFrames>0?m.flipFrames:fcols*frows; float ffps=m.flipFps>0.f?m.flipFps:5.f;
+            uint32_t h=(uint32_t)(0x9E3779B9u*(uint32_t)fcols ^ 0xC2B2AE35u*(uint32_t)frows ^ 0x27D4EB2Fu*(uint32_t)fframes ^ 0x85EBCA6Bu*(uint32_t)(long)(ffps*1000));
+            char ffn[160]; snprintf(ffn,sizeof ffn,"cooker/flipbook_%08x%s.surface.bin", h, meshFar?"_dc":"");
+            AssetKey3 flipK{}; auto it=rotShaders.find(ffn);
+            if (it!=rotShaders.end()) flipK=it->second;
+            else {
+                auto fbytes=readFileBytes(ffn);
+                if (fbytes.empty()) { const std::vector<uint8_t>& gbase = meshFar?shadBlendDC:shadBlend;   // unlitblend base (FAR -> depth-clamp remap)
+                    fbytes=shadergen::generate(gbase, shadergen::FLIPBOOK, (float)fcols,(float)frows,(float)fframes,ffps);
+                    if(!fbytes.empty()) writeFileBytes(ffn,fbytes); }
+                if(!fbytes.empty()){ char fp2[176]; snprintf(fp2,sizeof fp2,"%s/shaders/flipbook_%08x%s.surface/shader", MH.c_str(), h, meshFar?"_dc":"");
+                    flipK=keyForPath(fp2); assets.push_back({fp2, flipK.tgt, fbytes, flipK}); rotShaders[ffn]=flipK; } }
             matl = matBlend;
-            memcpy(matl.data() + 48,  &shaderFlipK.pkg, 8); memcpy(matl.data() + 56,  &shaderFlipK.ing, 8);  // field7 -> flipbook shader
-            memcpy(matl.data() + 120, &texK.pkg, 8);        memcpy(matl.data() + 128, &texK.ing, 8);          // base tex -> the 3x3 spritesheet
-            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FLIPBOOK grid=%dx%d (collapsed to 1 quad)\n", i, m.name.c_str(), m.flipCols, m.flipRows);
+            if (flipK.ing){ memcpy(matl.data()+48,&flipK.pkg,8); memcpy(matl.data()+56,&flipK.ing,8); }   // field7 -> generated flipbook shader
+            memcpy(matl.data()+120,&texK.pkg,8); memcpy(matl.data()+128,&texK.ing,8);                      // base tex -> the full spritesheet
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FLIPBOOK %dx%d %dframes @%.2ffps (auto-gen) %s\n", i, m.name.c_str(), fcols,frows,fframes,ffps, flipK.ing?"":"(MISSING -> static)");
         } else {
             matl = (m.blend && haveBlend) ? matBlend : matTpl;
             if (meshFar) { AssetKey3 dck = (m.blend && haveBlend) ? shaderBlendDCK : shaderDCK;   // FAR -> remap shader (renders past the 5000 clip); near keeps unlit/unlitblend = byte-exact

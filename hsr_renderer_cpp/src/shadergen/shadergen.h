@@ -23,7 +23,8 @@
 
 namespace shadergen {
 
-enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2 };
+//   FLIPBOOK : uv' = inUv*(1/cols,1/rows) + (col/cols,row/rows), frame=mod(floor(time*fps),frames) (skinned/grid sprite TV)
+enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3 };
 
 struct Inst { int op; std::vector<uint32_t> w; };   // w[0] = header word (recomputed on emit), w[1..] = operands
 struct VStage { int64_t slot, spvOff; uint32_t spvLen; };   // one vertex stage: FlatBuffer uoffset slot, SPIR-V magic, len
@@ -165,8 +166,8 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
     }
     for (auto& kv : names){ if (kv.second=="globalUniforms") gu=kv.first; else if (kv.second=="inPos") inPos=kv.first; else if (kv.second=="inUv") inUv=kv.first; }
 
-    uint32_t input = (mode==UVSCROLL) ? inUv : inPos;
-    uint32_t vecT  = (mode==UVSCROLL) ? tV2  : tV3;
+    uint32_t input = (mode==UVSCROLL||mode==FLIPBOOK) ? inUv : inPos;
+    uint32_t vecT  = (mode==UVSCROLL||mode==FLIPBOOK) ? tV2  : tV3;
     if (!tFloat||!tInt||!vecT||!glsl||!gu||!input||timeIdx<0) return {};
 
     // id + constant/type pools
@@ -194,6 +195,31 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
         body = {
             {65,{0,pUf,pt,gu,c_time}}, {61,{0,tFloat,t,pt}},
             {142,{0,tV2,off,ratevec,t}}, {129,{0,tV2,uvout,loadRes,off}},   // uv' = inUv + vec2(ru,rv)*time
+        };
+    } else if (mode==FLIPBOOK){
+        // p0=cols p1=rows ax=frames ay=fps. uv' = inUv*(1/cols,1/rows) + (col/cols,row/rows) for the time-driven cell.
+        const uint32_t GLSL_FLOOR=8;
+        int ncols=(int)(p0+0.5f), nrows=(int)(p1+0.5f), nframes=(int)(ax+0.5f); float fps=ay;
+        if (ncols<1) ncols=1; if (nrows<1) nrows=1; if (nframes<1) nframes=ncols*nrows; if (fps<=0.f) fps=5.f;
+        uint32_t c_fps=fconst(fps), c_nf=fconst((float)nframes), c_nc=fconst((float)ncols);
+        uint32_t c_invc=fconst(1.0f/ncols), c_invr=fconst(1.0f/nrows);
+        uint32_t c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
+        uint32_t pt=nid(),t=nid(),tf=nid(),fr=nid(),fm=nid(),col=nid(),rdiv=nid(),row=nid();
+        uint32_t uo=nid(),vo=nid(),cell=nid(),off=nid(),scaled=nid(),uvout=nid(); result=uvout;
+        body = {
+            {65,{0,pUf,pt,gu,c_time}}, {61,{0,tFloat,t,pt}},
+            {133,{0,tFloat,tf,t,c_fps}},                 // time*FPS
+            {12,{0,tFloat,fr,glsl,GLSL_FLOOR,tf}},       // floor()
+            {141,{0,tFloat,fm,fr,c_nf}},                 // frame = mod(.., NFRAMES)
+            {141,{0,tFloat,col,fm,c_nc}},                // col = mod(frame, NCOLS)
+            {133,{0,tFloat,rdiv,fm,c_invc}},             // frame/NCOLS
+            {12,{0,tFloat,row,glsl,GLSL_FLOOR,rdiv}},    // row = floor(frame/NCOLS)
+            {133,{0,tFloat,uo,col,c_invc}},              // uOff = col/NCOLS
+            {133,{0,tFloat,vo,row,c_invr}},              // vOff = row/NROWS
+            {80,{0,tV2,cell,c_invc,c_invr}},             // vec2(1/NCOLS,1/NROWS)
+            {80,{0,tV2,off,uo,vo}},                      // vec2(uOff,vOff)
+            {133,{0,tV2,scaled,loadRes,cell}},           // inUv * cell
+            {129,{0,tV2,uvout,scaled,off}},              // + off
         };
     } else if (mode==ROTATE){
         uint32_t c_om=fconst(p0), c_one=fconst(1.0f), cax=fconst(ax), cay=fconst(ay), caz=fconst(az);
@@ -256,9 +282,18 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
 // depth-only stages lack inUv -> editVertModule returns {} -> harmlessly skipped, so only real position stages grow.)
 inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode, float p0, float p1=0, float ax=0, float ay=1, float az=0){
     using namespace detail;
-    if (mode != UVSCROLL){ float l=std::sqrt(ax*ax+ay*ay+az*az); if (l<=0.f) l=1.f; ax/=l; ay/=l; az/=l; }  // axis -> unit
+    if (mode==ROTATE || mode==OSCILLATE){ float l=std::sqrt(ax*ax+ay*ay+az*az); if (l<=0.f) l=1.f; ax/=l; ay/=l; az/=l; }  // axis -> unit (UVSCROLL/FLIPBOOK use these args as params, not an axis)
     const uint8_t* d = src.data(); size_t N = src.size();
-    std::vector<VStage> stages; collectVertStages(d, N, stages);
+    std::vector<VStage> stages;
+    if (mode==FLIPBOOK){
+        // FLIPBOOK edits ONLY the forward vertex stage (exactly like make_flipbook_shader.py). The UV-cell offset doesn't
+        // affect depth/position, so the depth/shadow/motion stages don't need it — and injecting the floor/fmod body into
+        // those stages (the unlitblend base HAS inUv there) corrupted them on device = the WHOLE-ENV render break.
+        int64_t slot=0, spvOff=0; uint32_t spvLen=0;
+        if (detail::findFwdVertSpv(d, N, slot, spvOff, spvLen)) stages.push_back({slot, spvOff, spvLen});
+    } else {
+        collectVertStages(d, N, stages);   // ROTATE/OSCILLATE move POSITION -> every stage must match (depth/motion/shadow)
+    }
     if (stages.empty()) return {};
     std::vector<uint8_t> o = src; int edited = 0;
     for (const auto& st : stages){

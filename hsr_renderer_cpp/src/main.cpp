@@ -1270,6 +1270,9 @@ int main(int argc, char** argv) {
     // with HSR_EXPORT_QUIT, exits — lets the editor's Export path run batch / from the command line.
     if (std::getenv("HSR_EXPORT")) {
         if (editor.projectPath.empty()) { editor.projectPath = apkPath; editor.loadProject(); }   // headless cook includes the saved session
+        // Populate md.positions with an ANIMATED frame (the render loop hasn't run yet here): skinned FLIPBOOKS (e.g. the
+        // Rick&Morty TV) only collapse to a single screen quad when ONE cell is ON — the raw bind pose is a spread grid.
+        if (isV79 && gltf.hasAnimation()) gltf.animate(gltf.animDuration*0.5f);
         editor.exportAPKSync();   // synchronous cook + auto-sign with a terminal progress bar
         if (std::getenv("HSR_EXPORT_QUIT")) return 0;
     }

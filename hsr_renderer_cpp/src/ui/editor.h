@@ -657,7 +657,7 @@ struct Editor {
         std::string suf = tg.size()>1 ? (" ("+std::to_string(tg.size())+")") : std::string();
         int nHidden=0; for (int i=0;i<(int)r->gpuMeshes.size();++i) if (r->isHidden(i)) nHidden++;
         std::string colLbl = gm.dynamicVerts ? (isAnimCollider(ctxMesh) ? "Remove Animated Collider" : "Animated Collider (follows anim)")
-                                              : (std::string("Add Mesh Collider")+suf);
+                                              : (std::string("Make Mesh Collider (exact)")+suf);
         std::vector<std::pair<std::string,int>> items = {
             {gm.name, -1}, {"Focus / teleport",0}, {soloed?"Unsolo":"Solo only",1},
             {std::string(hidden?"Unhide":"Hide")+suf,2}, {std::string("Reset transform")+suf,3}, {"Copy name",4},
@@ -665,6 +665,8 @@ struct Editor {
             {std::string(isSkyboxMesh(ctxMesh)?"Unmark skybox backdrop":"Make skybox backdrop")+suf, 6} };   // -> SkyboxPlatformComponent (far-clip-exempt)
         // CREATE a Meta Component fitted to this mesh (the user wanted every Meta Component reachable from right-click).
         items.push_back({"-- Make component from mesh --", -1});
+        items.push_back({"Mesh Collider (static, exact tris)", 16});   // always a STATIC ColliderMesh, even for animated meshes
+        items.push_back({"Navmesh (walkable scene)", 17});             // generate the scene's walkable navmesh from here
         items.push_back({"Box Collider (wrap mesh)", 10});
         items.push_back({"Wall (faces camera)", 11});
         items.push_back({"Spawn Point (on top)", 12});
@@ -706,6 +708,8 @@ struct Editor {
                 else if (a==13) addItemFromMesh(sitem::CHAIR, ctxMesh);
                 else if (a==14) addItemFromMesh(sitem::HOTSPOT, ctxMesh);
                 else if (a==15) addItemFromMesh(sitem::BOUNDARY, ctxMesh);
+                else if (a==16) addMeshCollider(ctxMesh, true);   // STATIC mesh collider (exact tris) even on animated meshes
+                else if (a==17) addNavmesh(1);                    // generate the walkable scene navmesh (smart)
                 ctxOpen=false;
             }
             ry+=rh;
@@ -1666,7 +1670,12 @@ struct Editor {
             if (md.hasNormal && !md.normalRGBA.empty()){ em.normalRGBA=md.normalRGBA; em.normalW=md.normalW; em.normalH=md.normalH; em.hasNormal=true; }
             em.vatInstTrackIndex=md.vatTrackIndex; em.vatInstRateFactor=md.vatRateFactor; em.vatInstTimeOffset=md.vatTimeOffset; em.atlasCellIndex=md.atlasCellIndex;
             int fcols=0,frows=0;
-            if (detectAndCollapseFlipbook(em.positions, em.uvs, em.indices, fcols, frows)) { em.flipbook=true; em.flipCols=fcols; em.flipRows=frows; em.blend=true; }
+            if (detectAndCollapseFlipbook(em.positions, em.uvs, em.indices, fcols, frows)) {
+                em.flipbook=true; em.flipCols=fcols; em.flipRows=frows; em.blend=true;
+                em.flipFrames=fcols*frows;                                  // one cell per frame, the whole sheet
+                em.flipFps = (animDuration>0.f) ? (float)em.flipFrames/animDuration : 5.f;   // cycle the sheet over the source loop
+                fprintf(stderr,"[COOK] m%zu '%s' FLIPBOOK %dx%d (%d cells @ %.2ffps) -> auto-gen shader\n", i, md.name.c_str(), fcols, frows, em.flipFrames, em.flipFps);
+            }
             else { if (vatBaker){ int bnv=0; auto off=vatBaker((int)i,64,bnv); if(!off.empty()&&bnv==(int)nv){ em.vatOffsets=std::move(off); em.vatFrames=64; } }
                    if (hzAnimExtractor) hzAnimExtractor((int)i,64,em); }
             if (md.hasTexture && md.texRGBA.size()>=(size_t)md.texW*md.texH*4){ em.rgba=md.texRGBA; em.w=md.texW; em.h=md.texH; }
@@ -2042,19 +2051,21 @@ struct Editor {
     }
     // "Make this object a mesh collider": a ColliderMesh built from ONE mesh's exact triangles (a solid obstacle you
     // can't walk through — same haven component as a navmesh, just sourced from a single object). Right-click -> Add.
-    void addMeshCollider(int m){
+    void addMeshCollider(int m, bool forceStatic=false){
         if (m<0 || m>=(int)r->gpuMeshes.size()) return;
         auto& gm=r->gpuMeshes[m];
-        if (gm.dynamicVerts) {   // ANIMATED mesh -> a same-entity KINEMATIC collider that follows the animation (toggle)
+        if (!forceStatic && gm.dynamicVerts) {   // ANIMATED mesh -> a same-entity KINEMATIC collider that follows the animation (toggle)
             auto it=std::find(animColliders.begin(),animColliders.end(),m);
             if (it==animColliders.end()){ animColliders.push_back(m); setStatus("Animated collider ON (follows anim): "+gm.name); }
             else { animColliders.erase(it); setStatus("Animated collider OFF: "+gm.name); }
             return;
         }
-        sitem::Item it; it.type=sitem::NAVMESH; it.navMode=2; it.srcMeshes={m};   // STATIC mesh -> separate ColliderMesh entity
+        // STATIC ColliderMesh entity from the mesh's exact triangles (forceStatic bakes the CURRENT pose of an animated mesh).
+        sitem::Item it; it.type=sitem::NAVMESH; it.navMode=2; it.srcMeshes={m};
         it.name="Collider ("+gm.name+")";
         bakeNavGeometry(it);
         deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; showType[sitem::NAVMESH]=true; showMeshCol=true; tab=TAB_OBJECT;
+        setStatus("Static mesh collider from '"+gm.name+"'");
     }
     bool isAnimCollider(int m) const { return std::find(animColliders.begin(),animColliders.end(),m)!=animColliders.end(); }
     // A NAVMESH editor item is a MESH COLLIDER (added via "Add Mesh Collider") vs a walkable navmesh, by its name.
