@@ -6,24 +6,32 @@ Blender-style in-app editor.
 
 ---
 
-## ⚠️ DISCLAIMER — WORK IN PROGRESS, **NOT DONE**
+## Status — work in progress, but a **LOT** now works
 
-This tool is **incomplete and under active development**. Expect broken rendering,
-missing features, and rough edges. It is shared **as-is**, as a research /
-reverse-engineering work-in-progress — **not** a finished product.
+Under active reverse-engineering and shared **as-is** as a research project — not a polished
+product; bugs, crashes, and visual errors still happen. That said, a lot has been cracked:
 
-Known unfinished areas:
+**Working now:**
 
-- **V203 / HSL material rendering is not finished.** PBR materials (lightmap,
-  emissive, rgbmasked, the isotropic family) are only partially wired — many surfaces
-  render flat, mis-shaded, or with wrong colors. The per-material constants
-  (`matParams`) are not yet mapped by name, and some texture/UV mappings are off.
-- **The V79 → HSL cooking / repack pipeline produces installable, signed APKs** (see the
-  [**Converter Guide (Wiki)**](https://github.com/xAstroBoy/v79-quest-home-porter/wiki)), but the **rendering of ported content is not yet faithful** —
-  expect wrong colours, flat shading, and some content that doesn't draw on older headsets (Quest 2).
-- **Vistas and many environments are not yet faithful.**
+- **V79 → HSL cook → installable, signed APK** — one-press **cook + sign + auto-install**
+  (rooted own-package, or a non-root **Haven 2025 spoof**); the full pipeline is solid (see the
+  [**Converter Guide (Wiki)**](https://github.com/xAstroBoy/v79-quest-home-porter/wiki)).
+- **Geometry, textures, baked lightmaps, and most materials** — per-material shaders with the
+  cooked constants bound **by name** (`matParams` = `MurmurHash3` of the member), so tints / masks /
+  lightmaps resolve (this fixed the big "everything grey / pink / wrong-colour" blocker).
+- **Animation** — V79 node anims (spin / sway / UV-scroll / flipbook), VAT vistas, and skeletal
+  **HZANIM skinned meshes** (clouds / dragons / creatures). Large skinned meshes are auto-split into
+  device-safe pieces so they **load and animate** without crashing or OOM.
+- **Collision & navmesh** — walkable ColliderBox grid + double-sided trimesh, spawn / chair / mesh-collider
+  scene items, and far-clip / skybox handling so distant backdrops don't get clipped.
 
-Do not expect a polished result. Bugs, crashes, and visual errors are expected.
+**Still rough:**
+
+- Some PBR material variants (specIBL / parts of the isotropic family) render flat or mis-shaded.
+- A few vistas and effects aren't fully faithful; **Quest 2** can still miss some content.
+- The device's async asset loader can need **one retry** on the first switch into a heavy skinned env.
+
+Don't expect a finished product — but **most old homes now port, render, and animate.**
 
 ---
 
