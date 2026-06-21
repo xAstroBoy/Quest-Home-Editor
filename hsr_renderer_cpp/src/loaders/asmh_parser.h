@@ -99,7 +99,7 @@ inline bool parseAsmh(const std::vector<u8>& data, AssetMap& out) {
         if (ing0 < 0x100000000ULL) continue;  // must be a large random-looking ID
 
         i32 pref0 = i32at(t0 + 32);
-        if (pref0 <= 0 || pref0 > 4096) continue;
+        if (pref0 <= 0 || (u32)pref0 > SZ) continue;   // string offset is within the (possibly large) manifest, not a fixed 4096
         std::string path0 = fbStr((u32)((i32)(t0 + 32) + pref0));
         if (path0.empty() || path0.find("meta/") == std::string::npos) continue;
 
@@ -117,7 +117,7 @@ inline bool parseAsmh(const std::vector<u8>& data, AssetMap& out) {
             if (ing < 0x100000000ULL) continue;
 
             i32 pref = i32at(t + 32);
-            if (pref <= 0 || pref > 4096) continue;
+            if (pref <= 0 || (u32)pref > SZ) continue;
             std::string path = fbStr((u32)((i32)(t + 32) + pref));
             if (path.empty() || path.find("meta/") == std::string::npos) continue;
 

@@ -1306,6 +1306,72 @@ inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMe
     }
     return out;
 }
+// Split a LARGE SKINNED mesh (>cap unique verts) into SEPARATE single-part skinned meshes, each its own entity that
+// references the SAME skeleton + anim (deduped by the skel/anim byte-pool → one armatureN.skel + animclipN.anim). The
+// skinned RENDMESH encoder ALREADY multi-parts a >60k-vert mesh into u16 parts, but a MULTI-PART skinned mesh CRASHES
+// the device: DEVICE-PROVEN (snakeway 5_Car, 125,460 verts → 3 parts) the V205 HzAnimSystem skin-bind reads a per-part
+// bone-id list (ptr,len) and murmur3-hashes `len` bytes; with one skin descriptor but N parts it indexes past the
+// 1-element descriptor vector → garbage `len` → reads off the end of the mmap'd asset → SIGSEGV/SEGV_ACCERR on
+// HSR:Async-0 during load (every other working skinned env — incredibles droid, calming butterflies — is SINGLE-part,
+// <3k verts). The faithful fix is the SAME as the static-mesh split: many SINGLE-PART (u16) skinned meshes. Each piece
+// carries its own per-vertex restPos / boneIdx / boneWgt / uv / uv1 subset; the skeleton + clip are identical bytes so
+// they dedup to one shared asset every piece's AnimatorPlatformComponent points at (nuxd prism_wave + motes prove a
+// shared skeleton/anim across entities). Splitting by triangle preserves each vertex's skin weights, so all pieces
+// deform + animate together as one dragon. HSR_NOSKINSPLIT = keep the (crashing) multi-part path for diagnostics.
+inline std::vector<ExportMesh> splitLargeSkinnedMeshes(const std::vector<ExportMesh>& in, size_t cap = 60000) {
+    if (std::getenv("HSR_NOSKINSPLIT")) return in;
+    // DEVICE-PROVEN: MeshAssetBuilder::updateAsset (Clay) over-allocates building a LARGE SKINNED mesh — its per-part
+    // skinning buffer scales ~O(verts²) so a 60000-vert part balloons to gigabytes ("Requested new size exceeds size
+    // representable by size_type" → std::length_error / OOM → env load REJECTED → nuxd fallback). The shipped skinned
+    // envs (incredibles droid, calming butterflies) are all <3k verts/part, so they never hit it. Keep skinned parts
+    // SMALL so verts² stays bounded; this just makes more (cheap) single-part skinned entities sharing the one skeleton.
+    // Cap = balance of TWO opposing device failure modes (both throw std::length_error during the cold async load):
+    //   • per-part verts TOO BIG  → MeshAssetBuilder over-allocates (~O(verts²)) → OOM.
+    //   • TOO MANY pieces         → too many entities concurrently load the SHARED skel/anim → async-loader RACE.
+    // Device-swept: 60000=OOM, 8000(18pc)=race-prone w/ a 256-frame clip, 24000(6pc)=OOM-prone, 16000(9pc)=best
+    // (loads first-try most cold switches, ≤1 quick retry — beats the un-split incredibles). HSR_SKINCAP overrides.
+    if (const char* e = std::getenv("HSR_SKINCAP")) { long c = atol(e); if (c >= 1000) cap = (size_t)c; }
+    else cap = 16000;
+    std::vector<ExportMesh> out;
+    for (const auto& m : in) {
+        size_t nv = m.positions.size() / 3;
+        bool skinned = m.hzJointCount > 0 && m.hzBoneIdx.size() >= nv * 4;
+        if (!skinned || nv <= cap || m.indices.size() < 3) { out.push_back(m); continue; }
+        bool haveUv   = m.uvs.size()       >= nv * 2;
+        bool haveUv2  = m.uvs2.size()      >= nv * 2;
+        bool haveRest = m.hzRestPos.size() >= nv * 3;
+        bool haveBW   = m.hzBoneWgt.size() >= nv * 4;
+        size_t ntri = m.indices.size() / 3, t = 0; int npiece = 0;
+        while (t < ntri) {
+            ExportMesh c = m;   // copy ALL shared fields (skeleton hzJoint*/hzParents, anim hzTrsLocal, scalars, texture)
+            c.positions.clear(); c.uvs.clear(); c.uvs2.clear(); c.indices.clear();
+            c.hzRestPos.clear(); c.hzBoneIdx.clear(); c.hzBoneWgt.clear();
+            std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(cap + 16);
+            while (t < ntri) {
+                uint32_t tri[3] = { m.indices[t*3], m.indices[t*3+1], m.indices[t*3+2] };
+                int newv = 0; for (uint32_t g : tri) if (!remap.count(g)) newv++;
+                if (!remap.empty() && remap.size() + (size_t)newv > cap) break;
+                for (uint32_t g : tri) {
+                    auto it = remap.find(g); uint32_t l;
+                    if (it == remap.end()) {
+                        l = (uint32_t)remap.size(); remap.emplace(g, l);
+                        c.positions.push_back(m.positions[g*3]); c.positions.push_back(m.positions[g*3+1]); c.positions.push_back(m.positions[g*3+2]);
+                        if (haveUv)   { c.uvs.push_back(m.uvs[g*2]); c.uvs.push_back(m.uvs[g*2+1]); }
+                        if (haveUv2)  { c.uvs2.push_back(m.uvs2[g*2]); c.uvs2.push_back(m.uvs2[g*2+1]); }
+                        if (haveRest) { c.hzRestPos.push_back(m.hzRestPos[g*3]); c.hzRestPos.push_back(m.hzRestPos[g*3+1]); c.hzRestPos.push_back(m.hzRestPos[g*3+2]); }
+                        for (int k = 0; k < 4; k++) c.hzBoneIdx.push_back(m.hzBoneIdx[g*4+k]);
+                        for (int k = 0; k < 4; k++) c.hzBoneWgt.push_back(haveBW ? m.hzBoneWgt[g*4+k] : (uint8_t)(k==0?255:0));
+                    } else l = it->second;
+                    c.indices.push_back(l);
+                }
+                t++;
+            }
+            out.push_back(std::move(c)); npiece++;
+        }
+        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] SKINNED-SPLIT '%s' %zu verts -> %d single-part pieces (avoids multi-part skinned device crash)\n", m.name.c_str(), nv, npiece);
+    }
+    return out;
+}
 // ── AUTO-PROVISION the signing toolchain when a machine has NOTHING installed ───────────────────────────────
 // curl (ships with Win10+/Linux/macOS) fetches the OS's official package; miniz/tar extracts it BESIDE the exe.
 // Cached after the first run. So `--sign` / Cook works on a clean PC with no Android SDK and no JDK — zero setup.
@@ -1704,6 +1770,8 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     float smn[3]={1e30f,1e30f,1e30f}, smx[3]={-1e30f,-1e30f,-1e30f};
     // Split >60000-vert STATIC meshes into separate single-part meshes (multi-part static doesn't render on device).
     std::vector<ExportMesh> meshesV = splitLargeStaticMeshes(meshes);
+    // Split >60000-vert SKINNED meshes the SAME way (multi-part skinned CRASHES the device — snakeway 5_Car dragon).
+    meshesV = splitLargeSkinnedMeshes(meshesV);
     // ── HSR_FITCLIP: scale EVERY mesh under the shell's fixed far-clip plane (default R=4500, margin under 5000) ──
     // Per-mesh UNIFORM scale ABOUT THE SPAWN: each vertex keeps its DIRECTION (angular position) and the mesh keeps its
     // apparent size (size/distance) from the spawn -> looks identical, textures untouched, internal depth scales with it

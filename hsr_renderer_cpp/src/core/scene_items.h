@@ -38,6 +38,7 @@ inline const char* unitAxisName(int a) {
 struct Item {
     int   type = SPAWN;
     std::string name;
+    bool  hidden = false;          // per-item visibility eye (hides this item's marker + gizmo in the editor)
     float pos[3]   = {0,0,0};       // world position
     float rot[3]   = {0,0,0};       // EULER DEGREES (UI); cooked as radians
     float scale[3] = {1,1,1};
