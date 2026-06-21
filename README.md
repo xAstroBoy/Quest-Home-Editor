@@ -32,9 +32,15 @@ Do not expect a polished result. Bugs, crashes, and visual errors are expected.
 - Loads V79 `.gltf.ovrscene` + `.opa` environments and V203 / HSL `.apk` homes.
 - Renders them in a custom Vulkan renderer, decoding meshes, textures, materials,
   animations, and lightmaps as faithfully as possible from Meta's `libshell`.
-- Blender-style in-app **editor** (ImGui + ImGuizmo): outliner tree, click-to-select,
-  move / rotate / scale gizmos, undo/redo, mesh + material inspection, editor overlays
-  (navmesh / collision / spawn points).
+- Blender-style in-app **editor** (custom immediate-mode UI): outliner tree with
+  per-item / per-mesh **visibility eyes**, click-to-select, move / rotate / scale gizmos,
+  undo/redo, mesh + material inspection, scene items (spawn / chair / navmesh / mesh
+  collider / wall / hotspot), and always-visible viewport toggles (Move/Rotate/Scale,
+  Walk-sim, PC audio, and overlay toggles for navmesh / collision / spawn / far-clip).
+  Sessions persist to `saved/<env>.hsledit`.
+- **Ports animated content** — V79 node animations (spin/sway/UV-scroll/flipbook) and
+  skeletal **HZANIM** skinned meshes (clouds/dragons/creatures); large skinned meshes are
+  auto-split into device-safe pieces so they load and animate without crashing.
 - **V203 shader decode** — `v203_shader_tool.py` extracts the pre-compiled SPIR-V
   shaders directly out of an environment `.apk` (`scene.zip` → `*.surface/shader_t2w9`
   "SHAD" containers) and reflects each variant's descriptor + vertex interface into a
@@ -86,7 +92,7 @@ Drag-and-drop an environment onto the window, or pass it on the command line.
 
 See the **[Converter Guide (Wiki)](https://github.com/xAstroBoy/v79-quest-home-porter/wiki)** for the full walkthrough. In short: drop `adb.exe` +
 `AdbWinApi.dll` + `AdbWinUsbApi.dll` beside the exe, load the old home, open the **Cook** tab, and
-press **`COOK + SIGN + INSTALL`**. A cook writes up to two APKs next to the env:
+press **`COOK + SIGN + INSTALL`**. A cook writes up to two APKs into the **`cooked/`** folder:
 
 - **`<env>_NoRoot-Spoof.apk`** — masquerades as Meta's **Haven 2025** home; the **only** option that
   installs on a **non-rooted** Quest. Install it, then pick "Haven 2025" in the home menu.
@@ -94,7 +100,7 @@ press **`COOK + SIGN + INSTALL`**. A cook writes up to two APKs next to the env:
 
 The auto-installer detects root over `adb` and picks the right one for you (rooted → unspoofed +
 auto-select; non-rooted → **back up the real Haven 2025**, install the spoof, relaunch the shell).
-The pristine backup is kept beside the exe as `haven2025_ORIGINAL_backup.apk` and is never overwritten.
+The pristine backup is kept beside the exe in the **`Haven2025_Backup/`** folder (never overwritten); restore it anytime with `hsr_renderer.exe --restore-haven`.
 
 ### Sign a cooked APK
 
