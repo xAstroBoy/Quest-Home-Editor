@@ -12,7 +12,7 @@ struct Camera {
     float yaw      = 0.0f;
     float pitch    = 0.0f;
     float speed    = 3.0f;    // m/s
-    float nearZ    = 0.1f;
+    float nearZ    = 0.02f;   // close near plane so you can get right up to a mesh without it clipping away (reversed-Z float depth keeps precision)
     float farZ     = 40000.0f;   // the vista/skybox sphere is ~13k out (up to ~26k across) — must be inside the far plane or it gets clipped away (flat clear-color background)
     float fovDeg   = 75.0f;
 
@@ -96,7 +96,7 @@ struct Camera {
     void moveDown(float dt) { pos[1] -= speed * dt; }
 
     void rotate(float dx, float dy) {
-        yaw   -= dx * 0.003f;
+        yaw   += dx * 0.003f;   // drag-look: mouse LEFT (dx<0) -> yaw decreases -> look LEFT (was inverted: -= made left look right)
         pitch -= dy * 0.003f;
         if (pitch > 1.55f) pitch = 1.55f;
         if (pitch < -1.55f) pitch = -1.55f;

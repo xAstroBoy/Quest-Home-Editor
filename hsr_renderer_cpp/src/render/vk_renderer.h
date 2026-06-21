@@ -322,6 +322,15 @@ public:
     float cachedVP[16];  // view-projection matrix cached from updateUniforms
     std::chrono::time_point<std::chrono::high_resolution_clock> startTime;
     bool timeStarted = false;
+    // EDITOR-TIMELINE clock for time-driven anims. The cooked getTime() shaders (rot/osc/wispscale/flipbook/VAT) and the
+    // procedural motes/prism skinning read this. <0 => free-running wall-clock (pure headless). The editor sets it to the
+    // looped playhead each frame so pause/scrub/loop control EVERY animation uniformly (they used to ignore the timeline).
+    float extAnimTime = -1.f;
+    float animClockSec() {
+        if (!timeStarted) { startTime = std::chrono::high_resolution_clock::now(); timeStarted = true; }
+        if (extAnimTime >= 0.f) return extAnimTime;
+        return std::chrono::duration<float>(std::chrono::high_resolution_clock::now() - startTime).count();
+    }
 
     bool debugMode = false;
     bool wireframe = false;                    // toggle with F key
@@ -3676,9 +3685,7 @@ public:
     // drift/bob and the wave undulates — the ambient motion these env joints produce.
     // skinningMatrix is column-major; with identity invBind this is a world delta.
     void updateSkinning() {
-        if (!timeStarted) { startTime = std::chrono::high_resolution_clock::now(); timeStarted = true; }
-        float t = std::chrono::duration<float>(
-            std::chrono::high_resolution_clock::now() - startTime).count();
+        float t = animClockSec();   // editor-timeline clock (pause/scrub/loop), else wall-clock
         // Precompute a small per-bone drift offset (256 bones), each with its own phase.
         float off[256][3];
         for (u32 b = 0; b < 256; ++b) {
@@ -3821,9 +3828,10 @@ public:
         ubo[100] = cx; ubo[101] = cy; ubo[102] = cz; ubo[103] = 1.0f;
         // +592 whitePoint = 1.0
         ubo[148] = 1.0f;
-        // +596 time (seconds elapsed) — drives procedural vertex animations (motes, prism_wave)
-        if (!timeStarted) { startTime = std::chrono::high_resolution_clock::now(); timeStarted = true; }
-        ubo[149] = std::chrono::duration<float>(std::chrono::high_resolution_clock::now() - startTime).count();
+        // +596 time — drives EVERY getTime() shader anim (cooked rot/osc/wispscale/flipbook/VAT, motes, prism_wave).
+        // animClockSec() = the editor-timeline playhead when the editor drives it (pause/scrub/loop apply), else the
+        // renderer's own wall-clock (pure headless). This is what ties the cooked shader anims to the editor timeline.
+        ubo[149] = animClockSec();
         // +664 viewportSize = {W, H}
         ubo[166] = W; ubo[167] = H;
         // FOG — the cooked frag's fogMixColor reads GlobalUniforms.fogColor(@672)/fogStart(@688)/

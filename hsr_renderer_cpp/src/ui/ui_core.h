@@ -58,7 +58,7 @@ struct Context {
     Input in;
     uint32_t hot=0, active=0;        // hovered / pressed widget
     uint32_t kbFocus=0;              // text field with keyboard focus
-    std::string editBuf; int editCur=0;   // text-field edit state
+    std::string editBuf; int editCur=0, editSel=-1;   // text-field edit state (editSel = selection anchor; -1 = no selection)
     float t=0.f; bool consumedMouse=false;
 
     bool inClip(float x,float y) const { VkRect2D c=dl->cur(); return x>=c.offset.x&&y>=c.offset.y&&x<c.offset.x+(int)c.extent.width&&y<c.offset.y+(int)c.extent.height; }
@@ -190,14 +190,21 @@ struct Context {
     }
     // Editable single-line text field (used by Cook package name).
     bool textField(uint32_t id,float x,float y,float w,float h,std::string& s){
-        bool hv=hover(x,y,w,h); if(hv&&in.pressed[0]){ kbFocus=id; editBuf=s; editCur=(int)s.size(); }
+        bool hv=hover(x,y,w,h); if(hv&&in.pressed[0]){ kbFocus=id; editBuf=s; editCur=(int)s.size(); editSel=-1; }
         if(in.pressed[0]&&!hv&&kbFocus==id){ kbFocus=0; s=editBuf; }
         bool committed=false;
         if(kbFocus==id){
-            if(!in.text.empty()){ editBuf.insert(editCur,in.text); editCur+=(int)in.text.size(); }
-            if(in.keyRepeat[KEY_BACKSPACE]&&editCur>0){ editBuf.erase(editCur-1,1); editCur--; }
-            if(in.keyRepeat[KEY_LEFT]&&editCur>0)editCur--;
-            if(in.keyRepeat[KEY_RIGHT]&&editCur<(int)editBuf.size())editCur++;
+            // delete the active selection (returns true if it deleted something) — shared by typing/backspace/delete
+            auto delSel=[&]()->bool{ if(editSel<0||editSel==editCur){ editSel=-1; return false; }
+                int a=editSel<editCur?editSel:editCur, b=editSel<editCur?editCur:editSel; editBuf.erase(a,b-a); editCur=a; editSel=-1; return true; };
+            if(in.ctrl && in.keyRepeat[KEY_A]){ editSel=0; editCur=(int)editBuf.size(); }   // Ctrl+A = select all
+            if(!in.text.empty()){ delSel(); editBuf.insert(editCur,in.text); editCur+=(int)in.text.size(); }
+            if(in.keyRepeat[KEY_BACKSPACE]){ if(!delSel() && editCur>0){ editBuf.erase(editCur-1,1); editCur--; } }
+            if(in.keyRepeat[KEY_DELETE]){ if(!delSel() && editCur<(int)editBuf.size()){ editBuf.erase(editCur,1); } }   // forward delete
+            if(in.keyRepeat[KEY_LEFT]){ editSel=-1; if(editCur>0)editCur--; }
+            if(in.keyRepeat[KEY_RIGHT]){ editSel=-1; if(editCur<(int)editBuf.size())editCur++; }
+            if(in.keyRepeat[KEY_HOME]){ editSel=-1; editCur=0; }
+            if(in.keyRepeat[KEY_END]){ editSel=-1; editCur=(int)editBuf.size(); }
             if(in.keyRepeat[KEY_ENTER]){ s=editBuf; kbFocus=0; committed=true; }
             if(in.keyRepeat[KEY_ESCAPE]){ kbFocus=0; }
         }
@@ -210,6 +217,11 @@ struct Context {
         dl->pushClip(x,y,w,h);                                        // EVERYTHING (text + caret) clipped to the box
         Font* of=dl->font; dl->font=fnt;
         float ty=y+(h-(fnt->ascent-fnt->descent))*0.5f;
+        if(kbFocus==id && editSel>=0 && editSel!=editCur){            // selection highlight (Ctrl+A etc.)
+            int a=editSel<editCur?editSel:editCur, b=editSel<editCur?editCur:editSel;
+            float sa=fnt->textWidth(shown.c_str(),a), sb=fnt->textWidth(shown.c_str(),b);
+            dl->rect(x+pad-scroll+sa, y+3, sb-sa, h-6, th.accent);
+        }
         dl->text(x+pad-scroll, ty, shown.c_str(), th.text);
         if(kbFocus==id && (((int)(t*2))&1)) dl->rect(x+pad-scroll+caretX, y+3, 1, h-6, th.text);
         dl->font=of;

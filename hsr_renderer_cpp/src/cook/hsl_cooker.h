@@ -1156,6 +1156,7 @@ struct ExportMesh {
     std::vector<uint8_t> rgba;      // decoded base-color RGBA8 (optional)
     uint32_t w = 0, h = 0;
     bool blend = false;             // alpha-blended (transparent) -> route to unlitblend.surface
+    bool doubleSided = false;       // glTF doubleSided material -> cook appends REVERSED tris so the single-sided unlit shader still draws back faces (else flat/open meshes back-face-cull on device = see-through HOLES; renderer honors doubleSided so its preview looked fine)
     bool flipbook = false;          // animated flat material -> route to unlitspritesheetflipbookadditive.surface (GPU getTime() spritesheet cycle, NO skeleton)
     int flipCols = 0, flipRows = 0; // spritesheet grid (0 -> use the template's 11x11)
     float matTint[4] = {1,1,1,1};   // the mesh's OWN base-color tint (glTF baseColorFactor) for its material params
@@ -2152,6 +2153,14 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             if (nvp){ float cx=(float)(cc[0]/nvp), cy=(float)(cc[1]/nvp), cz=(float)(cc[2]/nvp);
                       for (size_t v=0; v<nvp; v++){ skyPos[v*3]-=cx; skyPos[v*3+1]-=cy; skyPos[v*3+2]-=cz; } }
             posPtr = &skyPos;
+        }
+        // DOUBLE-SIDED: append REVERSED tris so the single-sided cooked unlit shader still draws back faces. The skybox
+        // dome needs it (viewed from inside); ANY glTF doubleSided source material needs it too — else flat/open meshes
+        // (the bat-computer monitor-screen quad, thin wall panels) get back-face-culled on device = see-through HOLES,
+        // even though the editor preview (which honors doubleSided = no cull) showed them. Geometry-only, no z-fight (for
+        // any pixel exactly one of the coincident tris is front-facing). Skinned (own doublesided shader) / VAT+rot+flip
+        // billboards (intentionally single-sided, face the player) keep their own handling.
+        if ((m.skybox || (m.doubleSided && !useVat && !useRot && !usePulse && !useUvScroll && !usePose && !m.flipbook)) && !useHz) {
             dsIdx = m.indices; dsIdx.reserve(m.indices.size()*2);
             for (size_t t=0; t+2<m.indices.size(); t+=3) { dsIdx.push_back(m.indices[t]); dsIdx.push_back(m.indices[t+2]); dsIdx.push_back(m.indices[t+1]); }
             sIdx = &dsIdx;
@@ -2437,6 +2446,13 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     int userLocalSpawn = 0, sidx = 700000;
     for (const auto& si : sceneItems) {
         if (si.type == sitem::NAVMESH) continue;
+        // SAFETY: a CHAIR's chair_location locator makes the HomeLocomotionSystem build a chair-button that DEREFERENCES
+        // the ChairIcon child mesh — ship a chair without that icon and the device null-derefs -> CRASH LOOP. The icon is
+        // embedded (embassets), so iconOk is normally true; if it's ever unavailable, SKIP the chair rather than crash.
+        if (si.type == sitem::CHAIR && !iconOk) {
+            fprintf(stderr, "[COOK] WARNING: chair-icon mesh unavailable -> SKIPPED chair '%s' (a chair without its ChairIcon child crash-loops the device). Rebuild with cooker/chair_icon_mesh.bin+chair_icon_tex.bin embedded.\n", si.name.c_str());
+            continue;
+        }
         std::string iid = sitem::uuid(sidx);
         // HOTSPOT reuses the stolen icon mesh as its visible "dot"; pass its ref as meshAssetJson.
         // SPAWN: the shell teleports the player's HEAD/EYE to the spawn transform (IDA: SpawnPointPlatformComponent is

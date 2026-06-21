@@ -14,6 +14,10 @@ COOKER_FILES = [
     "realdome_mat.bin","realfloor_mat.bin","realfloor_phys.bin","ref_skinned_mesh.bin",
     "skinned_mat.bin","skinned_mat_v2.bin","unlitblendskinned.bin","unlitdoublesidedskinned.bin",
     "vat_mat.bin","vat_shader.bin","vatunlitblend.surface.bin","wispscale.surface.bin",
+    # ⚠ chair_icon_mesh/tex are LOAD-BEARING: without them iconOk=false -> a cooked CHAIR ships with no ChairIcon child
+    # -> HomeLocomotionSystem null-derefs -> device CRASH LOOP. Embed so a standalone .exe (no cooker/ folder) is safe.
+    "chair_icon_mesh.bin","chair_icon_tex.bin",
+    "nuxd_unlit_depthclamp.bin","nuxd_unlitblend_depthclamp.bin","skybox_surface.bin",   # depth-clamp far-clip + skybox backdrop
 ]
 # nuxd donor: everything spliceAPK keeps (scene.zip + AndroidManifest are replaced; META-INF + these are dropped).
 NUXD_DROP = {"assets/scene.zip","AndroidManifest.xml",

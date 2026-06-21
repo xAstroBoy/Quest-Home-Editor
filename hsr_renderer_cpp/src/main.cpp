@@ -796,7 +796,9 @@ int main(int argc, char** argv) {
     // feedback. The cook prints [GLTF]/[COOK]/[EXPORT] progress to the console; HSR_EXPORT_QUIT exits when done.
     bool g_cookHeadless = std::getenv("HSR_EXPORT") != nullptr;
     if (g_cookHeadless) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
-    else glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);  // always-on-top so external screenshot capture is reliable
+    // Always-on-top (GLFW_FLOATING) ONLY for capture modes (reliable external screenshots). The interactive editor
+    // defaults OFF — an always-on-top editor window is annoying — and exposes a runtime "Always on top" toggle.
+    else if (std::getenv("HSR_SHOT") || std::getenv("HSR_LIVE") || std::getenv("HSR_FLOATING")) glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
     // Title shows WHICH loader/format is active (V79 glTF / V79 OPA / HSL) + the env file name.
     std::string g_fmtName = isV79 ? "V79 glTF" : (isOpa ? "V79 OPA" : "HSL");
     std::string g_baseName = apkPath; { size_t sl = g_baseName.find_last_of("/\\"); if (sl != std::string::npos) g_baseName = g_baseName.substr(sl + 1); }
@@ -1460,6 +1462,12 @@ int main(int argc, char** argv) {
         if (glfwGetKey(g_window, GLFW_KEY_Q) == GLFW_PRESS) cam.moveDown(dt);
         }
 
+        // Tie the cooked getTime() shader anims (rot/osc/wispscale/flipbook/VAT) + procedural motes/prism to the EDITOR
+        // TIMELINE so pause/scrub/loop control EVERY animation (they were free-running on wall-clock = ignored the
+        // timeline). g_animOverride is true while the editor drives the playhead; HSR_ANIMTIME freezes; else (pure
+        // headless) <0 keeps the renderer's own wall-clock.
+        vkRenderer.extAnimTime = g_animOverride ? g_animScrub
+                               : ((fixedAnimTime >= 0.f) ? fixedAnimTime : -1.f);
         vkRenderer.render();
         glfwPollEvents();
         // (pick + the gizmo are handled immediately in editor.onMouseButton, using the viewport pane rect)

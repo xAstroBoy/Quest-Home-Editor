@@ -78,10 +78,16 @@ struct Editor {
     bool playSim = false; float pVelY = 0.f;
     std::vector<float> simV; std::vector<uint32_t> simI;   // cached walkable triangles for the sim
     int  selItem = -1;             // index into items (-1 = none; mesh selection active instead)
+    float lastItemClickT = -1.f;   // for double-click-to-focus detection (single click = select only, no camera teleport)
+    bool alwaysOnTop = false;       // window always-on-top toggle (OFF by default — see the "Pin" pill in the viewport header)
+    bool chairTiltLock = true;      // chairs rotate YAW-only (stay upright); the gizmo won't tip them over. Toggle in chair props.
+    bool xrayMesh = false;          // "X-ray" overlay: draw the SELECTED mesh(es) wireframe ALWAYS-on-top so you can see
+                                    // exactly where the real mesh is vs a collider box (the boxes draw on top, so from some
+                                    // camera angles a box LOOKS aligned with its mesh but isn't — this removes that ambiguity).
     bool showItems = true;         // item markers visible (the things you add are always shown)
     bool showFarClip = false;      // viewport overlay: draw the device far-clip (PortalStereoCamera far=5000) boundary sphere
     bool showType[sitem::TYPE_COUNT] = { true,true,true,true,true,true,true };   // per-Meta-component visibility toggles
-    bool showMeshCol = true;       // DEDICATED viewport toggle for ADDED mesh colliders (markers + gizmo). Off = hide them so you can edit meshes.
+    bool showMeshCol = false;      // DEDICATED viewport toggle for ADDED mesh colliders (markers + gizmo). DEFAULT OFF so a freshly-loaded env (which restores saved per-mesh colliders) isn't cluttered with red collider overlays on launch — toggle "Collision" on to edit them. (Adding a navmesh flips it on so you see what you just placed.)
     // distinct marker colours (deliberately AVOID the gizmo's R/G/B axes): cyan / orange / magenta / teal / purple / yellow
     uint32_t typeColor(int t, bool seld) const {
         switch (t) {
@@ -118,13 +124,52 @@ struct Editor {
     }
     void addItem(int type) {
         if (type==sitem::NAVMESH) { addNavmesh(sel.empty()?1:2); return; }   // navmesh has its own mode-aware path
+        pushItemUndo(items);   // undoable add
         sitem::Item it; it.type=type; it.name=std::string(sitem::typeName(type))+" "+std::to_string(items.size()+1);
-        float cp=std::cos(r->cam.pitch); float fwd[3]={std::sin(r->cam.yaw)*cp, std::sin(r->cam.pitch), -std::cos(r->cam.yaw)*cp};
-        it.pos[0]=r->cam.pos[0]+fwd[0]*2.5f; it.pos[1]=r->cam.pos[1]+fwd[1]*2.5f; it.pos[2]=r->cam.pos[2]+fwd[2]*2.5f;
+        float hp[3];
+        if (cameraForwardHit(hp)) { it.pos[0]=hp[0]; it.pos[1]=hp[1]; it.pos[2]=hp[2]; }   // drop it where you're LOOKING (on a surface)
+        else { float cp=std::cos(r->cam.pitch); float fwd[3]={std::sin(r->cam.yaw)*cp, std::sin(r->cam.pitch), -std::cos(r->cam.yaw)*cp};
+               it.pos[0]=r->cam.pos[0]+fwd[0]*2.5f; it.pos[1]=r->cam.pos[1]+fwd[1]*2.5f; it.pos[2]=r->cam.pos[2]+fwd[2]*2.5f; }  // nothing in view -> 2.5 m ahead
         if (type==sitem::SPAWN||type==sitem::CHAIR||type==sitem::BOXCOL) dropToFloor(it.pos);   // land ground items ON the floor (not floating at overview-camera height)
         deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; tab=TAB_OBJECT;
     }
-    void deleteSelItem() { if (selItem>=0 && selItem<(int)items.size()) { items.erase(items.begin()+selItem); selItem=-1; } }
+    // Create a Meta Component DERIVED from a mesh's world geometry (right-click -> Make ...). Each type is fitted to the
+    // mesh so it's immediately solid/usable instead of a default placeholder you then hand-size.
+    void addItemFromMesh(int type, int meshIdx){
+        if (meshIdx<0 || meshIdx>=(int)r->gpuMeshes.size()) return;
+        pushItemUndo(items);
+        float mn[3],mx[3]; worldAabb(r->gpuMeshes[meshIdx],mn,mx);
+        float C[3]={(mn[0]+mx[0])*0.5f,(mn[1]+mx[1])*0.5f,(mn[2]+mx[2])*0.5f};
+        float H[3]={std::max(0.02f,(mx[0]-mn[0])*0.5f),std::max(0.02f,(mx[1]-mn[1])*0.5f),std::max(0.02f,(mx[2]-mn[2])*0.5f)};
+        sitem::Item it; it.type=type; it.name=std::string(sitem::typeName(type))+" "+std::to_string(items.size()+1);
+        it.pos[0]=C[0]; it.pos[1]=C[1]; it.pos[2]=C[2];
+        switch(type){
+          case sitem::BOXCOL:                                       // a box collider that wraps the whole mesh
+            it.half[0]=H[0]; it.half[1]=H[1]; it.half[2]=H[2]; break;
+          case sitem::WALLPLACE: {                                  // a flat wall ON the clicked face, TILTED to the real surface
+            // IDA (V205.2): horizon::hpi::WallPlacementComponent is a UserComponent with only propRank/propMaxWidth/
+            // propMaxHeight — its facing is purely the ENTITY TRANSFORM. So orient the transform to the MESH SURFACE
+            // NORMAL at the right-clicked face (tilt and all), not just a flat yaw. forward(-Z) = normal toward you.
+            float P[3],N[3];
+            if (screenRayHitMesh(ctxX, ctxY, meshIdx, P, N)) {
+                it.pos[0]=P[0]; it.pos[1]=P[1]; it.pos[2]=P[2];     // sit exactly on the clicked surface point
+                forwardToEuler(N, it.rot);                          // wall normal = surface normal (TILTED to match the face)
+                it.propW=std::max(0.2f, std::max(2*H[0],2*H[2])); it.propH=std::max(0.2f, 2*H[1]);
+            } else {                                                // not on a face -> flat wall facing the camera (yaw only)
+                float dx=r->cam.pos[0]-C[0], dz=r->cam.pos[2]-C[2]; float L=std::sqrt(dx*dx+dz*dz); if(L<1e-4f){dx=0;dz=1;L=1;} dx/=L; dz/=L;
+                it.rot[1]=std::atan2(dx,-dz)*57.29578f;
+                it.propW=std::max(0.2f, std::fabs(2*H[0]*dz)+std::fabs(2*H[2]*dx)); it.propH=std::max(0.2f, 2*H[1]);
+                float depth=std::fabs(2*H[0]*dx)+std::fabs(2*H[2]*dz); it.pos[0]=C[0]+dx*depth*0.5f; it.pos[2]=C[2]+dz*depth*0.5f;
+            } break; }
+          case sitem::SPAWN:   it.pos[1]=mx[1]; it.allowStart=true; it.isLocal=true; break;   // stand on top of the mesh
+          case sitem::CHAIR:   it.pos[1]=mx[1]; break;                                        // seat on top
+          case sitem::BOUNDARY:it.pos[1]=mn[1]; break;                                        // kill-floor plane at the mesh base
+          default: break;                                                                    // HOTSPOT etc. -> mesh center
+        }
+        deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; tab=TAB_OBJECT;
+        setStatus(std::string("Created ")+sitem::typeName(type)+" from '"+r->gpuMeshes[meshIdx].name+"'");
+    }
+    void deleteSelItem() { if (selItem>=0 && selItem<(int)items.size()) { pushItemUndo(items); items.erase(items.begin()+selItem); selItem=-1; } }
     // Import a V79 env's assets/markup.json Locators as scene items: portal->Spawn, seat-hotspots->Chair,
     // other hotspots/mirrors/curios->Hotspot. position/rotation + avatar_position(->exit)/avatar_rotation(->facing).
     int importMarkup(const std::string& json) {
@@ -251,8 +296,14 @@ struct Editor {
 
     // ── undo/redo ──
     struct Xform { float t[3]={0,0,0}, r[4]={0,0,0,1}, s[3]={1,1,1}; };
-    struct UndoOp { std::vector<int> m; std::vector<Xform> b, a; };   // multi-mesh (one drag of a multi-selection = one op)
+    struct UndoOp { std::vector<int> m; std::vector<Xform> b, a;       // mesh-transform op (multi-mesh = one drag = one op)
+                    bool isItems=false; std::vector<sitem::Item> itemsState; };   // OR a scene-items snapshot (add/delete/move/paste)
     std::vector<UndoOp> undoStack, redoStack;
+    sitem::Item clipboardItem; bool hasClipboard=false;   // copy/paste one scene item
+    std::vector<sitem::Item> itemsBeforeDrag;             // snapshot captured when an item gizmo-drag starts (pushed on release)
+    // snapshot the items vector BEFORE a mutation so Ctrl+Z can restore it (swap-based: the op holds the other state).
+    void pushItemUndo(std::vector<sitem::Item> before){ UndoOp op; op.isItems=true; op.itemsState=std::move(before);
+        undoStack.push_back(std::move(op)); redoStack.clear(); if (undoStack.size()>256) undoStack.erase(undoStack.begin()); }
     bool editing = false; int editMesh = -1; Xform editBefore;
 
     // ── gizmo ──
@@ -369,7 +420,7 @@ struct Editor {
             if (b == 0 && gzVisible && in3D && !exitDrag) {     // gizmo handle hit-test (cached screen positions)
                 int hit = gizmoHitTest(cx.in.mx, cx.in.my);
                 if (hit >= 0) {
-                    if (selItem>=0) { gizmoDrag=true; gizmoAxis=hit; gizmoSel.clear(); }   // scene-item drag (its own transform)
+                    if (selItem>=0) { gizmoDrag=true; gizmoAxis=hit; gizmoSel.clear(); itemsBeforeDrag=items; }   // scene-item drag (snapshot for undo)
                     else if (!sel.empty()) { gizmoDrag=true; gizmoAxis=hit; gizmoSel=sel; gizmoBeforeV.clear(); for (int m:sel) gizmoBeforeV.push_back(captureX(r->gpuMeshes[m])); }
                 }
             }
@@ -379,7 +430,10 @@ struct Editor {
             cx.in.down[b] = false; cx.in.released[b] = true;
             bool wasExit = exitDrag; if (b==0) exitDrag=false;
             bool wasBox = (b==0)&&boxSel; if (b==0) boxSel=false;
-            if (b == 0 && gizmoDrag) { std::vector<Xform> after; for (int m:gizmoSel) after.push_back(captureX(r->gpuMeshes[m])); pushUndo(gizmoSel, gizmoBeforeV, after); gizmoDrag=false; gizmoAxis=-1; }
+            if (b == 0 && gizmoDrag) {
+                if (gizmoSel.empty() && !itemsBeforeDrag.empty()) { pushItemUndo(std::move(itemsBeforeDrag)); itemsBeforeDrag.clear(); }   // item drag -> item undo
+                else { std::vector<Xform> after; for (int m:gizmoSel) after.push_back(captureX(r->gpuMeshes[m])); pushUndo(gizmoSel, gizmoBeforeV, after); }
+                gizmoDrag=false; gizmoAxis=-1; }
             else if (b == 0 && in3D && !wasExit) {   // a click (pick) OR a Ctrl/Shift box-drag (rubber-band multi-select)
                 float dx=cx.in.mx-(float)cx.in.pressX[0], dy=cx.in.my-(float)cx.in.pressY[0];
                 if (wasBox && dx*dx+dy*dy >= 25.f*uiScale*uiScale) boxSelectRect(boxX0, boxY0, (float)cx.in.mx, (float)cx.in.my, cx.in.ctrl);   // Ctrl box = toggle/unpick, Shift box = add
@@ -414,6 +468,13 @@ struct Editor {
         if ((mods&GLFW_MOD_CONTROL) && key=='Y') doRedo();
         if ((mods&GLFW_MOD_CONTROL) && key=='S') saveProject();   // persist the session
         if ((mods&GLFW_MOD_CONTROL) && key=='L') loadProject();   // restore the session
+        if ((mods&GLFW_MOD_CONTROL) && key=='C' && selItem>=0 && selItem<(int)items.size()) { clipboardItem=items[selItem]; hasClipboard=true; }   // copy item
+        if ((mods&GLFW_MOD_CONTROL) && key=='V' && hasClipboard) {   // paste a copy (offset so it's visible), undoable, and select it
+            pushItemUndo(items); sitem::Item it=clipboardItem; it.pos[0]+=0.5f; it.pos[2]+=0.5f; it.name+=" copy";
+            deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; }
+        if ((mods&GLFW_MOD_CONTROL) && key=='D' && selItem>=0 && selItem<(int)items.size()) {   // Ctrl+D = duplicate in place+offset
+            pushItemUndo(items); sitem::Item it=items[selItem]; it.pos[0]+=0.5f; it.pos[2]+=0.5f; it.name+=" copy";
+            deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; }
         if (key=='P' && !(mods&GLFW_MOD_CONTROL)) { if(playSim) stopSim(); else startSim(); }   // toggle WALK mode (player sim)
         if (key==GLFW_KEY_DELETE && selItem>=0) deleteSelItem();   // remove the selected scene item
     }
@@ -456,6 +517,7 @@ struct Editor {
         // own opaque background and the layout tiles the rest, so the viewport pane stays the live 3D view.
         drawViewportOverlay();
         drawItems();                                            // spawn/chair/collider/wall/hotspot/navmesh markers
+        if (xrayMesh) drawSelectedMeshWire();                   // X-ray: selected mesh wireframe over the boxes (alignment)
         if (hasRespawn) {                                       // visualize the respawn kill-floor: a red grid at respawnY around you
             VkRect2D vp=rcViewport; dl.pushClip((float)vp.offset.x,(float)vp.offset.y,(float)vp.extent.width,(float)vp.extent.height);
             float cx0=r->cam.pos[0], cz0=r->cam.pos[2], S=60.f; uint32_t col=ui::rgba(255,80,80,150);
@@ -561,6 +623,14 @@ struct Editor {
             {std::string(hidden?"Unhide":"Hide")+suf,2}, {std::string("Reset transform")+suf,3}, {"Copy name",4},
             {colLbl,5},
             {std::string(isSkyboxMesh(ctxMesh)?"Unmark skybox backdrop":"Make skybox backdrop")+suf, 6} };   // -> SkyboxPlatformComponent (far-clip-exempt)
+        // CREATE a Meta Component fitted to this mesh (the user wanted every Meta Component reachable from right-click).
+        items.push_back({"-- Make component from mesh --", -1});
+        items.push_back({"Box Collider (wrap mesh)", 10});
+        items.push_back({"Wall (faces camera)", 11});
+        items.push_back({"Spawn Point (on top)", 12});
+        items.push_back({"Chair / Seat (on top)", 13});
+        items.push_back({"Locomotion Hotspot", 14});
+        items.push_back({"Kill Floor / Boundary", 15});
         if (nHidden>0) items.push_back({std::string("Unhide ALL (")+std::to_string(nHidden)+")", 7});
         float rh=th.rowH+2*uiScale, w=180*uiScale, h=items.size()*rh+6*uiScale;
         float x=ctxX, y=ctxY; if (x+w>fbW) x=fbW-w; if (y+h>fbH) y=fbH-h; if (x<0)x=0; if (y<0)y=0;
@@ -590,6 +660,12 @@ struct Editor {
                     setStatus(std::string(makeSky?"Marked ":"Unmarked ")+std::to_string(tg.size())+" mesh(es) as skybox backdrop (far-clip-exempt)");
                 }
                 else if (a==7) { for (int i=0;i<(int)r->gpuMeshes.size();++i) r->setHidden(i,false); setStatus("Unhid ALL meshes"); }   // unhide everything
+                else if (a==10) addItemFromMesh(sitem::BOXCOL, ctxMesh);
+                else if (a==11) addItemFromMesh(sitem::WALLPLACE, ctxMesh);
+                else if (a==12) addItemFromMesh(sitem::SPAWN, ctxMesh);
+                else if (a==13) addItemFromMesh(sitem::CHAIR, ctxMesh);
+                else if (a==14) addItemFromMesh(sitem::HOTSPOT, ctxMesh);
+                else if (a==15) addItemFromMesh(sitem::BOUNDARY, ctxMesh);
                 ctxOpen=false;
             }
             ry+=rh;
@@ -640,6 +716,12 @@ struct Editor {
         // PC PREVIEW AUDIO — front-and-center toggle (was buried in cook options). Mutes/unmutes the desktop background loop.
         { const char* s = previewAudio?"\xF0\x9F\x94\x8A Audio On":"\xF0\x9F\x94\x87 Audio Off"; float w=dl.textW(s)+16*uiScale;
           if (cx.tab(ui::hashId("hdraudio"), px+8*uiScale, v.offset.y, w, bh, s, previewAudio)) { previewAudio=!previewAudio; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); } px+=w+8*uiScale; }
+        // ALWAYS-ON-TOP toggle (window is NOT pinned by default now). "Pin" = keep the editor above other windows.
+        { const char* s = alwaysOnTop?"Pin: On":"Pin: Off"; float w=dl.textW(s)+16*uiScale;
+          if (cx.tab(ui::hashId("hdrpin"), px+8*uiScale, v.offset.y, w, bh, s, alwaysOnTop)) { alwaysOnTop=!alwaysOnTop; if(win) glfwSetWindowAttrib(win, GLFW_FLOATING, alwaysOnTop?GLFW_TRUE:GLFW_FALSE); } px+=w+8*uiScale; }
+        // X-RAY: selected mesh wireframe over the boxes (align colliders to meshes without camera-angle ambiguity)
+        { const char* s = "X-ray"; float w=dl.textW(s)+16*uiScale;
+          if (cx.tab(ui::hashId("hdrxray"), px+8*uiScale, v.offset.y, w, bh, s, xrayMesh)) xrayMesh=!xrayMesh; px+=w+8*uiScale; }
         if (playSim) cx.textAligned(v.offset.x+8*uiScale, v.offset.y+v.extent.height-40*uiScale, v.extent.width-16, 18*uiScale, "WALK MODE — WASD+mouse to walk the navmesh, P to exit", ui::rgba(120,230,140), 0);
         // overlay toggles (the navmesh/collider/spawn gizmos) — SEPARATE + all OFF by default, right of the header
         const char* ov[5]={"Navmesh","Colliders","Spawn","Far-clip","Collision"}; bool* ovp[5]={&r->showNavmesh,&r->showCollision,&r->showSpawn,&showFarClip,&showMeshCol};
@@ -707,7 +789,9 @@ struct Editor {
                 cx.textAligned(x+28*uiScale,ry,w-48*uiScale,rowH,lbl, it.hidden?th.textDim:(seld?th.textSel:th.text), 0);
                 float ex=x+w-15*uiScale; bool dh=cx.hover(ex-3*uiScale,ry,18*uiScale,rowH);
                 cx.textAligned(ex,ry,14*uiScale,rowH,"x", dh?ui::rgba(255,120,120):th.textDim, 0);
-                if (!addMenuOpen && !eyeClicked && cx.hover(x,ry,w,rowH) && cx.in.pressed[0]) { if (dh) { items.erase(items.begin()+i); selItem=-1; dl.popClip(); return; } selItem=i; deselectAll(); focusItem(i); }   // pick -> focus on it
+                if (!addMenuOpen && !eyeClicked && cx.hover(x,ry,w,rowH) && cx.in.pressed[0]) { if (dh) { pushItemUndo(items); items.erase(items.begin()+i); selItem=-1; dl.popClip(); return; }
+                    bool dbl = (selItem==i) && (cx.t - lastItemClickT < 0.35f); selItem=i; deselectAll(); lastItemClickT=cx.t;
+                    if (dbl) focusItem(i); }   // SELECT only (no teleport); DOUBLE-click (or the Focus button) frames it — so a stray click doesn't fling the camera
             }
         }
         if (onScreen(ry)) cx.textAligned(x+6*uiScale,ry,w,rowH,"MESHES",th.textDim,0); ry+=rowH;
@@ -779,7 +863,10 @@ struct Editor {
         switch (it.type){
           case sitem::SPAWN: { cx.checkbox(ui::hashId("spstart"), x, y, "allowStart (this is a player start)", it.allowStart); y+=rh;
                                cx.checkbox(ui::hashId("splocal"), x, y, "local (else: remote players)", it.isLocal); y+=rh; break; }
-          case sitem::CHAIR: { vecRowF("Exit pos", it.exitPos, 3, 0.01f, x, y, w); cx.label(x,y,w,rh,"(where the avatar stands up)",th.textDim); y+=rh;
+          case sitem::CHAIR: {
+                               cx.checkbox(ui::hashId("chtilt"), x, y, "Tilt lock (stay upright - yaw only)", chairTiltLock); y+=rh+2*uiScale;
+                               if (chairTiltLock && (it.rot[0]!=0.f||it.rot[2]!=0.f)) { it.rot[0]=0.f; it.rot[2]=0.f; }   // snap upright while locked
+                               vecRowF("Exit pos", it.exitPos, 3, 0.01f, x, y, w); cx.label(x,y,w,rh,"(where the avatar stands up)",th.textDim); y+=rh;
                                if (cx.button(ui::hashId("exitgiz"), x, y, w, rh, editExit?"Editing EXIT with gizmo (click to stop)":"Move exit point with the GIZMO", editExit)) editExit=!editExit;
                                y+=rh+2*uiScale;
                                if (cx.button(ui::hashId("exitcam"), x, y, w, rh, "Set exit point to camera position")) {
@@ -1445,13 +1532,18 @@ struct Editor {
         bool exitMode = editExit && selItem>=0 && selItem<(int)items.size() && items[selItem].type==sitem::CHAIR;
         if (gizmoOp==1) {   // ── ROTATE: tangential mouse drag about world axis A (item euler OR mesh quat) ──
             if (exitMode) return;   // the exit point has no rotation
-            float rox=cx.in.mx-gzOrigin[0], roy=cx.in.my-gzOrigin[1]; float rl=std::sqrt(rox*rox+roy*roy); if (rl<4.f) return;
-            float tx=-roy/rl, ty=rox/rl;                                   // screen tangent at the cursor
-            float drag = cx.in.dmx*tx + cx.in.dmy*ty;                      // px swept around the ring
-            float ang  = drag * 0.0075f * (gzAxisFace[k]>0?-1.f:1.f);      // radians (sign tracks the cursor)
+            // HORIZONTAL-scrub rotate: side-to-side mouse = rotate. (The old tangential "drag around the ring" model
+            // rotated on up/down or side/side depending on where the cursor happened to sit relative to the gizmo
+            // center — unintuitive; user wanted plain left/right = rotate.)
+            float ang = cx.in.dmx * 0.0075f * (gzAxisFace[k]>0?-1.f:1.f);   // radians; dmx = horizontal mouse delta
             float h=std::sin(ang*0.5f), dq[4]={A[0]*h,A[1]*h,A[2]*h,std::cos(ang*0.5f)};
             if (selItem>=0 && selItem<(int)items.size()) {                 // item: rotate its euler via a world-axis delta quat
-                auto& it=items[selItem]; float q0[4]; eulerToQuat(it.rot,q0); float nq[4]; quatMul(dq,q0,nq); normalizeQuat(nq); quatToEuler(nq,it.rot); return;
+                auto& it=items[selItem];
+                if (chairTiltLock && it.type==sitem::CHAIR) {              // TILT-LOCK: chairs only YAW (stay upright) — no pitch/roll tip-over
+                    it.rot[1] += ang*57.29578f; it.rot[0]=0.f; it.rot[2]=0.f;
+                    while(it.rot[1]>180.f)it.rot[1]-=360.f; while(it.rot[1]<-180.f)it.rot[1]+=360.f; return;
+                }
+                float q0[4]; eulerToQuat(it.rot,q0); float nq[4]; quatMul(dq,q0,nq); normalizeQuat(nq); quatToEuler(nq,it.rot); return;
             }
             for (int m : sel) { if (m<0||m>=(int)r->gpuMeshes.size()) continue; VkGpuMesh& gm=r->gpuMeshes[m];
                 float nr[4]; quatMul(dq, gm.editR, nr); memcpy(gm.editR,nr,16); normalizeQuat(gm.editR); recomputeModel(gm); }
@@ -1495,6 +1587,7 @@ struct Editor {
             ExportMesh em; em.name=md.name; em.positions.resize(nv*3);
             for (size_t v=0;v<nv;v++){ float p[3]={md.positions[v*3],md.positions[v*3+1],md.positions[v*3+2]},o[3]; xformPoint(gm.model,p,o); em.positions[v*3]=o[0]; em.positions[v*3+1]=o[1]; em.positions[v*3+2]=o[2]; }
             em.uvs=md.uvs; em.indices=md.indices; em.blend = gm.useBlend||gm.additive;
+            em.doubleSided = md.doubleSided;   // WAS DROPPED -> cooked single-sided -> flat/open doubleSided meshes (monitor screens, thin panels) back-face-culled on device = see-through HOLES. Carry it so the cook double-sides them (reversed tris). Renderer honors doubleSided (gm.cullBack=!doubleSided) so the live preview already looked right.
             em.wantCollider = isAnimCollider((int)i);   // user marked this animated mesh -> same-entity kinematic collider
             em.skybox = isSkyboxMesh((int)i);            // user marked this as far backdrop -> SkyboxPlatformComponent (far-clip-exempt)
             for (int k=0;k<4;k++) em.matTint[k]=md.tint[k];
@@ -1770,6 +1863,7 @@ struct Editor {
     }
     void startCook() {
         if (cooking.load()) return;
+        saveProject();   // AUTO-SAVE the session on cook — the user's edits (transforms/renames/hides/spawn points/colliders/skybox marks + cook config) are persisted to <env>.hsledit BEFORE cooking, so a cook never silently loses unsaved edits (they're already baked into the APK via the live state; this just keeps the on-disk session in sync).
         auto ems = buildExportMeshes();
         if (ems.empty()) { setStatus("ERROR: no exportable meshes"); return; }
         if (cookThread.joinable()) cookThread.join();
@@ -1794,7 +1888,15 @@ struct Editor {
     std::vector<int> navSourceMeshes(const sitem::Item& si){
         if (!si.srcMeshes.empty()) return si.srcMeshes;
         std::vector<int> all;
-        for (int i=0;i<(int)r->gpuMeshes.size();++i) if (!r->isHidden(i) && !isBackdrop(r->gpuMeshes[i].name)) all.push_back(i);
+        for (int i=0;i<(int)r->gpuMeshes.size();++i){
+            if (r->isHidden(i) || isBackdrop(r->gpuMeshes[i].name)) continue;
+            // SKIP backdrop-SCALE geometry by name-blind size: a vista/skybox dome or outer-structure mesh (the
+            // spacestation's M_vista ±13000, stars, tubes) would make FLAT span the whole sky ("way too big") and
+            // SMART "grab all meshes". Only meshes that fit the playable area (AABB extent < 2km) are walkable ground.
+            float a[3],b[3]; worldAabb(r->gpuMeshes[i],a,b);
+            if (b[0]-a[0] > 2000.f || b[1]-a[1] > 2000.f || b[2]-a[2] > 2000.f) continue;
+            all.push_back(i);
+        }
         return all;
     }
     // Build a navmesh item's WORLD-space triangles per its mode. The cook PhysX-cooks these into a Meta ColliderMesh;
@@ -1932,6 +2034,23 @@ struct Editor {
     void stopSim(){ playSim=false; }
     void simulatePlayer(float dt){
         if(!playSim) return; if(dt<=0.f||dt>0.1f) dt=0.016f;
+        // HORIZONTAL blocking on placed box colliders (BOXCOL) + invisible walls (WALLPLACE) — walk mode used to phase
+        // straight through them (only the floor was solid). Push the player capsule out of any box it's inside.
+        const float pr=0.3f, feet=r->cam.pos[1]-1.6f, head=r->cam.pos[1];
+        for (auto& it : items){
+            float hx,hy,hz;
+            if (it.type==sitem::BOXCOL)        { hx=it.half[0]*it.scale[0]; hy=it.half[1]*it.scale[1]; hz=it.half[2]*it.scale[2]; }
+            else if (it.type==sitem::WALLPLACE){ hx=it.propW*0.5f; hy=it.propH*0.5f; hz=0.02f; }
+            else continue;
+            if (head < it.pos[1]-hy || feet > it.pos[1]+hy) continue;                    // no vertical overlap with this box
+            float q[4]; eulerToQuat(it.rot,q); float qc[4]={-q[0],-q[1],-q[2],q[3]};      // box rotation + its inverse
+            float rel[3]={r->cam.pos[0]-it.pos[0],0.f,r->cam.pos[2]-it.pos[2]}, loc[3]; quatRotVec(qc,rel,loc);   // player in box-local XZ
+            if (std::fabs(loc[0]) < hx+pr && std::fabs(loc[2]) < hz+pr){                  // inside (inflated by player radius) -> eject along least-penetration axis
+                float penX=(hx+pr)-std::fabs(loc[0]), penZ=(hz+pr)-std::fabs(loc[2]);
+                if (penX<penZ) loc[0]=(loc[0]<0?-(hx+pr):(hx+pr)); else loc[2]=(loc[2]<0?-(hz+pr):(hz+pr));
+                float back[3]; quatRotVec(q,loc,back); r->cam.pos[0]=it.pos[0]+back[0]; r->cam.pos[2]=it.pos[2]+back[2];
+            }
+        }
         float feetY=r->cam.pos[1]-1.6f, gy;
         if(groundAt(r->cam.pos[0],r->cam.pos[2],feetY,gy)){
             float target=gy+1.6f;
@@ -1940,6 +2059,23 @@ struct Editor {
             pVelY=0;
         } else { pVelY-=12.f*dt; r->cam.pos[1]+=pVelY*dt; }                              // no floor below -> fall
         if((hasRespawn && r->cam.pos[1]<respawnY) || r->cam.pos[1]<-2000.f) spawnPlayer();   // fell into the void -> respawn
+    }
+    // X-RAY: draw the selected mesh(es) as an always-on-top wireframe so you can SEE the real mesh over the collider
+    // boxes and align precisely (the boxes draw on top, so depth alone is misleading from many camera angles).
+    void drawSelectedMeshWire(){
+        uint32_t col = ui::rgba(120,255,180,220);   // bright green
+        for (int m : sel){ if (m<0||m>=(int)r->gpuMeshes.size()) continue; auto& gm=r->gpuMeshes[m];
+            const auto& P=gm.pickPos; const auto& I=gm.pickIdx; if (P.size()<9||I.size()<3) continue;
+            size_t ntri=I.size()/3, maxTri=40000, stride=ntri>maxTri?ntri/maxTri:1;
+            for (size_t t=0;t<ntri;t+=stride){ uint32_t a=I[t*3],b=I[t*3+1],d=I[t*3+2];
+                if((size_t)a*3+2>=P.size()||(size_t)b*3+2>=P.size()||(size_t)d*3+2>=P.size()) continue;
+                float wa[3],wb[3],wd[3]; xformPoint(gm.model,&P[a*3],wa); xformPoint(gm.model,&P[b*3],wb); xformPoint(gm.model,&P[d*3],wd);
+                float sa[2],sb[2],sd[2]; bool oa=worldToScreen(wa,sa[0],sa[1]),ob=worldToScreen(wb,sb[0],sb[1]),od=worldToScreen(wd,sd[0],sd[1]);
+                if(oa&&ob)dl.line(sa[0],sa[1],sb[0],sb[1],col,0.7f);
+                if(ob&&od)dl.line(sb[0],sb[1],sd[0],sd[1],col,0.7f);
+                if(od&&oa)dl.line(sd[0],sd[1],sa[0],sa[1],col,0.7f);
+            }
+        }
     }
     // Draw a navmesh's baked triangles as a wireframe overlay (the "way to see it"). Capped so huge meshes stay cheap.
     void drawNavWire(const sitem::Item& it, uint32_t col){
@@ -2013,6 +2149,63 @@ struct Editor {
                 float t; if (rayTri(O,D,w0,w1,w2,t)&&t<bestT){bestT=t;best=i;} }
         }
         return best;
+    }
+    // Raycast straight ahead from the camera; return the nearest scene-surface hit point. Used to drop a NEW item
+    // where you're LOOKING (on a real surface) instead of floating a fixed 2.5 m in front ("objects in the wrong spot").
+    bool cameraForwardHit(float out[3]){
+        if (!r || r->gpuMeshes.empty()) return false;
+        float O[3]={r->cam.pos[0],r->cam.pos[1],r->cam.pos[2]};
+        float cp=std::cos(r->cam.pitch); float D[3]={std::sin(r->cam.yaw)*cp, std::sin(r->cam.pitch), -std::cos(r->cam.yaw)*cp};
+        float bestT=1e30f; bool hit=false;
+        for (int i=0;i<(int)r->gpuMeshes.size();++i){ if(r->isHidden(i))continue; auto&gm=r->gpuMeshes[i]; if(isBackdrop(gm.name))continue;
+            float mn[3],mx[3]; worldAabb(gm,mn,mx); float ta; if(!rayAabb(O,D,mn,mx,ta))continue; if(ta-0.02f>bestT)continue;
+            const auto&P=gm.pickPos; const auto&I=gm.pickIdx; if(P.empty()||I.size()<3)continue;
+            for(size_t k=0;k+2<I.size();k+=3){ uint32_t a=I[k],b=I[k+1],c=I[k+2];
+                if((size_t)a*3+2>=P.size()||(size_t)b*3+2>=P.size()||(size_t)c*3+2>=P.size())continue;
+                float w0[3],w1[3],w2[3]; xformPoint(gm.model,&P[a*3],w0); xformPoint(gm.model,&P[b*3],w1); xformPoint(gm.model,&P[c*3],w2);
+                float t; if(rayTri(O,D,w0,w1,w2,t)&&t<bestT){bestT=t;hit=true;} } }
+        if(hit){ out[0]=O[0]+D[0]*bestT; out[1]=O[1]+D[1]*bestT; out[2]=O[2]+D[2]*bestT; }
+        return hit;
+    }
+    // Raycast a SCREEN point against ONE mesh; return the hit point + that triangle's surface normal (oriented toward
+    // the camera). Used to place a Wall on the exact clicked face, tilted to the surface.
+    bool screenRayHitMesh(double mx, double my, int meshIdx, float outP[3], float outN[3]){
+        if(!r||meshIdx<0||meshIdx>=(int)r->gpuMeshes.size())return false;
+        float W=(float)rcViewport.extent.width,H=(float)rcViewport.extent.height; if(W<=0||H<=0)return false;
+        float vp[16]; mat4mul(r->cam.proj,r->cam.view,vp); float inv[16]; if(!invertMat4(vp,inv))return false;
+        float ndcx=2.f*((float)mx-rcViewport.offset.x)/W-1.f, ndcy=2.f*((float)my-rcViewport.offset.y)/H-1.f;
+        float O[3],Fp[3]; unproject(inv,ndcx,ndcy,1.f,O); unproject(inv,ndcx,ndcy,0.f,Fp);
+        float D[3]={Fp[0]-O[0],Fp[1]-O[1],Fp[2]-O[2]}; float dl_=std::sqrt(D[0]*D[0]+D[1]*D[1]+D[2]*D[2]); if(dl_<1e-6f)return false; D[0]/=dl_;D[1]/=dl_;D[2]/=dl_;
+        auto&gm=r->gpuMeshes[meshIdx]; const auto&P=gm.pickPos; const auto&I=gm.pickIdx; if(P.size()<9||I.size()<3)return false;
+        float bestT=1e30f; bool hit=false; float bn[3]={0,1,0};
+        for(size_t k=0;k+2<I.size();k+=3){ uint32_t a=I[k],b=I[k+1],c=I[k+2];
+            if((size_t)a*3+2>=P.size()||(size_t)b*3+2>=P.size()||(size_t)c*3+2>=P.size())continue;
+            float w0[3],w1[3],w2[3]; xformPoint(gm.model,&P[a*3],w0); xformPoint(gm.model,&P[b*3],w1); xformPoint(gm.model,&P[c*3],w2);
+            float t; if(rayTri(O,D,w0,w1,w2,t)&&t<bestT){ bestT=t; hit=true;
+                float e1[3]={w1[0]-w0[0],w1[1]-w0[1],w1[2]-w0[2]},e2[3]={w2[0]-w0[0],w2[1]-w0[1],w2[2]-w0[2]};
+                bn[0]=e1[1]*e2[2]-e1[2]*e2[1]; bn[1]=e1[2]*e2[0]-e1[0]*e2[2]; bn[2]=e1[0]*e2[1]-e1[1]*e2[0];
+                float nl=std::sqrt(bn[0]*bn[0]+bn[1]*bn[1]+bn[2]*bn[2]); if(nl>1e-9f){bn[0]/=nl;bn[1]/=nl;bn[2]/=nl;} } }
+        if(hit){ outP[0]=O[0]+D[0]*bestT; outP[1]=O[1]+D[1]*bestT; outP[2]=O[2]+D[2]*bestT;
+            if(bn[0]*D[0]+bn[1]*D[1]+bn[2]*D[2]>0.f){bn[0]=-bn[0];bn[1]=-bn[1];bn[2]=-bn[2];}   // face TOWARD the camera
+            outN[0]=bn[0];outN[1]=bn[1];outN[2]=bn[2]; }
+        return hit;
+    }
+    // Euler (deg) for an orientation whose item-forward (-Z) points along F (e.g. a surface normal). Same matrix->quat
+    // ->euler as cameraEuler, but for an arbitrary forward so a Wall can TILT to the surface, not just yaw.
+    void forwardToEuler(const float Fin[3], float e[3]){
+        float F[3]={Fin[0],Fin[1],Fin[2]}; float fl=std::sqrt(F[0]*F[0]+F[1]*F[1]+F[2]*F[2]); if(fl<1e-6f){e[0]=e[1]=e[2]=0;return;} for(int k=0;k<3;k++)F[k]/=fl;
+        float z[3]={-F[0],-F[1],-F[2]}; float up[3]={0,1,0};
+        float x[3]={up[1]*z[2]-up[2]*z[1], up[2]*z[0]-up[0]*z[2], up[0]*z[1]-up[1]*z[0]}; float xl=std::sqrt(x[0]*x[0]+x[1]*x[1]+x[2]*x[2]);
+        if(xl<1e-4f){ up[0]=0;up[1]=0;up[2]=1; x[0]=up[1]*z[2]-up[2]*z[1]; x[1]=up[2]*z[0]-up[0]*z[2]; x[2]=up[0]*z[1]-up[1]*z[0]; xl=std::sqrt(x[0]*x[0]+x[1]*x[1]+x[2]*x[2]); }
+        for(int k=0;k<3;k++)x[k]/=xl;
+        float yv[3]={z[1]*x[2]-z[2]*x[1], z[2]*x[0]-z[0]*x[2], z[0]*x[1]-z[1]*x[0]};
+        float m00=x[0],m10=x[1],m20=x[2], m01=yv[0],m11=yv[1],m21=yv[2], m02=z[0],m12=z[1],m22=z[2];
+        float tr=m00+m11+m22, q[4];
+        if(tr>0){ float s=std::sqrt(tr+1.f)*2.f; q[3]=0.25f*s; q[0]=(m21-m12)/s; q[1]=(m02-m20)/s; q[2]=(m10-m01)/s; }
+        else if(m00>m11&&m00>m22){ float s=std::sqrt(1.f+m00-m11-m22)*2.f; q[3]=(m21-m12)/s; q[0]=0.25f*s; q[1]=(m01+m10)/s; q[2]=(m02+m20)/s; }
+        else if(m11>m22){ float s=std::sqrt(1.f+m11-m00-m22)*2.f; q[3]=(m02-m20)/s; q[0]=(m01+m10)/s; q[1]=0.25f*s; q[2]=(m12+m21)/s; }
+        else { float s=std::sqrt(1.f+m22-m00-m11)*2.f; q[3]=(m10-m01)/s; q[0]=(m02+m20)/s; q[1]=(m12+m21)/s; q[2]=0.25f*s; }
+        normalizeQuat(q); quatToEuler(q,e);
     }
     void pick(double mx, double my, bool add){
         int it = pickItem(mx,my);
@@ -2104,8 +2297,10 @@ struct Editor {
     void pushUndo(int mesh, const Xform& b, const Xform& a){ pushUndo(std::vector<int>{mesh}, std::vector<Xform>{b}, std::vector<Xform>{a}); }
     void endEdit(const VkGpuMesh& gm){ if (!editing) return; pushUndo(editMesh, editBefore, captureX(gm)); editing=false; }
     void restoreOp(const UndoOp& op, bool redo){ for (size_t i=0;i<op.m.size();++i) if (op.m[i]>=0&&op.m[i]<(int)r->gpuMeshes.size()) applyX(r->gpuMeshes[op.m[i]], redo?op.a[i]:op.b[i]); sel=op.m; selected=op.m.empty()?-1:op.m.back(); r->selectedMesh=selected; }
-    void doUndo(){ if (undoStack.empty()) return; UndoOp op=undoStack.back(); undoStack.pop_back(); restoreOp(op,false); redoStack.push_back(op); }
-    void doRedo(){ if (redoStack.empty()) return; UndoOp op=redoStack.back(); redoStack.pop_back(); restoreOp(op,true); undoStack.push_back(op); }
+    void doUndo(){ if (undoStack.empty()) return; UndoOp op=undoStack.back(); undoStack.pop_back();
+        if (op.isItems){ std::swap(op.itemsState, items); selItem=-1; } else restoreOp(op,false); redoStack.push_back(std::move(op)); }
+    void doRedo(){ if (redoStack.empty()) return; UndoOp op=redoStack.back(); redoStack.pop_back();
+        if (op.isItems){ std::swap(op.itemsState, items); selItem=-1; } else restoreOp(op,true); undoStack.push_back(std::move(op)); }
     // ── focus ──
     void focusOn(float cx_,float cy,float cz){ Camera& c=r->cam; float ex=cx_,ey=cy+1.2f,ez=cz+3.5f; c.pos[0]=ex;c.pos[1]=ey;c.pos[2]=ez; float dx=cx_-ex,dy=cy-ey,dz=cz-ez,L=std::sqrt(dx*dx+dy*dy+dz*dz); if (L<1e-4f) L=1.f; c.yaw=std::atan2(dx,-dz); c.pitch=std::asin(dy/L); }
     void focusMesh(VkGpuMesh& gm){   // frame the whole object by its world AABB size (so big meshes aren't clipped)

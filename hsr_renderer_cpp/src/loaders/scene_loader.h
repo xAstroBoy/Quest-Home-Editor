@@ -755,6 +755,17 @@ public:
             if (sp && (sp->find("blend") != std::string::npos ||
                        sp->find("Blend") != std::string::npos))
                 md.useBlend = true;
+            // The cook's GENERATED rotation / oscillation / uv-scroll shaders use a "_b" filename-suffix for their
+            // BLEND variant (rot_<hash>_b.surface, osc_*_b, uvscroll_*_b, +optional _dc) — built from the unlitblend
+            // base, so they ARE alpha-blended, but the name carries no "blend" token and the forward pass-state matches
+            // unlitblend's (which the renderer detects by NAME, not f4-omission). Without this the Outer Wilds planet /
+            // erebor wisp billboards render OPAQUE in HSL-mode preview — their transparent margins become solid boxes,
+            // so a planet's whole quad shows (looks huge / "super close"). Match the cook's _b suffix convention.
+            if (sp && (sp->find("_b.surface") != std::string::npos || sp->find("_b_dc.surface") != std::string::npos))
+                md.useBlend = true;
+            // The cook's wisp-breathe shader (wispscale.surface, the erebor flame wisps) is built from the unlitblend
+            // base + blend material, but its name has no "blend" token -> same opaque-box bug as the _b shaders above.
+            if (sp && sp->find("wispscale") != std::string::npos) md.useBlend = true;
             // vatlitbubble is a TRANSLUCENT shader (its frag computes alpha/alphaSq/fogAlpha + ACES tonemap)
             // but its name has no "blend" token, so it was drawn in the OPAQUE pass — the alpha was ignored
             // and the bubbles rendered as solid GRAY spheres. Mark bubble shaders blend so the alpha shows.
@@ -1352,14 +1363,32 @@ public:
                 std::string key = (zipKey.rfind("content/",0)==0) ? zipKey.substr(8) : zipKey;
                 std::vector<u8> sb; if (!extractIdx(si, sb)) continue;
                 AnimGroup g; if (!parseRendSkel(sb, g.skel)) continue;
-                // matching anim clip under the SAME asset key
+                // matching anim clip. V79/glTF share the .fbx base, so the clip path starts with the skeleton's
+                // zipKey. The COOK instead names them armatureN.skel + animclipM.anim under ONE home dir (different
+                // bases, independent dedup indices) — so prefix-matching found NO clip (cooked multi-rig = "0 groups",
+                // every skinned mesh forced static). For cooked naming, match within the shared HOME DIR and require the
+                // clip's JOINT COUNT to equal this skeleton's (the device pairs them via the AnimatorComponent; joint
+                // count is the file-level proxy). [[project_hsr_skinned_rendmesh_skinblock]]
+                std::string homeDir = zipKey; { size_t hs = zipKey.rfind('/'); if (hs != std::string::npos) homeDir = zipKey.substr(0, hs + 1); }
                 std::vector<u8> ab; bool gotAnim=false;
-                for (int ai=0; ai<nf && !gotAnim; ++ai) {
-                    mz_zip_archive_file_stat at; if (!mz_zip_reader_file_stat(&sceneZip, ai, &at)) continue;
-                    std::string ap = at.m_filename;
-                    if (ap.size()<zipKey.size() || ap.compare(0,zipKey.size(),zipKey)!=0) continue;
-                    if (ap.find("__hzanim_anim_sub_targets__")==std::string::npos && ap.find(".anim/anim")==std::string::npos) continue;
-                    if (extractIdx(ai, ab) && parseRendClip(ab, (int)g.skel.joints.size(), g.clip)) gotAnim=true;
+                // PASS 0 = exact base prefix (every env where the clip shares the skeleton's .fbx/<name> base —
+                // V79/glTF AND official V203). PASS 1 (cook only) = the cook's armatureN.skel + animclipM.anim live
+                // under one home dir with different bases, so fall back to home-dir + matching JOINT COUNT. Exact-first
+                // means official envs keep their precise pairing (no cross-rig mismatch); only our cook needs the fallback.
+                for (int pass=0; pass<(cookedNaming?2:1) && !gotAnim; ++pass) {
+                    const std::string& pre = (pass==0) ? zipKey : homeDir;
+                    for (int ai=0; ai<nf && !gotAnim; ++ai) {
+                        mz_zip_archive_file_stat at; if (!mz_zip_reader_file_stat(&sceneZip, ai, &at)) continue;
+                        std::string ap = at.m_filename;
+                        if (ap.size()<pre.size() || ap.compare(0,pre.size(),pre)!=0) continue;
+                        if (ap.find("__hzanim_anim_sub_targets__")==std::string::npos && ap.find(".anim/anim")==std::string::npos) continue;
+                        if (!extractIdx(ai, ab) || !parseRendClip(ab, (int)g.skel.joints.size(), g.clip)) continue;
+                        if (pass==1) {   // home-dir fallback: disambiguate the rigs sharing the dir — clip must be THIS skeleton's
+                            int cj = g.clip.acl ? g.clip.aclJoints : g.clip.nJoints;
+                            if (cj > 0 && cj != (int)g.skel.joints.size()) { if (g.clip.acl) hzAclDestroy(g.clip.acl); g.clip = RendClip{}; continue; }
+                        }
+                        gotAnim=true;
+                    }
                 }
                 if (!gotAnim) { log("  HzAnim '%s': %zu joints but no clip", key.c_str(), g.skel.joints.size()); continue; }
                 // FAITHFUL slot->joint remap (the MAP libshell reads, NOT a DFS guess). The mesh's per-vertex
@@ -1377,8 +1406,17 @@ public:
                 // bind every skinned mesh from THIS fbx (matched by shared asset path).
                 for (size_t mi=0; mi<meshes.size(); ++mi) {
                     auto& md=meshes[mi];
-                    if (md.meshPath.size()<key.size() || md.meshPath.compare(0,key.size(),key)!=0) continue;
                     if (!md.hasBones || md.boneIndices.size() < md.positions.size()/3*4) continue;
+                    // PREFER the shared-base path match (V79/glTF/official: mesh shares the skeleton's .fbx/<name>
+                    // base). The cook's mXXX.rendmesh does NOT share the armatureN base, so for cooked naming fall back
+                    // to BONE PALETTE: the mesh belongs to THIS rig iff every palette slot's joint name-hash is in this
+                    // skeleton (the faithful map the device uses) — disambiguates the spacestation's 1-joint vs 25-joint vehicle rigs.
+                    bool pathMatch = (md.meshPath.size()>=key.size() && md.meshPath.compare(0,key.size(),key)==0);
+                    if (!pathMatch) {
+                        if (!cookedNaming || md.bonePalette.empty()) continue;
+                        bool all=true; for (u32 ph : md.bonePalette){ bool f=false; for(int j=0;j<nJ;++j) if((u32)jointHash[j]==ph){f=true;break;} if(!f){all=false;break;} }
+                        if (!all) continue;
+                    }
                     if (!md.bonePalette.empty() && !std::getenv("HSR_HZNOREMAP")) {
                         // slot -> joint by the palette's name-hash (THE faithful map). Fixes the bird flock
                         // (palette != DFS); the whale palette == its DFS so it's unchanged.
