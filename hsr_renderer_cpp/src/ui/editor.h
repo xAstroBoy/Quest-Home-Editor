@@ -702,14 +702,15 @@ struct Editor {
                     setStatus(std::string(makeSky?"Marked ":"Unmarked ")+std::to_string(tg.size())+" mesh(es) as skybox backdrop (far-clip-exempt)");
                 }
                 else if (a==7) { for (int i=0;i<(int)r->gpuMeshes.size();++i) r->setHidden(i,false); setStatus("Unhid ALL meshes"); }   // unhide everything
-                else if (a==10) addItemFromMesh(sitem::BOXCOL, ctxMesh);
-                else if (a==11) addItemFromMesh(sitem::WALLPLACE, ctxMesh);
-                else if (a==12) addItemFromMesh(sitem::SPAWN, ctxMesh);
-                else if (a==13) addItemFromMesh(sitem::CHAIR, ctxMesh);
-                else if (a==14) addItemFromMesh(sitem::HOTSPOT, ctxMesh);
-                else if (a==15) addItemFromMesh(sitem::BOUNDARY, ctxMesh);
-                else if (a==16) addMeshCollider(ctxMesh, true);   // STATIC mesh collider (exact tris) even on animated meshes
-                else if (a==17) addNavmesh(1);                    // generate the walkable scene navmesh (smart)
+                // "Make component from mesh" — BULK: one component per mesh in the whole selection (tg), not just the clicked one.
+                else if (a==10) for(int t:tg) addItemFromMesh(sitem::BOXCOL, t);
+                else if (a==11) for(int t:tg) addItemFromMesh(sitem::WALLPLACE, t);
+                else if (a==12) for(int t:tg) addItemFromMesh(sitem::SPAWN, t);
+                else if (a==13) for(int t:tg) addItemFromMesh(sitem::CHAIR, t);
+                else if (a==14) for(int t:tg) addItemFromMesh(sitem::HOTSPOT, t);
+                else if (a==15) for(int t:tg) addItemFromMesh(sitem::BOUNDARY, t);
+                else if (a==16) for(int t:tg) addMeshCollider(t, true);   // STATIC mesh collider (exact tris) on EACH selected mesh
+                else if (a==17) addNavmesh(1);                            // generate the walkable scene navmesh (smart)
                 ctxOpen=false;
             }
             ry+=rh;
@@ -1701,6 +1702,14 @@ struct Editor {
     void runCook(std::vector<hslcook::ExportMesh> ems, std::array<float,3> camSpawn, std::string pkg, bool sign, bool spoof, bool terminalBar, std::vector<sitem::Item> sceneItems) {
         using namespace hslcook;
         if (ems.empty()) { setStatus("ERROR: no exportable meshes"); cooking.store(false); return; }
+        // BAKE each navmesh/mesh-collider's GIZMO transform (T·R·S) into its navVerts — the cook reads navVerts raw, so
+        // without this a navmesh you MOVED in the editor cooks at its ORIGINAL spot ("navmesh gizmo doesn't work").
+        for (auto& it : sceneItems) if (it.type==sitem::NAVMESH && it.navVerts.size()>=9) {
+            float M[16]; itemTRS(it,M);
+            bool ident = M[12]==0&&M[13]==0&&M[14]==0 && M[0]==1&&M[5]==1&&M[10]==1 && M[1]==0&&M[2]==0&&M[4]==0&&M[6]==0&&M[8]==0&&M[9]==0;
+            if (!ident){ for (size_t v=0;v+2<it.navVerts.size();v+=3){ float p[3]={it.navVerts[v],it.navVerts[v+1],it.navVerts[v+2]},o[3]; xformPoint(M,p,o); it.navVerts[v]=o[0]; it.navVerts[v+1]=o[1]; it.navVerts[v+2]=o[2]; }
+                it.pos[0]=it.pos[1]=it.pos[2]=0; it.rot[0]=it.rot[1]=it.rot[2]=0; it.scale[0]=it.scale[1]=it.scale[2]=1; }   // baked in -> identity
+        }
         // Navmesh options are UI TOGGLES (navmesh panel), not env flags — push them to the cook here so hsl_cooker.h reads them.
         setenv_("HSR_NAVSMOOTH", navSmooth ? "1" : "");
         setenv_("HSR_NAVDEBUG",  navDebugClone ? "1" : "");
