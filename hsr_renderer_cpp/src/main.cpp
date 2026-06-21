@@ -1160,7 +1160,7 @@ int main(int argc, char** argv) {
         // globalUniforms.time and fades the wisp's opacity+brightness CONTINUOUSLY ("slow fade in/out"), on the shipped
         // unlitblend base that renders. ShellPoseAnimationComponent is a 2-keyframe ONE-SHOT (sub_14651D8) that plays
         // once then HOLDS static ("visible but not moving"), so it's opt-in only (HSR_POSEANIM). HSR_NOPULSE = off.
-        else if (gltf.isNodeAnimated(meshIdx) && !std::getenv("HSR_NOPULSE")) {
+        else if (gltf.isNodeAnimated(meshIdx) && gltf.nodeAnimMoves(meshIdx) && !std::getenv("HSR_NOPULSE")) {   // nodeAnimMoves: skip CONSTANT tracks (no getTime shader -> static, not "breathing")
             // Y-ROTATION (Outer Wilds skybox/Interloper) takes precedence: a uniform node-spin -> getTime() Y-rotation
             // shader. Falls through to the wisp scale-pulse for non-rotation node anims (erebor flames have no rot channel).
             float rax[3] = {0,1,0}, rom = 0.f, rpiv[3] = {0,0,0}, ramp = 0.f, rper = 0.f; bool rosc = false;

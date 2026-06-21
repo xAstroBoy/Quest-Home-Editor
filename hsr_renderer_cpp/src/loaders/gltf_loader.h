@@ -793,6 +793,21 @@ public:
         for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) return true;
         return false;
     }
+    // True only if the node animation ACTUALLY changes the transform. Some V79 exports (Star Trek TNG bridge) bake a
+    // 50-key CONSTANT T/R/S track onto EVERY object = "animated" but motionless; without this gate they all get a getTime
+    // wisp PULSE shader -> the whole env "breathes"/moves on device. Returns false for constant (static) tracks.
+    bool nodeAnimMoves(int meshIdx) const {
+        int nodeIdx = -1; for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; break; }
+        if (nodeIdx < 0) return false;
+        for (auto& ch : gchannels) {
+            if (ch.node != nodeIdx || ch.sampler < 0 || (size_t)ch.sampler >= gsamplers.size()) continue;
+            const GSampler& s = gsamplers[ch.sampler]; int n = (int)s.times.size(); if (n < 2) continue;
+            for (int c = 0; c < s.comps; ++c) { float mn=1e30f, mx=-1e30f;
+                for (int k = 0; k < n; ++k){ float v=s.vals[(size_t)k*s.comps+c]; if(v<mn)mn=v; if(v>mx)mx=v; }
+                if (mx - mn > 1e-4f) return true; }   // some component actually moves
+        }
+        return false;
+    }
     // Dump the V79 node's animation channels for a node-anim mesh (HSR_VERBOSE) — so we can replicate the wisp SCALE
     // pulse FAITHFULLY (exact amplitude/period/keyframe shape) instead of guessing a sinusoid.
     void dumpNodeAnimTrack(int meshIdx) const {
