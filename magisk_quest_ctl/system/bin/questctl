@@ -1,0 +1,31 @@
+#!/system/bin/sh
+# questctl — on-device control CLI for HSR env testing (installed to /system/bin by the Magisk module).
+# The Quest-Ctl MCP server drives this over `adb shell questctl <cmd>`. Run as root (Magisk).
+cmd="$1"; shift 2>/dev/null
+case "$cmd" in
+  awake)   # spoof "worn" -> stay active, suppress the idle menu/dock
+    setprop persist.device_config.mros_vendor.hmd_disable_prox_sensor true
+    am broadcast -a com.oculus.vrpowermanager.prox_close >/dev/null 2>&1
+    input keyevent KEYCODE_WAKEUP >/dev/null 2>&1
+    echo "awake (prox disabled, worn-spoofed)";;
+  sleep)   # restore normal proximity behaviour
+    setprop persist.device_config.mros_vendor.hmd_disable_prox_sensor false
+    am broadcast -a com.oculus.vrpowermanager.prox_open >/dev/null 2>&1
+    echo "sleep allowed (prox restored)";;
+  menu)    # best-effort dismiss of the universal menu/dock overlay (VR-composited, not an Android window):
+           # worn-spoof + back. A full hide needs the vrshell menu-hook (see project_hsr_magisk_mcp_plan).
+    am broadcast -a com.oculus.vrpowermanager.prox_close >/dev/null 2>&1
+    input keyevent KEYCODE_BACK >/dev/null 2>&1
+    echo "menu: worn-spoof + back sent (full hide TODO: vrshell hook)";;
+  sniff)   # stream ShellHsr (or a given tag) — the sniff feed
+    tag="${1:-ShellHsr}"
+    exec logcat -v time -s "$tag":V *:E;;
+  tap)     input tap "$1" "$2"; echo "tap $1 $2";;
+  key)     input keyevent "$1"; echo "key $1";;
+  swipe)   input swipe "$1" "$2" "$3" "$4" "${5:-200}"; echo "swipe";;
+  screencap) screencap -p "${1:-/sdcard/_questctl_shot.png}"; echo "${1:-/sdcard/_questctl_shot.png}";;
+  reloadshell) kill "$(pidof com.oculus.vrshell)" 2>/dev/null; echo "vrshell killed (reloads)";;
+  env)     dumpsys oemprefs --user 0 get environment_selected 2>/dev/null || settings get secure environment_selected;;
+  status)  echo "vrshell_pid=$(pidof com.oculus.vrshell) prox_disabled=$(getprop persist.device_config.mros_vendor.hmd_disable_prox_sensor) loglevel=$(getprop debug.oculus.shell.logLevel)";;
+  *) echo "usage: questctl {awake|sleep|menu|sniff [tag]|tap X Y|key K|swipe X1 Y1 X2 Y2 [ms]|screencap [path]|reloadshell|env|status}";;
+esac
