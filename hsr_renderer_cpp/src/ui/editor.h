@@ -208,10 +208,26 @@ struct Editor {
     // was launched (the old CWD-relative "saved/" broke when launched from the taskbar). So we look in a "saved/" subfolder
     // at EVERY ancestor of the env (nearest first) — finds the repo-level saved/ that already holds your sessions.
     std::string sessionPath;   // the .hsledit path load/save actually used this session (so save round-trips to it)
+    // A cooked APK is "<stem>_Rooted-System.apk" / "<stem>_NoRoot-Spoof.apk" / "<stem>_cooked.apk". Strip the cook
+    // suffix so the session round-trips to the SOURCE env's "<stem>.apk.hsledit" — loading the COOKED APK then shows
+    // the same scene ITEMS (spawn/navmesh/colliders) the cook baked in. (The cook re-orders meshes, so the cooked APK
+    // can't replay the session's index-based MESH transforms — loadProject skips those when the env is cooked.)
+    static std::string stripCookSuffix(const std::string& fname) {
+        size_t dot = fname.rfind(".apk");
+        std::string stem = (dot==std::string::npos)?fname:fname.substr(0,dot);
+        std::string ext  = (dot==std::string::npos)?std::string():fname.substr(dot);
+        for (const std::string suf : {"_Rooted-System","_NoRoot-Spoof","_cooked"})
+            if (stem.size()>=suf.size() && stem.compare(stem.size()-suf.size(),suf.size(),suf)==0) { stem.resize(stem.size()-suf.size()); break; }
+        return stem + ext;
+    }
+    std::string rawBase() const {
+        if (projectPath.empty()) return "editor_project";
+        size_t sl=projectPath.find_last_of("/\\"); return (sl==std::string::npos)?projectPath:projectPath.substr(sl+1);
+    }
+    bool envIsCookedApk() const { std::string r=rawBase(); return r!=stripCookSuffix(r); }   // loaded a cook OUTPUT (re-ordered meshes)
     std::string projectBase() const {
         if (projectPath.empty()) return "editor_project";
-        size_t sl=projectPath.find_last_of("/\\"); std::string n=(sl==std::string::npos)?projectPath:projectPath.substr(sl+1);
-        return n;
+        return stripCookSuffix(rawBase());
     }
     // Candidate session-FILE paths, nearest-to-the-env first. NOTE: pure path math — no directory is created here (the old
     // create_directories side-effect made an empty co-located saved/ that then SHADOWED the real repo-level one).
@@ -287,13 +303,14 @@ struct Editor {
         fprintf(stderr,"[EDIT] loaded session: %s\n", used.c_str());
         std::string all; fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ all.resize(n); fread(&all[0],1,n,f);} fclose(f);
         items.clear(); selItem=-1; deselectAll(); animColliders.clear(); skyboxMeshes.clear();
+        const bool cooked = envIsCookedApk();   // a cook OUTPUT: take the session's scene ITEMS but NOT its index-based MESH transforms (already baked into the cook) — re-derive the navmesh from THIS env's ground by name
         size_t p=0; int meshN=0, itemN=0;
         while(p<all.size()){
             size_t e=all.find('\n',p); std::string line=all.substr(p, e==std::string::npos?std::string::npos:e-p); p=(e==std::string::npos)?all.size():e+1;
             auto t=tokenize(line); if(t.empty()) continue;
             if(t[0]=="CAM" && t.size()>=6){ r->cam.pos[0]=(float)atof(t[1].c_str()); r->cam.pos[1]=(float)atof(t[2].c_str()); r->cam.pos[2]=(float)atof(t[3].c_str()); r->cam.yaw=(float)atof(t[4].c_str()); r->cam.pitch=(float)atof(t[5].c_str()); }
             else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
-            else if(t[0]=="MESH" && t.size()>=14){ int idx=atoi(t[1].c_str()); if(idx>=0&&idx<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[idx];
+            else if(t[0]=="MESH" && t.size()>=14 && !cooked){ int idx=atoi(t[1].c_str()); if(idx>=0&&idx<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[idx];
                 gm.name=t[2]; gm.editT[0]=(float)atof(t[3].c_str()); gm.editT[1]=(float)atof(t[4].c_str()); gm.editT[2]=(float)atof(t[5].c_str());
                 gm.editR[0]=(float)atof(t[6].c_str()); gm.editR[1]=(float)atof(t[7].c_str()); gm.editR[2]=(float)atof(t[8].c_str()); gm.editR[3]=(float)atof(t[9].c_str());
                 gm.editS[0]=(float)atof(t[10].c_str()); gm.editS[1]=(float)atof(t[11].c_str()); gm.editS[2]=(float)atof(t[12].c_str());
@@ -307,10 +324,10 @@ struct Editor {
                 it.half[0]=(float)atof(t[17].c_str()); it.half[1]=(float)atof(t[18].c_str()); it.half[2]=(float)atof(t[19].c_str());
                 it.propW=(float)atof(t[20].c_str()); it.propH=(float)atof(t[21].c_str()); it.navMode=atoi(t[22].c_str());
                 int nsrc=atoi(t[23].c_str()); for(int k=0;k<nsrc && 24+k<(int)t.size();++k) it.srcMeshes.push_back(atoi(t[24+k].c_str()));
-                if(it.type==sitem::NAVMESH) bakeNavGeometry(it);
+                if(it.type==sitem::NAVMESH){ if(cooked){ it.srcMeshes.clear(); fillGroundMeshes(it.srcMeshes); } bakeNavGeometry(it); }   // cooked: re-pick ground by NAME (the cook re-ordered meshes -> the saved indices point at the wrong meshes)
                 items.push_back(std::move(it)); itemN++; }
-            else if(t[0]=="COLLIDERS"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) animColliders.push_back(atoi(t[2+k].c_str())); }
-            else if(t[0]=="SKYBOX"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) skyboxMeshes.push_back(atoi(t[2+k].c_str())); }   // restore far-backdrop skybox marks
+            else if(t[0]=="COLLIDERS" && !cooked){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) animColliders.push_back(atoi(t[2+k].c_str())); }
+            else if(t[0]=="SKYBOX" && !cooked){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) skyboxMeshes.push_back(atoi(t[2+k].c_str())); }   // restore far-backdrop skybox marks
             else if(t[0]=="IHIDE"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k){ int idx=atoi(t[2+k].c_str()); if(idx>=0&&idx<(int)items.size()) items[idx].hidden=true; } }   // restore per-item visibility eyes
         }
         didAutoSel = true;   // a session was restored -> don't let frame-1 auto-focus clobber the restored camera
@@ -319,14 +336,19 @@ struct Editor {
     // V79 stores NO navmesh file — the LocomotionSystem generates it from the walkable ground geometry at runtime.
     // So auto-add a NAVMESH item sourced from the env's ground/floor/terrain meshes (the faithful re-creation; the
     // cook PhysX-cooks them into a V203 ColliderMesh). Returns the mesh count (0 = none found -> user picks manually).
-    int autoNavmeshFromGround() {
-        sitem::Item nv; nv.type=sitem::NAVMESH; nv.name="Navmesh (V79 ground)";
+    // Pick the env's walkable ground/floor meshes by NAME (index-independent), so it works on the SOURCE env or a
+    // cook OUTPUT (whose meshes are re-ordered) alike — used by autoNavmeshFromGround + the cooked-APK navmesh re-derive.
+    void fillGroundMeshes(std::vector<int>& out) const {
         static const char* kw[] = { "ground","floor","terrain","mainground","lakeshore","walk","path","road","plane","sidewalk","tile" };
         for (int i=0;i<(int)r->gpuMeshes.size();++i){
             if (r->isHidden(i) || isBackdrop(r->gpuMeshes[i].name)) continue;
             std::string n=r->gpuMeshes[i].name; for (auto& c:n) c=(char)tolower(c);
-            for (const char* k : kw) if (n.find(k)!=std::string::npos) { nv.srcMeshes.push_back(i); break; }
+            for (const char* k : kw) if (n.find(k)!=std::string::npos) { out.push_back(i); break; }
         }
+    }
+    int autoNavmeshFromGround() {
+        sitem::Item nv; nv.type=sitem::NAVMESH; nv.name="Navmesh (V79 ground)";
+        fillGroundMeshes(nv.srcMeshes);
         if (nv.srcMeshes.empty()) return 0;
         items.push_back(nv);
         fprintf(stderr, "[EDITOR] auto-navmesh from %d V79 walkable ground meshes\n", (int)nv.srcMeshes.size());
@@ -400,7 +422,7 @@ struct Editor {
     float cfgFogColor[3] = {0.05f, 0.06f, 0.09f};
     float cfgFogStart = 20.f;         // meters where fog begins
     float cfgFogDensity = 0.015f;     // distance-fog density
-    float cfgFar = 150000.f;          // ScenePlatformComponent farClippingPlane (device extends from its 500m default)
+    float cfgFar = 150000.f;          // ScenePlatformComponent farClippingPlane (device extends from its 5000m default)
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  INIT / SHUTDOWN
@@ -1281,7 +1303,7 @@ struct Editor {
         { y0=y; cx.label(x,y,150*uiScale,th.rowH,"Far clip (m)",th.textDim);
           char fcb[32]; snprintf(fcb,sizeof fcb,"%.0f",cfgFar); std::string fcss=fcb;
           cx.textField(ui::hashId("cfgfar"), x+152*uiScale, y, w-152*uiScale, th.rowH, fcss); cfgFar=(float)atof(fcss.c_str()); if(cfgFar<1.f)cfgFar=150000.f;
-          cx.tip(x,y0,w,th.rowH,"ScenePlatformComponent farClippingPlane. The device default is 500m;\nthe cook extends it to this. Use the viewport 'Far-clip' overlay to\nsee the 500m default boundary."); y+=th.rowH+6*uiScale; }
+          cx.tip(x,y0,w,th.rowH,"ScenePlatformComponent farClippingPlane. The device default is 5000m;\nthe cook extends it to this. Use the viewport 'Far-clip' overlay to\nsee the 5000m default boundary."); y+=th.rowH+6*uiScale; }
         // Live WYSIWYG: push the fog config into the renderer so the preview matches the cooked look (density 0 when off).
         if (r) { float fcol[4]={cfgFogColor[0],cfgFogColor[1],cfgFogColor[2],1.f};
                  r->setSceneFog(fcol, cfgFogStart, cfgFog?cfgFogDensity:0.f, 0.f, 1500.f); }
@@ -1444,11 +1466,11 @@ struct Editor {
     bool exitHVis=false; float exitHS[2]={0,0}; bool exitDrag=false;   // chair exit-position smart handle
     bool editExit=false;   // when a chair is selected: retarget the MAIN gizmo to its exit point (full X/Y/Z gizmo, not a square)
     void drawItems(){
-        if (showFarClip) {   // FAR-CLIP boundary on camera (HSL view): the device's SceneComponent DEFAULT far is 500m — geometry
+        if (showFarClip) {   // FAR-CLIP boundary on camera (HSL view): the device's SceneComponent DEFAULT far is 5000m — geometry
             // beyond this red sphere renders ONLY if the cook's ScenePlatformComponent far-extension applies on device (else it
             // clips here). Backdrops past it -> mark SkyboxPlatformComponent (far-exempt). 3 great circles @ origin (~spawn).
             VkRect2D vf=rcViewport; dl.pushClip((float)vf.offset.x,(float)vf.offset.y,(float)vf.extent.width,(float)vf.extent.height);
-            const float R=500.f; uint32_t fcc=ui::rgba(255,95,60,190);
+            const float R=5000.f; uint32_t fcc=ui::rgba(255,95,60,190);
             for (int pl=0;pl<3;pl++){ float pv[2]={0,0}; bool pk=false;
                 for (int a=0;a<=64;a++){ float an=a/64.f*6.2831853f, cc=cosf(an)*R, sn=sinf(an)*R, wp[3];
                     if(pl==0){wp[0]=cc;wp[1]=sn;wp[2]=0;} else if(pl==1){wp[0]=cc;wp[1]=0;wp[2]=sn;} else {wp[0]=0;wp[1]=cc;wp[2]=sn;}
