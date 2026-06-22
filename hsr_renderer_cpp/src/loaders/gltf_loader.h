@@ -1027,6 +1027,14 @@ public:
         std::vector<int> nodeToJoint(gnodes.size(), -1);
         for (int j = 0; j < nj; ++j) if ((size_t)sk.joints[j] < gnodes.size()) nodeToJoint[sk.joints[j]] = j;
         e.jointCount = nj;
+        // The skin's OWN clip length — NOT the global animDuration. A 0.83s warp sampled over a 60s scene-max plays its
+        // motion then FREEZES for 59s before looping = the "warp too slow / wrong speed" bug. = the latest keytime among
+        // channels animating THIS skin's joints (same per-clip basis the node-ROTATION path already uses). Device loop = this.
+        float clipDur = 0.f;
+        for (auto& ch : gchannels)
+            if (ch.node>=0 && (size_t)ch.node<nodeToJoint.size() && nodeToJoint[ch.node]>=0
+                && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){ auto& tv=gsamplers[ch.sampler].times; if(!tv.empty()&&tv.back()>clipDur) clipDur=tv.back(); }
+        if (clipDur <= 1e-4f) clipDur = animDuration;
         e.jointPos.resize(nj*3); e.jointQuat.resize(nj*4); e.jointScale.resize(nj); e.parents.resize(nj);
         // Joints can be parented through INTERMEDIATE non-joint nodes (rig groups): the glTF node's LOCAL transform is
         // then NOT relative to the parent JOINT, so storing it directly + dropping the broken parent link gives false
@@ -1099,10 +1107,10 @@ public:
                 int iw = (int)(w*255.0f + 0.5f); e.boneWgt[v*4+c] = (uint8_t)(iw<0?0:(iw>255?255:iw));
             }
         }
-        e.frameCount = frames; e.fps = (float)frames / animDuration;
+        e.frameCount = frames; e.fps = (float)frames / clipDur;
         e.trsLocal.resize((size_t)frames*nj*10);
         for (int f = 0; f < frames; ++f) {
-            float t = (float)f / (float)frames * animDuration;
+            float t = (float)f / (float)frames * clipDur;
             std::vector<GNode> cur = gnodes;
             for (auto& ch : gchannels) {
                 if (ch.node<0||(size_t)ch.node>=cur.size()||ch.sampler<0||(size_t)ch.sampler>=gsamplers.size()) continue;
