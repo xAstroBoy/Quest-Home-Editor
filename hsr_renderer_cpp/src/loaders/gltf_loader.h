@@ -850,26 +850,33 @@ public:
     // Returns false if the node has no translation channel or it doesn't actually move.
     bool extractNodeTranslation(int meshIdx, int N, std::vector<float>& frameOffs, float& loopSec) const {
         int nodeIdx = -1; for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; break; }
-        if (nodeIdx < 0 || N < 2) return false;
-        const GSampler* ss = nullptr;
-        for (auto& ch : gchannels)
-            if (ch.node == nodeIdx && ch.path == 0 && ch.sampler >= 0 && (size_t)ch.sampler < gsamplers.size()) { ss = &gsamplers[ch.sampler]; break; }
-        if (!ss || ss->comps < 3 || ss->times.size() < 2) return false;
-        float t0 = ss->times.front(), t1 = ss->times.back();
-        loopSec = (animDuration > 0.f) ? animDuration : (t1 - t0);
+        if (nodeIdx < 0 || N < 2 || nodeIdx >= (int)gnodes.size()) return false;
+        loopSec = animDuration;
+        if (loopSec <= 1e-4f){ for (auto& ch : gchannels) if (ch.node==nodeIdx && ch.path==0 && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){ auto& tv=gsamplers[ch.sampler].times; if(!tv.empty()) loopSec=tv.back(); } }
         if (loopSec <= 1e-4f) return false;
-        const float base[3] = { ss->vals[0], ss->vals[1], ss->vals[2] };   // t=0 translation (baked into the geometry)
-        auto sampleAt = [&](float t, float out[3]){
-            if (t <= ss->times.front()){ for(int c=0;c<3;c++) out[c]=ss->vals[c]; return; }
-            if (t >= ss->times.back()){ size_t k=ss->times.size()-1; for(int c=0;c<3;c++) out[c]=ss->vals[k*(size_t)ss->comps+c]; return; }
-            size_t i=0; while (i+1<ss->times.size() && ss->times[i+1] < t) ++i;
-            float ta=ss->times[i], tb=ss->times[i+1], f=(tb>ta)?(t-ta)/(tb-ta):0.f;
-            for(int c=0;c<3;c++){ float a=ss->vals[i*(size_t)ss->comps+c], b=ss->vals[(i+1)*(size_t)ss->comps+c]; out[c]=a+(b-a)*f; }
-        };
+        // Compute the node's full composed WORLD transform at time t (sample EVERY ancestor's T/R/S channel). The cook bakes
+        // the geometry in WORLD space (md.positions x gm.model), so the offset MUST be the WORLD translation delta — using
+        // the LOCAL channel delta ignored the parent SCALE and made the screens slide ~10x too far ("they go beyond").
+        auto trsMat=[](const float* t,const float* r,const float* sc,float* mm){ float x=r[0],y=r[1],z=r[2],ww=r[3];
+            mm[0]=(1-2*(y*y+z*z))*sc[0]; mm[1]=(2*(x*y+ww*z))*sc[0]; mm[2]=(2*(x*z-ww*y))*sc[0]; mm[3]=0;
+            mm[4]=(2*(x*y-ww*z))*sc[1]; mm[5]=(1-2*(x*x+z*z))*sc[1]; mm[6]=(2*(y*z+ww*x))*sc[1]; mm[7]=0;
+            mm[8]=(2*(x*z+ww*y))*sc[2]; mm[9]=(2*(y*z-ww*x))*sc[2]; mm[10]=(1-2*(x*x+y*y))*sc[2]; mm[11]=0;
+            mm[12]=t[0]; mm[13]=t[1]; mm[14]=t[2]; mm[15]=1; };
+        auto mulMat=[](const float* a,const float* b,float* o){ for(int c=0;c<4;c++)for(int rr=0;rr<4;rr++) o[c*4+rr]=a[rr]*b[c*4]+a[4+rr]*b[c*4+1]+a[8+rr]*b[c*4+2]+a[12+rr]*b[c*4+3]; };
+        std::function<void(int,float,float*)> worldAt=[&](int n,float t,float* out){
+            float tt[3]={gnodes[n].t[0],gnodes[n].t[1],gnodes[n].t[2]}, q[4]={gnodes[n].r[0],gnodes[n].r[1],gnodes[n].r[2],gnodes[n].r[3]}, sc[3]={gnodes[n].s[0],gnodes[n].s[1],gnodes[n].s[2]};
+            for (auto& ch : gchannels) if (ch.node==n && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
+                float o4[4]; sampleSampler(gsamplers[ch.sampler], t, o4);
+                if (ch.path==0){ tt[0]=o4[0]; tt[1]=o4[1]; tt[2]=o4[2]; }
+                else if (ch.path==1){ q[0]=o4[0]; q[1]=o4[1]; q[2]=o4[2]; q[3]=o4[3]; }
+                else if (ch.path==2){ sc[0]=o4[0]; sc[1]=o4[1]; sc[2]=o4[2]; } }
+            float loc[16]; trsMat(tt,q,sc,loc);
+            if (gnodes[n].parent>=0 && (size_t)gnodes[n].parent<gnodes.size()){ float pw[16]; worldAt(gnodes[n].parent,t,pw); mulMat(pw,loc,out); } else memcpy(out,loc,64); };
+        float w0[16]; worldAt(nodeIdx, 0.f, w0);
         frameOffs.assign((size_t)N*3, 0.f); float maxd = 0.f;
-        for (int fi=0; fi<N; ++fi){ float t = t0 + loopSec * (float)fi/(float)N, s[3]; sampleAt(t,s);
-            for(int c=0;c<3;c++){ float o = s[c]-base[c]; frameOffs[(size_t)fi*3+c]=o; float ad=o<0?-o:o; if(ad>maxd)maxd=ad; } }
-        return maxd > 1e-3f;   // actually moves
+        for (int fi=0; fi<N; ++fi){ float wt[16]; worldAt(nodeIdx, loopSec * (float)fi/(float)N, wt);
+            for(int c=0;c<3;c++){ float o = wt[12+c]-w0[12+c]; frameOffs[(size_t)fi*3+c]=o; float ad=o<0?-o:o; if(ad>maxd)maxd=ad; } }
+        return maxd > 1e-3f;   // actually moves (WORLD space)
     }
     // Extract a uniform NODE Y-ROTATION track (Outer Wilds skybox = +Y 333s; Interloper = -Y 81s). Walks the parent
     // chain so a mesh INHERITS an animated ancestor's spin — the OW planets are children of the rotating skybox node,
