@@ -25,6 +25,18 @@ case "$cmd" in
   swipe)   input swipe "$1" "$2" "$3" "$4" "${5:-200}"; echo "swipe";;
   screencap) screencap -p "${1:-/sdcard/_questctl_shot.png}"; echo "${1:-/sdcard/_questctl_shot.png}";;
   reloadshell) kill "$(pidof com.oculus.vrshell)" 2>/dev/null; echo "vrshell killed (reloads)";;
+  apps)    pm list packages -3 2>/dev/null | sed 's/package://' | sort;;        # user apps
+  allapps) pm list packages 2>/dev/null | sed 's/package://' | sort;;            # everything
+  current) dumpsys activity activities 2>/dev/null | grep -m1 -i "ResumedActivity\|topResumed" || dumpsys window 2>/dev/null | grep -m1 mCurrentFocus;;
+  launch)  monkey -p "$1" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1 && echo "launched $1" || { am start -n "$1" 2>&1; };;
+  start)   am start -n "$1"; echo "started $1";;          # explicit component pkg/.Activity
+  kill)    am force-stop "$1"; echo "force-stopped $1";;
+  killbg)  am kill "$1"; echo "killed (bg) $1";;
+  clear)   pm clear "$1"; echo "cleared data $1";;
+  button)  # inject a controller KEY (e.g. 304=A 305=B 307=X 308=Y) on BOTH controllers. `getevent -p` lists codes.
+    for d in /dev/input/event4 /dev/input/event5; do
+      sendevent $d 1 "$1" 1; sendevent $d 0 0 0; sendevent $d 1 "$1" 0; sendevent $d 0 0 0
+    done; echo "button $1 pressed";;
   env)     dumpsys oemprefs --user 0 get environment_selected 2>/dev/null || settings get secure environment_selected;;
   status)  echo "vrshell_pid=$(pidof com.oculus.vrshell) prox_disabled=$(getprop persist.device_config.mros_vendor.hmd_disable_prox_sensor) loglevel=$(getprop debug.oculus.shell.logLevel)";;
   *) echo "usage: questctl {awake|sleep|menu|sniff [tag]|tap X Y|key K|swipe X1 Y1 X2 Y2 [ms]|screencap [path]|reloadshell|env|status}";;

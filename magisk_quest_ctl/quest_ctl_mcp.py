@@ -32,6 +32,11 @@ TOOLS = [
     {"name": "quest_screencap", "description": "Capture the screen and pull it to a local PNG path.", "inputSchema": {"type": "object", "properties": {"out": {"type": "string"}}}},
     {"name": "quest_reload_shell", "description": "Kill com.oculus.vrshell so it reloads (re-applies the selected env).", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "quest_status", "description": "vrshell pid + prox/loglevel + selected env.", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "quest_apps", "description": "List installed user app packages (or all=true for system too).", "inputSchema": {"type": "object", "properties": {"all": {"type": "boolean"}}}},
+    {"name": "quest_launch", "description": "Launch an app by package (LAUNCHER intent; or pass component pkg/.Activity).", "inputSchema": {"type": "object", "properties": {"pkg": {"type": "string"}}, "required": ["pkg"]}},
+    {"name": "quest_kill", "description": "Force-stop an app by package (toggle off / close).", "inputSchema": {"type": "object", "properties": {"pkg": {"type": "string"}}, "required": ["pkg"]}},
+    {"name": "quest_current", "description": "Current foreground activity/focus.", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "quest_button", "description": "Inject a controller button KEY on both controllers (304=A 305=B 307=X 308=Y; getevent -p for codes).", "inputSchema": {"type": "object", "properties": {"code": {"type": "integer"}}, "required": ["code"]}},
 ]
 
 def call(name, args):
@@ -47,6 +52,11 @@ def call(name, args):
         dev = "/sdcard/_questctl_shot.png"; out = args.get("out", "questctl_shot.png")
         adb("shell", "screencap", "-p", dev); adb("pull", dev, out); adb("shell", "rm", dev)
         return "saved " + out
+    if name == "quest_apps":    return qctl("allapps" if args.get("all") else "apps")
+    if name == "quest_launch":  return qctl("launch", args["pkg"])
+    if name == "quest_kill":    return qctl("kill", args["pkg"])
+    if name == "quest_current": return qctl("current")
+    if name == "quest_button":  return qctl("button", int(args["code"]))
     if name == "quest_reload_shell": return qctl("reloadshell")
     if name == "quest_status":
         env = adb("shell", "su", "-c", "dumpsys oemprefs --user 0 get environment_selected").strip() or adb("shell", "settings", "get", "secure", "environment_selected").strip()
