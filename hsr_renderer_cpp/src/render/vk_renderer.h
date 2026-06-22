@@ -347,7 +347,7 @@ public:
     int soloMesh = -1;                          // if >=0, draw ONLY this mesh index (debug, env HSR_SOLO)
     int hideMesh = -1;                          // if >=0, SKIP this mesh index (debug, env HSR_HIDEMESH)
     bool hideAllGeom = false;                   // editor "solo navmesh": skip ALL meshes so only the navmesh overlay shows
-    float clearRGB[3] = {0.05f, 0.05f, 0.08f};  // render-pass clear colour; set bright (e.g. magenta) to expose see-through HOLES
+    float clearRGB[3] = {0.0f, 0.0f, 0.0f};  // BLACK = space. The old 0.05 linear -> ~0.24 sRGB gray WASHED OUT additive effects (the warp streaks/glow ADD to the background, so on gray they looked faded/wrong vs the device's black space). Preview now matches device. (set bg=1,1,1 to expose see-through HOLES)
     // Diffuse IBL irradiance cubemap (V79 SpecIbl). When loaded, *_specibl* meshes get their per-vertex
     // color = diffuseCube(worldN)·ambientIBLTint baked in (the dominant lift off the white/dark fallback).
     ibl::Cubemap iblDiffuse;

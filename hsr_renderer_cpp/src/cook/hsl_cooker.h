@@ -1852,6 +1852,21 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         if (skinnedOpaque && m.rgba.size() >= (size_t)m.w * m.h * 4) {
             texOpaque = m.rgba; for (size_t k = 3; k < texOpaque.size(); k += 4) texOpaque[k] = 255; texSrc = texOpaque.data();
         }
+        else if (m.additive && m.rgba.size() >= (size_t)m.w * m.h * 4) {
+            // ADDITIVE glow uses hard additive (src+dst, ignores alpha). A FULL-COLOR texture then renders as a SOLID
+            // disc (the Star Trek warp "blue tunnel") because the soft falloff lives in the ALPHA, which additive drops.
+            // PREMULTIPLY rgb*=a so additive shows color*alpha = a SOFT glow (the warp tube fades out). Bright streak
+            // pixels (alpha~1) stay bright; the empty gaps (alpha~0) stay dark -> streaks unaffected. Cache key (rh
+            // below) hashes texSrc, so the premultiplied variant dedups correctly and never collides with a straight tex.
+            texOpaque = m.rgba;
+            for (size_t k = 0; k + 3 < texOpaque.size(); k += 4) {
+                uint32_t a = texOpaque[k+3];
+                texOpaque[k+0] = (uint8_t)(texOpaque[k+0] * a / 255);
+                texOpaque[k+1] = (uint8_t)(texOpaque[k+1] * a / 255);
+                texOpaque[k+2] = (uint8_t)(texOpaque[k+2] * a / 255);
+            }
+            texSrc = texOpaque.data();
+        }
         bool droidWhite = std::getenv("HSR_DROIDWHITE") && m.hzJointCount > 0;   // diag: force the droid to the white fallback tex (isolate texture vs mesh)
         if (m.rgba.size() >= (size_t)m.w * m.h * 4 && m.w && m.h && !droidWhite) {
             uint64_t rh = murmur64A(texSrc, (size_t)m.w * m.h * 4);   // dedup identical textures (esp. the chunks a big mesh was split into)
