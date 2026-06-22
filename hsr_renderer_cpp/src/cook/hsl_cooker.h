@@ -1156,6 +1156,7 @@ struct ExportMesh {
     std::vector<uint8_t> rgba;      // decoded base-color RGBA8 (optional)
     uint32_t w = 0, h = 0;
     bool blend = false;             // alpha-blended (transparent) -> route to unlitblend.surface
+    bool additive = false;          // EMISSIVE GLOW (warp streaks, nebula fog, force-field) -> route to the OPAQUE-pass shader (unlit/unlitdoublesidedskinned, f2,f3 PRESENT) kept in the TRANSPARENT MATL = ADDITIVE blend (src+dst). Alpha-blended these vanish on a dark backdrop (the Star Trek warp/fog "IS NOT VISIBLE" bug). 3x device-proven: opaque vs alpha shaders differ ONLY in pass f2,f3; the shipped unlitspritesheetflipbookadditive keeps f2,f3 PRESENT.
     bool doubleSided = false;       // glTF doubleSided material -> cook appends REVERSED tris so the single-sided unlit shader still draws back faces (else flat/open meshes back-face-cull on device = see-through HOLES; renderer honors doubleSided so its preview looked fine)
     bool flipbook = false;          // animated flat material -> route to unlitspritesheetflipbookadditive.surface (GPU getTime() spritesheet cycle, NO skeleton)
     int flipCols = 0, flipRows = 0; // spritesheet grid (cols x rows)
@@ -1288,7 +1289,7 @@ inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMe
         bool haveUv = m.uvs.size() >= nv * 2;
         size_t ntri = m.indices.size() / 3, t = 0;
         while (t < ntri) {
-            ExportMesh c; c.name = m.name; c.blend = m.blend; c.w = m.w; c.h = m.h; c.rgba = m.rgba;
+            ExportMesh c; c.name = m.name; c.blend = m.blend; c.additive = m.additive; c.w = m.w; c.h = m.h; c.rgba = m.rgba;
             c.skybox = m.skybox;   // split parts MUST inherit the skybox mark, else a big dome (>60k verts) loses it -> far-clipped/black
             for (int k = 0; k < 4; k++) c.matTint[k] = m.matTint[k];
             std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(cap + 16);
@@ -1894,7 +1895,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // field7 shader ref @48(pkg)/@56(ing)/@64(tgt) -> our env-local skinned shader; tgt @64 stays 0xA1767FE9 (murmur3"shader").
                 // BLEND skinned meshes (the omnidroid SHIELD = alphaMode BLEND) use unlitBLENDskinned so the device alpha-blends
                 // them (transparent force-field); OPAQUE skinned (droid body) use unlitdoublesidedskinned. Same matParams layout.
-                const AssetKey3& sk = (m.blend && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
+                // ADDITIVE skinned glow (the warp-streak tunnel): use the OPAQUE-pass skinned shader (unlitdoublesidedskinned,
+                // f2,f3 PRESENT) but keep the TRANSPARENT skinned MATL (matSkinB, field2=2) -> ADDITIVE blend = bright streaks
+                // on the dark viewscreen (alpha-blend made them near-invisible). Non-emissive blend skinned (a real force-field
+                // glass) still uses unlitBLENDskinned (alpha).
+                const AssetKey3& sk = (m.blend && !m.additive && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
                 memcpy(matl.data() + 48, &sk.pkg, 8); memcpy(matl.data() + 56, &sk.ing, 8);
                 // texture ref pkg @120 / ing @128 -> THIS mesh's texture; tgt @136 stays 0x6E4CC522 (murmur3"tex").
                 // pkg is NOT implicit: the butterflies template's @120 holds the CALMING package, so leaving it makes the
@@ -2083,6 +2088,9 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             matl = (m.blend && haveBlend) ? matBlend : matTpl;
             if (meshFar) { AssetKey3 dck = (m.blend && haveBlend) ? shaderBlendDCK : shaderDCK;   // FAR -> remap shader (renders past the 5000 clip); near keeps unlit/unlitblend = byte-exact
                            if (dck.ing) { memcpy(matl.data()+48,&dck.pkg,8); memcpy(matl.data()+56,&dck.ing,8); } }
+            else if (m.additive && haveBlend) {   // EMISSIVE GLOW (warp/nebula/fog): transparent MATL (matBlend) + the OPAQUE-pass unlit shader (f2,f3 PRESENT) = ADDITIVE blend -> the glow ADDS light (visible) instead of faint alpha-lerp that vanishes on a dark backdrop
+                           memcpy(matl.data()+48,&shaderK.pkg,8); memcpy(matl.data()+56,&shaderK.ing,8);
+                           if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' ADDITIVE glow (opaque-pass shader in transparent MATL)\n", i, m.name.c_str()); }
             memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);
         }
         // Skinned: use the CENTERED rest positions (extractHzAnim centered mesh+skeleton+clip near origin so the

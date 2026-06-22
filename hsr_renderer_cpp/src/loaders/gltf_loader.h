@@ -362,6 +362,21 @@ public:
             const auto& m = mats[matIdx];
             return m.has("doubleSided") && m["doubleSided"].asBool();
         };
+        // ADDITIVE glow: a BLEND material driven by an EMISSION shader (emissiveFactor ~[1,1,1]) is a self-lit
+        // GLOW (warp streaks, nebula haze, force-field, fire), NOT alpha-glass. Alpha-blended faint on dark
+        // backdrops -> nearly invisible on device (the Star Trek warp/fog "IS NOT VISIBLE"). Such meshes must
+        // ADD light (src+dst), not alpha-lerp. Real transparent glass exports emissiveFactor=[0,0,0] -> stays
+        // alpha. (Blender's glTF exporter writes emissiveFactor=[1,1,1] for an Emission/unlit material.)
+        auto matIsEmissiveGlow = [&](int matIdx) -> bool {
+            if (matIdx < 0 || !root.has("materials")) return false;
+            const auto& mats = root["materials"];
+            if ((size_t)matIdx >= mats.size()) return false;
+            const auto& m = mats[matIdx];
+            if (!m.has("emissiveFactor")) return false;
+            const auto& ef = m["emissiveFactor"];
+            float mx = 0.f; for (int i = 0; i < 3 && i < (int)ef.size(); ++i) { float v = (float)ef[i].asFloat(); if (v > mx) mx = v; }
+            return mx >= 0.5f;
+        };
 
         const auto& accessors  = root.has("accessors") ? root["accessors"] : tinyjson::Value();
         const auto& bufferViews= root.has("bufferViews") ? root["bufferViews"] : tinyjson::Value();
@@ -625,6 +640,7 @@ public:
                             md.texRGBA={c[0],c[1],c[2],c[3]}; md.texW=md.texH=1; md.hasTexture=true;
                         }
                         md.useBlend = matIsBlend(matIdx);  // alpha-blend transparent materials
+                        md.additive = md.useBlend && matIsEmissiveGlow(matIdx);  // emissive BLEND = glow -> ADDITIVE (not faint alpha)
                         md.doubleSided = matIsDoubleSided(matIdx);  // single-sided -> back-face cull
                         // This mesh's OWN base-color tint (glTF baseColorFactor; identity-white for a plain textured
                         // mesh). The cooker uses it for the skinned material instead of borrowing nuxd's "motes"

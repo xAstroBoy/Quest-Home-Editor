@@ -1657,7 +1657,7 @@ struct Editor {
             size_t nv=md.positions.size()/3; if (nv<3||md.indices.size()<3) continue;
             ExportMesh em; em.name=md.name; em.positions.resize(nv*3);
             for (size_t v=0;v<nv;v++){ float p[3]={md.positions[v*3],md.positions[v*3+1],md.positions[v*3+2]},o[3]; xformPoint(gm.model,p,o); em.positions[v*3]=o[0]; em.positions[v*3+1]=o[1]; em.positions[v*3+2]=o[2]; }
-            em.uvs=md.uvs; em.indices=md.indices; em.blend = gm.useBlend||gm.additive;
+            em.uvs=md.uvs; em.indices=md.indices; em.blend = gm.useBlend||gm.additive; em.additive = gm.additive;   // additive (emissive glow) -> cook routes to the opaque-pass shader in the transparent MATL = ADD light (warp/fog visible), not faint alpha
             em.doubleSided = md.doubleSided;   // WAS DROPPED -> cooked single-sided -> flat/open doubleSided meshes (monitor screens, thin panels) back-face-culled on device = see-through HOLES. Carry it so the cook double-sides them (reversed tris). Renderer honors doubleSided (gm.cullBack=!doubleSided) so the live preview already looked right.
             em.wantCollider = isAnimCollider((int)i);   // user marked this animated mesh -> same-entity kinematic collider
             em.skybox = isSkyboxMesh((int)i);            // user marked this as far backdrop -> SkyboxPlatformComponent (far-clip-exempt)
