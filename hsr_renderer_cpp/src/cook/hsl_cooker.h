@@ -901,7 +901,8 @@ inline std::vector<uint8_t> buildStoredZip(const std::vector<CookFile>& files) {
 // kotlin builtins / res / assets) are EMBEDDED (no external Nuxd.apk); the AndroidManifest is hardcoded (haven), the
 // scene.zip is the env's. Returns the unsigned APK bytes. `baseApk` is ignored (kept for signature compatibility).
 inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vector<uint8_t>& sceneZip,
-                                      const std::string& oldPkg, const std::string& newPkg, bool* ok = nullptr) {
+                                      const std::string& oldPkg, const std::string& newPkg, bool* ok = nullptr,
+                                      const std::string& editorSession = {}) {
     (void)baseApk;
     if (ok) *ok = false;
     mz_zip_archive out; memset(&out,0,sizeof out); mz_zip_writer_init_heap(&out,0,0);
@@ -913,6 +914,8 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
     };
     for (auto& kv : donor) addFile(kv.first, std::move(kv.second));   // donor excludes scene.zip / manifest / META-INF
     addFile("assets/scene.zip", sceneZip);
+    if (!editorSession.empty())   // self-contained round-trip: the editor reads this back when a cooked APK has no source .hsledit
+        addFile("assets/_editor_session.hsledit", std::vector<uint8_t>(editorSession.begin(), editorSession.end()));
     {   // AndroidManifest = hardcoded haven, package renamed to the target (LATEST manifest the engine tolerates).
         std::string name="AndroidManifest.xml"; std::vector<uint8_t> data;
         {
@@ -1633,7 +1636,8 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                                            std::vector<uint8_t>* outSceneZip = nullptr,
                                            const std::vector<uint8_t>& bgOgg = {},
                                            const std::function<void(float,const char*)>& progress = {},
-                                           const std::vector<sitem::Item>& sceneItems = {}) {
+                                           const std::vector<sitem::Item>& sceneItems = {},
+                                           const std::string& editorSession = {}) {   // .hsledit text -> embedded in the APK so an ORPHAN cook re-opens with its scene items
     auto prog = [&](float f, const char* s){ if (progress) progress(f, s); };
     prog(0.02f, "Preparing scene");
     if (ok) *ok = false;
@@ -2706,7 +2710,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     // (e.g. set HSR_COOK_SHELL=haven2025.apk + HSR_COOK_FROMPKG/HSR_COOK_PKG=<haven2025 pkg> to replace it). The
     // shell's current package is HSR_COOK_FROMPKG (default nuxd's); the new one is HSR_COOK_PKG.
     const char* fp = getenv("HSR_COOK_FROMPKG"); const char* tp = getenv("HSR_COOK_PKG");
-    return spliceAPK(nuxdApk, sceneZip, fp ? fp : "com.meta.environment.prod.nuxd", tp ? tp : "com.environment.outerwilds", ok);
+    return spliceAPK(nuxdApk, sceneZip, fp ? fp : "com.meta.environment.prod.nuxd", tp ? tp : "com.environment.outerwilds", ok, editorSession);
 }
 
 } // namespace hslcook
