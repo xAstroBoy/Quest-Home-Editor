@@ -1827,8 +1827,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // navmesh bounds: explicit mesh (HSR_NAVMESH), else substantial GROUND geometry only — skip the skybox and
         // the billboard-planets (few verts, far away) so the ground sits ON the terrain, not hundreds of m below it.
         size_t mnv = m.positions.size() / 3;
+        // Only OPAQUE ground/walls define the playable bounds (scale/spawn). Skip skyboxes AND transparent EFFECT meshes
+        // (warp tunnel / nebula "Glow" / sliding screens are blend) — Star Trek's 286-unit-long warp glow was inflating the
+        // bounds to ext=286 -> gs=47.7 -> the whole bridge cooked tiny (and the fog/everything shrank with it).
         bool navCand = (navIdx >= 0) ? ((int)i == navIdx)
-                     : (mnv >= 100 && m.name.find("sky") == std::string::npos && m.name.find("Sky") == std::string::npos);
+                     : (mnv >= 100 && !m.blend && m.name.find("sky") == std::string::npos && m.name.find("Sky") == std::string::npos);
         if (navCand) for (size_t v = 0; v + 2 < m.positions.size(); v += 3) for (int k = 0; k < 3; k++) { float p = m.positions[v + k]; if (p < smn[k]) smn[k] = p; if (p > smx[k]) smx[k] = p; }
         char base[96]; snprintf(base, sizeof base, "%s/m%03zu", MH.c_str(), i);
         std::string pMesh = std::string(base) + ".rendmesh/mesh", pMat = std::string(base) + ".material/material",

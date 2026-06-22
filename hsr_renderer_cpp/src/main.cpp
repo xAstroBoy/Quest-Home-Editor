@@ -1272,9 +1272,11 @@ int main(int argc, char** argv) {
     // with HSR_EXPORT_QUIT, exits — lets the editor's Export path run batch / from the command line.
     if (std::getenv("HSR_EXPORT")) {
         if (editor.projectPath.empty()) { editor.projectPath = apkPath; editor.loadProject(); }   // headless cook includes the saved session
-        // Populate md.positions with an ANIMATED frame (the render loop hasn't run yet here): skinned FLIPBOOKS (e.g. the
-        // Rick&Morty TV) only collapse to a single screen quad when ONE cell is ON — the raw bind pose is a spread grid.
-        if (isV79 && gltf.hasAnimation()) gltf.animate(gltf.animDuration*0.5f);
+        // Populate md.positions at the t=0 REST frame (the render loop hasn't run yet). REST (not mid-anim) is REQUIRED:
+        // node-anim meshes are dynamicVerts so md.positions is what gets baked, and the getTime TRANSLATE/ROTATE shaders add
+        // their offset RELATIVE TO t=0 — baking a mid-anim frame double-applied the motion (Star Trek screens "go beyond").
+        // Skinned FLIPBOOKS still collapse here: at t=0 the loop's first cell is the only one ON (others scaled to 0).
+        if (isV79 && gltf.hasAnimation()) gltf.animate(0.f);
         editor.exportAPKSync();   // synchronous cook + auto-sign with a terminal progress bar
         if (std::getenv("HSR_EXPORT_QUIT")) return 0;
     }
