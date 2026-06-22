@@ -126,6 +126,7 @@ struct VkGpuMesh {
     bool alphaTest = false;      // cutout: opaque pass, depth-write ON, shader discards (libshell AlphaTest)
     bool cullBack = false;       // single-sided material (glTF doubleSided=false) -> back-face cull
     bool additive = false;       // Additive material (god-rays/glow) -> ADD blend instead of alpha
+    bool premultAdd = false;     // additive texture is PREMULTIPLIED (cooked: rgb<=a) -> HARD additive (src=ONE), else SRC_ALPHA/ONE would double-attenuate
     bool isSkybox = false;       // SkyboxPlatformComponent dome/cube: camera-locked + far-scaled each frame (a 1-unit cube at origin otherwise = invisible)
     bool culled = false;         // per-frame: V205 frustum+distance cull result (HSR_CLIP). false unless culling ON.
     std::string name;
@@ -338,7 +339,8 @@ public:
     VkPipeline blendPipeline = VK_NULL_HANDLE;  // SRC_ALPHA blend for dome/motes
     VkPipeline graphicsPipelineCull = VK_NULL_HANDLE;  // opaque, back-face cull (single-sided glTF materials)
     VkPipeline blendPipelineCull = VK_NULL_HANDLE;     // blend, back-face cull (cel-outline inverted hull)
-    VkPipeline additivePipeline = VK_NULL_HANDLE;      // ADD blend (god-rays/glow: dst += src, no depth write)
+    VkPipeline additivePipeline = VK_NULL_HANDLE;      // ADD blend (god-rays/glow: dst += src, no depth write) — SRC_ALPHA/ONE (RAW textures)
+    VkPipeline additivePipelineHard = VK_NULL_HANDLE;  // ADD blend, src=ONE — for PREMULTIPLIED textures (cooked glow); SRC_ALPHA here would double-attenuate
     VkCullModeFlags singleSidedCull = VK_CULL_MODE_BACK_BIT;  // env HSR_CULLMODE=front overrides (testing)
     bool framebufferResized = false;           // set by GLFW resize callback
     bool astcLdrSupported = false;             // GPU native ASTC_LDR decode
@@ -1373,8 +1375,15 @@ public:
                 md.positions.size()/3, ymin, ymax, md.positions[0],md.positions[1],md.positions[2],
                 md.positions[3],md.positions[4],md.positions[5], md.positions[6],md.positions[7],md.positions[8]);
         }
-        { int taMin=255,taMax=0; double taSum=0; size_t taN=0;
-          for (size_t q=3;q<md.texRGBA.size();q+=4){int a=md.texRGBA[q]; if(a<taMin)taMin=a; if(a>taMax)taMax=a; taSum+=a; ++taN;}
+        { int taMin=255,taMax=0; double taSum=0; size_t taN=0, taRgbOverA=0;
+          for (size_t q=3;q<md.texRGBA.size();q+=4){int a=md.texRGBA[q]; if(a<taMin)taMin=a; if(a>taMax)taMax=a; taSum+=a; ++taN;
+              int mr=md.texRGBA[q-3]; if(md.texRGBA[q-2]>mr)mr=md.texRGBA[q-2]; if(md.texRGBA[q-1]>mr)mr=md.texRGBA[q-1]; if(mr>a+8)++taRgbOverA; }
+          // PREMULTIPLIED-additive detect: the cook bakes rgb*=a so the device's HARD additive (src=ONE) shows a SOFT glow;
+          // such a texture has rgb<=a everywhere. RAW additive (the V79 source warp/glow + Meta VFX caustics) has bright rgb
+          // over low alpha -> rgb>a. The desktop additive pipeline is SRC_ALPHA/ONE (soft, correct for RAW); a PREMULT texture
+          // there double-attenuates (rgb*a*a) -> the cooked warp rendered weak/sparse. So premult meshes use a HARD additive
+          // pipeline (premult*ONE = rgb*a = the same soft glow). Auto-detected so source + cooked + Meta VFX all match.
+          gm.premultAdd = gm.useBlend && taN>0 && taMin<250 && (taRgbOverA*50 < taN);   // blend + VARYING alpha (a glow, not an opaque tex) + <2% rgb>a -> a PREMULTIPLIED additive glow (the cook premults ONLY additive textures), even if the cooked MATL didn't re-flag it additive
           // A mesh flagged blend (glTF alphaMode=BLEND / cooked mdBlend) whose texture is FULLY OPAQUE
           // (min alpha 255) has nothing to blend — the no-depth-write blend pass made it see-through
           // (King Kai / snakeway: his front didn't occlude his back -> scrambled black blob). Treat it
@@ -1579,7 +1588,8 @@ public:
                         bp = (gm.additive && p.pipeAdditive) ? p.pipeAdditive
                            : (gm.cullBack && p.pipeBlendCull) ? p.pipeBlendCull : p.pipeBlend;
                     } else {
-                        bp = (gm.additive && additivePipeline) ? additivePipeline
+                        bp = (gm.premultAdd && additivePipelineHard) ? additivePipelineHard
+                           : (gm.additive && additivePipeline) ? additivePipeline
                            : (gm.cullBack && blendPipelineCull) ? blendPipelineCull : blendPipeline;
                     }
                     if (!bp) continue;
@@ -3203,6 +3213,13 @@ public:
             if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &additivePipeline) != VK_SUCCESS)
                 log("WARN: additive pipeline creation failed");
             else log("  Additive pipeline created OK");
+            // HARD additive (src=ONE) for PREMULTIPLIED textures (the cook bakes rgb*=a): premult*ONE = rgb*a = soft glow,
+            // identical to RAW*SRC_ALPHA. Without this the cooked warp double-attenuated (rgb*a*a) -> weak/sparse on desktop.
+            VkPipelineColorBlendAttachmentState cbAddHard = cbAddAtt; cbAddHard.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            VkPipelineColorBlendStateCreateInfo cbAddHardInfo = cbAddInfo; cbAddHardInfo.pAttachments = &cbAddHard;
+            pipeInfo.pColorBlendState = &cbAddHardInfo;
+            if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &additivePipelineHard) != VK_SUCCESS)
+                log("WARN: hard additive pipeline creation failed");
 
             // restore for any later pipeline that reuses pipeInfo
             pipeInfo.pRasterizationState = &rsInfo;
