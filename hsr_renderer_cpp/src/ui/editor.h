@@ -263,45 +263,64 @@ struct Editor {
         }
         return t;
     }
-    void saveProject(){
-        std::string target=saveTargetFile();
-        FILE* f=fopen(target.c_str(),"wb"); if(!f){ setStatus("SAVE FAILED: "+target); return; }
-        sessionPath=target;   // future saves/loads round-trip to here
-        fprintf(f,"HSLEDIT 2\n");
-        fprintf(f,"CAM %.4f %.4f %.4f %.5f %.5f\n", r->cam.pos[0],r->cam.pos[1],r->cam.pos[2], r->cam.yaw, r->cam.pitch);
-        // HSL render + cook config (fog / far / skybox / cull / collision / audio) — persisted with the session so it
-        // survives a reload (was lost before). Saved in the same .hsledit save folder, not a separate scattered file.
-        fprintf(f,"CFG %d %.3f %.3f %.3f %.1f %.4f %.0f %d %.0f %d %d %d %d %d\n",
+    // Serialize the editor session (.hsledit text). Used by saveProject (to disk) AND embedded into the cooked APK
+    // (assets/_editor_session.hsledit) so an ORPHAN cooked APK — one whose source saved/<env>.hsledit is gone — still
+    // round-trips its scene items when reloaded (loadProject extracts + parses it cooked-mode). [[the cook embeds this]]
+    std::string serializeSession(){
+        std::string s; char b[640];
+        s += "HSLEDIT 2\n";
+        snprintf(b,sizeof b,"CAM %.4f %.4f %.4f %.5f %.5f\n", r->cam.pos[0],r->cam.pos[1],r->cam.pos[2], r->cam.yaw, r->cam.pitch); s+=b;
+        snprintf(b,sizeof b,"CFG %d %.3f %.3f %.3f %.1f %.4f %.0f %d %.0f %d %d %d %d %d\n",
             cfgFog?1:0, cfgFogColor[0],cfgFogColor[1],cfgFogColor[2], cfgFogStart, cfgFogDensity, cfgFar,
-            skybox?1:0, skyboxDist, noCull?1:0, solidCollision?1:0, animSkinned?1:0, cookAudio?1:0, previewAudio?1:0);
+            skybox?1:0, skyboxDist, noCull?1:0, solidCollision?1:0, animSkinned?1:0, cookAudio?1:0, previewAudio?1:0); s+=b;
         for(int i=0;i<(int)r->gpuMeshes.size();++i){ auto& gm=r->gpuMeshes[i];
-            fprintf(f,"MESH %d %s %.5f %.5f %.5f %.6f %.6f %.6f %.6f %.5f %.5f %.5f %d\n", i, qstr(gm.name).c_str(),
+            snprintf(b,sizeof b,"MESH %d %s %.5f %.5f %.5f %.6f %.6f %.6f %.6f %.5f %.5f %.5f %d\n", i, qstr(gm.name).c_str(),
                 gm.editT[0],gm.editT[1],gm.editT[2], gm.editR[0],gm.editR[1],gm.editR[2],gm.editR[3],
-                gm.editS[0],gm.editS[1],gm.editS[2], r->isHidden(i)?1:0); }
+                gm.editS[0],gm.editS[1],gm.editS[2], r->isHidden(i)?1:0); s+=b; }
         for(auto& it:items){
-            fprintf(f,"ITEM %d %s %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %d %d %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %d %d",
+            snprintf(b,sizeof b,"ITEM %d %s %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %d %d %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f %d %d",
                 it.type, qstr(it.name).c_str(), it.pos[0],it.pos[1],it.pos[2], it.rot[0],it.rot[1],it.rot[2],
                 it.scale[0],it.scale[1],it.scale[2], it.allowStart?1:0, it.isLocal?1:0,
                 it.exitPos[0],it.exitPos[1],it.exitPos[2], it.half[0],it.half[1],it.half[2], it.propW,it.propH,
-                it.navMode, (int)it.srcMeshes.size());
-            for(int m:it.srcMeshes) fprintf(f," %d", m);
-            fprintf(f,"\n");
+                it.navMode, (int)it.srcMeshes.size()); s+=b;
+            for(int m:it.srcMeshes){ snprintf(b,sizeof b," %d", m); s+=b; }
+            s+="\n";
         }
-        if(!animColliders.empty()){ fprintf(f,"COLLIDERS %d", (int)animColliders.size()); for(int m:animColliders) fprintf(f," %d", m); fprintf(f,"\n"); }
-        if(!skyboxMeshes.empty()){ fprintf(f,"SKYBOX %d", (int)skyboxMeshes.size()); for(int m:skyboxMeshes) fprintf(f," %d", m); fprintf(f,"\n"); }   // persist far-backdrop skybox marks
-        { int n=0; for(auto& it:items) if(it.hidden) n++; if(n){ fprintf(f,"IHIDE %d",n); for(int i=0;i<(int)items.size();++i) if(items[i].hidden) fprintf(f," %d",i); fprintf(f,"\n"); } }  // per-item visibility eyes
-        fclose(f);
+        if(!animColliders.empty()){ s+="COLLIDERS "+std::to_string(animColliders.size()); for(int m:animColliders){ snprintf(b,sizeof b," %d",m); s+=b; } s+="\n"; }
+        if(!skyboxMeshes.empty()){ s+="SKYBOX "+std::to_string(skyboxMeshes.size()); for(int m:skyboxMeshes){ snprintf(b,sizeof b," %d",m); s+=b; } s+="\n"; }
+        { int n=0; for(auto& it:items) if(it.hidden) n++; if(n){ s+="IHIDE "+std::to_string(n); for(int i=0;i<(int)items.size();++i) if(items[i].hidden){ snprintf(b,sizeof b," %d",i); s+=b; } s+="\n"; } }
+        return s;
+    }
+    void saveProject(){
+        std::string target=saveTargetFile();
+        std::string s=serializeSession();
+        FILE* f=fopen(target.c_str(),"wb"); if(!f){ setStatus("SAVE FAILED: "+target); return; }
+        sessionPath=target;   // future saves/loads round-trip to here
+        fwrite(s.data(),1,s.size(),f); fclose(f);
         setStatus("Saved -> "+target);
+    }
+    // Read assets/_editor_session.hsledit that the cook EMBEDDED inside this APK — so an ORPHAN cooked APK (its source
+    // saved/<env>.hsledit is gone, e.g. copied to another machine) still round-trips its scene items. projectPath = the APK.
+    std::string extractEmbeddedSession(){
+        if (projectPath.size() < 4 || projectPath.substr(projectPath.size()-4) != ".apk") return {};
+        mz_zip_archive z; memset(&z, 0, sizeof z);
+        if (!mz_zip_reader_init_file(&z, projectPath.c_str(), 0)) return {};
+        std::string out; int idx = mz_zip_reader_locate_file(&z, "assets/_editor_session.hsledit", nullptr, 0);
+        if (idx >= 0) { size_t sz=0; void* d=mz_zip_reader_extract_to_heap(&z, idx, &sz, 0); if(d){ out.assign((const char*)d, sz); mz_free(d); } }
+        mz_zip_reader_end(&z);
+        return out;
     }
     void loadProject(){
         // Try every "saved/<env>.hsledit" up the env's directory tree (nearest first) — checks the FILE itself, so an
         // empty co-located saved/ never shadows the real one. First hit wins and becomes the round-trip target.
         FILE* f=nullptr; std::string used;
         for (auto& c : projectCandidates()) { f=fopen(c.c_str(),"rb"); if(f){ used=c; break; } }
-        if(!f){ fprintf(stderr,"[EDIT] no saved session found for this env (none of the saved/<env>.hsledit candidates exist)\n"); return; }
-        sessionPath=used;
-        fprintf(stderr,"[EDIT] loaded session: %s\n", used.c_str());
-        std::string all; fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ all.resize(n); fread(&all[0],1,n,f);} fclose(f);
+        std::string all;
+        if(f){ sessionPath=used; fprintf(stderr,"[EDIT] loaded session: %s\n", used.c_str());
+               fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ all.resize(n); fread(&all[0],1,n,f);} fclose(f); }
+        else { all = extractEmbeddedSession();   // ORPHAN cooked APK: no saved/<env>.hsledit on disk -> read the session the cook EMBEDDED inside the APK ("extract em")
+               if(all.empty()){ fprintf(stderr,"[EDIT] no saved session (disk) and no _editor_session.hsledit embedded in the APK\n"); return; }
+               sessionPath.clear(); fprintf(stderr,"[EDIT] loaded EMBEDDED session from cooked APK (%zu bytes)\n", all.size()); }
         items.clear(); selItem=-1; deselectAll(); animColliders.clear(); skyboxMeshes.clear();
         const bool cooked = envIsCookedApk();   // a cook OUTPUT: take the session's scene ITEMS but NOT its index-based MESH transforms (already baked into the cook) — re-derive the navmesh from THIS env's ground by name
         size_t p=0; int meshN=0, itemN=0;
@@ -1760,7 +1779,7 @@ struct Editor {
         { char fcl[24]; snprintf(fcl,sizeof fcl,"%.0f",cfgFar); setenv_("HSR_FARCLIP",fcl); }
         { char sd[32]; snprintf(sd,sizeof sd,"%.0f",skyboxDist); setenv_("HSR_SKYBOX_DIST", skybox ? sd : ""); }  // far backdrop -> skybox pass (escapes PortalStereoCamera far=5000)
         std::vector<uint8_t> vspv, fspv;
-        auto apk = exportSceneAPK(ems, nuxd, vspv, fspv, true, &ok, spawn, &sceneZip, (cookAudio ? bgOgg : std::vector<uint8_t>{}), progress, sceneItems);
+        auto apk = exportSceneAPK(ems, nuxd, vspv, fspv, true, &ok, spawn, &sceneZip, (cookAudio ? bgOgg : std::vector<uint8_t>{}), progress, sceneItems, serializeSession());
         if (!ok || apk.empty()) { setStatus("ERROR: cook failed (shell: "+nuxd+")"); cooking.store(false); return; }
         if (!writeFile(out, apk)) { setStatus("ERROR: cannot write "+out); cooking.store(false); return; }
         // ── ONE-CLICK COOK→PREVIEW (HSR_COOK_PREVIEW=1): spawn a fresh renderer on the just-cooked V205 APK, so the
