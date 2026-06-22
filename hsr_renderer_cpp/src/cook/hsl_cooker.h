@@ -1170,6 +1170,8 @@ struct ExportMesh {
     bool rotAnim = false; float rotOmega = 0.f; float rotAxis[3] = {0,1,0}; float rotPivot[3] = {0,0,0};   // ARBITRARY-axis spin: signed rad/s about rotAxis around rotPivot (node WORLD origin; children orbit it)
     bool rotOsc = false; float rotAmp = 0.f; float rotPeriod = 0.f;   // OSCILLATION (sway): angle=(amp/2)(1-cos(2pi t/period)) about rotAxis — clips that swing out & back (Snake Way King Kai planet), NOT a spin
     bool uvScroll = false; float uvRate[2] = {0.f, 0.f};   // mat.sanim UV-SCROLL (water/foam/waterfall) -> getTime() uv += uvRate*time shader
+    // GENERAL node TRANSLATION replay (Star Trek sliding screens etc.) -> shadergen::TRANSLATE getTime() shader (faithful, any track)
+    bool transAnim = false; std::vector<float> transFrames; int transN = 0; float transLoop = 0.f;   // transN frames of vec3 OFFSET, loop seconds
     // V203 NON-skeletal pose/scale animation (the FAITHFUL wisp port — IDA: ShellPoseAnimationComponent -> CoPoseAnimation,
     // ticked by AnimationSystem, NO skeleton). Lerps the entity pose start->end; for a wisp = startScale<->endScale (V79 min/max).
     bool poseAnim = false;
@@ -1874,9 +1876,10 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 m.hzTrsLocal.size(), (size_t)m.hzFrames*m.hzJointCount*10,
                 m.hzRestPos.size(), m.positions.size());
         bool useRot = !useHz && m.rotAnim && ((m.rotOmega > 1e-5f || m.rotOmega < -1e-5f) || (m.rotOsc && (m.rotAmp > 0.02f || m.rotAmp < -0.02f)));   // node spin OR sway (any axis) -> getTime() Rodrigues shader
-        bool useUvScroll = !useHz && !useRot && m.uvScroll && (m.uvRate[0]!=0.f || m.uvRate[1]!=0.f);   // mat.sanim UV scroll (water/foam) -> getTime() uv-translate shader
-        bool usePulse = !useHz && !useRot && !useUvScroll && m.pulse && havePulse;   // node-animated billboard -> custom getTime() pulse shader
-        bool useVat = !useHz && !useRot && !useUvScroll && !usePulse && !m.vatOffsets.empty() && m.vatFrames > 1 && haveVat && m.vatOffsets.size() >= (size_t)vc * m.vatFrames * 3;
+        bool useTrans = !useHz && !useRot && m.transAnim && m.transN >= 2 && m.transFrames.size() >= (size_t)m.transN*3;   // GENERAL node-translation replay (sliding screens)
+        bool useUvScroll = !useHz && !useRot && !useTrans && m.uvScroll && (m.uvRate[0]!=0.f || m.uvRate[1]!=0.f);   // mat.sanim UV scroll (water/foam) -> getTime() uv-translate shader
+        bool usePulse = !useHz && !useRot && !useTrans && !useUvScroll && m.pulse && havePulse;   // node-animated billboard -> custom getTime() pulse shader
+        bool useVat = !useHz && !useRot && !useTrans && !useUvScroll && !usePulse && !m.vatOffsets.empty() && m.vatFrames > 1 && haveVat && m.vatOffsets.size() >= (size_t)vc * m.vatFrames * 3;
         std::vector<uint8_t> vatTex; AssetKey3 vatTexK;
         if (useVat) { vatTex = encodeVatTexture(m.vatOffsets, vc, m.vatFrames); if (vatTex.empty()) useVat = false; }
         std::vector<uint8_t> matl; std::string animatorComp;
@@ -1981,6 +1984,27 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);                  // base tex
             if (std::getenv("HSR_VERBOSE")) { if (m.rotOsc) fprintf(stderr, "[COOK] m%03zu '%s' SWAY amp=%+.0fdeg period=%.1fs axis=(%.2f,%.2f,%.2f) dir=%s %s %s\n", i, m.name.c_str(), m.rotAmp*57.2958f, m.rotPeriod, m.rotAxis[0],m.rotAxis[1],m.rotAxis[2], m.rotAmp>=0?"+":"-", rblend ? "BLEND" : "opaque", rotK.ing ? "" : "(MISSING -> static)");
                 else fprintf(stderr, "[COOK] m%03zu '%s' SPIN %.1fs axis=(%.2f,%.2f,%.2f) dir=%s(%+.4f rad/s) %s %s\n", i, m.name.c_str(), 6.2831853f/(m.rotOmega<0?-m.rotOmega:m.rotOmega), m.rotAxis[0],m.rotAxis[1],m.rotAxis[2], m.rotOmega>=0?"CCW":"CW", m.rotOmega, rblend ? "BLEND" : "opaque", rotK.ing ? "" : "(MISSING -> static)"); }
+        } else if (useTrans) {
+            // GENERAL node-TRANSLATION replay (Star Trek sliding screens): a shadergen::TRANSLATE getTime() shader that
+            // adds the piecewise-linear-interpolated sampled OFFSET to inPos -> FAITHFULLY ports ANY translation track.
+            // Generated on demand, hashed by the frames+loop (dedup). Position-anim -> edits all vertex stages (like rot).
+            bool tblend = m.blend && haveBlend;
+            uint32_t h = (uint32_t)(0x9E3779B9u*(uint32_t)m.transN ^ 0x85EBCA6Bu*(uint32_t)(long)(m.transLoop*1000));
+            for (size_t k=0;k<m.transFrames.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.transFrames[k]*10000);
+            char tfn[160]; snprintf(tfn, sizeof tfn, "cooker/trans_%08x%s%s.surface.bin", h, tblend ? "_b" : "", meshFar ? "_dc" : "");
+            AssetKey3 transK{}; auto it = rotShaders.find(tfn);
+            if (it != rotShaders.end()) transK = it->second;
+            else {
+                auto tbytes = readFileBytes(tfn);
+                if (tbytes.empty()) { const std::vector<uint8_t>& gbase = meshFar ? (tblend ? shadBlendDC : shadDC) : (tblend ? shadBlend : shad);
+                    tbytes = shadergen::generate(gbase, shadergen::TRANSLATE, m.transLoop, 0.f, 0.f, 1.f, 0.f, m.transFrames, m.transN);
+                    if (!tbytes.empty()) writeFileBytes(tfn, tbytes); }
+                if (!tbytes.empty()) { char tp[176]; snprintf(tp, sizeof tp, "%s/shaders/trans_%08x%s%s.surface/shader", MH.c_str(), h, tblend ? "_b" : "", meshFar ? "_dc" : "");
+                    transK = keyForPath(tp); assets.push_back({ tp, transK.tgt, tbytes, transK }); rotShaders[tfn] = transK; } }
+            matl = tblend ? matBlend : matTpl;
+            if (transK.ing) { memcpy(matl.data()+48,&transK.pkg,8); memcpy(matl.data()+56,&transK.ing,8); }   // field7 -> translate shader
+            memcpy(matl.data()+120,&texK.pkg,8); memcpy(matl.data()+128,&texK.ing,8);                          // base tex
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' TRANSLATE %d frames loop=%.2fs %s %s\n", i, m.name.c_str(), m.transN, m.transLoop, tblend ? "BLEND" : "opaque", transK.ing ? "" : "(MISSING -> static)");
         } else if (useUvScroll) {
             // mat.sanim UV-SCROLL (water/foam/waterfall): a getTime() uv += rate*time shader, generated on demand per
             // (rate,blend) — the global converter. Cooked geometry is unchanged; only the sampled UV scrolls.
@@ -2176,7 +2200,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // even though the editor preview (which honors doubleSided = no cull) showed them. Geometry-only, no z-fight (for
         // any pixel exactly one of the coincident tris is front-facing). Skinned (own doublesided shader) / VAT+rot+flip
         // billboards (intentionally single-sided, face the player) keep their own handling.
-        if ((m.skybox || (m.doubleSided && !useVat && !useRot && !usePulse && !useUvScroll && !usePose && !m.flipbook)) && !useHz) {
+        if ((m.skybox || (m.doubleSided && !useVat && !useRot && !useTrans && !usePulse && !useUvScroll && !usePose && !m.flipbook)) && !useHz) {
             dsIdx = m.indices; dsIdx.reserve(m.indices.size()*2);
             for (size_t t=0; t+2<m.indices.size(); t+=3) { dsIdx.push_back(m.indices[t]); dsIdx.push_back(m.indices[t+2]); dsIdx.push_back(m.indices[t+1]); }
             sIdx = &dsIdx;
@@ -2253,7 +2277,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // the skybox pass (like official vistas) makes them render. Heuristic: geometry centroid distance > HSR_SKYBOX_DIST
         // (default 80m). Only plain STATIC meshes (animated/skinned keep their normal walkable path).
         bool skybox = false;
-        if (!dclamp && !fit && !useHz && !usePose && !usePulse && !useRot) {   // depth-clamp/fitclip make far geometry render in place -> no skybox needed (and it's camera-locked/fragile)
+        if (!dclamp && !fit && !useHz && !usePose && !usePulse && !useRot && !useTrans) {   // depth-clamp/fitclip make far geometry render in place -> no skybox needed (and it's camera-locked/fragile)
             // skyboxEntityJson now emits the FULL vista recipe (colorTexture+reflectionMap+MaterialPropertyOverrides) so the
             // backdrop renders (no longer black). Enabled by the editor "Far backdrop -> skybox" toggle => HSR_SKYBOX_DIST=<m>.
             // Far backdrop beyond this radius is drawn in the depth-clamped skybox pass, EXEMPT from the hard

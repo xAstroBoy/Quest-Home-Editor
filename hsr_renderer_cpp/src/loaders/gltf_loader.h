@@ -844,6 +844,33 @@ public:
         duration = animDuration > 0.f ? animDuration : (ss->times.back() - ss->times.front());
         return true;
     }
+    // GENERAL node TRANSLATION port: sample the node's translation channel at N uniform frames over the loop, as OFFSETS
+    // from the t=0 (baked) translation. The cooker generates a shadergen::TRANSLATE shader that replays them with piecewise-
+    // linear interpolation -> FAITHFULLY ports ANY translation animation (Star Trek sliding screens), not a pattern guess.
+    // Returns false if the node has no translation channel or it doesn't actually move.
+    bool extractNodeTranslation(int meshIdx, int N, std::vector<float>& frameOffs, float& loopSec) const {
+        int nodeIdx = -1; for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; break; }
+        if (nodeIdx < 0 || N < 2) return false;
+        const GSampler* ss = nullptr;
+        for (auto& ch : gchannels)
+            if (ch.node == nodeIdx && ch.path == 0 && ch.sampler >= 0 && (size_t)ch.sampler < gsamplers.size()) { ss = &gsamplers[ch.sampler]; break; }
+        if (!ss || ss->comps < 3 || ss->times.size() < 2) return false;
+        float t0 = ss->times.front(), t1 = ss->times.back();
+        loopSec = (animDuration > 0.f) ? animDuration : (t1 - t0);
+        if (loopSec <= 1e-4f) return false;
+        const float base[3] = { ss->vals[0], ss->vals[1], ss->vals[2] };   // t=0 translation (baked into the geometry)
+        auto sampleAt = [&](float t, float out[3]){
+            if (t <= ss->times.front()){ for(int c=0;c<3;c++) out[c]=ss->vals[c]; return; }
+            if (t >= ss->times.back()){ size_t k=ss->times.size()-1; for(int c=0;c<3;c++) out[c]=ss->vals[k*(size_t)ss->comps+c]; return; }
+            size_t i=0; while (i+1<ss->times.size() && ss->times[i+1] < t) ++i;
+            float ta=ss->times[i], tb=ss->times[i+1], f=(tb>ta)?(t-ta)/(tb-ta):0.f;
+            for(int c=0;c<3;c++){ float a=ss->vals[i*(size_t)ss->comps+c], b=ss->vals[(i+1)*(size_t)ss->comps+c]; out[c]=a+(b-a)*f; }
+        };
+        frameOffs.assign((size_t)N*3, 0.f); float maxd = 0.f;
+        for (int fi=0; fi<N; ++fi){ float t = t0 + loopSec * (float)fi/(float)N, s[3]; sampleAt(t,s);
+            for(int c=0;c<3;c++){ float o = s[c]-base[c]; frameOffs[(size_t)fi*3+c]=o; float ad=o<0?-o:o; if(ad>maxd)maxd=ad; } }
+        return maxd > 1e-3f;   // actually moves
+    }
     // Extract a uniform NODE Y-ROTATION track (Outer Wilds skybox = +Y 333s; Interloper = -Y 81s). Walks the parent
     // chain so a mesh INHERITS an animated ancestor's spin — the OW planets are children of the rotating skybox node,
     // so they ORBIT origin (the skybox node's pivot), not spin in place. Returns period (one revolution, s), dir

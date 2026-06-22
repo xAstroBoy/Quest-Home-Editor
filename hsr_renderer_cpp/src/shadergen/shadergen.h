@@ -24,7 +24,9 @@
 namespace shadergen {
 
 //   FLIPBOOK : uv' = inUv*(1/cols,1/rows) + (col/cols,row/rows), frame=mod(floor(time*fps),frames) (skinned/grid sprite TV)
-enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3 };
+//   TRANSLATE: pos' = inPos + replay(N sampled translation OFFSETS, looped) — FAITHFULLY ports ANY node TRANSLATION track
+//              (e.g. Star Trek sliding screens) by piecewise-linear interpolation of the sampled frames; not pattern-matched.
+enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3, TRANSLATE = 4 };
 
 struct Inst { int op; std::vector<uint32_t> w; };   // w[0] = header word (recomputed on emit), w[1..] = operands
 struct VStage { int64_t slot, spvOff; uint32_t spvLen; };   // one vertex stage: FlatBuffer uoffset slot, SPIR-V magic, len
@@ -135,7 +137,8 @@ inline void collectVertStages(const uint8_t* d, size_t N, std::vector<VStage>& o
 
 // Inject the getTime() animation into ONE vertex SPIR-V module (sd -> the 0x07230203 magic word, spvLen bytes).
 // Returns the grown module bytes, or {} if this stage can't be animated for this mode (lacks inPos/inUv — safe to skip).
-inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, Mode mode, float p0, float p1, float ax, float ay, float az){
+inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, Mode mode, float p0, float p1, float ax, float ay, float az,
+                                           const std::vector<float>& tframes = {}, int tN = 0){
     using namespace detail;
     size_t nw = spvLen/4;
     auto W=[&](size_t k){ return u32(sd,spvLen,(int64_t)k*4); };
@@ -196,6 +199,36 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
             {65,{0,pUf,pt,gu,c_time}}, {61,{0,tFloat,t,pt}},
             {142,{0,tV2,off,ratevec,t}}, {129,{0,tV2,uvout,loadRes,off}},   // uv' = inUv + vec2(ru,rv)*time
         };
+    } else if (mode==TRANSLATE){
+        // GENERAL node-translation REPLAY: p0=loopSec, tframes = tN vec3 OFFSETS (delta from the baked base) sampled
+        // uniformly over the loop. t01=fract(time/loopSec); piecewise-linearly interpolate the N offsets (segment i spans
+        // [i/N,(i+1)/N], the last wraps off[N-1]->off[0] for a seamless loop); pos' = inPos + offset. Ports ANY translation.
+        const uint32_t GLSL_FRACT=10, GLSL_STEP=48, GLSL_FCLAMP=43;
+        int N = tN<2?2:tN; float loopSec = (p0>1e-4f)?p0:1.f;
+        uint32_t c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
+        uint32_t c_invloop=fconst(1.0f/loopSec), c_N=fconst((float)N), c0=fconst(0.f), c1=fconst(1.f);
+        std::vector<uint32_t> off(N);
+        for (int i=0;i<N;i++){ uint32_t cx=fconst(tframes[i*3]), cy=fconst(tframes[i*3+1]), cz=fconst(tframes[i*3+2]);
+            uint32_t v=nid(); newConsts.push_back({0x2c,{0,tV3,v,cx,cy,cz}}); off[i]=v; }
+        uint32_t pt=nid(),t=nid(),tn=nid(),t01=nid();
+        body.push_back({65,{0,pUf,pt,gu,c_time}});
+        body.push_back({61,{0,tFloat,t,pt}});
+        body.push_back({133,{0,tFloat,tn,t,c_invloop}});                 // time / loopSec
+        body.push_back({12,{0,tFloat,t01,glsl,GLSL_FRACT,tn}});          // fract -> [0,1)
+        uint32_t acc=off[0]; float invN=1.0f/(float)N;
+        for (int i=0;i<N;i++){ int j=(i+1)%N; uint32_t c_lo=fconst((float)i*invN);
+            uint32_t w =nid(); body.push_back({12,{0,tFloat,w,glsl,GLSL_STEP,c_lo,t01}});   // step(lo,t01): 1 if t01>=lo
+            uint32_t sb=nid(); body.push_back({131,{0,tFloat,sb,t01,c_lo}});                // t01 - lo
+            uint32_t ml=nid(); body.push_back({133,{0,tFloat,ml,sb,c_N}});                  // *(N)
+            uint32_t fr=nid(); body.push_back({12,{0,tFloat,fr,glsl,GLSL_FCLAMP,ml,c0,c1}});// clamp(.,0,1) = local frac
+            uint32_t df=nid(); body.push_back({131,{0,tV3,df,off[j],off[i]}});              // off[j]-off[i]
+            uint32_t sc=nid(); body.push_back({142,{0,tV3,sc,df,fr}});                      // *fr
+            uint32_t sg=nid(); body.push_back({129,{0,tV3,sg,off[i],sc}});                  // seg = off[i] + ...
+            uint32_t rd=nid(); body.push_back({131,{0,tV3,rd,sg,acc}});                     // seg - acc
+            uint32_t rs=nid(); body.push_back({142,{0,tV3,rs,rd,w}});                       // *w
+            uint32_t na=nid(); body.push_back({129,{0,tV3,na,acc,rs}}); acc=na;             // acc = mix(acc,seg,w)
+        }
+        uint32_t posOut=nid(); body.push_back({129,{0,tV3,posOut,loadRes,acc}}); result=posOut;   // pos' = inPos + offset
     } else if (mode==FLIPBOOK){
         // p0=cols p1=rows ax=frames ay=fps. uv' = inUv*(1/cols,1/rows) + (col/cols,row/rows) for the time-driven cell.
         const uint32_t GLSL_FLOOR=8;
@@ -280,9 +313,10 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
 // (forward + depth + shadow + motion-vector). Editing only the forward stage left depth/motion using the un-animated
 // vertex on device -> depth-test/cull/motion mismatch = "animated meshes/textures don't render on device". (UV-scroll's
 // depth-only stages lack inUv -> editVertModule returns {} -> harmlessly skipped, so only real position stages grow.)
-inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode, float p0, float p1=0, float ax=0, float ay=1, float az=0){
+inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode, float p0, float p1=0, float ax=0, float ay=1, float az=0,
+                                     const std::vector<float>& tframes = {}, int tN = 0){
     using namespace detail;
-    if (mode==ROTATE || mode==OSCILLATE){ float l=std::sqrt(ax*ax+ay*ay+az*az); if (l<=0.f) l=1.f; ax/=l; ay/=l; az/=l; }  // axis -> unit (UVSCROLL/FLIPBOOK use these args as params, not an axis)
+    if (mode==ROTATE || mode==OSCILLATE){ float l=std::sqrt(ax*ax+ay*ay+az*az); if (l<=0.f) l=1.f; ax/=l; ay/=l; az/=l; }  // axis -> unit (UVSCROLL/FLIPBOOK/TRANSLATE use these args as params, not an axis)
     const uint8_t* d = src.data(); size_t N = src.size();
     std::vector<VStage> stages;
     if (mode==FLIPBOOK){
@@ -297,7 +331,7 @@ inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode,
     if (stages.empty()) return {};
     std::vector<uint8_t> o = src; int edited = 0;
     for (const auto& st : stages){
-        std::vector<uint8_t> mod = editVertModule(d + st.spvOff, st.spvLen, mode, p0, p1, ax, ay, az);
+        std::vector<uint8_t> mod = editVertModule(d + st.spvOff, st.spvLen, mode, p0, p1, ax, ay, az, tframes, tN);
         if (mod.empty()) continue;     // this vertex stage lacks the needed input for this mode -> skip (harmless)
         while (o.size()%4) o.push_back(0);
         uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
