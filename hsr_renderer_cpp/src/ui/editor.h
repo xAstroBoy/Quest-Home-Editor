@@ -42,6 +42,9 @@ struct Editor {
     // ── UI toolkit ──
     ui::Font font, mono; ui::UIDraw uiDraw; ui::Context cx; ui::DrawList dl;
     int fbW = 0, fbH = 0; float uiScale = 1.f; double lastT = 0.0;
+    float dpiScale = 1.f;                 // OS content-scale (DPI), captured once; uiScale = dpiScale * window-fit factor
+    float baseRowH=0, baseHeaderH=0, basePad=0, baseIndent=0, baseTimelineH=0;   // UNSCALED theme metrics (re-derived on resize)
+    static constexpr float baseFontPx = 15.f;
 
     // ── selection / outliner ──
     int  selected = -1;            // the ACTIVE object (gizmo origin, properties); -1 = none
@@ -403,13 +406,8 @@ struct Editor {
     int dragSplit = 0;           // 1=right border 2=outliner/props border 3=timeline border
 
     // ── properties tabs ──
-    enum { TAB_OBJECT, TAB_SCENE, TAB_MATERIAL, TAB_ANIM, TAB_PHYSICS, TAB_COOK, TAB_QUEST };
+    enum { TAB_OBJECT, TAB_SCENE, TAB_MATERIAL, TAB_ANIM, TAB_PHYSICS, TAB_COOK };
     int tab = TAB_OBJECT;
-    // ── Quest Control: live libshell toggles via the quest-bridge CLI (mirrors the in-headset debug UI) ──
-    std::string questBridge = "d:\\Quest Stuff\\Restore Old Envs\\_quest_bridge\\quest_mcp_server.py";
-    std::string questResult = "(idle) — connect the Quest, then click a toggle.";
-    std::mutex  questMx;
-    bool        questBusy = false;
 
     // ── cook (threaded) ──
     std::thread cookThread; std::atomic<bool> cooking{false}; std::atomic<float> cookProg{0.f};
@@ -425,6 +423,7 @@ struct Editor {
                                        // NO root -> back up the real haven2025, then install the haven2025 SPOOF.
     std::string adbSerial, wifiIp;     // device serial ("" = default); wifiIp -> "adb connect" for wireless adb
     std::thread restoreThread; std::atomic<bool> restoring{false};   // "Restore original Haven 2025" button (runs off the UI thread)
+    std::thread javaThread; std::atomic<int> javaState{0};           // proactive Java auto-install: 0=installing, 1=ready, 2=failed
     bool animSkinned = true;   // HZANIM skinned + 1-joint rigid clips (door/discs/screens/cars/train/sphere). DEFAULT ON:
                                // the incredibles fixed-type-targetId fix ([[project_hsr_skinned_rendmesh_skinblock]]) made
                                // the clip cook stable on device (loads, no std::length_error). Opt-out: toggle / HSR_NOHZ.
@@ -450,25 +449,38 @@ struct Editor {
         r = renderer; win = window; audio = a;
         animOverride = animOver; animScrub = animSc; animDuration = animDur;
         float xs = 1.f, ys = 1.f; glfwGetWindowContentScale(window, &xs, &ys);
-        uiScale = (xs > 0.5f) ? xs : 1.f;
-        loadUIFont(font, 15.f * uiScale, false);
+        dpiScale = (xs > 0.5f) ? xs : 1.f; uiScale = dpiScale;
+        loadUIFont(font, baseFontPx * uiScale, false);
         mono = font;   // the UI pipeline binds ONE atlas (the main font); "mono" MUST share it or its glyph UVs index garbage
         uiDraw.init(r, &font);
         cx.font = &font; cx.mono = &font;
-        // scale the theme metrics for HiDPI
+        // capture UNSCALED theme metrics, then scale for DPI; recomputeUiScale() re-derives them from these on every resize
+        baseRowH=cx.th.rowH; baseHeaderH=cx.th.headerH; basePad=cx.th.pad; baseIndent=cx.th.indent; baseTimelineH=timelineH;
         cx.th.rowH *= uiScale; cx.th.headerH *= uiScale; cx.th.pad *= uiScale; cx.th.indent *= uiScale;
         timelineH *= uiScale;
         r->overlayBegin = [this]() { this->buildFrame(); };
         r->overlayDraw  = [this](VkCommandBuffer cmd) { uiDraw.record(cmd, dl); };
         // (auto-select of a centered, in-front object happens on frame 1 in buildFrame, when the camera matrices are valid)
+        // Proactively AUTO-INSTALL Java if not present (Temurin JRE beside the exe), in the background, so the first
+        // cook isn't blocked on a ~40MB download. apksigner/keytool need it; a no-op if java is already on PATH.
+        javaThread = std::thread([this]{
+            std::string jh = hslcook::ensureJava([](float,const char*){});
+#ifdef _WIN32
+            bool onPath = (system("java -version >NUL 2>&1")==0);
+#else
+            bool onPath = (system("java -version >/dev/null 2>&1")==0);
+#endif
+            javaState.store((!jh.empty() || onPath) ? 1 : 2);
+        });
         ready = true;
     }
     void shutdown() {
         if (cookThread.joinable()) cookThread.join();
         if (restoreThread.joinable()) restoreThread.join();
+        if (javaThread.joinable()) javaThread.join();
         if (ready) { vkDeviceWaitIdle(r->device); uiDraw.destroy(); ready = false; }
     }
-    ~Editor() { if (cookThread.joinable()) cookThread.join(); if (restoreThread.joinable()) restoreThread.join(); }
+    ~Editor() { if (cookThread.joinable()) cookThread.join(); if (restoreThread.joinable()) restoreThread.join(); if (javaThread.joinable()) javaThread.join(); }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  INPUT  (GLFW callbacks in main route here; we accumulate into cx.in, cleared at end of buildFrame)
@@ -568,9 +580,26 @@ struct Editor {
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  FRAME  (overlayBegin: layout -> set viewport pane -> build the DrawList; overlayDraw records it)
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
+    // Responsive UI: recompute uiScale from the viewport each frame. dpiScale keeps physical size right; the window-fit
+    // factor (logical height vs a 900px baseline, clamped) upscales on big windows / downscales on small ones. The font
+    // atlas re-bake+upload is gated on the integer pixel size, so a resize-drag triggers only a handful of reloads.
+    void recomputeUiScale() {
+        if (fbH <= 0) return;
+        float logicalH = (dpiScale > 0.1f) ? (float)fbH / dpiScale : (float)fbH;
+        // The DPI scale already gives the right PHYSICAL size, so only DOWNSCALE when the window is small (so the UI
+        // fits); never upscale past the DPI size — the old 1.7x cap made the UI huge on big/4K monitors ("too upscaled").
+        float target   = dpiScale * std::clamp(logicalH / 1080.f, 0.72f, 1.0f);
+        if (std::fabs(target - uiScale) < 0.01f) return;
+        uiScale = target;
+        cx.th.rowH=baseRowH*uiScale; cx.th.headerH=baseHeaderH*uiScale; cx.th.pad=basePad*uiScale; cx.th.indent=baseIndent*uiScale;
+        timelineH = baseTimelineH*uiScale;
+        int px = (int)(baseFontPx*uiScale + 0.5f);
+        if (px >= 8 && px != (int)(font.pixelHeight + 0.5f)) { loadUIFont(font, (float)px, false); uiDraw.reloadFont(); }
+    }
     void buildFrame() {
         if (!ready) return;
         fbW = (int)r->swapchainExtent.width; fbH = (int)r->swapchainExtent.height;
+        recomputeUiScale();                                      // responsive: adapt uiScale + font + theme to the viewport
         // Recompute the view matrix NOW (WASD already moved the camera this frame) so the overlay's worldToScreen
         // matches the meshes the renderer draws later this frame. Without this the overlay uses last frame's view,
         // so the selection wireframe drifts off the mesh during camera motion and snaps back when you stop.
@@ -773,7 +802,6 @@ struct Editor {
         const char* menus[] = {"File","Edit","Object","View"};
         float mx = 220*uiScale;
         for (auto m : menus) { float w = dl.textW(m)+18*uiScale; cx.button(ui::hashId(m), mx, 3*uiScale, w, h-6*uiScale, m); mx += w+2*uiScale; }
-        { float w = dl.textW("Quest")+22*uiScale; if (cx.button(ui::hashId("hdrquest"), mx+8*uiScale, 3*uiScale, w, h-6*uiScale, "Quest", tab==TAB_QUEST)) tab=TAB_QUEST; mx += w+10*uiScale; }
         // right side: Save / Load (persist the session) + Cook quick-button + progress
         float bw = 96*uiScale, bh = h-8*uiScale, bx = W - bw - pad;
         if (cooking) { cx.progressBar(bx-150*uiScale, 4*uiScale, 150*uiScale+bw, bh, cookProg.load(), stageStr().c_str()); }
@@ -1070,13 +1098,12 @@ struct Editor {
         float x=(float)a.offset.x, y=(float)a.offset.y, w=(float)a.extent.width, h=(float)a.extent.height;
         dl.rect(x,y,w,h, th.panelBg);
         // tab strip
-        float th_h = 22*uiScale; const char* tabs[]={"Object","Scene","Material","Anim","Physics","Cook","Quest"};
-        float tx=x, tw=w/7.f;
-        for (int i=0;i<7;i++){ if (cx.tab(ui::hashId(4000+i,13), tx, y, tw, th_h, tabs[i], tab==i)) tab=i; tx+=tw; }
+        float th_h = 22*uiScale; const char* tabs[]={"Object","Scene","Material","Anim","Physics","Cook"};
+        float tx=x, tw=w/6.f;
+        for (int i=0;i<6;i++){ if (cx.tab(ui::hashId(4000+i,13), tx, y, tw, th_h, tabs[i], tab==i)) tab=i; tx+=tw; }
         dl.rect(x,y+th_h,w,1,th.splitLine);
         float cy = y+th_h+6*uiScale, cx0 = x+8*uiScale, cw = w-16*uiScale;
         dl.pushClip(x, y+th_h, w, h-th_h);
-        if (tab==TAB_QUEST) { drawQuestPanel(cx0, cy, cw); dl.popClip(); return; }    // libshell live toggles via the quest-bridge
         if (tab==TAB_SCENE) { drawScenePanel(cx0, cy, cw); dl.popClip(); return; }   // the Meta-component manager (toggles + Add)
         if (selItem>=0 && selItem<(int)items.size() && tab!=TAB_COOK) { drawItemProps(cx0, cy, cw); dl.popClip(); return; }
         if (selected<0 || selected>=(int)r->gpuMeshes.size()) {
@@ -1220,59 +1247,6 @@ struct Editor {
     }
 
     // ── Cook / Export panel: package name, auto-sign + spoof toggles, Cook button, live progress, status ──
-    // Run a quest-bridge tool async (it shells out frida/adb, ~6-8s) and capture its output into questResult.
-    void runQuestTool(const std::string& tool, const std::string& args) {
-        { std::lock_guard<std::mutex> lk(questMx); if (questBusy) return; questBusy=true; questResult = "running "+tool+" ..."; }
-        std::string bridge=questBridge, t=tool, a=args;
-        std::thread([this,bridge,t,a]{
-            char cmd[2200];
-            snprintf(cmd, sizeof cmd, "python \"%s\" --cli %s %s 2>&1", bridge.c_str(), t.c_str(), a.c_str());
-            std::string out;
-#ifdef _WIN32
-            FILE* p=_popen(cmd,"r");
-#else
-            FILE* p=popen(cmd,"r");
-#endif
-            if (p) { char b[512]; size_t n; while ((n=fread(b,1,sizeof b,p))>0) out.append(b,n);
-#ifdef _WIN32
-                _pclose(p);
-#else
-                pclose(p);
-#endif
-            } else out="(failed to launch bridge — is python on PATH?)";
-            std::lock_guard<std::mutex> lk(questMx); questResult = out.empty()?"(no output)":out; questBusy=false;
-        }).detach();
-    }
-
-    void drawQuestPanel(float x, float y, float w) {
-        auto& th=cx.th; float rh=th.rowH;
-        cx.label(x,y,w,rh,"Quest Control — live libshell toggles (via the quest-bridge)",th.text); y+=rh+6*uiScale;
-        bool busy; { std::lock_guard<std::mutex> lk(questMx); busy=questBusy; }
-        auto full=[&](const char* id,const char* lbl,const char* tool,const char* args){
-            if (cx.button(ui::hashId(id), x, y, w, rh, lbl) && !busy) runQuestTool(tool,args); y+=rh+4*uiScale; };
-        full("qdbgui","Enable in-headset debug UI (ImGui + NetImgui :8888)","quest_enable_debug_ui","net_imgui_port=8888");
-        full("qjump","Unlimited air jump","quest_enable_unlim_jump","");
-        full("qlogs","Verbose logs (level 5 -> hidden DEBUG logs)","quest_enable_verbose_logs","");
-        full("qguard","Disable guardian","quest_debug_props","set_kv=persist.oculus.guardian_disable=1");
-        y+=4*uiScale; cx.label(x,y,w,rh,"Debug overlays (ON / OFF):",th.textDim); y+=rh+2*uiScale;
-        const char* dr[5]={"navmesh","charactercontroller","contactshape","movingplatform","fallbackrender"};
-        for (int i=0;i<5;i++){ float hw=w*0.5f-3*uiScale;
-            if (cx.button(ui::hashId(3300+i,4), x, y, hw, rh, (std::string("ON  ")+dr[i]).c_str()) && !busy) runQuestTool("quest_debug_draw", std::string("feature=")+dr[i]+" on=true");
-            if (cx.button(ui::hashId(3320+i,4), x+w*0.5f+3*uiScale, y, hw, rh, (std::string("OFF ")+dr[i]).c_str()) && !busy) runQuestTool("quest_debug_draw", std::string("feature=")+dr[i]+" on=false");
-            y+=rh+2*uiScale; }
-        y+=4*uiScale; float hw=w*0.5f-3*uiScale;
-        if (cx.button(ui::hashId("qreload"), x, y, hw, rh, "Reload shell") && !busy) runQuestTool("quest_reload_vrshell","");
-        if (cx.button(ui::hashId("qstatus"), x+w*0.5f+3*uiScale, y, hw, rh, "Status / connect") && !busy) runQuestTool("quest_status","");
-        y+=rh+8*uiScale;
-        cx.label(x,y,w,rh, busy?"Result  (running...):":"Result:", th.textDim); y+=rh;
-        std::string res; { std::lock_guard<std::mutex> lk(questMx); res=questResult; }
-        size_t pos=0; int ln=0;
-        while (pos<res.size() && ln<12){ size_t nl=res.find('\n',pos);
-            std::string line = res.substr(pos, nl==std::string::npos?std::string::npos:nl-pos);
-            cx.label(x,y,w,rh, line.c_str(), th.textDim); y+=rh; ln++;
-            if (nl==std::string::npos) break; pos=nl+1; }
-    }
-
     void drawCookPanel(float x, float y, float w) {
         auto& th=cx.th;
         float y0;
@@ -1282,6 +1256,8 @@ struct Editor {
         cx.tip(x,y0,w,th.rowH,"Android package id for the UNSPOOFED (rooted) APK,\ne.g. com.environment.outerwilds.\nThe haven2025 spoof always uses Meta's haven2025\npackage and ignores this field."); y+=th.rowH+4*uiScale;
         y0=y; cx.checkbox(ui::hashId("autosign"), x, y, "Auto-sign (zipalign + apksigner)", autoSign);
         cx.tip(x,y0,w,th.rowH,"Sign the APKs so the Quest will install them (unsigned ->\nINSTALL_PARSE_FAILED_NO_CERTIFICATES). Build-tools are\nauto-detected, or auto-downloaded beside the exe on first\nuse (pre-fetch with --fetch-tools). Keep this ON."); y+=th.rowH;
+        { int js=javaState.load(); const char* jt = js==1 ? "Java: ready (auto-installed if it was missing)" : js==2 ? "Java: auto-install failed - retries on cook, or install a JDK" : "Java: installing runtime in background...";
+          cx.label(x+14*uiScale, y, w, th.rowH, jt, js==2?ui::rgba(230,160,80):th.textDim); y+=th.rowH; }
         y0=y; cx.checkbox(ui::hashId("spoof"), x, y, "Emit haven2025 spoof (no-root install)", spoofHaven);
         cx.tip(x,y0,w,th.rowH,"Also build <env>_NoRoot-Spoof.apk, which masquerades as\nMeta's haven2025 home. This is the ONLY way to install on a\nNON-rooted Quest: it replaces haven2025, then you pick\n\"Haven 2025\" in the home menu. Keep this ON."); y+=th.rowH;
         y0=y; cx.checkbox(ui::hashId("hzanim"), x, y, "Animate skinned meshes (HZANIM — EXPERIMENTAL)", animSkinned);
@@ -1693,12 +1669,18 @@ struct Editor {
         if (!r || !sceneMeshes) return ems;
         size_t n = std::min(sceneMeshes->size(), r->gpuMeshes.size());
         for (size_t i=0;i<n;i++){
-            if (r->isHidden((int)i)) continue;
+            // isHidden is the EDITOR-ONLY visibility eye (a working aid) — hidden meshes MUST still ship in the cook
+            // (user-confirmed). Deleted/removed items are already absent from sceneMeshes, so there's nothing to skip
+            // here. (Was: `if (r->isHidden((int)i)) continue;` which wrongly dropped hidden geometry from the home.)
             const MeshData& md=(*sceneMeshes)[i]; const VkGpuMesh& gm=r->gpuMeshes[i];
             size_t nv=md.positions.size()/3; if (nv<3||md.indices.size()<3) continue;
             ExportMesh em; em.name=md.name; em.positions.resize(nv*3);
             for (size_t v=0;v<nv;v++){ float p[3]={md.positions[v*3],md.positions[v*3+1],md.positions[v*3+2]},o[3]; xformPoint(gm.model,p,o); em.positions[v*3]=o[0]; em.positions[v*3+1]=o[1]; em.positions[v*3+2]=o[2]; }
-            em.uvs=md.uvs; em.indices=md.indices; em.blend = gm.useBlend||gm.additive; em.additive = gm.additive;   // additive (emissive glow) -> cook routes to the opaque-pass shader in the transparent MATL = ADD light (warp/fog visible), not faint alpha
+            em.uvs=md.uvs; em.indices=md.indices; em.blend = gm.useBlend||gm.additive||(gm.alphaTest && !std::getenv("HSR_DIAG_NOCUTBLEND")); em.additive = gm.additive;   // additive (emissive glow) -> cook routes to the opaque-pass shader in the transparent MATL = ADD light (warp/fog visible), not faint alpha. (HSR_DIAG_NOCUTBLEND = A/B test whether the alphaTest->blend routing is what crashes the device load)
+            // alphaTest (OPA "masked"/foliage CUTOUT, alphaTest=true but useBlend=false) MUST cook transparent too: the cook
+            // has no cutout/alpha-test shader, so an OPAQUE cook drops the texture's alpha and the transparent BACKGROUND
+            // renders SOLID (the lakesidepeak "textures have no transparent background" bug). Route to BLEND like the V79
+            // foliage path does (scene_loader sets useBlend=true alongside alphaTest) -> transparent, like the OW planet cards.
             em.doubleSided = md.doubleSided;   // WAS DROPPED -> cooked single-sided -> flat/open doubleSided meshes (monitor screens, thin panels) back-face-culled on device = see-through HOLES. Carry it so the cook double-sides them (reversed tris). Renderer honors doubleSided (gm.cullBack=!doubleSided) so the live preview already looked right.
             em.wantCollider = isAnimCollider((int)i);   // user marked this animated mesh -> same-entity kinematic collider
             em.skybox = isSkyboxMesh((int)i);            // user marked this as far backdrop -> SkyboxPlatformComponent (far-clip-exempt)
@@ -1891,61 +1873,88 @@ struct Editor {
     static std::string havenBackupDir() { return AppConfig::s_exeDir.empty() ? std::string("Haven2025_Backup") : AppConfig::exeRel("Haven2025_Backup"); }
     static std::string havenBackupApk() { return havenBackupDir() + "/haven2025_ORIGINAL_backup.apk"; }
     enum HavenBkp { HB_ABSENT, HB_OK, HB_FAILED };   // not installed / backed-up (or already had one) / pull failed
+    // The backup is the FULL split set (base.apk + split_config.*.apk) in the folder; haven2025 is a split APK on
+    // modern Quest, so pulling only base.apk restores a BROKEN home. Returned base-first; legacy single-file last.
+    static std::vector<std::string> havenBackupApks() {
+        namespace fs=std::filesystem; std::error_code ec; std::string dir=havenBackupDir(); std::vector<std::string> v;
+        if (fs::is_directory(dir, ec)) for (auto& e : fs::directory_iterator(dir, ec))
+            if (e.path().extension()==".apk" && e.path().filename()!="haven2025_ORIGINAL_backup.apk") v.push_back(e.path().string());
+        std::sort(v.begin(), v.end(), [](const std::string& a, const std::string& b){
+            return (int)(a.find("base.apk")!=std::string::npos) > (int)(b.find("base.apk")!=std::string::npos); });   // base first
+        if (v.empty() && fileEx(havenBackupApk())) v.push_back(havenBackupApk());   // legacy single-file backup
+        return v;
+    }
+    // Install the backup set, CAPTURING adb output. `adb install` can exit 0 yet print "Failure", so the old
+    // exit-code check falsely reported "Restored". On a signature/downgrade Failure (our spoof is installed),
+    // uninstall it and clean-install. Returns true only if adb actually printed Success.
+    static bool installHavenBackup(const std::string& ADB, const std::string& sel, const std::vector<std::string>& apks, std::string& log) {
+        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        auto build=[&](const char* verb){ std::string t=verb; for(auto&a:apks) t+=" \""+bs(a)+"\""; return t; };
+        log = adbCapture(ADB, sel, build(apks.size()>1 ? "install-multiple -r -d -g" : "install -r -d -g"));
+        if (log.find("Success")!=std::string::npos) return true;
+        adbCapture(ADB, sel, std::string("uninstall ")+HAVEN_PKG());               // spoof has a different signature -> remove it
+        log += "\n" + adbCapture(ADB, sel, build(apks.size()>1 ? "install-multiple -g" : "install -g"));
+        return log.find("Success")!=std::string::npos;
+    }
     // Back up the REAL haven2025 off the device BEFORE anything is uninstalled. Keeps the first/pristine backup;
-    // never overwrites it. Writes a HOW_TO_RESTORE.txt next to it and reports the folder.
+    // never overwrites it. Pulls the FULL split set. Writes a HOW_TO_RESTORE.txt and reports the folder.
     HavenBkp backupOriginalHaven(std::string& outBkp) {
         auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         std::string dir = havenBackupDir(); outBkp = havenBackupApk();
-        if (fileEx(outBkp)) { fprintf(stderr, "[COOK] Haven 2025 backup already exists (pristine, kept): %s\n", outBkp.c_str()); return HB_OK; }
+        if (fileEx(outBkp) || !havenBackupApks().empty()) { fprintf(stderr, "[COOK] Haven 2025 backup already exists (pristine, kept): %s\n", dir.c_str()); return HB_OK; }
         std::string out = adbCapture(ADB, sel, std::string("shell pm path ")+HAVEN_PKG());
-        size_t p = out.find("package:");
-        if (p == std::string::npos) { fprintf(stderr, "[COOK] Haven 2025 not installed on device — nothing to back up\n"); outBkp.clear(); return HB_ABSENT; }
-        p += 8; size_t e = out.find_first_of("\r\n", p);
-        std::string dev = out.substr(p, e==std::string::npos ? std::string::npos : e-p);
-        while (!dev.empty() && (dev.back()=='\r'||dev.back()=='\n'||dev.back()==' '||dev.back()=='\t')) dev.pop_back();
-        if (dev.empty()) { outBkp.clear(); return HB_FAILED; }
+        if (out.find("package:") == std::string::npos) { fprintf(stderr, "[COOK] Haven 2025 not installed on device - nothing to back up\n"); outBkp.clear(); return HB_ABSENT; }
         std::error_code ec; std::filesystem::create_directories(dir, ec);
-        runAdb(ADB, sel, "pull \""+dev+"\" \""+bs(outBkp)+"\"");
-        if (!fileEx(outBkp)) { fprintf(stderr, "[COOK] WARN: Haven 2025 backup pull FAILED (%s)\n", outBkp.c_str()); outBkp.clear(); return HB_FAILED; }
-        if (FILE* rf = fopen((dir+"/HOW_TO_RESTORE.txt").c_str(), "wb")) {            // plain-language recovery note
-            fputs("This folder holds a backup of the ORIGINAL Meta \"Haven 2025\" home APK, taken automatically\n"
-                  "before the converter replaced it with a spoofed (custom) home.\n\n"
+        std::vector<std::string> pulled; size_t pos=0;                              // pull EVERY split (base + split_config.*)
+        while ((pos=out.find("package:", pos)) != std::string::npos) {
+            pos+=8; size_t e=out.find_first_of("\r\n", pos);
+            std::string dev=out.substr(pos, e==std::string::npos?std::string::npos:e-pos);
+            while(!dev.empty()&&(dev.back()=='\r'||dev.back()=='\n'||dev.back()==' '||dev.back()=='\t')) dev.pop_back();
+            if(!dev.empty()){ std::string base=dev.substr(dev.find_last_of('/')+1), loc=dir+"/"+base;
+                runAdb(ADB,sel,"pull \""+dev+"\" \""+bs(loc)+"\""); if(fileEx(loc)) pulled.push_back(loc); }
+            if(e==std::string::npos) break; pos=e;
+        }
+        if (pulled.empty()) { fprintf(stderr, "[COOK] WARN: Haven 2025 backup pull FAILED\n"); outBkp.clear(); return HB_FAILED; }
+        std::filesystem::copy_file(pulled[0], outBkp, std::filesystem::copy_options::overwrite_existing, ec);   // legacy single-file marker = base.apk
+        if (FILE* rf = fopen((dir+"/HOW_TO_RESTORE.txt").c_str(), "wb")) {
+            fputs("This folder holds a backup of the ORIGINAL Meta \"Haven 2025\" home (base.apk + any split_config.*.apk),\n"
+                  "taken automatically before the converter replaced it with a spoofed (custom) home.\n\n"
                   "RESTORE the original Haven 2025:\n"
-                  "  hsr_renderer.exe --restore-haven\n"
-                  "  (or manually:  adb install -r -d \"haven2025_ORIGINAL_backup.apk\"\n"
-                  "                 adb shell kill $(adb shell pidof com.oculus.vrshell) )\n\n"
-                  "Do NOT delete this folder — it is the only copy of your original Haven 2025.\n"
+                  "  hsr_renderer.exe --restore-haven    (or the editor's \"Restore original Haven 2025\" button)\n\n"
+                  "Do NOT delete this folder - it is the only copy of your original Haven 2025.\n"
                   "If you ever lose it, re-download Haven 2025 from Meta (headset Settings) or factory-reset.\n", rf);
             fclose(rf);
         }
-        fprintf(stderr, "[COOK] Backed up REAL Haven 2025 -> %s  (restore: hsr_renderer --restore-haven)\n", dir.c_str());
+        fprintf(stderr, "[COOK] Backed up REAL Haven 2025 (%zu apk) -> %s  (restore: hsr_renderer --restore-haven)\n", pulled.size(), dir.c_str());
         return HB_OK;
     }
-    // RESTORE the original Haven 2025 from the backup (button + --restore-haven CLI share this idea).
+    // RESTORE the original Haven 2025 from the backup (button + --restore-haven CLI share installHavenBackup).
     void restoreHaven() {
         auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
-        std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial), bkp=havenBackupApk();
-        if (!fileEx(bkp)) { setStatus("No Haven 2025 backup found at "+bkp+" — nothing to restore. See the guide for re-download / factory-reset."); return; }
-        int rc = runAdb(ADB, sel, "install -r -d \""+bs(bkp)+"\"");
-        if (rc!=0){ runAdb(ADB, sel, std::string("uninstall ")+HAVEN_PKG()); rc = runAdb(ADB, sel, "install \""+bs(bkp)+"\""); }
-        relaunchShell(ADB, sel);
-        setStatus(rc==0 ? "Restored the ORIGINAL Haven 2025 from backup + relaunched shell." : "Restore FAILED (adb/device?). Backup is still at "+bkp);
+        std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
+        std::vector<std::string> apks = havenBackupApks();
+        if (apks.empty()) { setStatus("No Haven 2025 backup found in "+havenBackupDir()+" - nothing to restore (a backup is made automatically the first time you install a spoof)."); return; }
+        std::string log; bool ok = installHavenBackup(ADB, sel, apks, log);
+        if (ok) relaunchShell(ADB, sel);
+        std::string first = log.substr(0, log.find_first_of("\r\n"));
+        setStatus(ok ? ("Restored the ORIGINAL Haven 2025 ("+std::to_string(apks.size())+" apk"+std::string(apks.size()>1?"s":"")+") + relaunched shell.")
+                     : ("Restore FAILED: "+(first.empty()?std::string("is the headset connected? (adb devices)"):first)+"  Backup kept in "+havenBackupDir()+"."));
     }
     // Static CLI restore (no Editor instance / no serial) for `hsr_renderer --restore-haven`.
     static int cliRestoreHaven() {
         std::string ADB=adbPath(); for(char&c:ADB) if(c=='/')c='\\';
-        std::string bkp=havenBackupApk(), bbkp=bkp; for(char&c:bbkp) if(c=='/')c='\\';
-        if (!fileEx(bkp)) { fprintf(stderr, "[RESTORE] no backup at %s — nothing to restore.\n", bkp.c_str()); return 1; }
-        auto run=[&](const std::string& tail){ char c[1600]; snprintf(c,sizeof c,"\"\"%s\" %s\"", ADB.c_str(), tail.c_str()); return system(c); };
-        int rc = run("install -r -d \""+bbkp+"\"");
-        if (rc!=0){ run(std::string("uninstall ")+HAVEN_PKG()); rc = run("install \""+bbkp+"\""); }
-        std::string pids = adbCapture(ADB, "", "shell pidof com.oculus.vrshell"); std::string pid;
-        for (char c : pids){ if(c=='\r'||c=='\n') break; pid.push_back(c); }
-        while(!pid.empty() && (pid.back()==' '||pid.back()=='\t')) pid.pop_back();
-        if (!pid.empty()){ run("shell su -c \"kill "+pid+"\""); run("shell kill "+pid); }
-        fprintf(stderr, rc==0 ? "[RESTORE] restored ORIGINAL Haven 2025 from %s + relaunched shell\n" : "[RESTORE] FAILED (adb/device?). Backup kept at %s\n", bkp.c_str());
-        return rc==0 ? 0 : 1;
+        std::vector<std::string> apks = havenBackupApks();
+        if (apks.empty()) { fprintf(stderr, "[RESTORE] no backup in %s - nothing to restore.\n", havenBackupDir().c_str()); return 1; }
+        std::string log; bool ok = installHavenBackup(ADB, "", apks, log);
+        if (ok) {   // relaunch the shell so the restored home loads
+            std::string pids = adbCapture(ADB, "", "shell pidof com.oculus.vrshell"); std::string pid;
+            for (char c : pids){ if(c=='\r'||c=='\n') break; if(c!=' '&&c!='\t') pid.push_back(c); }
+            if (!pid.empty()){ char k[256]; snprintf(k,sizeof k,"\"\"%s\" shell kill %s\"", ADB.c_str(), pid.c_str()); system(k); }
+        }
+        if (ok) fprintf(stderr, "[RESTORE] restored ORIGINAL Haven 2025 (%zu apk) from %s + relaunched shell\n", apks.size(), havenBackupDir().c_str());
+        else    fprintf(stderr, "[RESTORE] FAILED. adb log:\n%s\nBackup kept in %s\n", log.c_str(), havenBackupDir().c_str());
+        return ok ? 0 : 1;
     }
     // Connect wireless adb to wifiIp (e.g. "192.168.1.35[:5555]"); call before installing over Wi-Fi.
     bool wifiConnect() {

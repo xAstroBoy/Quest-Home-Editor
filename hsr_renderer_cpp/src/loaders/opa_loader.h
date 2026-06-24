@@ -420,7 +420,11 @@ public:
         animate(0.f);   // restore rest pose (geometry bake reads the renderer's GPU model, this just resets the loader)
         if (maxd < 0.01f) return e;   // node doesn't TRANSLATE → leave pure spins to the getTime() Rodrigues path
         size_t nv = ar->basePos.size()/3;
-        e.jointCount=1; e.frameCount=NF; e.fps = animFps>0.f?animFps:30.f;
+        // fps over the DOWNSAMPLED frame count so the device loop = the REAL clipDur (the OPA analogue of the
+        // 70274aa warp-speed fix). NF<=64 frames are sampled INCLUSIVELY over [0,clipDur] (line ~414) = NF-1
+        // intervals, so fps MUST be (NF-1)/clipDur, NOT the global animFps. With animFps a >64-frame path played
+        // in (NF-1)/animFps s (e.g. 63/30=2.1s for a real 10s path = ~5x too fast). clipDur>0 + NF>=2 hold above.
+        e.jointCount=1; e.frameCount=NF; e.fps = (float)(NF-1) / clipDur;
         e.parents={-1}; e.jointPos={0,0,0}; e.jointQuat={1,0,0,0}; e.jointScale={1};   // identity bind
         e.restPos = ar->basePos;   // node-LOCAL verts (the clip's WORLD transform places them)
         e.boneIdx.assign(nv*4,0); e.boneWgt.assign(nv*4,0); for (size_t v=0;v<nv;v++) e.boneWgt[v*4]=255;
@@ -452,6 +456,35 @@ public:
         return true;
     }
 
+    // ── COOK: node SCALE "breathe" (NON-UNIFORM per-axis) → N per-axis FACTOR frames (= scale(t)/scale(0), frame0=(1,1,1))
+    //    sampled over the SCALE track's OWN length, for a shadergen::SCALE getTime() shader. pivot = node WORLD origin
+    //    (the shader scales in place). Scale is a LOCAL channel, so the factor needs only the node's own scale track.
+    //    Returns false if the node has no scale track or it doesn't actually breathe (matches the glTF extractNodeScaleFrames). ──
+    bool cookExtractNodeScaleFrames(int meshIdx, int N, std::vector<float>& frameFactors, float& loopSec, float pivot[3]) {
+        frameFactors.clear(); loopSec = 0.f; pivot[0]=pivot[1]=pivot[2]=0.f;
+        if (animMaxFrames < 2 || N < 2) return false;
+        const AnimRec* ar=nullptr; for (auto& a : animRecs) if ((int)a.meshIdx==meshIdx){ ar=&a; break; }
+        if (!ar) return false;
+        uint32_t node=ar->nodeIdx; if (node >= animNodes.size()) return false;
+        auto it = nodeAnim.find(animNodes[node].name);
+        if (it == nodeAnim.end() || it->second.s.nFrames <= 1 || it->second.s.comps != 3) return false;   // no real scale track
+        const Track& st = it->second.s;
+        // loopSec = the SCALE track's OWN length (frames/fps), like the glTF per-clip-duration. animFps = the engine rate.
+        loopSec = (animFps > 0.f) ? (float)st.nFrames / animFps : 0.f;
+        if (loopSec <= 1e-4f) loopSec = animDuration();
+        if (loopSec <= 1e-4f) return false;
+        float base[3]={animNodes[node].s[0],animNodes[node].s[1],animNodes[node].s[2]};
+        sampleTrack(st, 0.f, animFps, 3, base);                       // t=0 baked scale (clamped first frame)
+        for (int c=0;c<3;c++) if (base[c]==0.f) base[c]=1.f;
+        frameFactors.assign((size_t)N*3, 1.f); float maxDev=0.f;
+        for (int fi=0; fi<N; ++fi){ float s[3]={base[0],base[1],base[2]};
+            sampleTrack(st, loopSec*(float)fi/(float)N, animFps, 3, s);
+            for (int c=0;c<3;c++){ float f=s[c]/base[c]; frameFactors[(size_t)fi*3+c]=f; float d=f>1.f?f-1.f:1.f-f; if(d>maxDev)maxDev=d; } }
+        evalAnimNodes(0.f);   // rest pose -> node world origin = pivot
+        if (node < nodeWorldAnim.size()){ pivot[0]=nodeWorldAnim[node].m[12]; pivot[1]=nodeWorldAnim[node].m[13]; pivot[2]=nodeWorldAnim[node].m[14]; }
+        animate(0.f);
+        return maxDev > 1e-3f;   // actually breathes
+    }
     // ── COOK: batch-fit every node-animated mesh to a SPIN/SWAY about an axis (the V79->V203 port). Samples each
     //    animated mesh's WORLD positions across the clip via animate(t), runs the shared noderot::fit, and returns
     //    meshIdx -> Result. Leaves the meshes at REST (animate(0)) so the static geometry bake is the t=0 pose. The
@@ -491,12 +524,11 @@ public:
 
     // ── COOK: mat.sanim UV-SCROLL port. A UVTrack is a per-frame 2x3 affine [a,b,c,d,e,f]; a continuous SCROLL
     //    (water/foam/waterfall) keeps the 2x2 ~ identity and TRANSLATES (c,f). Derive the VISIBLE scroll rate the
-    //    same way animate() plays it (net UV travel over min(clipLen, HSR_MATLOOP=5s)) -> uvRate (UV/s) for a
+    //    rate = avg per-frame UV delta * fps = UV/second (the source's literal visible speed) -> uvRate for a
     //    getTime() uv += rate*time shader. Flipbook atlases (2x2 = cell scale) are a separate pass -> skipped. ──
     void cookExtractUVScroll(std::unordered_map<size_t, std::pair<float,float>>& out) {
         out.clear();
         if (uvAnimRecs.empty() || animFps <= 0.f) return;
-        float matLoopMax = 5.0f; if (const char* e = std::getenv("HSR_MATLOOP")) matLoopMax = (float)atof(e);
         for (auto& ur : uvAnimRecs) {
             if (out.count(ur.meshIdx)) continue;
             auto it = matUVAnim.find(ur.node);
@@ -515,13 +547,12 @@ public:
                 sdu += dc; sdv += df; ++n;
             }
             if (n < 1) continue;
-            double totalU = (sdu/n) * (double)(tr.nFrames-1), totalV = (sdv/n) * (double)(tr.nFrames-1);
-            float loopSec = (float)tr.nFrames / animFps; if (matLoopMax > 0.f && loopSec > matLoopMax) loopSec = matLoopMax;
-            if (loopSec < 1e-3f) continue;
-            float ru = (float)(totalU/loopSec), rv = (float)(totalV/loopSec);
-            float sp = std::sqrt(ru*ru+rv*rv);
-            if (sp < 1e-3f) continue;
-            if (sp > 0.5f) { ru *= 0.5f/sp; rv *= 0.5f/sp; }    // clamp to a watery max so dense tracks don't blur
+            // FAITHFUL scroll rate = avg per-frame UV delta * fps = UV/second, exactly the source's visible speed.
+            // The getTime() shader is `uv += rate*time` (unbounded; the texture's REPEAT wrap makes it loop), so ONLY
+            // the rate matters -- the old HSR_MATLOOP=5s loopSec cap + 0.5 UV/s clamp were guesses that divorced the
+            // cooked rate from the source (lakeside water: a true ~336s loop forced to 5s then clamped 0.5 = no relation).
+            float ru = (float)(sdu / n * animFps), rv = (float)(sdv / n * animFps);
+            if (std::sqrt(ru*ru + rv*rv) < 1e-4f) continue;
             out[ur.meshIdx] = std::make_pair(ru, rv);
         }
     }
@@ -1499,6 +1530,9 @@ private:
     // ships APPEAR; full CPU skeletal skinning (via *.skel/*.anim) is a follow-up. Robust to the
     // exact container header by SCANNING for the "SkinnedPos" posFmt marker.
     void loadSkins(const std::vector<uint8_t>& sceneZip) {
+        if (std::getenv("HSR_DUMPNODES")) { log("=== scene nodes: %zu ===", nodes.size());
+            for (size_t k=0;k<nodes.size();++k){ const float* W=(k<nodeWorld.size())?nodeWorld[k].m:nullptr;
+                log("node[%zu] '%s' par=%d t=(%.2f,%.2f,%.2f)", k, nodes[k].name.c_str(), nodes[k].parent, W?W[12]:0.f, W?W[13]:0.f, W?W[14]:0.f); } }
         mz_zip_archive z; memset(&z, 0, sizeof(z));
         if (!mz_zip_reader_init_mem(&z, sceneZip.data(), sceneZip.size(), 0)) return;
         uint32_t nf = mz_zip_reader_get_num_files(&z);

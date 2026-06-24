@@ -1176,6 +1176,9 @@ struct ExportMesh {
     bool uvScroll = false; float uvRate[2] = {0.f, 0.f};   // mat.sanim UV-SCROLL (water/foam/waterfall) -> getTime() uv += uvRate*time shader
     // GENERAL node TRANSLATION replay (Star Trek sliding screens etc.) -> shadergen::TRANSLATE getTime() shader (faithful, any track)
     bool transAnim = false; std::vector<float> transFrames; int transN = 0; float transLoop = 0.f;   // transN frames of vec3 OFFSET, loop seconds
+    // GENERAL node SCALE "breathe" replay (Erebor's 12 wisps, NON-UNIFORM per-axis) -> shadergen::SCALE getTime() shader.
+    // scaleFrames = scaleN frames of per-axis FACTOR (= scale(t)/scale(0), frame0=(1,1,1)); scalePivot = node WORLD origin.
+    bool scaleAnim = false; std::vector<float> scaleFrames; int scaleN = 0; float scaleLoop = 0.f; float scalePivot[3] = {0,0,0};
     // V203 NON-skeletal pose/scale animation (the FAITHFUL wisp port — IDA: ShellPoseAnimationComponent -> CoPoseAnimation,
     // ticked by AnimationSystem, NO skeleton). Lerps the entity pose start->end; for a wisp = startScale<->endScale (V79 min/max).
     bool poseAnim = false;
@@ -1887,10 +1890,62 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // hash structs being emitted 12B/align-4 when V205.2's NEW MeshDefinition verifier requires 8B/align-8
         // (IDA @0xeba93c). Fixed in encodeRendMeshParts -> no size cap needed. HSR_HZMAXVERTS still overrides if set.
         int hzMaxVerts = std::getenv("HSR_HZMAXVERTS") ? atoi(std::getenv("HSR_HZMAXVERTS")) : 0x7FFFFFFF;
+        // The device reads the ACL clip block size into a SIGNED 16-bit field (IDA; see main.cpp HZ note): an encoded
+        // clip over ~32 KB wraps NEGATIVE -> bad std::string/vector resize -> `std::length_error` crash on load (the
+        // lakesidepeak crash; m154 = 9 joints x 400 frames = 41 KB). Pre-encode the clip HERE; if it exceeds the byte
+        // budget, SUBSAMPLE the frame count (evenly-spaced frames across the clip, DURATION preserved) and re-encode,
+        // reducing N until it fits — so the mesh still ANIMATES at the highest fps that fits, NOT dropped to static.
+        // This mirrors the glTF path (main.cpp ~1184) which caps the frame count up front. fps = (N-1)/duration keeps
+        // playback speed correct (duration = (frames-1)/fps; ACL samples inclusively over the interval -> NF-1 spans).
+        // Budget = HSR_HZMAXBYTES (default 20000; the glTF note: ~22 KB loads, ~65 KB throws length_error). Set it very
+        // high (e.g. 999999) to ship the FULL untouched clip = device-test the TRUE limit. Only when even an 8-frame
+        // clip won't fit do we fall back to STATIC (the device physically can't take it).
+        size_t hzMaxBytes = 20000;
+        if (const char* eb = std::getenv("HSR_HZMAXBYTES")) { long v = atol(eb); if (v > 0) hzMaxBytes = (size_t)v; }
+        std::vector<uint8_t> hzAnimPre; bool hzClipFits = true;
+        if (std::getenv("HSR_HZANIM") && haveSkin && m.hzFrames > 1 && m.hzJointCount > 0
+            && m.hzTrsLocal.size() >= (size_t)m.hzFrames*m.hzJointCount*10) {
+            const int   nj0  = m.hzJointCount;
+            const int   nf0  = m.hzFrames;
+            const float fps0 = m.hzFps;
+            // clip duration (seconds) — preserved across every subsample so playback speed never changes.
+            const float dur  = (fps0 > 1e-6f && nf0 > 1) ? (float)(nf0 - 1) / fps0 : 0.f;
+            const std::vector<float> trs0 = m.hzTrsLocal;   // keep the FULL-res source; subsample picks from it
+            int    nf   = nf0;
+            float  fps  = fps0;
+            std::vector<float> trsCur = trs0;               // current candidate clip (starts = full clip)
+            hzAnimPre = hzAclEncode(trsCur.data(), m.hzParents.data(), nj0, nf, fps);
+            // Reduce N (~3/4 each step, floor 8) until the encoded clip fits the byte budget. trsCur[(f*nj+j)*10 .. +10)
+            // = {qx,qy,qz,qw, t3, s3} — sample N evenly-spaced source frames (endpoints inclusive) into a tight buffer.
+            while ((hzAnimPre.empty() || hzAnimPre.size() > hzMaxBytes) && nf > 8 && dur > 0.f) {
+                int newNf = (int)(nf * 3 / 4); if (newNf < 8) newNf = 8; if (newNf >= nf) newNf = nf - 1;
+                trsCur.assign((size_t)newNf * nj0 * 10, 0.f);
+                for (int f = 0; f < newNf; ++f) {
+                    // map output frame f -> source frame index (inclusive endpoints): f*(nf0-1)/(newNf-1)
+                    int sf = (newNf > 1) ? (int)((double)f * (nf0 - 1) / (newNf - 1) + 0.5) : 0;
+                    if (sf < 0) sf = 0; if (sf > nf0 - 1) sf = nf0 - 1;
+                    std::memcpy(trsCur.data() + (size_t)f * nj0 * 10,
+                                trs0.data()    + (size_t)sf * nj0 * 10,
+                                (size_t)nj0 * 10 * sizeof(float));
+                }
+                nf  = newNf;
+                fps = (newNf > 1) ? (float)(newNf - 1) / dur : fps0;   // DURATION-preserving fps (no #3 warp-speed bug)
+                hzAnimPre = hzAclEncode(trsCur.data(), m.hzParents.data(), nj0, nf, fps);
+            }
+            if (hzAnimPre.empty() || hzAnimPre.size() > hzMaxBytes) hzClipFits = false;   // even 8 frames won't fit -> static
+            // The subsampled fps lives INSIDE the re-encoded ACL clip (hzAclEncode's fps arg), so hzAnimPre alone carries
+            // the slower-fps-but-same-duration motion downstream — m is const & the emit block reads only the bind pose
+            // (m.hzJointPos/Quat/Scale, unchanged) + this hzAnimPre, never m.hzFrames/m.hzFps after here. Nothing to mutate.
+            if (std::getenv("HSR_VERBOSE"))
+                fprintf(stderr, "[COOK] m%03zu HZANIM clip %zuB (j=%d f=%d->%d fps=%.2f->%.2f dur=%.2fs budget=%zu) %s\n",
+                        i, hzAnimPre.size(), nj0, nf0, nf, fps0, fps, dur, hzMaxBytes,
+                        hzClipFits ? (nf != nf0 ? "OK (subsampled)" : "OK") : "-> STATIC (8 frames over budget)");
+        }
         bool useHz  = std::getenv("HSR_HZANIM") && haveSkin && m.hzFrames > 1 && m.hzJointCount > 0
                     && m.hzBoneIdx.size() >= (size_t)vc*4 && m.hzBoneWgt.size() >= (size_t)vc*4
                     && m.hzTrsLocal.size() >= (size_t)m.hzFrames*m.hzJointCount*10
                     && m.hzRestPos.size() == m.positions.size()   // centered rest positions present
+                    && hzClipFits                                 // clip fits the device signed-16 size field (else static)
                     && vc <= hzMaxVerts;                          // no longer a verifier guard; only the optional HSR_HZMAXVERTS override
         if (std::getenv("HSR_VERBOSE") && haveSkin && m.hzJointCount>0)
             fprintf(stderr, "[COOK] m%03zu useHz=%d HZANIM=%d frames=%d joints=%d boneIdx=%zu(need%d) boneWgt=%zu(need%d) trs=%zu(need%zu) rest=%zu(pos%zu)\n",
@@ -1900,9 +1955,10 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 m.hzRestPos.size(), m.positions.size());
         bool useRot = !useHz && m.rotAnim && ((m.rotOmega > 1e-5f || m.rotOmega < -1e-5f) || (m.rotOsc && (m.rotAmp > 0.02f || m.rotAmp < -0.02f)));   // node spin OR sway (any axis) -> getTime() Rodrigues shader
         bool useTrans = !useHz && !useRot && m.transAnim && m.transN >= 2 && m.transFrames.size() >= (size_t)m.transN*3;   // GENERAL node-translation replay (sliding screens)
-        bool useUvScroll = !useHz && !useRot && !useTrans && m.uvScroll && (m.uvRate[0]!=0.f || m.uvRate[1]!=0.f);   // mat.sanim UV scroll (water/foam) -> getTime() uv-translate shader
-        bool usePulse = !useHz && !useRot && !useTrans && !useUvScroll && m.pulse && havePulse;   // node-animated billboard -> custom getTime() pulse shader
-        bool useVat = !useHz && !useRot && !useTrans && !useUvScroll && !usePulse && !m.vatOffsets.empty() && m.vatFrames > 1 && haveVat && m.vatOffsets.size() >= (size_t)vc * m.vatFrames * 3;
+        bool useScale = !useHz && !useRot && !useTrans && m.scaleAnim && m.scaleN >= 2 && m.scaleFrames.size() >= (size_t)m.scaleN*3;   // GENERAL node-SCALE breathe replay (Erebor wisps, per-axis)
+        bool useUvScroll = !useHz && !useRot && !useTrans && !useScale && m.uvScroll && (m.uvRate[0]!=0.f || m.uvRate[1]!=0.f);   // mat.sanim UV scroll (water/foam) -> getTime() uv-translate shader
+        bool usePulse = !useHz && !useRot && !useTrans && !useScale && !useUvScroll && m.pulse && havePulse;   // node-animated billboard -> custom getTime() pulse shader
+        bool useVat = !useHz && !useRot && !useTrans && !useScale && !useUvScroll && !usePulse && !m.vatOffsets.empty() && m.vatFrames > 1 && haveVat && m.vatOffsets.size() >= (size_t)vc * m.vatFrames * 3;
         std::vector<uint8_t> vatTex; AssetKey3 vatTexK;
         if (useVat) { vatTex = encodeVatTexture(m.vatOffsets, vc, m.vatFrames); if (vatTex.empty()) useVat = false; }
         std::vector<uint8_t> matl; std::string animatorComp;
@@ -1943,7 +1999,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // made the device's async asset loader race -> std::length_error crash-loop (5-6x then loaded). Dedup by bytes:
             // ship a shared armatureN.skel/anim once; later meshes with identical bytes reference it.
             auto skelBytes = encodeHzSkel(joints);
-            auto anim = hzAclEncode(m.hzTrsLocal.data(), m.hzParents.data(), m.hzJointCount, m.hzFrames, m.hzFps);
+            auto anim = std::move(hzAnimPre);   // reuse the clip pre-encoded above (size already checked vs the device signed-16 limit)
             if (!anim.empty()) {
                 // ── SKEL pool: each mesh's own bind skeleton (dedup byte-identical). ──
                 AssetKey3 skK{};
@@ -1954,7 +2010,13 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     char rb[96]; snprintf(rb, sizeof rb, "%s/armature%zu", MH.c_str(), skelPool.size());
                     std::string pSkel = std::string(rb) + ".skel/skeleton";
                     skK = keyForPath(pSkel); skK.tgt = 2292226755u;  // HZAN:SKEL FIXED type targetId (all official envs)
-                    assets.push_back({ pSkel, skK.tgt, skelBytes, skK, TYPE_HZAN, TYPE_SKEL });
+                    // ⚠ CRASH FIX: the device animation registry keys skeletons by their INTERNAL name. encodeHzSkel defaults
+                    // every skel to "Skeleton_0", so an env with several distinct skeletons (lakesidepeak ships 7) registers
+                    // them all under the SAME name -> the registry's std::string key corrupts -> env-unload/Full-compaction
+                    // std::length_error crash-loop (nuxd/incredibles never hit it: they ship ONE skeleton_0). Give each its
+                    // own name. Dedup above stays byte-on-geometry (constant name), so byte-identical armatures still share.
+                    auto skelShip = encodeHzSkel(joints, "Skeleton_" + std::to_string(skelPool.size()));
+                    assets.push_back({ pSkel, skK.tgt, skelShip, skK, TYPE_HZAN, TYPE_SKEL });
                     skelPool.push_back({ skelBytes, skK });
                 }
                 // ── ANIM pool: shared clip emitted ONCE (THE crash fix — no duplicate large async loads). ──
@@ -1966,7 +2028,12 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     char rb[96]; snprintf(rb, sizeof rb, "%s/animclip%zu", MH.c_str(), animPool.size());
                     std::string pAnim = std::string(rb) + ".anim/anim";
                     anK = keyForPath(pAnim); anK.tgt = 1496459219u;  // HZAN:ANIM FIXED type targetId
-                    assets.push_back({ pAnim, anK.tgt, anim, anK, TYPE_HZAN, TYPE_ANIM });
+                    // ⚠ CRASH FIX (same root as the skel name): hzAclEncode hardcodes the clip name "Take 001" (8 bytes @+32),
+                    // so multiple clips collide in the device animation registry -> std::length_error. Patch THIS shipped copy's
+                    // name to a unique "Take NNN"; dedup below stays on the original constant-name motion bytes.
+                    auto animShip = anim;
+                    if (animShip.size() >= 40) { char tk[9]; snprintf(tk, sizeof tk, "Take %03zu", animPool.size()); std::memcpy(animShip.data()+32, tk, 8); }
+                    assets.push_back({ pAnim, anK.tgt, animShip, anK, TYPE_HZAN, TYPE_ANIM });
                     animPool.push_back({ anim, anK });
                 }
                 animatorComp = animatorComponentJson(skK, anK);
@@ -2032,6 +2099,31 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             if (transK.ing) { memcpy(matl.data()+48,&transK.pkg,8); memcpy(matl.data()+56,&transK.ing,8); }   // field7 -> translate shader
             memcpy(matl.data()+120,&texK.pkg,8); memcpy(matl.data()+128,&texK.ing,8);                          // base tex
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' TRANSLATE %d frames loop=%.2fs %s %s\n", i, m.name.c_str(), m.transN, m.transLoop, tblend ? "BLEND" : "opaque", transK.ing ? "" : "(MISSING -> static)");
+        } else if (useScale) {
+            // GENERAL node-SCALE "breathe" replay (Erebor's 12 wisps, NON-UNIFORM per-axis): a shadergen::SCALE getTime()
+            // shader that does pos' = pivot + (inPos-pivot)*factor(t), where factor is the piecewise-linear-interpolated
+            // sampled per-axis SCALE FACTOR (= source scale(t)/scale(0)). FAITHFUL per-axis amplitudes (the single hand-rolled
+            // wispscale.surface couldn't). Generated on demand, hashed by the frames+loop+pivot (dedup). The shader pivots in
+            // WORLD space, so the geometry stays at its baked world verts (NOT recentered — useCenter excludes useScale).
+            // Position-anim -> edits ALL vertex stages (like rot/trans) so depth/motion match.
+            bool sblend = m.blend && haveBlend;
+            uint32_t h = (uint32_t)(0x9E3779B9u*(uint32_t)m.scaleN ^ 0x85EBCA6Bu*(uint32_t)(long)(m.scaleLoop*1000));
+            for (int k=0;k<3;k++) h = h*16777619u ^ (uint32_t)(long)(m.scalePivot[k]*1000);
+            for (size_t k=0;k<m.scaleFrames.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.scaleFrames[k]*10000);
+            char sfn[160]; snprintf(sfn, sizeof sfn, "cooker/scale_%08x%s%s.surface.bin", h, sblend ? "_b" : "", meshFar ? "_dc" : "");
+            AssetKey3 scaleK{}; auto it = rotShaders.find(sfn);
+            if (it != rotShaders.end()) scaleK = it->second;
+            else {
+                auto sbytes = readFileBytes(sfn);
+                if (sbytes.empty()) { const std::vector<uint8_t>& gbase = meshFar ? (sblend ? shadBlendDC : shadDC) : (sblend ? shadBlend : shad);
+                    sbytes = shadergen::generate(gbase, shadergen::SCALE, m.scaleLoop, 0.f, m.scalePivot[0], m.scalePivot[1], m.scalePivot[2], m.scaleFrames, m.scaleN);
+                    if (!sbytes.empty()) writeFileBytes(sfn, sbytes); }
+                if (!sbytes.empty()) { char sp[176]; snprintf(sp, sizeof sp, "%s/shaders/scale_%08x%s%s.surface/shader", MH.c_str(), h, sblend ? "_b" : "", meshFar ? "_dc" : "");
+                    scaleK = keyForPath(sp); assets.push_back({ sp, scaleK.tgt, sbytes, scaleK }); rotShaders[sfn] = scaleK; } }
+            matl = sblend ? matBlend : matTpl;
+            if (scaleK.ing) { memcpy(matl.data()+48,&scaleK.pkg,8); memcpy(matl.data()+56,&scaleK.ing,8); }   // field7 -> scale shader
+            memcpy(matl.data()+120,&texK.pkg,8); memcpy(matl.data()+128,&texK.ing,8);                          // base tex
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SCALE %d frames loop=%.2fs pivot=(%.2f,%.2f,%.2f) %s %s\n", i, m.name.c_str(), m.scaleN, m.scaleLoop, m.scalePivot[0],m.scalePivot[1],m.scalePivot[2], sblend ? "BLEND" : "opaque", scaleK.ing ? "" : "(MISSING -> static)");
         } else if (useUvScroll) {
             // mat.sanim UV-SCROLL (water/foam/waterfall): a getTime() uv += rate*time shader, generated on demand per
             // (rate,blend) — the global converter. Cooked geometry is unchanged; only the sampled UV scrolls.

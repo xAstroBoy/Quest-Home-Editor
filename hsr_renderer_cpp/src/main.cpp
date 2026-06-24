@@ -1171,6 +1171,11 @@ int main(int argc, char** argv) {
                 em.vatOffsets.clear(); em.vatFrames = 0;   // rotation/sway -> getTime() Rodrigues shader, NOT VAT (vatBaker also ran on this node-anim mesh)
             } else if (gltf.extractNodeTranslation(meshIdx, 16, em.transFrames, em.transLoop)) {   // GENERAL node-translation replay (sliding screens) — port ANY translation, not the wrong pulse default
                 em.transAnim = true; em.transN = 16;
+            } else if (!std::getenv("HSR_NOSCALE") && gltf.extractNodeScaleFrames(meshIdx, 16, em.scaleFrames, em.scaleLoop, em.scalePivot)) {
+                // GENERAL node-SCALE "breathe" replay (Erebor's 12 wisps, NON-UNIFORM per-axis) -> shadergen::SCALE getTime()
+                // shader. FAITHFUL per-axis amplitudes (the hand-rolled wispscale.surface couldn't). The pre-existing pose/
+                // pulse path stays as the gated FALLBACK: HSR_NOSCALE skips this so a node still takes the old wispscale route.
+                em.scaleAnim = true; em.scaleN = 16;
             } else if (std::getenv("HSR_POSEANIM") && gltf.extractNodeScaleAnim(meshIdx, em.poseStartScale, em.poseEndScale, em.poseDuration))
                 em.poseAnim = true;
             else em.pulse = true;
@@ -1230,6 +1235,13 @@ int main(int argc, char** argv) {
                 return;
             }
             }   // end HSR_OPAHZ gate
+            // NODE-SCALE "breathe" (NON-UNIFORM per-axis) -> shadergen::SCALE getTime() shader (faithful per-axis amplitudes).
+            // Sits before the translation/spin paths so a pure scale-pulse takes the scale shader. HSR_NOSCALE skips it.
+            if (!std::getenv("HSR_NOSCALE") && opa.cookExtractNodeScaleFrames(meshIdx, 16, em.scaleFrames, em.scaleLoop, em.scalePivot)) {
+                em.scaleAnim=true; em.scaleN=16;
+                em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
+                return;
+            }
             // CARS/TRAIN: node TRANSLATION -> ShellPoseAnimationComponent (the FAITHFUL, device-proven node-anim port;
             // NO skin, so MeshDefinition::fix can't reject it like the 1-joint rigid did). Mesh stays static; the entity
             // pose lerps rest -> rest+delta over the clip. Pure spins (no translation) fall through to the spin shader.
@@ -1277,6 +1289,11 @@ int main(int argc, char** argv) {
         // their offset RELATIVE TO t=0 — baking a mid-anim frame double-applied the motion (Star Trek screens "go beyond").
         // Skinned FLIPBOOKS still collapse here: at t=0 the loop's first cell is the only one ON (others scaled to 0).
         if (isV79 && gltf.hasAnimation()) gltf.animate(0.f);
+        else if (isOpa) opa.animate(0.f);   // OPA SKINNED meshes: the skin loader stores PRE-skin (joint-local) basePos, so md.positions
+                                            // only becomes the real bind geometry once the clip is evaluated. The render loop hasn't run
+                                            // yet at cook time, so without this the cooked skinned verts collapse to a vertical streak
+                                            // ("messed up on conversion" / spiky skin.opa). animate(0.f) bakes the t=0 bind pose into
+                                            // md.positions (matches the glTF path above) -> correct STATIC geometry AND the bind verts the device re-skins from.
         editor.exportAPKSync();   // synchronous cook + auto-sign with a terminal progress bar
         if (std::getenv("HSR_EXPORT_QUIT")) return 0;
     }

@@ -178,6 +178,29 @@ struct UIDraw {
         vkDestroyShaderModule(r->device,vm,nullptr); vkDestroyShaderModule(r->device,fm,nullptr);
     }
 
+    // Re-upload the atlas after the caller re-baked font->pixels at a new size (responsive UI scaling). Safe to call
+    // from overlayBegin/buildFrame: that runs after swapchain-recreate and before this frame's draw is recorded, so
+    // vkDeviceWaitIdle here only waits out prior frames (none reference the about-to-be-destroyed atlas).
+    void reloadFont() {
+        if (!r || !font) return;
+        int aw=font->atlasW, ah=font->atlasH;
+        for (int yy=ah-6; yy<ah-2 && yy>=0; ++yy) for (int xx=aw-6; xx<aw-2 && xx>=0; ++xx) font->pixels[(size_t)yy*aw+xx]=255;
+        whiteU=(aw-4.0f)/aw; whiteV=(ah-4.0f)/ah;
+        vkDeviceWaitIdle(r->device);
+        if (atlasView) vkDestroyImageView(r->device,atlasView,nullptr);
+        if (atlas)     vkDestroyImage(r->device,atlas,nullptr);
+        if (atlasMem)  vkFreeMemory(r->device,atlasMem,nullptr);
+        r->createTextureImageRaw(font->pixels.data(), (uint32_t)font->pixels.size(), aw, ah, VK_FORMAT_R8_UNORM, atlas, atlasMem);
+        VkImageViewCreateInfo iv{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        iv.image=atlas; iv.viewType=VK_IMAGE_VIEW_TYPE_2D; iv.format=VK_FORMAT_R8_UNORM;
+        iv.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+        iv.components={VK_COMPONENT_SWIZZLE_IDENTITY,VK_COMPONENT_SWIZZLE_IDENTITY,VK_COMPONENT_SWIZZLE_IDENTITY,VK_COMPONENT_SWIZZLE_IDENTITY};
+        vkCreateImageView(r->device,&iv,nullptr,&atlasView);
+        VkDescriptorImageInfo di{r->sharedSampler, atlasView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w.dstSet=dset; w.dstBinding=0; w.descriptorCount=1;
+        w.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo=&di; vkUpdateDescriptorSets(r->device,1,&w,0,nullptr);
+    }
+
     void ensureBuf(VkBuffer& buf, VkDeviceMemory& mem, size_t& cap, size_t need, VkBufferUsageFlags usage) {
         if (need <= cap) return;
         if (buf) { vkDestroyBuffer(r->device,buf,nullptr); vkFreeMemory(r->device,mem,nullptr); }

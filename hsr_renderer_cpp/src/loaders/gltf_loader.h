@@ -894,6 +894,52 @@ public:
             for(int c=0;c<3;c++){ float o = wt[12+c]-w0[12+c]; frameOffs[(size_t)fi*3+c]=o; float ad=o<0?-o:o; if(ad>maxd)maxd=ad; } }
         return maxd > 1e-3f;   // actually moves (WORLD space)
     }
+    // GENERAL node SCALE port (Erebor "breathe" wisps — NON-UNIFORM per-axis): sample the node's composed LOCAL scale at
+    // N uniform frames over the clip, as per-axis FACTORS relative to the t=0 (baked) scale (frame 0 = (1,1,1)). The cooker
+    // generates a shadergen::SCALE shader that replays them with piecewise-linear interpolation -> FAITHFULLY reproduces the
+    // per-axis amplitudes (which the single hand-rolled wispscale.surface could not). loopSec = the SCALE node's OWN track
+    // length (per-clip-duration, like the 70274aa warp fix), NOT the global animDuration. pivot = the node's WORLD origin
+    // (so the scale pivots in place). Scale is a LOCAL channel — parent scale is constant relative to the factor, so the
+    // factor = scale(t)/scale(0) needs only the node's own scale track (unlike translation, which needs the world delta).
+    // Returns false if the node has no scale channel or it doesn't actually breathe.
+    bool extractNodeScaleFrames(int meshIdx, int N, std::vector<float>& frameFactors, float& loopSec, float pivot[3]) const {
+        int nodeIdx = -1; for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; break; }
+        if (nodeIdx < 0 || N < 2 || nodeIdx >= (int)gnodes.size()) return false;
+        const GSampler* ss = nullptr;   // the node's OWN scale channel
+        for (auto& ch : gchannels)
+            if (ch.node==nodeIdx && ch.path==2 && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()) { ss=&gsamplers[ch.sampler]; break; }
+        if (!ss || ss->comps < 3 || ss->times.empty()) return false;
+        // loopSec = the SCALE track's OWN length (per-clip), falling back to the global animDuration.
+        loopSec = (ss->times.size()>=2) ? (ss->times.back()-ss->times.front()) : 0.f;
+        if (loopSec <= 1e-4f) loopSec = animDuration;
+        if (loopSec <= 1e-4f) return false;
+        // t=0 baked scale = the channel value at the clip's first time (clamped). factor(t) = scale(t)/scale(0).
+        float base[3]; { float o4[4]; sampleSampler(*ss, ss->times.front(), o4); for (int c=0;c<3;c++) base[c] = (o4[c]!=0.f)?o4[c]:1.f; }
+        frameFactors.assign((size_t)N*3, 1.f); float maxDev = 0.f;
+        for (int fi=0; fi<N; ++fi){ float o4[4]; sampleSampler(*ss, ss->times.front() + loopSec*(float)fi/(float)N, o4);
+            for (int c=0;c<3;c++){ float f = o4[c]/base[c]; frameFactors[(size_t)fi*3+c]=f; float d=f>1.f?f-1.f:1.f-f; if(d>maxDev)maxDev=d; } }
+        // pivot = the node's WORLD origin at t=0 (the cook recenters geometry here so the scale pivots in place).
+        pivot[0]=pivot[1]=pivot[2]=0.f;
+        { float tt[3]={gnodes[nodeIdx].t[0],gnodes[nodeIdx].t[1],gnodes[nodeIdx].t[2]};
+          // walk parents at t=0 to compose the world origin (matches extractNodeTranslation's worldAt(node,0))
+          auto trsMat=[](const float* t,const float* r,const float* sc,float* mm){ float x=r[0],y=r[1],z=r[2],ww=r[3];
+              mm[0]=(1-2*(y*y+z*z))*sc[0]; mm[1]=(2*(x*y+ww*z))*sc[0]; mm[2]=(2*(x*z-ww*y))*sc[0]; mm[3]=0;
+              mm[4]=(2*(x*y-ww*z))*sc[1]; mm[5]=(1-2*(x*x+z*z))*sc[1]; mm[6]=(2*(y*z+ww*x))*sc[1]; mm[7]=0;
+              mm[8]=(2*(x*z+ww*y))*sc[2]; mm[9]=(2*(y*z-ww*x))*sc[2]; mm[10]=(1-2*(x*x+y*y))*sc[2]; mm[11]=0;
+              mm[12]=t[0]; mm[13]=t[1]; mm[14]=t[2]; mm[15]=1; };
+          auto mulMat=[](const float* a,const float* b,float* o){ for(int c=0;c<4;c++)for(int rr=0;rr<4;rr++) o[c*4+rr]=a[rr]*b[c*4]+a[4+rr]*b[c*4+1]+a[8+rr]*b[c*4+2]+a[12+rr]*b[c*4+3]; };
+          std::function<void(int,float*)> worldAt0=[&](int n,float* out){
+              float ttn[3]={gnodes[n].t[0],gnodes[n].t[1],gnodes[n].t[2]}, q[4]={gnodes[n].r[0],gnodes[n].r[1],gnodes[n].r[2],gnodes[n].r[3]}, sc[3]={gnodes[n].s[0],gnodes[n].s[1],gnodes[n].s[2]};
+              for (auto& ch : gchannels) if (ch.node==n && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
+                  float o4[4]; sampleSampler(gsamplers[ch.sampler], 0.f, o4);
+                  if (ch.path==0){ ttn[0]=o4[0]; ttn[1]=o4[1]; ttn[2]=o4[2]; }
+                  else if (ch.path==1){ q[0]=o4[0]; q[1]=o4[1]; q[2]=o4[2]; q[3]=o4[3]; }
+                  else if (ch.path==2){ sc[0]=o4[0]; sc[1]=o4[1]; sc[2]=o4[2]; } }
+              float loc[16]; trsMat(ttn,q,sc,loc);
+              if (gnodes[n].parent>=0 && (size_t)gnodes[n].parent<gnodes.size()){ float pw[16]; worldAt0(gnodes[n].parent,pw); mulMat(pw,loc,out); } else memcpy(out,loc,64); };
+          (void)tt; float w0[16]; worldAt0(nodeIdx, w0); pivot[0]=w0[12]; pivot[1]=w0[13]; pivot[2]=w0[14]; }
+        return maxDev > 1e-3f;   // actually breathes
+    }
     // Extract a uniform NODE Y-ROTATION track (Outer Wilds skybox = +Y 333s; Interloper = -Y 81s). Walks the parent
     // chain so a mesh INHERITS an animated ancestor's spin — the OW planets are children of the rotating skybox node,
     // so they ORBIT origin (the skybox node's pivot), not spin in place. Returns period (one revolution, s), dir

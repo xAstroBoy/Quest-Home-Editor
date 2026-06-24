@@ -37,6 +37,10 @@ TOOLS = [
     {"name": "quest_kill", "description": "Force-stop an app by package (toggle off / close).", "inputSchema": {"type": "object", "properties": {"pkg": {"type": "string"}}, "required": ["pkg"]}},
     {"name": "quest_current", "description": "Current foreground activity/focus.", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "quest_button", "description": "Inject a controller button KEY on both controllers (304=A 305=B 307=X 308=Y; getevent -p for codes).", "inputSchema": {"type": "object", "properties": {"code": {"type": "integer"}}, "required": ["code"]}},
+    {"name": "quest_player_enable", "description": "Arm (on=1) or idle (on=0) the questpctl zygisk player-control hook. Must be armed before teleport/walk.", "inputSchema": {"type": "object", "properties": {"on": {"type": "integer"}}}},
+    {"name": "quest_teleport", "description": "Teleport the player to absolute world x y z (questpctl hook must be armed). Does not fall (it's a position set, not a physics jump).", "inputSchema": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}, "required": ["x", "y", "z"]}},
+    {"name": "quest_walk", "description": "Walk the player: fwd + strafe step size (0 0 = stop). Steps via throttled teleport ~2.5Hz. Hook must be armed.", "inputSchema": {"type": "object", "properties": {"fwd": {"type": "number"}, "strafe": {"type": "number"}}, "required": ["fwd", "strafe"]}},
+    {"name": "quest_rotate", "description": "Rotate the player to face yaw (in place). Hook must be armed.", "inputSchema": {"type": "object", "properties": {"yaw": {"type": "number"}}, "required": ["yaw"]}},
 ]
 
 def call(name, args):
@@ -57,6 +61,10 @@ def call(name, args):
     if name == "quest_kill":    return qctl("kill", args["pkg"])
     if name == "quest_current": return qctl("current")
     if name == "quest_button":  return qctl("button", int(args["code"]))
+    if name == "quest_player_enable": return qctl("playerctl", int(args.get("on", 1)))
+    if name == "quest_teleport":      return qctl("teleport", args["x"], args["y"], args["z"])
+    if name == "quest_walk":          return qctl("walk", args["fwd"], args["strafe"])
+    if name == "quest_rotate":        return qctl("rotate", args["yaw"])
     if name == "quest_reload_shell": return qctl("reloadshell")
     if name == "quest_status":
         env = adb("shell", "su", "-c", "dumpsys oemprefs --user 0 get environment_selected").strip() or adb("shell", "settings", "get", "secure", "environment_selected").strip()

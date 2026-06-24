@@ -131,7 +131,19 @@ std::vector<uint8_t> hzAclEncode(const float* trs, const int* parents, int joint
     uint32_t aclOff = ((channelMapOff + (uint32_t)jointCount) + 15u) & ~15u;   // ACL blocks 16-aligned, after the channel map
     uint32_t s1a = (S1 + 15u) & ~15u;
     uint32_t blockSize = s1a + S2;                         // @0x14 = align16(jointClipSize) + floatClipSize
-    std::vector<uint8_t> b((size_t)aclOff + blockSize, 0);
+    // ⚠ CRASH FIX (THE lakesidepeak length_error — IDA-proven @0x1617f4c + ground-truth-verified vs official clips):
+    // version>=4 HzAnim clips carry a TRAILING channel-name table AFTER the ACL blocks (past aclOff+blockSize):
+    // a u32 count (+1 byte), then `count` u16-length-prefixed channel-name strings. The device's
+    // HzAnimAssetInitializer_deserialize reads that u32 count and, if non-zero, loops `std::string::resize(len-1)` +
+    // memcpy per name (the SECOND resize @0x16188ac, registered via HzAnimPlayback). EVERY official ver-6 clip
+    // (calming butterflies/birds, oceanarium whale) appends EXACTLY 5 zero bytes here (count=0 -> loop skipped). Our
+    // cook ended the file exactly at aclOff+blockSize, so the device read `count` from PAST the buffer end = adjacent
+    // heap garbage -> when non-zero it resized a string to a bogus length -> std::length_error: basic_string crash-loop
+    // -> nuxd fallback. When the heap there happened to be 0 it loaded fine -> "works on SOME cooked homes" (it was
+    // data-dependent, never a malformed clip — all header/ACL bytes validate). FIX: append the 5-byte empty table so
+    // the count reads 0, byte-structurally identical to the proven official clips. blockSize is UNCHANGED (the official
+    // clips also exclude these 5 bytes from blockSize: file == aclOff + blockSize + 5).
+    std::vector<uint8_t> b((size_t)aclOff + blockSize + 5, 0);   // +5 = version-6 trailing channel-name table (empty: count=0)
     auto w32 = [&](uint32_t o, uint32_t v){ std::memcpy(b.data() + o, &v, 4); };
     w32(0, 0xA34912B6u); w32(4, 6u); w32(8, (uint32_t)jointCount); w32(12, channelMapOff);   // version 6 (current device HzAnim format; was 3 -> device parsed/rejected the clip -> garbage poses -> mesh collapsed). Header layout is identical, byte-for-byte matched to the calming butterflies' working clip.
     w32(16, aclOff); w32(20, blockSize); w32(24, nameLen);

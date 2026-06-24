@@ -26,7 +26,10 @@ namespace shadergen {
 //   FLIPBOOK : uv' = inUv*(1/cols,1/rows) + (col/cols,row/rows), frame=mod(floor(time*fps),frames) (skinned/grid sprite TV)
 //   TRANSLATE: pos' = inPos + replay(N sampled translation OFFSETS, looped) — FAITHFULLY ports ANY node TRANSLATION track
 //              (e.g. Star Trek sliding screens) by piecewise-linear interpolation of the sampled frames; not pattern-matched.
-enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3, TRANSLATE = 4 };
+//   SCALE    : pos' = pivot + (inPos - pivot)*replay(N sampled per-axis SCALE FACTORS, looped) — FAITHFULLY ports ANY node
+//              SCALE "breathe" track (e.g. Erebor's 12 wisps, NON-UNIFORM per-axis amplitudes) by piecewise-linear
+//              interpolation of the sampled per-axis factor frames (frame0 = (1,1,1)); not a (1-cos) shape guess.
+enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3, TRANSLATE = 4, SCALE = 5 };
 
 struct Inst { int op; std::vector<uint32_t> w; };   // w[0] = header word (recomputed on emit), w[1..] = operands
 struct VStage { int64_t slot, spvOff; uint32_t spvLen; };   // one vertex stage: FlatBuffer uoffset slot, SPIR-V magic, len
@@ -229,6 +232,42 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
             uint32_t na=nid(); body.push_back({129,{0,tV3,na,acc,rs}}); acc=na;             // acc = mix(acc,seg,w)
         }
         uint32_t posOut=nid(); body.push_back({129,{0,tV3,posOut,loadRes,acc}}); result=posOut;   // pos' = inPos + offset
+    } else if (mode==SCALE){
+        // GENERAL node-SCALE REPLAY (Erebor "breathe" wisps): tframes = tN per-axis SCALE FACTORS (= source scale(t)/scale(0),
+        // so frame 0 = (1,1,1)) sampled uniformly over the loop; ax/ay/az = the world PIVOT. t01=fract(time/loopSec); piecewise-
+        // linearly interpolate the N vec3 factors (segment i spans [i/N,(i+1)/N], the last wraps factor[N-1]->factor[0] for a
+        // seamless loop); pos' = pivot + (inPos - pivot)*factor. Multiplies (NOT adds) around the pivot, per axis. Ports ANY
+        // SCALE track with FAITHFUL per-axis amplitudes (the whole point — wispscale.surface could not).
+        const uint32_t GLSL_FRACT=10, GLSL_STEP=48, GLSL_FCLAMP=43;
+        int N = tN<2?2:tN; float loopSec = (p0>1e-4f)?p0:1.f;
+        uint32_t c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
+        uint32_t c_invloop=fconst(1.0f/loopSec), c_N=fconst((float)N), c0=fconst(0.f), c1=fconst(1.f);
+        uint32_t c_px=fconst(ax), c_py=fconst(ay), c_pz=fconst(az);
+        uint32_t pivot=nid(); newConsts.push_back({0x2c,{0,tV3,pivot,c_px,c_py,c_pz}});
+        std::vector<uint32_t> fac(N);
+        for (int i=0;i<N;i++){ uint32_t cx=fconst(tframes[i*3]), cy=fconst(tframes[i*3+1]), cz=fconst(tframes[i*3+2]);
+            uint32_t v=nid(); newConsts.push_back({0x2c,{0,tV3,v,cx,cy,cz}}); fac[i]=v; }
+        uint32_t pt=nid(),t=nid(),tn=nid(),t01=nid();
+        body.push_back({65,{0,pUf,pt,gu,c_time}});
+        body.push_back({61,{0,tFloat,t,pt}});
+        body.push_back({133,{0,tFloat,tn,t,c_invloop}});                 // time / loopSec
+        body.push_back({12,{0,tFloat,t01,glsl,GLSL_FRACT,tn}});          // fract -> [0,1)
+        uint32_t acc=fac[0]; float invN=1.0f/(float)N;
+        for (int i=0;i<N;i++){ int j=(i+1)%N; uint32_t c_lo=fconst((float)i*invN);
+            uint32_t w =nid(); body.push_back({12,{0,tFloat,w,glsl,GLSL_STEP,c_lo,t01}});   // step(lo,t01): 1 if t01>=lo
+            uint32_t sb=nid(); body.push_back({131,{0,tFloat,sb,t01,c_lo}});                // t01 - lo
+            uint32_t ml=nid(); body.push_back({133,{0,tFloat,ml,sb,c_N}});                  // *(N)
+            uint32_t fr=nid(); body.push_back({12,{0,tFloat,fr,glsl,GLSL_FCLAMP,ml,c0,c1}});// clamp(.,0,1) = local frac
+            uint32_t df=nid(); body.push_back({131,{0,tV3,df,fac[j],fac[i]}});              // fac[j]-fac[i]
+            uint32_t sc=nid(); body.push_back({142,{0,tV3,sc,df,fr}});                      // *fr
+            uint32_t sg=nid(); body.push_back({129,{0,tV3,sg,fac[i],sc}});                  // seg = fac[i] + ...
+            uint32_t rd=nid(); body.push_back({131,{0,tV3,rd,sg,acc}});                     // seg - acc
+            uint32_t rs=nid(); body.push_back({142,{0,tV3,rs,rd,w}});                       // *w
+            uint32_t na=nid(); body.push_back({129,{0,tV3,na,acc,rs}}); acc=na;             // acc = mix(acc,seg,w)
+        }
+        uint32_t rel=nid(); body.push_back({131,{0,tV3,rel,loadRes,pivot}});               // inPos - pivot
+        uint32_t scl=nid(); body.push_back({133,{0,tV3,scl,rel,acc}});                      // *factor (component-wise)
+        uint32_t posOut=nid(); body.push_back({129,{0,tV3,posOut,scl,pivot}}); result=posOut; // pos' = pivot + (inPos-pivot)*factor
     } else if (mode==FLIPBOOK){
         // p0=cols p1=rows ax=frames ay=fps. uv' = inUv*(1/cols,1/rows) + (col/cols,row/rows) for the time-driven cell.
         const uint32_t GLSL_FLOOR=8;
