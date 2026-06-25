@@ -4,5 +4,6 @@
 // JPEG-only keeps the build lean; PNG keeps its existing custom decoder in gltf_loader.h.
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_JPEG
+#define STBI_ONLY_PNG      // Blender round-trip import: re-load the exported PNG textures (gltf_import.h, stbi_load_from_memory)
 #define STBI_NO_STDIO
 #include "stb_image.h"

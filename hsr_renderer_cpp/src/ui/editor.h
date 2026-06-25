@@ -10,7 +10,18 @@
 #include "core/camera.h"
 #include "core/scene_items.h"
 #include "cook/hsl_cooker.h"
+#include "io/gltf_export.h"          // Blender round-trip: env -> glTF 2.0 project
 #include "ui/ui_core.h"
+#ifdef _WIN32
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>
+  #include <shobjidl.h>            // IFileOpenDialog — the full Explorer folder picker for the Blender export path
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -810,6 +821,10 @@ struct Editor {
             float sw=56*uiScale;
             if (cx.button(ui::hashId("hdrload"), bx-sw-4*uiScale, 4*uiScale, sw, bh, "Load")) loadProject();
             if (cx.button(ui::hashId("hdrsave"), bx-2*sw-8*uiScale, 4*uiScale, sw, bh, "Save")) saveProject();
+            float blw = 96*uiScale;   // Blender round-trip: export (folder picker -> glTF) + import (file picker -> reopen)
+            float bex = bx-2*sw-12*uiScale-blw;
+            if (cx.button(ui::hashId("hdrblend"),  bex, 4*uiScale, blw, bh, "-> Blender")) exportBlender();
+            if (cx.button(ui::hashId("hdrimport"), bex-blw-4*uiScale, 4*uiScale, blw, bh, "Blender ->")) importBlender();
         }
     }
 
@@ -2047,6 +2062,104 @@ struct Editor {
         if (pid.empty()) return;
         runAdb(ADB, sel, "shell su -c \"kill "+pid+"\"");   // rooted
         runAdb(ADB, sel, "shell kill "+pid);                // non-root best-effort
+    }
+    // ── Blender round-trip ──────────────────────────────────────────────────────────────────────────────────────
+    // Modern full-Explorer FOLDER picker (IFileOpenDialog + FOS_PICKFOLDERS). Returns "" on cancel / non-Windows.
+    static std::string pickFolderWin32(const wchar_t* title) {
+#ifdef _WIN32
+        std::string result; bool co = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
+        IFileOpenDialog* dlg = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))) && dlg) {
+            DWORD opt = 0; dlg->GetOptions(&opt); dlg->SetOptions(opt | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+            if (title) dlg->SetTitle(title);
+            if (SUCCEEDED(dlg->Show(nullptr))) {
+                IShellItem* item = nullptr;
+                if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+                    PWSTR w = nullptr;
+                    if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &w)) && w) {
+                        int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+                        if (n > 1) { result.resize(n - 1); WideCharToMultiByte(CP_UTF8, 0, w, -1, &result[0], n, nullptr, nullptr); }
+                        CoTaskMemFree(w);
+                    }
+                    item->Release();
+                }
+            }
+            dlg->Release();
+        }
+        if (co) CoUninitialize();
+        return result;
+#else
+        (void)title; return "";
+#endif
+    }
+    std::string envStem() const {
+        std::string s = projectPath.empty() ? std::string("env") : projectPath;
+        size_t sl = s.find_last_of("/\\"); if (sl != std::string::npos) s = s.substr(sl + 1);
+        size_t dot = s.find_last_of('.'); if (dot != std::string::npos) s = s.substr(0, dot);
+        return s.empty() ? std::string("env") : s;
+    }
+    // Export the loaded env (meshes + materials + textures + per-mesh transforms) to a Blender-ready glTF 2.0 project
+    // under the user-picked folder. Opens directly in Blender; the sidecar lets it be re-imported & re-cooked.
+    void exportBlender() {
+        if (!sceneMeshes || sceneMeshes->empty()) { setStatus("Blender export: no meshes loaded"); return; }
+        std::string dir = pickFolderWin32(L"Choose a folder for the Blender project");
+        if (dir.empty()) { setStatus("Blender export cancelled"); return; }
+        std::string env = envStem();
+        std::string outDir = dir + "/" + env + "_blender";
+        setStatus("Exporting Blender project (geometry + skeletons + animations)...");
+        auto ems = buildExportMeshes();   // the FULL cook source: geometry + skins + skeletal clips + node anims + materials
+        bool ok = !ems.empty() && gltfexport::exportEnvFull(ems, outDir, env, "");
+        setStatus(ok ? ("Blender project exported -> " + outDir + "\\" + env + ".gltf  (open in Blender)") : "Blender export FAILED");
+    }
+    // Full-Explorer FILE picker (glTF/glb). Returns "" on cancel / non-Windows.
+    static std::string pickFileWin32(const wchar_t* title) {
+#ifdef _WIN32
+        std::string result; bool co = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
+        IFileOpenDialog* dlg = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))) && dlg) {
+            COMDLG_FILTERSPEC filt[] = { { L"Blender glTF (*.gltf;*.glb)", L"*.gltf;*.glb" }, { L"All files", L"*.*" } };
+            dlg->SetFileTypes(2, filt);
+            DWORD opt = 0; dlg->GetOptions(&opt); dlg->SetOptions(opt | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
+            if (title) dlg->SetTitle(title);
+            if (SUCCEEDED(dlg->Show(nullptr))) {
+                IShellItem* item = nullptr;
+                if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+                    PWSTR w = nullptr;
+                    if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &w)) && w) {
+                        int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+                        if (n > 1) { result.resize(n - 1); WideCharToMultiByte(CP_UTF8, 0, w, -1, &result[0], n, nullptr, nullptr); }
+                        CoTaskMemFree(w);
+                    }
+                    item->Release();
+                }
+            }
+            dlg->Release();
+        }
+        if (co) CoUninitialize();
+        return result;
+#else
+        (void)title; return "";
+#endif
+    }
+    // Import a Blender-edited glTF/glb back in. The env is rebuilt from the loader path (gltf_import.h), so we open it
+    // in a fresh editor instance with that file as the scene; the user closes this window when ready.
+    void importBlender() {
+        std::string file = pickFileWin32(L"Choose a Blender glTF / glb to import back");
+        if (file.empty()) { setStatus("Blender import cancelled"); return; }
+#ifdef _WIN32
+        wchar_t exe[MAX_PATH]; if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) { setStatus("Blender import: can't locate the editor exe"); return; }
+        int n = MultiByteToWideChar(CP_UTF8, 0, file.c_str(), -1, nullptr, 0);
+        std::wstring fw(n > 1 ? n - 1 : 0, L'\0'); if (n > 1) MultiByteToWideChar(CP_UTF8, 0, file.c_str(), -1, &fw[0], n);
+        std::wstring cmd = L"\"" + std::wstring(exe) + L"\" \"" + fw + L"\"";
+        std::vector<wchar_t> cmdbuf(cmd.begin(), cmd.end()); cmdbuf.push_back(0);
+        STARTUPINFOW si = { sizeof si }; PROCESS_INFORMATION pi = {};
+        if (CreateProcessW(exe, cmdbuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+            setStatus("Imported project opened in a NEW editor window — close this one when ready");
+        } else setStatus("Blender import: failed to launch the editor");
+#else
+        setStatus("Blender import is Windows-only for now");
+#endif
     }
     void startCook() {
         if (cooking.load()) return;

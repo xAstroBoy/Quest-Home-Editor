@@ -148,6 +148,8 @@ static void hsrHttpServer(int port) {
 #include "loaders/opa_loader.h"
 #include "core/audio.h"
 #include "ui/editor.h"
+#include "io/gltf_export.h"   // Blender round-trip: env -> glTF 2.0 project
+#include "io/gltf_import.h"   // Blender round-trip: re-import an edited glTF project
 #include "miniz.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -463,9 +465,16 @@ int main(int argc, char** argv) {
         for (const char* v : vistas) { std::string p = dir + v; FILE* f = fopen(p.c_str(),"rb"); if (f) { fclose(f); companionPath = p; break; } }
         if (!companionPath.empty()) fprintf(stderr, "[MAIN] haven2025 home -> auto-companion vista: %s\n", companionPath.c_str());
     }
-    bool isV79 = gltf.load(apkPath);
+    // Blender round-trip IMPORT: a plain .gltf/.glb (NOT a V79 .ovrscene) = a re-imported, Blender-edited project.
+    // Load it into MeshData[] so the editor's HSL tools can tweak it further and re-cook to an APK.
+    static std::vector<MeshData> blenderMeshes;
+    bool isBlender = gltfimport::isPlainGltf(apkPath) && gltfimport::importEnv(apkPath, blenderMeshes);
+    bool isV79 = !isBlender && gltf.load(apkPath);
     bool isOpa = false;
-    if (isV79) {
+    if (isBlender) {
+        fprintf(stderr, "[MAIN] Imported Blender glTF project — %zu meshes (editable + re-cookable)\n", blenderMeshes.size());
+        sceneMeshes = &blenderMeshes;
+    } else if (isV79) {
         fprintf(stderr, "[MAIN] Detected V79 .gltf.ovrscene env — %zu mesh primitives\n", gltf.meshes.size());
         sceneMeshes = &gltf.meshes;
     } else if ((isOpa = opa.load(apkPath))) {
@@ -1305,6 +1314,21 @@ int main(int argc, char** argv) {
                                             // ("messed up on conversion" / spiky skin.opa). animate(0.f) bakes the t=0 bind pose into
                                             // md.positions (matches the glTF path above) -> correct STATIC geometry AND the bind verts the device re-skins from.
         editor.exportAPKSync();   // synchronous cook + auto-sign with a terminal progress bar
+        if (std::getenv("HSR_EXPORT_QUIT")) return 0;
+    }
+
+    // One-shot Blender export: HSR_BLENDER_EXPORT writes the loaded env to a glTF 2.0 project (meshes + materials +
+    // textures + per-mesh node transforms) under blender_export/<env>/ that opens directly in Blender, plus a
+    // <env>.blendmeta.json sidecar (per-object src index + hstf components) for re-import & re-cook. HSR_EXPORT_QUIT exits.
+    if (std::getenv("HSR_BLENDER_EXPORT") && sceneMeshes) {
+        if (isV79 && gltf.hasAnimation()) gltf.animate(0.f);   // bake the t=0 rest frame (same as the APK cook path)
+        else if (isOpa) opa.animate(0.f);
+        std::string base = apkPath; size_t sl = base.find_last_of("/\\"); if (sl != std::string::npos) base = base.substr(sl+1);
+        size_t dot = base.find_last_of('.'); if (dot != std::string::npos) base = base.substr(0, dot);
+        std::string outDir = "blender_export/" + base;
+        auto ems = editor.buildExportMeshes();   // FULL source: geometry + skins + skeletal clips + node anims + materials
+        bool ok = !ems.empty() && gltfexport::exportEnvFull(ems, outDir, base, "");
+        fprintf(stderr, "[BLENDER] %s -> %s/%s.gltf  (%zu meshes, skins+anims)\n", ok ? "exported" : "FAILED", outDir.c_str(), base.c_str(), ems.size());
         if (std::getenv("HSR_EXPORT_QUIT")) return 0;
     }
 

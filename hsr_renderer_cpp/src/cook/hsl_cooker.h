@@ -453,8 +453,14 @@ inline std::string entityJson(const std::string& id, const std::string& name,
     std::string mats; for (size_t i=0;i<matRefs.size();++i){ if(i)mats+=","; mats+=refJson(matRefs[i]); }
     (void)animated;
     bool skinned = !extraComp.empty();
+    // SKINNED CULL FIX (oceanarium whale parity): the device IGNORES the entity transform when rendering a skinned mesh
+    // (it places it via the skeleton) but the CULLER uses the transform's position as the bounds center -> a populated
+    // transform makes the cull center MISMATCH where the mesh actually renders -> false frustum cull (the omnidroid).
+    // Whale01 ships an EMPTY TransformPlatformComponent ({}) so the cull falls back to the skeleton-derived bounds.
+    // Default ON for skinned; HSR_HZSOLIDTF restores the old populated transform.
+    std::string tfData = (skinned && !std::getenv("HSR_HZSOLIDTF")) ? std::string("{}") : std::string(tb);
     std::string comps =
-        comp("TransformPlatformComponent", 1, tb) + "," +
+        comp("TransformPlatformComponent", 1, tfData) + "," +
         comp("MeshPlatformComponent", meshVer, std::string("{\"mesh\":") + refJson(meshRef) + "}") + "," +
         comp("MaterialPlatformComponent", 1, std::string("{\"materials\":[") + mats + "],\"constantParameters\":[],\"textureParameters\":[]}");
     if (skinned) comps += "," + extraComp;   // AnimatorPlatformComponent LAST (exact calming butterfly order)
@@ -1005,7 +1011,7 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos_, 
     // skinned bounds span the scene → the frustum/occlusion cull can never drop the mesh. Joint 0 is already in the palette, so
     // the dense palette / maxBoneIdx / verifier are unaffected. HSR_NOBOUNDSVERT disables. (The skin-vertex analogue of HSR_NOCULL.)
     bool skinned_ = boneIdx_.size() >= (pos_.size()/3)*4 && boneWgt_.size() >= (pos_.size()/3)*4;
-    bool bvert = skinned_ && !pos_.empty() && !std::getenv("HSR_NOBOUNDSVERT");
+    bool bvert = skinned_ && !pos_.empty() && std::getenv("HSR_BOUNDSVERT");   // DEFAULT OFF: device-disproven (the runtime skinned cull bounds ignore mesh verts — see culling memory). Kept opt-in only; default-on shipped ±1e5 out-of-range verts that did nothing.
     std::vector<float> posA, uvA; std::vector<uint32_t> idxA; std::vector<uint8_t> biA, bwA;
     if (bvert) {
         posA = pos_; uvA = uv_; idxA = idx_; biA = boneIdx_; bwA = boneWgt_;
@@ -1022,11 +1028,33 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos_, 
         for (size_t i = 0; i < boneIdx_.size() && i < boneWgt_.size(); i++)
             if (boneWgt_[i] > 0 && boneIdx_[i] > anchorJoint) anchorJoint = boneIdx_[i];
         if (anchorJoint == 0) anchorJoint = 1;   // mesh uses only joint 0 (which the loop skips): reference joint 1 (the bounds vert's weight=255 makes it a legit palette entry)
-        posA.push_back(1.0e5f); posA.push_back(0.f); posA.push_back(0.f);   // FAR rest position (skins to ~1e5 via the anchor joint)
-        uvA.push_back(0.f); uvA.push_back(0.f);
-        biA.push_back(anchorJoint); biA.push_back(0); biA.push_back(0); biA.push_back(0);  // 100% to the mesh's HIGHEST joint (joint 0 is skipped by the device's skeleton-bounds loop)
-        bwA.push_back(255); bwA.push_back(0); bwA.push_back(0); bwA.push_back(0);
-        idxA.push_back(base); idxA.push_back(base); idxA.push_back(base);           // degenerate → zero area → invisible
+        // TWO tiny NON-DEGENERATE far triangles at OPPOSITE corners (±1e5) — the SKINNED-BOUNDS FIX. Root cause chain:
+        //  (1) the device recomputes a skinned mesh's CULL bounds from its geometry (ignores the cooked AABB);
+        //  (2) it SKIPS degenerate/zero-area triangles, so our old single far vert in a (base,base,base) tri was NEVER
+        //      counted → every prior variant failed identically;
+        //  (3) a single NON-degenerate far triangle at +X DID get counted (DEVICE-PROVEN) but gave an ASYMMETRIC box
+        //      (omnidroid..+1e5) → the omnidroid still culled when looking AWAY from +X near spawn, but NOT from elsewhere.
+        // FIX = two real triangles at OPPOSITE corners (-1e5,-1e5,-1e5) and (+1e5,+1e5,+1e5) → the recomputed AABB spans the
+        // scene SYMMETRICALLY in every direction → never culled from any viewpoint. Each tri is sub-pixel AND past the
+        // 150000 far-clip (corner dist ~1.73e5) → invisible. All weighted to a live joint so they skin to ~±1e5 each frame.
+        // ON-AXIS at 1e5 (NOT diagonal corners): the device EXCLUDES verts past the far-clip (150000) from the recomputed
+        // bounds — the diagonal corners (±1e5,±1e5,±1e5) at dist ~1.73e5 were clipped out (symmetric-corner attempt reverted
+        // to culling), while a +X vert at dist 1e5 WAS counted. Six axis extremes at dist 1e5 (< far-clip from anywhere in
+        // the ±200 scene) → AABB spans ±1e5 in EVERY direction, all counted → never culled. Sub-pixel at 1e5 → invisible.
+        const float C = 1.0e5f;
+        const float ext[6][3] = { { C,0,0 }, { -C,0,0 }, { 0,C,0 }, { 0,-C,0 }, { 0,0,C }, { 0,0,-C } };
+        for (int e = 0; e < 6; e++) {
+            for (int t = 0; t < 3; t++) {
+                posA.push_back(ext[e][0] + (t == 1 ? 1.0f : 0.0f));
+                posA.push_back(ext[e][1] + (t == 2 ? 1.0f : 0.0f));
+                posA.push_back(ext[e][2]);
+                uvA.push_back(0.f); uvA.push_back(0.f);
+                biA.push_back(0); biA.push_back(0); biA.push_back(0); biA.push_back(0);   // ROOT joint (rigid — doesn't scale/collapse the far verts when the droid unfolds; anchorJoint=spike collapsed them)
+                bwA.push_back(255); bwA.push_back(0); bwA.push_back(0); bwA.push_back(0);
+            }
+            uint32_t b = base + (uint32_t)e * 3;
+            idxA.push_back(b); idxA.push_back(b + 1); idxA.push_back(b + 2);   // NON-degenerate + within far-clip → counted; sub-pixel → invisible
+        }
     }
     const std::vector<float>&    pos     = bvert ? posA : pos_;
     const std::vector<float>&    uv      = bvert ? uvA  : uv_;
@@ -1143,7 +1171,20 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos_, 
         b.startObject(5); b.addStructSlot(0, VSF0, 8, 8); b.addScalar<uint32_t>(1, p.nv); b.addOffset(2, vbo); b.addOffset(3, ao); b.addStructSlot(4, vsf4, 8, 8); int vs = b.endObject();
         int vsvec = b.createOffsetVector({ vs });
         int matEmb = embeddedMatl.empty() ? 0 : b.createByteVector(embeddedMatl.data(), embeddedMatl.size());
-        b.startObject(6); b.addOffset(0, vsvec); b.addOffset(1, ibo); b.addOffset(3, matEmb); b.addStructSlot(4, (const uint8_t*)aabb, 24, 4); b.addStructSlot(5, pf5, 8, 8); int part = b.endObject();   // ALIGNMENT FIX (IDA-proven, V205.2 verify @0xeba93c): part.f5 = murmur64A(IB) is an 8-byte 8-ALIGNED struct (line ~552: v158 & 7 == 0). vertexStream.f0/f4 same (lines 444/491: & 7). Cook emitted these 12B/align-4 -> when a hash field landed at a 4-but-not-8 offset the NEWLY-ADDED verifier rejected the whole mesh -> skinned crash. Old libshell never verified, so it "worked". (part.f6 also dropped: not in schema -> verifier skips voffset 16 (reads v155[6,7,9]); it was harmless either way.)
+        b.startObject(7); b.addOffset(0, vsvec); b.addOffset(1, ibo); b.addOffset(3, matEmb); b.addStructSlot(4, (const uint8_t*)aabb, 24, 4); b.addStructSlot(5, pf5, 8, 8);   // ALIGNMENT FIX (IDA-proven, V205.2 verify @0xeba93c): part.f5 = murmur64A(IB) is an 8-byte 8-ALIGNED struct. vertexStream.f0/f4 same.
+        // part.f6 (52B) — present on EVERY official V205 vista mesh (oceanarium whale/coral/fish ALL have it); our cook used to
+        // DROP it (the ONLY structural diff between Meta's never-culling vista skinned meshes and our omnidroid). Layout decoded
+        // from the whale: {u32 52, u64 contentHash, u32 0, float[6] aabb(=part.f4), u32 16, u32 pad, u32 ibBytes}. The aabb is a
+        // SECOND bounds copy — emit it SCENE-SPANNING (= part.f4/root.f3) in case the device reads part.f6 (not part.f4) for the
+        // SKINNED-mesh cull bounds. HSR_NOPARTF6 disables.
+        if (std::getenv("HSR_PARTF6")) {   // OPT-IN: device-disproven (V205 ignores part.f6 — "not in mesh schema"; its tail = Meta shared-buffer offsets that don't map to our per-mesh format; adding it did NOT stop the omnidroid culling). Kept for experiments only.
+            uint8_t partF6[52]; memset(partF6, 0, 52);
+            uint32_t f6sz = 52, f6c = 16, f6ib = (uint32_t)p.ib.size();
+            memcpy(partF6, &f6sz, 4); memcpy(partF6 + 4, &ibH, 8); memcpy(partF6 + 16, (const uint8_t*)aabb, 24);
+            memcpy(partF6 + 40, &f6c, 4); memcpy(partF6 + 48, &f6ib, 4);
+            b.addStructSlot(6, partF6, 52, 4);
+        }
+        int part = b.endObject();
         partOffs.push_back(part);
     }
     int pv = b.createOffsetVector(partOffs);
