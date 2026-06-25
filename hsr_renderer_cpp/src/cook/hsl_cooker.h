@@ -21,6 +21,9 @@
 #include <functional>   // exportSceneAPK progress callback
 #include <cstdlib>
 #include <ctime>
+#include <thread>        // multi-threaded ASTC encode
+#include <fstream>       // texture-encode disk cache
+#include <filesystem>    // texture-encode disk cache dir
 #include "astcenc.h"   // ASTC ENCODE (full astcenc build) — RGBA8 -> ASTC blocks for RENDTXTR
 #include "miniz.h"     // ZIP read/write — scene.zip assembly + APK splice (already linked by the project)
 #include "cook/embedded_assets.h"   // STANDALONE: cooker templates + Nuxd donor files baked into the binary
@@ -100,8 +103,12 @@ inline uint16_t f32_to_f16(float f) { uint32_t x; memcpy(&x, &f, 4); uint32_t s 
 // still renders at its real baked vertex positions (bounds don't move verts) — only culling is defeated. Opt-in: it trades
 // the Quest's culling perf for V79-style "draw everything," which is exactly what porting old homes wants.
 inline void nocullBounds(float aabb[6], float& radius) {
-    const char* e = std::getenv("HSR_NOCULL");
-    if (!e || !*e || *e=='0') return;   // unset / empty / "0" = off (setenv_ with "" can leave an empty-but-present var)
+    // DEFAULT ON (V79-faithful "draw everything"): V205's GPU frustum/Hi-Z-occlusion/CLOD/size culler drops cooked-home
+    // meshes that V79 always drew — e.g. cyberhome's flying CARS vanish the moment you look at them (occlusion/size cull).
+    // Scene-spanning bounds make V205 treat every mesh as always-visible so it's never wrongly culled. HSR_CULL=1 opts back
+    // into the (buggy-for-us) device culler. This is generic: ANY env's small/distant/animated meshes stop disappearing.
+    const char* e = std::getenv("HSR_CULL");
+    if (e && *e && *e!='0') return;     // explicit opt-in to V205 culling -> keep the mesh's own tight bounds
     aabb[0]=aabb[1]=aabb[2]=-1.0e5f; aabb[3]=aabb[4]=aabb[5]=1.0e5f; radius=1.74e5f;
 }
 inline std::vector<uint8_t> encodeRendMesh(const std::vector<float>& posXYZ, const std::vector<float>& uvUV, const std::vector<uint16_t>& idx, const std::vector<uint8_t>& embeddedMatl = {}) {
@@ -264,32 +271,55 @@ enum : uint32_t { TGT_MESH = 0x4D455348, TGT_TEX = 0x6E4CC522, TGT_SURFACE = 0xA
 // (6x6->18, 8x8->20, 12x12->24). The device GPU-uploads the full mip chain (ErrorInvalidArg without it / with a
 // bad format). A box-filtered RGBA mip chain down to 1x1, each level ASTC-encoded and concatenated into f9.
 inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, int bw = 8, int bh = 8, uint8_t formatCode = 11) {
-    astcenc_config cfg{};
-    if (astcenc_config_init(ASTCENC_PRF_LDR, (unsigned)bw, (unsigned)bh, 1, ASTCENC_PRE_MEDIUM, 0, &cfg) != ASTCENC_SUCCESS) return {};
-    const astcenc_swizzle swz = { ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
+    // ── CONTENT-HASH DISK CACHE: re-encoding the same texture every re-cook is the dominant cost (lakeside = many
+    //    2048² ASTC encodes ≈ the whole ~10min). Cache the ASTC mip chain by an FNV-1a hash of the FINAL RGBA (+dims+
+    //    block), so re-cooks that change shaders/routing but NOT textures (i.e. every iteration here) skip the encode
+    //    entirely -> near-instant re-cooks. HSR_NOTEXCACHE disables it. ──
+    uint64_t hsh = 1469598103934665603ull; auto mix=[&](uint64_t v){ hsh=(hsh^v)*1099511628211ull; };
+    { size_t nb=(size_t)w*h*4, n64=nb/8; const uint64_t* p=(const uint64_t*)rgba;
+      for (size_t k=0;k<n64;k++) mix(p[k]); for (size_t k=n64*8;k<nb;k++) mix(rgba[k]);
+      mix(((uint64_t)(uint32_t)w<<32)|(uint32_t)h); mix(((uint64_t)bw<<8)|(uint32_t)bh); }
+    std::error_code _ec; std::filesystem::path cdir = std::filesystem::temp_directory_path()/"hsr_texcache";
+    bool useCache = !std::getenv("HSR_NOTEXCACHE");
+    if (useCache) std::filesystem::create_directories(cdir,_ec);
+    char cn[80]; snprintf(cn,sizeof cn,"%016llx_%d_%d_%dx%d.astcmip",(unsigned long long)hsh,w,h,bw,bh);
+    std::filesystem::path cf = cdir/cn;
     std::vector<uint8_t> data;                                  // concatenated ASTC mip chain
-    std::vector<uint8_t> cur(rgba, rgba + (size_t)w * h * 4); int cw = w, ch = h; int mipCount = 0;
-    while (true) {
-        mipCount++;
-        int cols = (cw + bw - 1) / bw, rows = (ch + bh - 1) / bh;
-        std::vector<uint8_t> blocks((size_t)cols * rows * 16);
-        astcenc_context* ctx = nullptr; if (astcenc_context_alloc(&cfg, 1, &ctx) != ASTCENC_SUCCESS) return {};
-        void* slice = cur.data();
-        astcenc_image img{}; img.dim_x = (unsigned)cw; img.dim_y = (unsigned)ch; img.dim_z = 1; img.data_type = ASTCENC_TYPE_U8; img.data = &slice;
-        astcenc_error e = astcenc_compress_image(ctx, &img, &swz, blocks.data(), blocks.size(), 0);
-        astcenc_context_free(ctx);
-        if (e != ASTCENC_SUCCESS) return {};
-        data.insert(data.end(), blocks.begin(), blocks.end());
-        if (cw == 1 && ch == 1) break;
-        int nw = cw > 1 ? cw / 2 : 1, nh = ch > 1 ? ch / 2 : 1;
-        std::vector<uint8_t> nx((size_t)nw * nh * 4);
-        for (int y = 0; y < nh; y++) for (int x = 0; x < nw; x++) for (int c = 0; c < 4; c++) {
-            int sx = x * 2, sy = y * 2, sx1 = sx + 1 < cw ? sx + 1 : sx, sy1 = sy + 1 < ch ? sy + 1 : sy;
-            int a = cur[((size_t)sy * cw + sx) * 4 + c], b2 = cur[((size_t)sy * cw + sx1) * 4 + c];
-            int c2 = cur[((size_t)sy1 * cw + sx) * 4 + c], d2 = cur[((size_t)sy1 * cw + sx1) * 4 + c];
-            nx[((size_t)y * nw + x) * 4 + c] = (uint8_t)((a + b2 + c2 + d2 + 2) / 4);
+    int mipCount = 0; { int d0 = w>h?w:h; while (true){ mipCount++; if (d0<=1) break; d0/=2; } }
+    if (useCache) { std::ifstream f(cf,std::ios::binary); if (f){ data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()); } }
+    if (data.empty()) {                                        // cache miss -> ENCODE (multi-threaded by default)
+        astcenc_config cfg{};
+        if (astcenc_config_init(ASTCENC_PRF_LDR, (unsigned)bw, (unsigned)bh, 1, ASTCENC_PRE_MEDIUM, 0, &cfg) != ASTCENC_SUCCESS) return {};
+        const astcenc_swizzle swz = { ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
+        unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());   // ASTC compress parallelizes across all cores
+        astcenc_context* ctx = nullptr; if (astcenc_context_alloc(&cfg, nthreads, &ctx) != ASTCENC_SUCCESS) return {};
+        std::vector<uint8_t> cur(rgba, rgba + (size_t)w * h * 4); int cw = w, ch = h; bool fail=false;
+        while (true) {
+            int cols = (cw + bw - 1) / bw, rows = (ch + bh - 1) / bh;
+            std::vector<uint8_t> blocks((size_t)cols * rows * 16);
+            void* slice = cur.data();
+            astcenc_image img{}; img.dim_x = (unsigned)cw; img.dim_y = (unsigned)ch; img.dim_z = 1; img.data_type = ASTCENC_TYPE_U8; img.data = &slice;
+            std::vector<std::thread> pool;                      // worker threads 1..N-1; this thread runs index 0
+            for (unsigned t=1;t<nthreads;t++) pool.emplace_back([&,t]{ astcenc_compress_image(ctx,&img,&swz,blocks.data(),blocks.size(),t); });
+            astcenc_error e = astcenc_compress_image(ctx, &img, &swz, blocks.data(), blocks.size(), 0);
+            for (auto& th:pool) th.join();
+            if (e != ASTCENC_SUCCESS) { fail=true; break; }
+            data.insert(data.end(), blocks.begin(), blocks.end());
+            if (cw == 1 && ch == 1) break;
+            astcenc_compress_reset(ctx);                        // reuse the (multi-thread) context for the next mip
+            int nw = cw > 1 ? cw / 2 : 1, nh = ch > 1 ? ch / 2 : 1;
+            std::vector<uint8_t> nx((size_t)nw * nh * 4);
+            for (int y = 0; y < nh; y++) for (int x = 0; x < nw; x++) for (int c = 0; c < 4; c++) {
+                int sx = x * 2, sy = y * 2, sx1 = sx + 1 < cw ? sx + 1 : sx, sy1 = sy + 1 < ch ? sy + 1 : sy;
+                int a = cur[((size_t)sy * cw + sx) * 4 + c], b2 = cur[((size_t)sy * cw + sx1) * 4 + c];
+                int c2 = cur[((size_t)sy1 * cw + sx) * 4 + c], d2 = cur[((size_t)sy1 * cw + sx1) * 4 + c];
+                nx[((size_t)y * nw + x) * 4 + c] = (uint8_t)((a + b2 + c2 + d2 + 2) / 4);
+            }
+            cur.swap(nx); cw = nw; ch = nh;
         }
-        cur.swap(nx); cw = nw; ch = nh;
+        astcenc_context_free(ctx);
+        if (fail) return {};
+        if (useCache) { std::ofstream f(cf,std::ios::binary); f.write((const char*)data.data(),(std::streamsize)data.size()); }
     }
     uint8_t blkEnum = (bw == 6 && bh == 6) ? 18 : (bw == 12 && bh == 12) ? 24 : 20;   // 8x8 default = 20
     FB b(data.size() + 512);
@@ -959,15 +989,50 @@ inline std::vector<uint8_t> assembleSceneZip(std::vector<CookAsset>& assets,
 // ── multi-part RENDMESH: split arbitrary (u32-indexed) geometry into u16 parts of <=60000 unique verts, each with
 //    its own VB + LOCAL u16 IB. parseRendMesh concatenates parts' VBs and offsets each part's indices by the
 //    running vertex base, so per-part local 0-based indices are correct. Handles meshes of any size. ──────────
-inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos, const std::vector<float>& uv,
-                                                const std::vector<uint32_t>& idx, const std::vector<uint8_t>& embeddedMatl = {},
+inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos_, const std::vector<float>& uv_,
+                                                const std::vector<uint32_t>& idx_, const std::vector<uint8_t>& embeddedMatl = {},
                                                 int vatVertexCount = 0,
-                                                const std::vector<uint8_t>& boneIdx = {}, const std::vector<uint8_t>& boneWgt = {},
+                                                const std::vector<uint8_t>& boneIdx_ = {}, const std::vector<uint8_t>& boneWgt_ = {},
                                                 const std::vector<uint32_t>& jointIds = {},   // jointIds = murmur3(joint name) per skeleton joint
                                                 bool spinBoundsY = false,    // Y-ROTATION mesh: bake the AABB as the swept cylinder so the device doesn't FRUSTUM-CULL the getTime()-rotated geometry (it can't see the shader's vertex spin)
                                                 const std::vector<uint8_t>& vertCol = {}) {   // per-ORIGINAL-vertex sem4 COLOR_0 RGBA (baked lightmap → shader does base×COLOR0); empty → white (neutral)
     struct Part { std::vector<uint8_t> vb, ib; uint32_t nv = 0; };
     std::vector<Part> parts;
+    // BOUNDS VERTEX (skinned-mesh CULL fix, V205): the device culls SKINNED meshes by their runtime SKINNED-VERTEX extent,
+    // NOT the cooked MeshDefinition AABB (DEVICE-PROVEN: scene-spanning lod.f3 AND a far skeleton anchor joint BOTH did
+    // nothing — the omnidroid still vanished on a small rotate). FIX = append ONE far vertex (rest pos ~1e5, weighted 100% to
+    // joint 0) as a DEGENERATE (zero-area, all-indices-equal → invisible) triangle: it skins to ~1e5 every frame → the runtime
+    // skinned bounds span the scene → the frustum/occlusion cull can never drop the mesh. Joint 0 is already in the palette, so
+    // the dense palette / maxBoneIdx / verifier are unaffected. HSR_NOBOUNDSVERT disables. (The skin-vertex analogue of HSR_NOCULL.)
+    bool skinned_ = boneIdx_.size() >= (pos_.size()/3)*4 && boneWgt_.size() >= (pos_.size()/3)*4;
+    bool bvert = skinned_ && !pos_.empty() && !std::getenv("HSR_NOBOUNDSVERT");
+    std::vector<float> posA, uvA; std::vector<uint32_t> idxA; std::vector<uint8_t> biA, bwA;
+    if (bvert) {
+        posA = pos_; uvA = uv_; idxA = idx_; biA = boneIdx_; bwA = boneWgt_;
+        if (uvA.size() < (posA.size()/3)*2) uvA.resize((posA.size()/3)*2, 0.f);   // UV parity before the append
+        uint32_t base = (uint32_t)(posA.size()/3);
+        // ANCHOR JOINT (IDA-PROVEN root cause, SkeletonSystem_vf7__1480F70): the device computes a SKINNED mesh's CULL
+        // bounds from the SKELETON's per-joint boxes (each joint's bind-pose influenced-vert AABB) transformed by the posed
+        // joint matrices — and its accumulation loop SKIPS JOINT 0 (iterates joints 1..n-1 starting at jointArray+120; the
+        // init fn__AF08EC only zeroes the accumulator, it does NOT add joint 0). So the old bounds vert weighted 100% to
+        // joint 0 was SILENTLY IGNORED (omnidroid still culled). FIX = weight it to the HIGHEST joint this mesh actually
+        // uses (>=1, already in the dense palette, and iterated by the loop) so THAT joint's box spans the scene -> the
+        // skeleton bounds span the scene -> the frustum/occlusion cull can never drop the skinned mesh.
+        uint8_t anchorJoint = 0;
+        for (size_t i = 0; i < boneIdx_.size() && i < boneWgt_.size(); i++)
+            if (boneWgt_[i] > 0 && boneIdx_[i] > anchorJoint) anchorJoint = boneIdx_[i];
+        if (anchorJoint == 0) anchorJoint = 1;   // mesh uses only joint 0 (which the loop skips): reference joint 1 (the bounds vert's weight=255 makes it a legit palette entry)
+        posA.push_back(1.0e5f); posA.push_back(0.f); posA.push_back(0.f);   // FAR rest position (skins to ~1e5 via the anchor joint)
+        uvA.push_back(0.f); uvA.push_back(0.f);
+        biA.push_back(anchorJoint); biA.push_back(0); biA.push_back(0); biA.push_back(0);  // 100% to the mesh's HIGHEST joint (joint 0 is skipped by the device's skeleton-bounds loop)
+        bwA.push_back(255); bwA.push_back(0); bwA.push_back(0); bwA.push_back(0);
+        idxA.push_back(base); idxA.push_back(base); idxA.push_back(base);           // degenerate → zero area → invisible
+    }
+    const std::vector<float>&    pos     = bvert ? posA : pos_;
+    const std::vector<float>&    uv      = bvert ? uvA  : uv_;
+    const std::vector<uint32_t>& idx     = bvert ? idxA : idx_;
+    const std::vector<uint8_t>&  boneIdx = bvert ? biA  : boneIdx_;
+    const std::vector<uint8_t>&  boneWgt = bvert ? bwA  : boneWgt_;
     bool haveUv = uv.size() >= (pos.size() / 3) * 2;
     size_t nvTotal = pos.size() / 3;
     bool skinned = boneIdx.size() >= nvTotal * 4 && boneWgt.size() >= nvTotal * 4;   // stride-24 SKINNED mesh (sem7 idx, sem8 wgt)
@@ -1158,13 +1223,16 @@ struct ExportMesh {
     std::vector<uint32_t> indices;  // triangle list
     std::vector<uint8_t> rgba;      // decoded base-color RGBA8 (optional)
     uint32_t w = 0, h = 0;
+    std::vector<uint8_t> iblVertCol; // FAITHFUL SpecIbl diffuse-irradiance per-vertex RGBA = diffuseCube(worldN)·ambientIBLTint, baked in buildExportMeshes (the renderer's exact uploadMesh bake). Device base·vertexColor0 = env-lit lake water, NOT the dark basecolor (the "black lake" bug). Empty for non-specibl meshes.
     bool blend = false;             // alpha-blended (transparent) -> route to unlitblend.surface
+    bool alphaTest = false;         // MASK/cutout (foliage, *_masked scenery): DEPTH-WRITE cutout shader (alpha-test discard) so it OCCLUDES + discards transparent texels — was routed to the no-depth-write blend pass = the lakeside 2D-scenery overlay/flash. Meta cuts depth-write too (unlitfoliage f2,f3 PRESENT).
     bool additive = false;          // EMISSIVE GLOW (warp streaks, nebula fog, force-field) -> route to the OPAQUE-pass shader (unlit/unlitdoublesidedskinned, f2,f3 PRESENT) kept in the TRANSPARENT MATL = ADDITIVE blend (src+dst). Alpha-blended these vanish on a dark backdrop (the Star Trek warp/fog "IS NOT VISIBLE" bug). 3x device-proven: opaque vs alpha shaders differ ONLY in pass f2,f3; the shipped unlitspritesheetflipbookadditive keeps f2,f3 PRESENT.
     bool doubleSided = false;       // glTF doubleSided material -> cook appends REVERSED tris so the single-sided unlit shader still draws back faces (else flat/open meshes back-face-cull on device = see-through HOLES; renderer honors doubleSided so its preview looked fine)
     bool flipbook = false;          // animated flat material -> route to unlitspritesheetflipbookadditive.surface (GPU getTime() spritesheet cycle, NO skeleton)
     int flipCols = 0, flipRows = 0; // spritesheet grid (cols x rows)
     int flipFrames = 0;             // total cells cycled (0 -> cols*rows)
     float flipFps = 0.f;            // playback rate (0 -> default 5fps); cook auto-generates the shadergen::FLIPBOOK shader for this grid/fps
+    bool flipOffset = false;        // OFFSET flipbook (mat.sanim waterfall/stream/fog): mesh UV maps to ONE cell -> uv'=inUv+(col/cols,row/rows), NO cell scale (vs spritesheet = full-quad scale flipbook)
     float matTint[4] = {1,1,1,1};   // the mesh's OWN base-color tint (glTF baseColorFactor) for its material params
     std::vector<float> vatOffsets;  // VAT vertex offsets, frames*vertexCount*3 (WORLD space) -> animated via VAT (non-skeletal)
     int vatFrames = 0;
@@ -1295,7 +1363,7 @@ inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMe
         bool haveUv = m.uvs.size() >= nv * 2;
         size_t ntri = m.indices.size() / 3, t = 0;
         while (t < ntri) {
-            ExportMesh c; c.name = m.name; c.blend = m.blend; c.additive = m.additive; c.w = m.w; c.h = m.h; c.rgba = m.rgba;
+            ExportMesh c; c.name = m.name; c.blend = m.blend; c.alphaTest = m.alphaTest; c.additive = m.additive; c.w = m.w; c.h = m.h; c.rgba = m.rgba;
             c.skybox = m.skybox;   // split parts MUST inherit the skybox mark, else a big dome (>60k verts) loses it -> far-clipped/black
             for (int k = 0; k < 4; k++) c.matTint[k] = m.matTint[k];
             std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(cap + 16);
@@ -1682,6 +1750,13 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     if (dclamp) fprintf(stderr, "[COOK] FAR-ONLY DEPTH-REMAP ON: meshes beyond %.0f from spawn use the remap shader; near byte-exact\n", farMargin);
     auto matTpl    = readFileBytes("cooker/realfloor_mat.bin");   // unlit.surface MATL template
     auto matBlend  = readFileBytes("cooker/realdome_mat.bin");    // unlitblend.surface MATL template
+    // ADDITIVE MATL = realdome (blend) with the blend-MODE field (MATL field2 @off44: opaque=absent, alpha-blend=2)
+    // set to 3 = ADDITIVE (dst=ONE). The DEVICE blend equation comes from the MATL blend-mode field, NOT the shader
+    // (proven: flipbookadditive.surface == unlitblend.surface forward-pass byte-for-byte). The old "opaque-pass shader
+    // in transparent MATL" trick only yields ALPHA-blend on device -> the lake foam's black-bg texture showed as a dark
+    // card (user: "full dark foam thingy"). A true additive MATL makes black add 0 = transparent overlay, white = foam.
+    auto matAdd    = readFileBytes("cooker/realadditive_mat.bin");
+    bool haveAdd   = matAdd.size() >= 176;
     auto shadVat   = readFileBytes("cooker/vat_shader.bin");      // vatunlitbasecolor (vertex-animation) shader — OPAQUE (fish/foliage)
     auto shadVatBlend = readFileBytes("cooker/vatunlitblend.surface.bin"); // vatunlitbasecolor made TRANSPARENT alpha-blend (cooker/make_vat_blend_shader.py): the faithful V79 wisp port (alphaMode=BLEND sparkle). Identical VAT vertex morph + descriptor layout as vatunlitbasecolor; only pass render-state fields f2,f3 are dropped to match the SHIPPED vatlitbubble's proven transparent state. ⛔ ALSO dropping f4 (doubleSided) = a combo NO shipped shader has → broke the pipeline → INVISIBLE sparkles on device (device-proven). Kept single-sided; the wisp billboards face the player.
     auto matVat    = readFileBytes("cooker/vat_mat.bin");         // VAT MATL template (416B, shader@48/56/64 + base@152/160 + VAT@192/200)
@@ -1708,6 +1783,33 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     if (haveBlend) {
         AssetKey3 shaderBlendK = { 0x608B25CE5424598Dull, 0xFBFB67B966D4BA47ull, 0xA1767FE9u };
         assets.push_back({ "meta/renderer_module/shaders/unlitblend.surface/shader", shaderBlendK.tgt, shadBlend, shaderBlendK });
+    }
+    // CUTOUT (alpha-test discard) shader — generated from unlit via cooker/make_cutout_shader.py: injects an OpKill on
+    // texel alpha<0.5 into the unlit FORWARD-frag SPIR-V (spirv-dis -> add discard -> spirv-as spv1.0 -> spirv-val).
+    // DEPTH-WRITES (inherits unlit's f2,f3 render-state) so cutouts OCCLUDE correctly + discard transparent texels —
+    // instead of the no-depth-write blend pass that made the lakeside MASK scenery (campsite *_dblsided_masked) overlay
+    // everything + flash. Reuses the unlit MATL (matTpl); shipped env-local. [[project_hsr_cook_2d_anim_depth_flash]]
+    // SHADERGEN the cutout from the stock unlit base (in-binary alpha-test discard via shadergen::CUTOUT — no NDK
+    // spirv tools, no pre-baked .bin, no haveCutout/CWD fragility). Faithful to Meta's unlitfoliage (decompiled): the
+    // forward frag gets `if (baseColor.a < 0.5) discard;` while KEEPING unlit's depth-write -> the card OCCLUDES (no
+    // depth issues) + drops its transparent silhouette to the sky (no black background). Falls back to a file if needed.
+    auto shadCutout = (!shad.empty()) ? shadergen::generate(shad, shadergen::CUTOUT, 0.5f) : std::vector<uint8_t>();
+    if (shadCutout.empty()) shadCutout = readFileBytes("cooker/nuxd_unlitcutout_shader.bin");
+    bool haveCutout = !shadCutout.empty() && matTpl.size() >= 176;
+    AssetKey3 shaderCutoutK{};
+    if (haveCutout) {
+        std::string pCut = MH + "/shaders/unlitcutout.surface/shader"; shaderCutoutK = keyForPath(pCut);
+        assets.push_back({ pCut, shaderCutoutK.tgt, shadCutout, shaderCutoutK });
+    }
+    // TREE-LINE cutout variant: a LOW discard threshold (0.12) so SPARSE tree cards (Hill/LakeTrees BG: ~20% solid +
+    // soft foliage, ~68% transparent) keep their foliage AND depth-write. At the standard 0.5 the soft foliage (alpha<0.5)
+    // was all discarded -> the BG trees rendered sparse ("don't render") and the gaps showed what's behind = depth issue.
+    auto shadCutoutTree = (!shad.empty()) ? shadergen::generate(shad, shadergen::CUTOUT, 0.12f) : std::vector<uint8_t>();
+    bool haveCutoutTree = !shadCutoutTree.empty() && matTpl.size() >= 176;
+    AssetKey3 shaderCutoutTreeK{};
+    if (haveCutoutTree) {
+        std::string pCutT = MH + "/shaders/unlitcutouttree.surface/shader"; shaderCutoutTreeK = keyForPath(pCutT);
+        assets.push_back({ pCutT, shaderCutoutTreeK.tgt, shadCutoutTree, shaderCutoutTreeK });
     }
     // FAR-ONLY remap shader variants — shipped under the env's OWN namespace; far meshes (below) repoint their material's
     // field7 shader ref to these so ONLY they get the infinite-projection remap (near meshes keep unlit/unlitblend = exact).
@@ -1859,6 +1961,13 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         if (skinnedOpaque && m.rgba.size() >= (size_t)m.w * m.h * 4) {
             texOpaque = m.rgba; for (size_t k = 3; k < texOpaque.size(); k += 4) texOpaque[k] = 255; texSrc = texOpaque.data();
         }
+        else if (m.additive && m.uvScroll) {
+            // FOAM (lake_foam Additive:true + mat.sanim): a BRIGHT-rgb foam texture with a LOW NATIVE ALPHA (the alpha IS
+            // the subtle foam coverage). Use the texture VERBATIM (no premultiply, no luminance) on the PROVEN alpha-blend
+            // path -> the device alpha-blends base·alpha over the lake = the faithful subtle translucent white foam. (Both
+            // the additive-MATL enum trick = dark sheet, AND alpha=luminance = an opaque white sheet, were wrong.)
+            texSrc = m.rgba.data();
+        }
         else if (m.additive && m.rgba.size() >= (size_t)m.w * m.h * 4) {
             // ADDITIVE glow uses hard additive (src+dst, ignores alpha). A FULL-COLOR texture then renders as a SOLID
             // disc (the Star Trek warp "blue tunnel") because the soft falloff lives in the ALPHA, which additive drops.
@@ -1905,16 +2014,34 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         std::vector<uint8_t> hzAnimPre; bool hzClipFits = true;
         if (std::getenv("HSR_HZANIM") && haveSkin && m.hzFrames > 1 && m.hzJointCount > 0
             && m.hzTrsLocal.size() >= (size_t)m.hzFrames*m.hzJointCount*10) {
-            const int   nj0  = m.hzJointCount;
+            // SKELETON BOUNDS ANCHOR (skinned-mesh CULL fix, V205): V205 culls SKINNED meshes by their SKELETON's animated
+            // joint extent, NOT the cooked mesh AABB — device-proven (the scene-spanning HSR_NOCULL AABB does NOTHING for
+            // skinned meshes: the omnidroid/cyberhome cars still vanish on a small rotate once their animated parts exceed the
+            // tight skeleton bound). FIX = append a FAR "anchor" joint (child of root, +1e5 on X) to the skeleton + clip so the
+            // skeleton bounds span the scene → the frustum/occlusion cull can never drop it (the skin-path analogue of the
+            // HSR_NOCULL mesh bounds). The anchor weights NO vertex (it's absent from the palette/f2/markers), so the skinning
+            // and the device MeshDefinition verifier are unaffected. HSR_NOSKELANCHOR disables it.
+            const int   anchorJ = std::getenv("HSR_SKELANCHOR") ? 1 : 0;   // DEFAULT OFF: device-proven the skinned cull bounds come from the SKINNED VERTICES (palette joints), not the skeleton joints — an anchor joint that weights no vertex does NOTHING (omnidroid still culled). Kept opt-in only.
+            const int   njReal  = m.hzJointCount;
+            const int   nj0  = njReal + anchorJ;            // joint count INCLUDING the bounds anchor — skel + clip BOTH use this
             const int   nf0  = m.hzFrames;
             const float fps0 = m.hzFps;
             // clip duration (seconds) — preserved across every subsample so playback speed never changes.
             const float dur  = (fps0 > 1e-6f && nf0 > 1) ? (float)(nf0 - 1) / fps0 : 0.f;
-            const std::vector<float> trs0 = m.hzTrsLocal;   // keep the FULL-res source; subsample picks from it
+            std::vector<int> parentsA(m.hzParents.begin(), m.hzParents.begin() + njReal);
+            if (anchorJ) parentsA.push_back(0);             // anchor parented to root joint 0
+            std::vector<float> trs0((size_t)nf0 * nj0 * 10);   // FULL-res source clip, augmented with the anchor's static FAR track
+            for (int f = 0; f < nf0; ++f) {
+                std::memcpy(&trs0[(size_t)f*nj0*10], &m.hzTrsLocal[(size_t)f*njReal*10], (size_t)njReal*10*sizeof(float));
+                if (anchorJ) { float* a = &trs0[((size_t)f*nj0 + njReal)*10];   // cook layout per joint = {qx,qy,qz,qw, t3, s3}
+                    a[0]=0;a[1]=0;a[2]=0;a[3]=1;            // identity quat (xyzw)
+                    a[4]=1.0e5f;a[5]=0;a[6]=0;              // FAR translation (local to root) → skeleton bound spans 1e5
+                    a[7]=1;a[8]=1;a[9]=1; }                 // unit scale
+            }
             int    nf   = nf0;
             float  fps  = fps0;
             std::vector<float> trsCur = trs0;               // current candidate clip (starts = full clip)
-            hzAnimPre = hzAclEncode(trsCur.data(), m.hzParents.data(), nj0, nf, fps);
+            hzAnimPre = hzAclEncode(trsCur.data(), parentsA.data(), nj0, nf, fps);
             // Reduce N (~3/4 each step, floor 8) until the encoded clip fits the byte budget. trsCur[(f*nj+j)*10 .. +10)
             // = {qx,qy,qz,qw, t3, s3} — sample N evenly-spaced source frames (endpoints inclusive) into a tight buffer.
             while ((hzAnimPre.empty() || hzAnimPre.size() > hzMaxBytes) && nf > 8 && dur > 0.f) {
@@ -1930,7 +2057,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 }
                 nf  = newNf;
                 fps = (newNf > 1) ? (float)(newNf - 1) / dur : fps0;   // DURATION-preserving fps (no #3 warp-speed bug)
-                hzAnimPre = hzAclEncode(trsCur.data(), m.hzParents.data(), nj0, nf, fps);
+                hzAnimPre = hzAclEncode(trsCur.data(), parentsA.data(), nj0, nf, fps);
             }
             if (hzAnimPre.empty() || hzAnimPre.size() > hzMaxBytes) hzClipFits = false;   // even 8 frames won't fit -> static
             // The subsampled fps lives INSIDE the re-encoded ACL clip (hzAclEncode's fps arg), so hzAnimPre alone carries
@@ -1992,6 +2119,16 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 jt.quat[0]=m.hzJointQuat[j*4]; jt.quat[1]=m.hzJointQuat[j*4+1]; jt.quat[2]=m.hzJointQuat[j*4+2]; jt.quat[3]=m.hzJointQuat[j*4+3];
                 jt.scale = m.hzJointScale[j];
                 joints.push_back(jt);
+            }
+            // FAR bounds-anchor joint (matches the clip's appended track at index njReal) → skeleton bounds span 1e5 so the
+            // skinned mesh is never frustum/occlusion-culled. NOT weighted by any vertex (absent from palette/f2). MUST match
+            // the clip's joint count (nj0) or the device skin build rejects the mesh — both gate on the SAME env var.
+            if (std::getenv("HSR_SKELANCHOR")) {
+                HzJoint a; a.parent = 0; a.name = "bounds_anchor";
+                a.pos[0]=1.0e5f; a.pos[1]=0; a.pos[2]=0;
+                a.quat[0]=1; a.quat[1]=0; a.quat[2]=0; a.quat[3]=0;   // encodeHzSkel writes (w,x,y,z) → identity = (1,0,0,0)
+                a.scale=1;
+                joints.push_back(a);
             }
             // SHARE one skeleton + one anim across all meshes that use the SAME armature (the omnidroid body + shield are
             // the same skin[0] -> identical encoded skel+anim). GROUND TRUTH: nuxd's prism_wave + motes both reference the
@@ -2127,10 +2264,16 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         } else if (useUvScroll) {
             // mat.sanim UV-SCROLL (water/foam/waterfall): a getTime() uv += rate*time shader, generated on demand per
             // (rate,blend) — the global converter. Cooked geometry is unchanged; only the sampled UV scrolls.
+            // FOAM (lake_foam Additive:true) renders via the PROVEN alpha-BLEND path: its texture alpha was set to LUMINANCE
+            // (texture stage above), so white-on-black foam -> white=opaque (shows) / black=alpha0 (transparent, the lake shows
+            // through). The foam's m.blend is already true (editor: additive->blend), so it routes as normal blend (matBlend +
+            // unlitblend uvscroll). This is robust vs the additive-MATL blend-mode enum, which I couldn't verify -> a wrong value
+            // made the whole-lake foam mesh a DARK SHEET over the water. (stream_foam = Additive:false, native alpha, same path.)
             bool ublend = m.blend && haveBlend;
+            const char* usuf = ublend ? "_b" : "";
             long ru=(long)(m.uvRate[0]*100000), rv=(long)(m.uvRate[1]*100000);
             uint32_t h = (uint32_t)(0x9E3779B9u*(uint32_t)ru ^ 0xC2B2AE35u*(uint32_t)rv ^ (ublend?0x68bc21ebu:0u));
-            char ufn[160]; snprintf(ufn, sizeof ufn, "cooker/uvscroll_%08x%s%s.surface.bin", h, ublend ? "_b" : "", meshFar ? "_dc" : "");
+            char ufn[160]; snprintf(ufn, sizeof ufn, "cooker/uvscroll_%08x%s%s.surface.bin", h, usuf, meshFar ? "_dc" : "");
             AssetKey3 uvK{};
             auto it = rotShaders.find(ufn);
             if (it != rotShaders.end()) uvK = it->second;
@@ -2141,12 +2284,12 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     ubytes = shadergen::generate(gbase, shadergen::UVSCROLL, m.uvRate[0], m.uvRate[1]);
                     if (!ubytes.empty()) writeFileBytes(ufn, ubytes);
                 }
-                if (!ubytes.empty()) { char up[160]; snprintf(up, sizeof up, "%s/shaders/uvscroll_%08x%s%s.surface/shader", MH.c_str(), h, ublend ? "_b" : "", meshFar ? "_dc" : "");
+                if (!ubytes.empty()) { char up[160]; snprintf(up, sizeof up, "%s/shaders/uvscroll_%08x%s%s.surface/shader", MH.c_str(), h, usuf, meshFar ? "_dc" : "");
                     uvK = keyForPath(up); assets.push_back({ up, uvK.tgt, ubytes, uvK }); rotShaders[ufn] = uvK; } }
-            matl = ublend ? matBlend : matTpl;
+            matl = ublend ? matBlend : matTpl;   // foam/water uvscroll -> blend (luminance alpha) or opaque
             if (uvK.ing) { memcpy(matl.data() + 48, &uvK.pkg, 8); memcpy(matl.data() + 56, &uvK.ing, 8); }   // field7 -> uvscroll shader
             memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);                  // base tex
-            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' UVSCROLL rate=(%.3f,%.3f)/s %s %s\n", i, m.name.c_str(), m.uvRate[0], m.uvRate[1], ublend ? "BLEND" : "opaque", uvK.ing ? "" : "(MISSING -> static)");
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' UVSCROLL rate=(%.3f,%.3f)/s %s%s %s\n", i, m.name.c_str(), m.uvRate[0], m.uvRate[1], (m.additive&&m.uvScroll)?"BLEND(lum-foam) ":"", ublend ? "BLEND" : "opaque", uvK.ing ? "" : "(MISSING -> static)");
         } else if (useVat) {
             std::string pVatTex = std::string(base) + ".vat.tex/tex"; vatTexK = keyForPath(pVatTex);
             matl = matVat;
@@ -2180,24 +2323,70 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // forever from globalUniforms.time. On-demand per (cols,rows,frames,fps); no pre-baked per-grid shaders.
             int fcols=m.flipCols>0?m.flipCols:3, frows=m.flipRows>0?m.flipRows:3;
             int fframes=m.flipFrames>0?m.flipFrames:fcols*frows; float ffps=m.flipFps>0.f?m.flipFps:5.f;
-            uint32_t h=(uint32_t)(0x9E3779B9u*(uint32_t)fcols ^ 0xC2B2AE35u*(uint32_t)frows ^ 0x27D4EB2Fu*(uint32_t)fframes ^ 0x85EBCA6Bu*(uint32_t)(long)(ffps*1000));
-            char ffn[160]; snprintf(ffn,sizeof ffn,"cooker/flipbook_%08x%s.surface.bin", h, meshFar?"_dc":"");
+            float foff = m.flipOffset ? 1.f : 0.f;   // OFFSET flipbook (mat.sanim waterfall: uv'=inUv+cellOff, no scale) vs SCALE spritesheet
+            uint32_t h=(uint32_t)(0x9E3779B9u*(uint32_t)fcols ^ 0xC2B2AE35u*(uint32_t)frows ^ 0x27D4EB2Fu*(uint32_t)fframes ^ 0x85EBCA6Bu*(uint32_t)(long)(ffps*1000) ^ (m.flipOffset?0xA1B2C3D4u:0u));
+            char ffn[160]; snprintf(ffn,sizeof ffn,"cooker/flipbook_%08x%s%s.surface.bin", h, m.flipOffset?"o":"", meshFar?"_dc":"");
             AssetKey3 flipK{}; auto it=rotShaders.find(ffn);
             if (it!=rotShaders.end()) flipK=it->second;
             else {
                 auto fbytes=readFileBytes(ffn);
                 if (fbytes.empty()) { const std::vector<uint8_t>& gbase = meshFar?shadBlendDC:shadBlend;   // unlitblend base (FAR -> depth-clamp remap)
-                    fbytes=shadergen::generate(gbase, shadergen::FLIPBOOK, (float)fcols,(float)frows,(float)fframes,ffps);
+                    fbytes=shadergen::generate(gbase, shadergen::FLIPBOOK, (float)fcols,(float)frows,(float)fframes,ffps,foff);  // az=foff -> offset-only flipbook
                     if(!fbytes.empty()) writeFileBytes(ffn,fbytes); }
-                if(!fbytes.empty()){ char fp2[176]; snprintf(fp2,sizeof fp2,"%s/shaders/flipbook_%08x%s.surface/shader", MH.c_str(), h, meshFar?"_dc":"");
+                if(!fbytes.empty()){ char fp2[176]; snprintf(fp2,sizeof fp2,"%s/shaders/flipbook_%08x%s%s.surface/shader", MH.c_str(), h, m.flipOffset?"o":"", meshFar?"_dc":"");
                     flipK=keyForPath(fp2); assets.push_back({fp2, flipK.tgt, fbytes, flipK}); rotShaders[ffn]=flipK; } }
             matl = matBlend;
             if (flipK.ing){ memcpy(matl.data()+48,&flipK.pkg,8); memcpy(matl.data()+56,&flipK.ing,8); }   // field7 -> generated flipbook shader
             memcpy(matl.data()+120,&texK.pkg,8); memcpy(matl.data()+128,&texK.ing,8);                      // base tex -> the full spritesheet
-            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FLIPBOOK %dx%d %dframes @%.2ffps (auto-gen) %s\n", i, m.name.c_str(), fcols,frows,fframes,ffps, flipK.ing?"":"(MISSING -> static)");
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FLIPBOOK %dx%d %dframes @%.2ffps %s (auto-gen) %s\n", i, m.name.c_str(), fcols,frows,fframes,ffps, m.flipOffset?"OFFSET":"scale", flipK.ing?"":"(MISSING -> static)");
         } else {
-            matl = (m.blend && haveBlend) ? matBlend : matTpl;
-            if (meshFar) { AssetKey3 dck = (m.blend && haveBlend) ? shaderBlendDCK : shaderDCK;   // FAR -> remap shader (renders past the 5000 clip); near keeps unlit/unlitblend = byte-exact
+            // GROUND TRUTH from the live-captured MeshShellEnv fragment + libshell ShaderCache (sub_2C6C06C/sub_2C6D468):
+            // the env shader has a HAS_MAKEOPAQUE variant (forces color.a=1 -> OPAQUE, ignores texture alpha) chosen for
+            // blend-mode 0/1, and a HAS_ALPHACUTOFF variant (discard alpha<AlphaCutoff). The V79 source flags are IDENTICAL
+            // for cliff/mountains AND fog/leaves (all Transparent:true, AlphaTest:false), so the device picks the variant by
+            // the TEXTURE's OPAQUE FRACTION (decoded from the real ASTC). Replicate:
+            //   AlphaTest:true ("_masked" GROUND) -> hard cutout (opaque MATL + alpha-test discard shader).
+            //   Transparent:true (mountain/cliff/lakeshore CARDS, foliage, fog) -> alpha BLEND (unlitblend) -> composites
+            //     over the cooked SkyDome, EXACTLY like the foliage that already cooks+renders fine. A prior
+            //     opaque-fraction>0.35 heuristic forced the mostly-opaque mountain/lakeshore cards to the CUTOUT path;
+            //     in the cook that landed them on the plain unlit (opaque) shader -> their transparent silhouette
+            //     rendered as BLACK (user: "transparent background rendered black" / glitched mountain cards). The OPA
+            //     preview discards-to-sky so it looked OK, but blend-over-sky is the faithful + robust cook. REMOVED.
+            // CUTOUT (shadergen depth-write alpha-test discard) for scenery that must OCCLUDE + drop its transparent
+            // silhouette to the sky: (a) authored AlphaTest "_masked" GROUND, and (b) mostly-OPAQUE Transparent CARDS
+            // (mountains/cliffs/lakeshore: a silhouette mountain shape + transparent sky around). Soft/gappy Transparent
+            // (foliage ~22% opaque, fog/smoke/waterfall ~0%) stays BLEND. Routing the mostly-opaque cards to BLEND (no
+            // depth-write) was the regression: they didn't occlude (DEPTH ISSUES) + blended over black where the SkyDome
+            // wasn't already in the framebuffer (BLACK background). Clean split at opaque>~35% (terrain >=47% vs foliage <=22%).
+            bool cutoutOK = (m.alphaTest && !m.additive && haveCutout && !meshFar);   // authored MASK
+            bool isTreeCutout = false;   // sparse tree-line card -> use the LOW-threshold cutout (keeps foliage, still depth-writes)
+            if (!cutoutOK && m.blend && !m.additive && haveCutout && !meshFar && m.rgba.size() >= 4) {
+                size_t nt = m.rgba.size()/4, opq=0, mid=0;
+                for (size_t k=3; k<m.rgba.size(); k+=4){ uint8_t a=m.rgba[k]; if (a>=230) opq++; if (a>=40 && a<=215) mid++; }
+                float opF = nt ? (float)opq/(float)nt : 0.f, midF = nt ? (float)mid/(float)nt : 1.f;
+                // (a) mostly-opaque silhouette cards (mountains/cliffs/lakeshore: opaque>35%); (b) distant TREE-LINE cards
+                // (LakeTrees etc.: sparser ~22% opaque + soft edges, so the opaque-fraction test misses them) — the user
+                // wants these SOLID, not see-through blend cards with a black border. This branch is STATIC-only (skinned
+                // foreground foliage takes the skinned path), so close soft foliage is unaffected by the tree-name rule.
+                bool treeCard = (m.name.find("Tree")!=std::string::npos || m.name.find("tree")!=std::string::npos) && opF > 0.10f;
+                bool cardCutout = (opF > 0.28f);   // mostly-opaque scenery/foliage CARD (mountains/cliffs/lakeshore + the
+                // merged foliage Planes): DEPTH-WRITE so it OCCLUDES instead of a no-depth-write blend card that z-fights /
+                // overlays its neighbours (user: Plane13718/Plane15 overlaying). Transparent FX (fog/smoke/water opF~0) and
+                // genuinely soft foliage (<0.28 opaque) stay BLEND. This branch is STATIC-only (skinned foliage is elsewhere).
+                if (cardCutout || treeCard) {
+                    cutoutOK = true;
+                    // CRISP silhouettes (mountains, midF<0.10) use the 0.5 discard (sharp edge); SOFT-edged cards (foliage
+                    // planes/trees, midF>=0.10) use the LOW 0.12 discard so their soft foliage survives instead of vanishing.
+                    isTreeCutout = midF >= 0.10f;
+                }
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' blendcard opF=%.2f midF=%.2f -> %s\n", i, m.name.c_str(), opF, midF, cutoutOK?"CUTOUT":"blend");
+            }
+            matl = (m.blend && haveBlend && !cutoutOK) ? matBlend : matTpl;
+            if (cutoutOK) {   // CUTOUT = opaque MATL + alpha-test DISCARD shader -> DEPTH-WRITE: authored MASK scenery OCCLUDES (fixes back-overlays-front); discard cuts the hard mask. Double-sided handled by the cook's reversed-tri append.
+                const AssetKey3& ck = (isTreeCutout && haveCutoutTree) ? shaderCutoutTreeK : shaderCutoutK;   // sparse tree cards -> low (0.12) threshold so the foliage survives the discard
+                memcpy(matl.data()+48,&ck.pkg,8); memcpy(matl.data()+56,&ck.ing,8);
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] m%03zu '%s' CUTOUT depth-write (blend=%d mask=%d tree=%d)\n", i, m.name.c_str(), (int)m.blend, (int)m.alphaTest, (int)isTreeCutout);
+            } else if (meshFar) { AssetKey3 dck = (m.blend && haveBlend) ? shaderBlendDCK : shaderDCK;   // FAR -> remap shader (renders past the 5000 clip); near keeps unlit/unlitblend = byte-exact
                            if (dck.ing) { memcpy(matl.data()+48,&dck.pkg,8); memcpy(matl.data()+56,&dck.ing,8); } }
             else if (m.additive && haveBlend) {   // EMISSIVE GLOW (warp/nebula/fog): transparent MATL (matBlend) + the OPAQUE-pass unlit shader (f2,f3 PRESENT) = ADDITIVE blend -> the glow ADDS light (visible) instead of faint alpha-lerp that vanishes on a dark backdrop
                            memcpy(matl.data()+48,&shaderK.pkg,8); memcpy(matl.data()+56,&shaderK.ing,8);
@@ -2280,7 +2469,12 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // room lighting (per-vertex, sampled at uv1), the basecolor/metal/gem factor, and the per-frame mat.sanim
         // MaterialTint (fog/dust/foam opacity in alpha) — no new shader/texture/UV-stream. (HSR_LMNOVFLIP for V.)
         std::vector<uint8_t> vertCol;
-        {
+        if (!m.iblVertCol.empty() && m.iblVertCol.size() >= (m.positions.size()/3)*4) {
+            // SpecIbl lake water: use the faithful diffuse-irradiance bake (env-lit) as vertexColor0 -> device base·col =
+            // the lit water instead of the dark basecolor. (Specibl meshes have no lightmap, so the lightmap path below is a no-op.)
+            vertCol = m.iblVertCol;
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SpecIbl irradiance vertexcolor baked (%zu verts)\n", i, m.name.c_str(), m.iblVertCol.size()/4);
+        } else {
             size_t nvc = m.positions.size()/3;
             bool hasLm = m.hasLightmap && !m.lmRGBA.empty() && m.lmW>0 && m.lmH>0 && m.uvs2.size() >= nvc*2;
             float fr=m.albedoFactor[0]*m.curTint[0], fg=m.albedoFactor[1]*m.curTint[1], fb=m.albedoFactor[2]*m.curTint[2], fa=m.curTint[3];
@@ -2420,13 +2614,21 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // ScenePlatformComponent (farClippingPlane). Geometry beyond 500m renders ONLY if that component applies on device.
             if (md > 500.f*500.f) fprintf(stderr, "[COOK] far-clip note: mesh '%s' reaches %.0fm (> the device 500m DEFAULT far) -> renders only via the cook's ScenePlatformComponent far extension; if that fails to parse on device it CLIPS. Mark 'Make skybox backdrop' if it's a backdrop.\n", m.name.c_str(), sqrtf(md));
         }
-        if (skybox) {
+        // GENERIC sky-DOME fix: the SkyboxPlatformComponent binds the dome's 2D texture as a CUBEMAP (colorTexture +
+        // reflectionMap) — the shell's skybox shader samples it as a cube and renders a 2D equirect/dome texture BLACK
+        // (cyberhome mat7 = the sunset dome). A 2D-textured backdrop renders correctly as a NORMAL far mesh: the cook's
+        // 150000 farClippingPlane already covers it (PROVEN — the cyberhome city buildings at 7–9.5km render fine as
+        // normal meshes). So render skybox-marked meshes as normal far meshes by default; HSR_SKYBOX_COMPONENT forces the
+        // cubemap component back (only correct for an actual cubemap skybox). This fixes ANY 2D sky dome, preview + device.
+        if (skybox && std::getenv("HSR_SKYBOX_COMPONENT")) {
             AssetKey3 stex = texK.tgt ? texK : whiteK; if (!texK.tgt) whiteUsed = true;
             entities += "," + skyboxEntityJson(mid, nm, meshK, stex);
             anySkybox = true;
-            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' -> SKYBOX (far backdrop, no far-clip)\n", i, m.name.c_str());
-        } else
-        entities += "," + entityJson(mid, nm, hzPos, rot0, hzScl, meshK, { matK }, AssetKey3{0,0,0}, extraComp, 5, false, poseKv);
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' -> SKYBOX component (cubemap)\n", i, m.name.c_str());
+        } else {
+            if (skybox && std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' -> far backdrop as NORMAL mesh (2D dome; farClip 150000 covers it — was the black cubemap skybox)\n", i, m.name.c_str());
+            entities += "," + entityJson(mid, nm, hzPos, rot0, hzScl, meshK, { matK }, AssetKey3{0,0,0}, extraComp, 5, false, poseKv);
+        }
         rels += (rels.empty() ? std::string() : std::string(",")) + relChildOf(mid, rootId);
     }
     if (rels.empty()) return {};

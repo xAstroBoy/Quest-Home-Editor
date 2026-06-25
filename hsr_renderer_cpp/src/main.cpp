@@ -1203,11 +1203,13 @@ int main(int argc, char** argv) {
     //    Rodrigues shader path the glTF rotations use (node TRANSFORM anims are the bulk of OPA motion). ──
     std::unordered_map<size_t, noderot::Result> g_opaRot;
     std::unordered_map<size_t, std::pair<float,float>> g_opaUv;
+    std::unordered_map<size_t, OpaLoader::FlipRec> g_opaFlip;   // mat.sanim ATLAS flipbooks (waterfall/stream/fog)
     if (isOpa && !std::getenv("HSR_NOROT")) {
         opa.cookExtractRotations(g_opaRot);
-        opa.cookExtractUVScroll(g_opaUv);   // mat.sanim water/foam UV scrolls
-        fprintf(stderr, "[OPA] cook anim: %zu spin/sway + %zu uv-scroll (of %zu meshes)\n", g_opaRot.size(), g_opaUv.size(), opa.meshes.size());
-        editor.hzAnimExtractor = [&g_opaRot,&g_opaUv,&opa](int meshIdx, int frames, hslcook::ExportMesh& em){
+        opa.cookExtractUVScroll(g_opaUv);   // mat.sanim water/foam UV scrolls (continuous)
+        opa.cookExtractFlipbook(g_opaFlip); // mat.sanim ATLAS flipbooks (cell-stepping waterfall/stream/fog)
+        fprintf(stderr, "[OPA] cook anim: %zu spin/sway + %zu uv-scroll + %zu flipbook (of %zu meshes)\n", g_opaRot.size(), g_opaUv.size(), g_opaFlip.size(), opa.meshes.size());
+        editor.hzAnimExtractor = [&g_opaRot,&g_opaUv,&g_opaFlip,&opa](int meshIdx, int frames, hslcook::ExportMesh& em){
             (void)frames;
             // OPA skeletal/rigid HZANIM port — DEFAULT ON (faithful animation). Was gated after an early cooked APK
             // crashed, but the incredibles skinned fix ([[project_hsr_skinned_rendmesh_skinblock]]) made HZANIM stable
@@ -1258,6 +1260,14 @@ int main(int argc, char** argv) {
                 em.rotAxis[0]=r.axis[0]; em.rotAxis[1]=r.axis[1]; em.rotAxis[2]=r.axis[2];
                 em.rotPivot[0]=r.pivot[0]; em.rotPivot[1]=r.pivot[1]; em.rotPivot[2]=r.pivot[2];
                 em.vatOffsets.clear(); em.vatFrames=0; }
+            auto fit = g_opaFlip.find((size_t)meshIdx);   // ATLAS flipbook (waterfall/stream/fog) -> OFFSET flipbook shader (frame-snap)
+            if (fit != g_opaFlip.end()) {
+                em.flipbook=true; em.flipOffset=true; em.blend=true;
+                em.flipCols=fit->second.cols; em.flipRows=fit->second.rows;
+                em.flipFrames=fit->second.frames; em.flipFps=fit->second.fps;
+                em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
+                return;
+            }
             auto uit = g_opaUv.find((size_t)meshIdx);   // UV scroll (cooker prioritizes rotation over scroll if both)
             if (uit != g_opaUv.end()) { em.uvScroll=true; em.uvRate[0]=uit->second.first; em.uvRate[1]=uit->second.second; }
         };

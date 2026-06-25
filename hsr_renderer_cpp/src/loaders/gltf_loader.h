@@ -377,6 +377,16 @@ public:
             float mx = 0.f; for (int i = 0; i < 3 && i < (int)ef.size(); ++i) { float v = (float)ef[i].asFloat(); if (v > mx) mx = v; }
             return mx >= 0.5f;
         };
+        // A BLEND material with a baseColorTexture is a TRANSLUCENT TEXTURED surface (the omnidroid SHIELD: Shield2-Shield
+        // alpha = the transparency), NOT a pure additive glow. Its texture's ALPHA is authoritative -> keep ALPHA-BLEND with
+        // the NATIVE alpha (no opacity-lift, no additive). Only a textureless emissive BLEND (pure Emission) is the additive glow.
+        auto matHasBaseTex = [&](int matIdx) -> bool {
+            if (matIdx < 0 || !root.has("materials")) return false;
+            const auto& mats = root["materials"];
+            if ((size_t)matIdx >= mats.size()) return false;
+            const auto& m = mats[matIdx];
+            return m.has("pbrMetallicRoughness") && m["pbrMetallicRoughness"].has("baseColorTexture");
+        };
 
         const auto& accessors  = root.has("accessors") ? root["accessors"] : tinyjson::Value();
         const auto& bufferViews= root.has("bufferViews") ? root["bufferViews"] : tinyjson::Value();
@@ -624,7 +634,9 @@ public:
                                         // opaque proportional to the glow (the omnidroid SHIELD's texture alpha ~25% made it
                                         // semi-invisible). GENERAL: applies to ANY constant-emissive blend mesh in any env.
                                         float lum = 0.299f*e[0]+0.587f*e[1]+0.114f*e[2]; if (lum>1.f) lum=1.f; if (lum<0.f) lum=0.f;
-                                        bool blendMat = mm.has("alphaMode") && mm["alphaMode"].asString()=="BLEND";
+                                        // Don't lift opacity for a TRANSLUCENT TEXTURED surface (the SHIELD): its texture alpha
+                                        // IS the intended transparency — lifting it (prior fix) made the purple dome OPAQUE (user).
+                                        bool blendMat = mm.has("alphaMode") && mm["alphaMode"].asString()=="BLEND" && !matHasBaseTex(matIdx);
                                         const float GLOW = 0.4f;   // gentle glow — full-strength emissive baked into base was TOO BRIGHT (user). HSR_GLOW overrides.
                                         float gk = std::getenv("HSR_GLOW") ? (float)atof(std::getenv("HSR_GLOW")) : GLOW;
                                         for (size_t p=0;p+3<md.texRGBA.size();p+=4) {
@@ -640,7 +652,7 @@ public:
                             md.texRGBA={c[0],c[1],c[2],c[3]}; md.texW=md.texH=1; md.hasTexture=true;
                         }
                         md.useBlend = matIsBlend(matIdx);  // alpha-blend transparent materials
-                        md.additive = md.useBlend && matIsEmissiveGlow(matIdx);  // emissive BLEND = glow -> ADDITIVE (not faint alpha)
+                        md.additive = md.useBlend && matIsEmissiveGlow(matIdx) && !matHasBaseTex(matIdx);  // emissive BLEND = additive glow ONLY for a textureLESS pure-Emission material; a textured BLEND (the SHIELD) keeps alpha-blend so its texture alpha = the transparency (additive discarded it = opaque purple dome)
                         md.doubleSided = matIsDoubleSided(matIdx);  // single-sided -> back-face cull
                         // This mesh's OWN base-color tint (glTF baseColorFactor; identity-white for a plain textured
                         // mesh). The cooker uses it for the skinned material instead of borrowing nuxd's "motes"

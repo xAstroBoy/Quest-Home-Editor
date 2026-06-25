@@ -18,6 +18,8 @@ COOKER_FILES = [
     # -> HomeLocomotionSystem null-derefs -> device CRASH LOOP. Embed so a standalone .exe (no cooker/ folder) is safe.
     "chair_icon_mesh.bin","chair_icon_tex.bin",
     "nuxd_unlit_depthclamp.bin","nuxd_unlitblend_depthclamp.bin","skybox_surface.bin",   # depth-clamp far-clip + skybox backdrop
+    "nuxd_unlitcutout_shader.bin",   # alpha-test DISCARD + depth-write (mostly-opaque "_alpha"/"_masked" scenery cards) — embed so haveCutout is reliable regardless of cook CWD
+    "realadditive_mat.bin",          # ADDITIVE MATL (realdome blend-mode field2 -> 3 = dst=ONE): lake/stream foam Additive:true overlays the water (black bg adds 0 = transparent)
 ]
 # nuxd donor: everything spliceAPK keeps (scene.zip + AndroidManifest are replaced; META-INF + these are dropped).
 NUXD_DROP = {"assets/scene.zip","AndroidManifest.xml",

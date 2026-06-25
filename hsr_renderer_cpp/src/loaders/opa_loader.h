@@ -249,6 +249,16 @@ public:
                                        // CLEARS each call (which made the bird's wing read the waterfall's node).
     int   animMaxFrames = 0;
     float animFps = 30.0f;
+    // Water/foam UV scroll has NO baked playback rate (libshell speed = runtime PlaybackState) so a track's frame
+    // count is arbitrary: the lake's 10079-frame 1-tile scroll @30fps = a near-frozen 336s loop, while the stream's
+    // 976-frame 1-tile scroll = a fine 32s. Cap the LOOP TIME so over-dense tracks (the lake) scroll visibly; fast
+    // tracks (waterfall ~2s) are untouched. Used by both cook + renderer (uvScrollRate). Editor "Water flow" slider.
+    float uvMaxLoopSec = 20.0f;
+    // UV-scroll VISIBLE SPEED CAP (UV/sec). The mat.sanim has NO FrameRate field so a UV track inherits the NODE
+    // sanim's 30fps (bird/butterfly) — wrong: that makes the fog scroll 3.0 tiles/s & the waterfall 3.75 (user:
+    // "wrong speed", far too fast). The real playback is a runtime PlaybackState we can't read, so cap the visible
+    // speed to a calm UV/sec, preserving DIRECTION + RELATIVE speed. Shared by cook + renderer (uvScrollRate).
+    float uvSpeedMax = 0.5f;
 
     // ── Skeletal animation (*.skel/*.anim.opa) for skinned meshes ──────────────────────────
     // An .anim clip stores, per frame, one 4x4 SKINNING matrix per joint (frame0 ~= identity ->
@@ -526,34 +536,100 @@ public:
     //    (water/foam/waterfall) keeps the 2x2 ~ identity and TRANSLATES (c,f). Derive the VISIBLE scroll rate the
     //    rate = avg per-frame UV delta * fps = UV/second (the source's literal visible speed) -> uvRate for a
     //    getTime() uv += rate*time shader. Flipbook atlases (2x2 = cell scale) are a separate pass -> skipped. ──
+    // FAITHFUL UV-scroll velocity (UV/sec) for one track: avg per-frame translation delta * animFps. Returns false
+    // for a FLIPBOOK atlas (2x2 != identity) or a still track. This is the SINGLE source of truth used by BOTH the
+    // cook (cookExtractUVScroll -> getTime() `uv += rate*time` device shader) AND the renderer's animate(), so the
+    // live preview scrolls IDENTICALLY to the cooked device. Direction + speed come straight off the animation track
+    // (water/foam/waterfall scroll exactly +1 UV tile; the lake spreads it over 10079 frames = a calm ~0.003 UV/s).
+    bool uvScrollRate(const UVTrack& tr, float& ru, float& rv) const {
+        ru = rv = 0.f;
+        if (tr.nFrames < 2 || animFps <= 0.f) return false;
+        const float* M0 = tr.m.data();
+        if (std::fabs(M0[0]-1.f)>0.05f || std::fabs(M0[4]-1.f)>0.05f || std::fabs(M0[1])>0.05f || std::fabs(M0[3])>0.05f) return false;  // flipbook atlas, not a continuous scroll
+        int win = tr.nFrames - 1; if (win > 256) win = 256;   // water tracks are uniform; a capped window avoids iterating 10k+ frames
+        double sdu=0, sdv=0; int n=0;
+        for (int f=0; f<win; f++) {
+            float dc = tr.m[(size_t)(f+1)*6+2] - tr.m[(size_t)f*6+2];
+            float df = tr.m[(size_t)(f+1)*6+5] - tr.m[(size_t)f*6+5];
+            if (std::fabs(dc)>0.5f || std::fabs(df)>0.5f) continue;   // skip a wrap-around jump
+            sdu += dc; sdv += df; ++n;
+        }
+        if (n < 1) return false;
+        // FLIPBOOK ATLAS detect (the real fix for the lakeside waterfall/stream/fog): the texture is an N×N grid of
+        // sprite frames (waterfall.png = 8×8 = 64 cells) and the mesh's base UV maps to ONE cell; the track STEPS the
+        // UV by ~1/cols PER FRAME (waterfall dc=0.125=1/8, fog dc≈0.1=1/10) to flip through cells. The 2×2 stays
+        // identity so the old "identity ⇒ continuous scroll" test mis-played it as a smooth scroll → the cells SMEAR
+        // into each other = "all messed", and at 0.125·30fps=3.75 cells/s it's "way too fast". A genuine continuous
+        // water scroll (lake) has a TINY per-frame delta (~0.0001). So: a LARGE per-frame step = a flipbook → return
+        // false here, routing it to animate()'s frame-SNAP path (one whole cell per frame, no smear). cook routes
+        // flipbooks to the spritesheet shader, not uvscroll.
+        double avgDu = sdu / n, avgDv = sdv / n;
+        if (std::fabs(avgDu) > 0.04 || std::fabs(avgDv) > 0.04) return false;   // cell-stepping flipbook, not a scroll
+        ru = (float)(avgDu * animFps); rv = (float)(avgDv * animFps);   // UV/sec = the track's AUTHORED visible speed at the base fps
+        // FAITHFUL: libshell plays the mat.sanim UVTransform by feeding the per-frame 2x3 matrix into the vertex
+        // shader's `BaseTextureMtx[2]` uniform (captured MeshShellEnv_runtime.vert) and computing oBaseTexCoord =
+        // BaseTextureMtx * TexCoord -- the matrix is applied DIRECTLY (no inversion) at the track's own rate. So the
+        // authored (rate, direction) per track IS the correct flow (waterfall = fast down, fog = slow drift). A prior
+        // GLOBAL speed-cap (0.5 UV/s) + direction-negate broke it: it slowed the waterfall to a crawl and flipped it to
+        // flow UP. REMOVED -- use the authored rate+direction verbatim. Only the SLOW-TRACK boost stays, to lift the
+        // near-frozen lake (10079 frames/30fps = 336s loop) into a visible drift; fast tracks are untouched.
+        if (uvMaxLoopSec > 0.f) {
+            float natLoop = (float)tr.nFrames / animFps;
+            if (natLoop > uvMaxLoopSec) { float s = natLoop / uvMaxLoopSec; ru *= s; rv *= s; }
+        }
+        return std::sqrt(ru*ru + rv*rv) >= 1e-4f;
+    }
     void cookExtractUVScroll(std::unordered_map<size_t, std::pair<float,float>>& out) {
+        out.clear();
+        bool uvdbg = std::getenv("HSR_UVDBG") != nullptr;
+        if (uvdbg) fprintf(stderr, "[UVDBG] cookExtractUVScroll: %zu uvAnimRecs animFps=%.2f\n", uvAnimRecs.size(), animFps);
+        if (uvAnimRecs.empty() || animFps <= 0.f) return;
+        for (auto& ur : uvAnimRecs) {
+            if (out.count(ur.meshIdx)) continue;
+            auto it = matUVAnim.find(ur.node);
+            if (it == matUVAnim.end()) continue;
+            float ru, rv;
+            if (uvScrollRate(it->second, ru, rv)) {
+                out[ur.meshIdx] = std::make_pair(ru, rv);
+                if (uvdbg) { const char* nm=(ur.meshIdx<meshes.size())?meshes[ur.meshIdx].name.c_str():"?";
+                             const float* MLast = it->second.m.data()+(size_t)(it->second.nFrames-1)*6;
+                             fprintf(stderr,"[UVDBG] m%zu '%s' nF=%d trans f0=(%.4f,%.4f) fLast=(%.4f,%.4f) -> SCROLL rate=(%.4f,%.4f)/s\n",
+                                     ur.meshIdx,nm,it->second.nFrames,it->second.m[2],it->second.m[5],MLast[2],MLast[5],ru,rv); }
+            }
+        }
+    }
+    // FLIPBOOK ATLAS tracks (lakeside waterfall/stream/fog): a mat.sanim UVTransform whose 2x2 is identity but whose
+    // per-frame OFFSET steps by ~1/cols (a whole cell) instead of a tiny scroll. uvScrollRate() rejects these (returns
+    // false) so they are NOT cooked as a continuous scroll. Here we detect them + derive the grid so the cook routes
+    // them to the OFFSET flipbook shader (shadergen::FLIPBOOK, az=1) = frame-SNAP, matching the live preview.
+    struct FlipRec { int cols, rows, frames; float fps; };
+    void cookExtractFlipbook(std::unordered_map<size_t, FlipRec>& out) {
         out.clear();
         if (uvAnimRecs.empty() || animFps <= 0.f) return;
         for (auto& ur : uvAnimRecs) {
             if (out.count(ur.meshIdx)) continue;
             auto it = matUVAnim.find(ur.node);
             if (it == matUVAnim.end() || it->second.nFrames < 2) continue;
-            const UVTrack& tr = it->second; const float* M0 = tr.m.data();
-            float a=M0[0], b=M0[1], dd=M0[3], e=M0[4];
-            if (std::fabs(a-1.f)>0.05f || std::fabs(e-1.f)>0.05f || std::fabs(b)>0.05f || std::fabs(dd)>0.05f) continue;  // flipbook atlas, not a scroll
-            // AVERAGE per-frame delta from a CAPPED window (water tracks are uniform; iterating 10k+ frames softlocks),
-            // then scale to the full track length.
-            int win = tr.nFrames - 1; if (win > 256) win = 256;
+            const UVTrack& tr = it->second;
+            const float* M0 = tr.m.data();
+            if (std::fabs(M0[0]-1.f)>0.05f || std::fabs(M0[4]-1.f)>0.05f) continue;   // not an identity-offset track
+            int win = tr.nFrames-1; if (win>256) win=256;
             double sdu=0, sdv=0; int n=0;
             for (int f=0; f<win; f++) {
-                float dc = tr.m[(size_t)(f+1)*6+2] - tr.m[(size_t)f*6+2];
-                float df = tr.m[(size_t)(f+1)*6+5] - tr.m[(size_t)f*6+5];
-                if (std::fabs(dc)>0.5f || std::fabs(df)>0.5f) continue;   // skip wrap jumps
-                sdu += dc; sdv += df; ++n;
+                float dc = tr.m[(size_t)(f+1)*6+2]-tr.m[(size_t)f*6+2];
+                float df = tr.m[(size_t)(f+1)*6+5]-tr.m[(size_t)f*6+5];
+                if (std::fabs(dc)>0.5f || std::fabs(df)>0.5f) continue;
+                sdu+=dc; sdv+=df; ++n;
             }
             if (n < 1) continue;
-            // FAITHFUL scroll rate = avg per-frame UV delta * fps = UV/second, exactly the source's visible speed.
-            // The getTime() shader is `uv += rate*time` (unbounded; the texture's REPEAT wrap makes it loop), so ONLY
-            // the rate matters -- the old HSR_MATLOOP=5s loopSec cap + 0.5 UV/s clamp were guesses that divorced the
-            // cooked rate from the source (lakeside water: a true ~336s loop forced to 5s then clamped 0.5 = no relation).
-            float ru = (float)(sdu / n * animFps), rv = (float)(sdv / n * animFps);
-            if (std::sqrt(ru*ru + rv*rv) < 1e-4f) continue;
-            out[ur.meshIdx] = std::make_pair(ru, rv);
+            double du=std::fabs(sdu/n), dv=std::fabs(sdv/n);
+            if (du <= 0.04 && dv <= 0.04) continue;   // continuous scroll, NOT a cell-stepping flipbook
+            FlipRec fr;
+            fr.cols   = (du>1e-4) ? (int)llround(1.0/du) : 1;  if (fr.cols<1) fr.cols=1;
+            fr.frames = tr.nFrames;
+            fr.rows   = (int)std::ceil((double)fr.frames/(double)fr.cols);  if (fr.rows<1) fr.rows=1;
+            fr.fps    = animFps;
+            out[ur.meshIdx] = fr;
         }
     }
 
@@ -720,40 +796,54 @@ public:
             auto it = matUVAnim.find(ur.node);
             if (it == matUVAnim.end() || it->second.nFrames < 1) continue;
             const UVTrack& tr = it->second;
-            // These are FLIPBOOK atlases (e.g. *_flipbook.png; the UV offset steps by exactly
-            // 1/cols per frame — CARD_steam = +0.125/frame = an 8-wide sheet). libshell plays them
-            // by SNAPPING to the integer frame: interpolating would slide the sample window across
-            // a cell boundary and blend two sprites = smear. Each flipbook loops on its OWN length
-            // at the engine sample rate (animFps); tying it to the global (longest-clip) duration is
-            // what made short flipbooks crawl ("looks like a flipbook, not animated"). Direction +
-            // per-frame speed are already baked into the keyframe deltas.
-            // VISIBLE-LOOP: the cooked UV tracks span from a few flipbook frames to THOUSANDS of
-            // dense scroll steps (lakeside water/waterfall = 10078 frames). libshell times these
-            // off a runtime animation::PlaybackState we proved can't be read statically, and at one
-            // global fps the dense scrolls crawl invisibly (10078/30 = 336s -> looks frozen). So cap
-            // the loop period (HSR_MATLOOP, default 5s): short flipbooks keep their own fast pace,
-            // long scrolls loop in <=matLoopMax so the water/waterfall/smoke actually animate.
-            static float matLoopMax = -1.f;
-            if (matLoopMax < 0.f) { const char* e = std::getenv("HSR_MATLOOP"); matLoopMax = e ? (float)atof(e) : 5.0f; }
-            float loopSec = (animFps > 0.f) ? (float)tr.nFrames / animFps : 0.f;
-            if (matLoopMax > 0.f && loopSec > matLoopMax) loopSec = matLoopMax;
-            float phase = (loopSec > 1e-4f) ? fmodf(t / loopSec, 1.0f) * (float)tr.nFrames
-                                            : fmodf(t * animFps, (float)tr.nFrames);
-            if (phase < 0.0f) phase += (float)tr.nFrames;
-            int frame = (int)phase;
-            if (frame < 0) frame = 0; if (frame >= tr.nFrames) frame = tr.nFrames - 1;
-            const float* M = tr.m.data() + (size_t)frame * 6;
             MeshData& md = meshes[ur.meshIdx];
             size_t nuv = ur.baseUV.size() / 2;
             if (md.uvs.size() < nuv*2) md.uvs.resize(nuv*2);
-            for (size_t i = 0; i < nuv; ++i) {
-                float u0 = ur.baseUV[i*2], v0 = ur.baseUV[i*2+1];
-                md.uvs[i*2]   = M[0]*u0 + M[1]*v0 + M[2];
-                md.uvs[i*2+1] = M[3]*u0 + M[4]*v0 + M[5];
+            float ru, rv;
+            if (uvScrollRate(tr, ru, rv)) {
+                // CONTINUOUS linear UV scroll (deconstructed from lakesidepeak.apk mat.sanim: fog/fogB/smoke/
+                // waterfall_fog/waterfall/stream/lake all have an IDENTITY 2x2 + a constant-velocity offset, e.g.
+                // fog dc=0.1/fr & smoke dc=0.125/fr — NOT atlas flipbooks). The faithful play is uv = baseUV + rate*t
+                // (UNBOUNDED; the texture REPEAT wrap makes it seamless), which is EXACTLY the device cook's getTime()
+                // `uv += rate*time` shader (the SAME uvScrollRate), so the preview matches the headset. Frame-sampling
+                // a capped loop instead snaps the UV back to frame0 each loop -> a visible JUMP for the non-integer-tile
+                // fog/smoke (fog ends at u=9.9 = a 0.9 backward snap; smoke at 15.875) = the "not animated right" bug.
+                // WRAP the offset into one tile (fmod): t is a free-running wall clock, so an UNBOUNDED rate*t grows to
+                // hundreds of UV units -> float32 loses sub-texel precision in the GPU interpolator = shimmer/FLASH.
+                // fmod keeps it in (-1,1); the texture REPEAT makes the 1->0 wrap seamless (the whole card shifts by a
+                // uniform offset, so no torn triangle, no mip change). Device cook scrolls the same rate continuously.
+                float du = std::fmod(ru * t, 1.0f), dv = std::fmod(rv * t, 1.0f);
+                for (size_t i = 0; i < nuv; ++i) {
+                    md.uvs[i*2]   = ur.baseUV[i*2]   + du;
+                    md.uvs[i*2+1] = ur.baseUV[i*2+1] + dv;
+                }
+                static int matdbg = -1; if (matdbg<0) matdbg = std::getenv("HSR_MATDBG")?1:0;
+                if (matdbg && nuv>0) fprintf(stderr, "[MATDBG] t=%.2f mesh#%zu '%s' SCROLL rate=(%.4f,%.4f) uv0=(%.4f,%.4f)\n",
+                    t, ur.meshIdx, ur.node.c_str(), ru, rv, md.uvs[0], md.uvs[1]);
+            } else {
+                // FLIPBOOK ATLAS (storybook lilypad scale-flipbook, AND the lakeside waterfall/stream/fog which step
+                // an identity-matrix UV by ~1/cols per frame): the texture is a sprite GRID, the track flips cells.
+                // SNAP to the integer frame (interpolating would slide across a cell boundary = blend two sprites =
+                // the smeared "all messed" waterfall). flipSlow stretches the loop so the flipbook reads as flowing
+                // water, not a frantic flicker (waterfall 64 frames @30fps = 2.1s was "way too fast"); HSR_FLIPSLOW tunes.
+                static float flipSlow = -1.f; if (flipSlow < 0.f) { const char* e = std::getenv("HSR_FLIPSLOW"); flipSlow = e ? (float)atof(e) : 1.0f; }
+                float loopSec = (animFps > 0.f) ? (float)tr.nFrames / animFps * flipSlow : 0.f;
+                if (uvMaxLoopSec > 0.f && loopSec > uvMaxLoopSec) loopSec = uvMaxLoopSec;
+                float phase = (loopSec > 1e-4f) ? fmodf(t / loopSec, 1.0f) * (float)tr.nFrames
+                                                : fmodf(t * animFps, (float)tr.nFrames);
+                if (phase < 0.0f) phase += (float)tr.nFrames;
+                int frame = (int)phase;
+                if (frame < 0) frame = 0; if (frame >= tr.nFrames) frame = tr.nFrames - 1;
+                const float* M = tr.m.data() + (size_t)frame * 6;
+                for (size_t i = 0; i < nuv; ++i) {
+                    float u0 = ur.baseUV[i*2], v0 = ur.baseUV[i*2+1];
+                    md.uvs[i*2]   = M[0]*u0 + M[1]*v0 + M[2];
+                    md.uvs[i*2+1] = M[3]*u0 + M[4]*v0 + M[5];
+                }
+                static int matdbg = -1; if (matdbg<0) matdbg = std::getenv("HSR_MATDBG")?1:0;
+                if (matdbg && nuv>0) fprintf(stderr, "[MATDBG] t=%.2f mesh#%zu '%s' FLIP fr=%d/%d M=[%.3f %.3f] uv0=(%.4f,%.4f)\n",
+                    t, ur.meshIdx, ur.node.c_str(), frame, tr.nFrames, M[2], M[5], md.uvs[0], md.uvs[1]);
             }
-            static int matdbg = -1; if (matdbg<0) matdbg = std::getenv("HSR_MATDBG")?1:0;
-            if (matdbg && nuv>0) fprintf(stderr, "[MATDBG] t=%.2f mesh#%zu '%s' fr=%d/%d loopSec=%.2f M=[%.3f %.3f] uv0=(%.4f,%.4f)\n",
-                t, ur.meshIdx, ur.node.c_str(), frame, tr.nFrames, loopSec, M[2], M[5], md.uvs[0], md.uvs[1]);
         }
         // ── mat.sanim MaterialTint: per-frame RGBA the shader multiplies into the fragment
         //    (UniformColor). UNLIKE the UV flipbook this is a smooth opacity fade, so LERP between

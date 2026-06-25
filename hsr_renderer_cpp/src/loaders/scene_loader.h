@@ -647,7 +647,9 @@ public:
                     const std::string* sp = resolve(sk);
                     if (!sp) { sk.pkg = mi.shaderPkg; sp = resolve(sk); }
                     if (sp && (sp->find("blend") != std::string::npos ||
-                               sp->find("Blend") != std::string::npos))
+                               sp->find("Blend") != std::string::npos ||
+                               sp->find("flipbook") != std::string::npos ||   // cook flipbook (waterfall/fog atlas) = blend
+                               sp->find("_b.surface") != std::string::npos || sp->find("wispscale") != std::string::npos))
                         me.useBlend = true;
                 }
                 // Pre-decode texture
@@ -763,6 +765,13 @@ public:
             // so a planet's whole quad shows (looks huge / "super close"). Match the cook's _b suffix convention.
             if (sp && (sp->find("_b.surface") != std::string::npos || sp->find("_b_dc.surface") != std::string::npos))
                 md.useBlend = true;
+            // The cook's ADDITIVE uv-scroll variant (uvscroll_<hash>_a.surface — lake/stream FOAM: ShellEnv Additive:true)
+            // is the OPAQUE-pass uvscroll shader kept in a transparent MATL = ADDITIVE on device. Its name has no "blend"/"_b"
+            // token, so HSL-mode read it OPAQUE -> the dark/low-alpha foam texture rendered as a solid black card over the lake
+            // (user: "don't see lake_foam in the cooked HSL"). Mark additive+blend so the preview ADDS the premultiplied foam.
+            if (sp && (sp->find("_a.surface") != std::string::npos || sp->find("_a_dc.surface") != std::string::npos)) {
+                md.useBlend = true; md.additive = true;
+            }
             // The cook's wisp-breathe shader (wispscale.surface, the erebor flame wisps) is built from the unlitblend
             // base + blend material, but its name has no "blend" token -> same opaque-box bug as the _b shaders above.
             if (sp && sp->find("wispscale") != std::string::npos) md.useBlend = true;
@@ -775,6 +784,14 @@ public:
             // discards by design but the per-material variant pick doesn't always hit the discard variant, so
             // mark it alpha-test (and blend as the safety net) to kill the black halo.
             if (sp && sp->find("foliage") != std::string::npos) { md.alphaTest = true; md.useBlend = true; }
+            // The cook's CUTOUT shader (unlitcutout.surface — the "_masked" ground/terrain) is opaque-pass + alpha-test
+            // DISCARD; its name has no "blend" token so HSL-mode read it OPAQUE -> the hard-alpha border rendered as
+            // solid black. Mark alpha-test so the discard drops the transparent texels (user: "transparent bg black").
+            if (sp && sp->find("cutout") != std::string::npos) md.alphaTest = true;
+            // The cook's FLIPBOOK shader (flipbook_*.surface — the waterfall/stream/fog ATLAS, incl. the OFFSET "...o"
+            // variant) is built from the unlitblend base = ALPHA-BLEND, but the name carries no "blend" token -> HSL-mode
+            // drew it OPAQUE (the soft fog/waterfall rendered as a solid black card). Mark blend so the alpha shows.
+            if (sp && sp->find("flipbook") != std::string::npos) md.useBlend = true;
             // Transparent atmospheric/water shaders that lack a "blend" token but ARE alpha-blended on device:
             // unlitmist (the mist planes rendered as SOLID BLOCKS), lakesurf/water (transparent surface), smoke.
             if (sp && (sp->find("mist") != std::string::npos || sp->find("smoke") != std::string::npos ||

@@ -676,12 +676,16 @@ public:
                                 // non-specibl couch/merged shells): albedo lives in the 1x1 tex / real tex.
                                 col[0]=cl(irr[0]*ambientIBLTint[0]); col[1]=cl(irr[1]*ambientIBLTint[1]); col[2]=cl(irr[2]*ambientIBLTint[2]);
                             }
-                        } else if (!md.hasLightmap && !haveVC && !std::getenv("HSR_NOHEMI")) {
-                            // Meshes with NO baked lightmap (the merge-grouped ones whose lightmap mapping is
+                        } else if (!md.hasLightmap && !haveVC && !md.useBlend && !std::getenv("HSR_NOHEMI")) {
+                            // OPAQUE meshes with NO baked lightmap (the merge-grouped ones whose lightmap mapping is
                             // absent from the standalone APK: cieling/rugB/slats/woodPlanks/... + footprint
                             // floors) get a soft HEMISPHERIC ambient baked into vColor (shader does base·vColor)
                             // so they read as LIT, not flat — warm from above, dimmer below (approximates the
                             // lightprobe SH the device bakes). NOT a faked lightmap match — an honest ambient.
+                            // SKIP for TRANSPARENT FX (waterfall/fog/foam/smoke/water): those are Unlit:true SELF-LIT
+                            // effects (their MeshShellEnv frag does NOT light) — the ambient darkened the white
+                            // waterfall to a faint dark streak (user: "the waterfall"). Blend FX keep white vColor =
+                            // full texture brightness, the faithful unlit look.
                             float ny = nrm[i*3+1];                       // -1 down .. +1 up
                             float t  = ny*0.5f+0.5f;
                             float amb = 0.55f + 0.45f*t;                 // ceiling/down 0.55 .. floor/up 1.0
@@ -1375,8 +1379,9 @@ public:
                 md.positions.size()/3, ymin, ymax, md.positions[0],md.positions[1],md.positions[2],
                 md.positions[3],md.positions[4],md.positions[5], md.positions[6],md.positions[7],md.positions[8]);
         }
-        { int taMin=255,taMax=0; double taSum=0; size_t taN=0, taRgbOverA=0;
+        { int taMin=255,taMax=0; double taSum=0; size_t taN=0, taRgbOverA=0, taOpq=0, taMid=0;
           for (size_t q=3;q<md.texRGBA.size();q+=4){int a=md.texRGBA[q]; if(a<taMin)taMin=a; if(a>taMax)taMax=a; taSum+=a; ++taN;
+              if(a>=230)++taOpq; if(a>=40&&a<=215)++taMid;   // opaque + soft-edge counts for the MAKEOPAQUE-vs-blend split
               int mr=md.texRGBA[q-3]; if(md.texRGBA[q-2]>mr)mr=md.texRGBA[q-2]; if(md.texRGBA[q-1]>mr)mr=md.texRGBA[q-1]; if(mr>a+8)++taRgbOverA; }
           // PREMULTIPLIED-additive detect: the cook bakes rgb*=a so the device's HARD additive (src=ONE) shows a SOFT glow;
           // such a texture has rgb<=a everywhere. RAW additive (the V79 source warp/glow + Meta VFX caustics) has bright rgb
@@ -1398,9 +1403,30 @@ public:
                                // fragment derives fog density/alpha from noise×time — keep its alpha blend (was a WHITE block).
                                md.shaderPath.find("animatedfog")!=std::string::npos;
           if (gm.useBlend && taN>0 && taMin>=255 && !gm.additive && !gm.overlayKind && !computesAlpha) gm.useBlend = false;
-          log("  GPU mesh uploaded: [%zu] '%s' nVerts=%u nIdx=%u tex=%ux%u mdBlend=%d gmBlend=%d add=%d skinned=%d stride=%u uvOff=%u texA[%d/%.0f/%d] worldC=(%.2f,%.2f,%.2f)",
+          // SOLID-SCENERY vs SOFT-BLEND split — GROUND TRUTH from the live-captured MeshShellEnv fragment + libshell
+          // ShaderCache (sub_2C6C06C/sub_2C6D468): the env shader has a HAS_MAKEOPAQUE variant that forces `color.a=1.0`
+          // (renders OPAQUE, ignores texture alpha) + a HAS_ALPHACUTOFF variant that `discard`s alpha<AlphaCutoff. The
+          // V79 source flags are IDENTICAL for cliff/mountains AND fog/leaves (all Transparent:true,AlphaTest:false), so
+          // the device/cooker picks the variant by the TEXTURE's opaque fraction (decoded from the real ASTC):
+          //   cliff/mountains/trunk = 47-100% opaque, <3% mid  -> MAKEOPAQUE cutout (opaque pass + discard silhouette +
+          //                                                        DEPTH-WRITE) = SOLID & occludes. (was rendering see-
+          //                                                        through in the no-depth-write blend pass = the bug.)
+          //   leaves 22% / fog,smoke,waterfall ~0% opaque, lots of soft/mid alpha -> alpha BLEND (soft, no depth-write).
+          // Clean separation at opaque>~35% (terrain min 47% vs foliage max 22%). Routes to the alpha-test (opaque+
+          // discard, depth-write) pipeline. EXEMPT additive/overlay/computesAlpha FX.
+          // GUARD: only the OPA/V79 built-in path (alphaTestFragSpirv = the discard frag) can actually CUT OUT the
+          // silhouette. The COOKED-env path draws per-material programs whose alpha-test pipeline does NOT discard
+          // (p.pipeAlphaTest = p.pipe), so flipping a cooked unlitblend mountain card to alphaTest there left it OPAQUE
+          // with a BLACK transparent silhouette (user: cooked HSL preview "transparent background rendered black"). The
+          // cook already ships these as unlitblend (md flags) -> in HSL preview keep them BLEND. So require the discard frag.
+          if (!alphaTestFragSpirv.empty() && gm.progIdx < 0
+              && gm.useBlend && !gm.alphaTest && !gm.additive && !gm.overlayKind && !computesAlpha && taN>0
+              && (float)taOpq/(float)taN > 0.35f && (float)taMid/(float)taN < 0.10f) {
+              gm.alphaTest = true; gm.useBlend = false;   // MAKEOPAQUE cutout: SOLID scenery depth-writes + discards its silhouette (OPA preview only)
+          }
+          log("  GPU mesh uploaded: [%zu] '%s' nVerts=%u nIdx=%u tex=%ux%u mdBlend=%d gmBlend=%d aTest=%d add=%d skinned=%d stride=%u uvOff=%u texA[%d/%.0f/%d] worldC=(%.2f,%.2f,%.2f)",
             gpuMeshes.size(), gm.name.c_str(), nVerts, gm.nIdx, md.texW, md.texH,
-            (int)md.useBlend, (int)gm.useBlend, (int)gm.additive, (int)gm.isSkinned, gm.vboStride, gm.uvOffset,
+            (int)md.useBlend, (int)gm.useBlend, (int)gm.alphaTest, (int)gm.additive, (int)gm.isSkinned, gm.vboStride, gm.uvOffset,
             taMin, taN?taSum/taN:0.0, taMax, gm.centroid[0],gm.centroid[1],gm.centroid[2]); }
         gpuMeshes.push_back(gm);
     }
@@ -1452,6 +1478,9 @@ public:
         rpInfo.framebuffer = framebuffers[imageIndex];
         rpInfo.renderArea.extent = swapchainExtent;
         VkClearValue clearColors[2] = {};
+        static float bgOverride[3] = {-1,-1,-1};
+        if (bgOverride[0] < 0) { bgOverride[0]=bgOverride[1]=bgOverride[2]=0;   // HSR_BG="r,g,b" (0..1) overrides the clear color — diagnose see-through HOLES / black meshes vs holes
+            if (const char* e = std::getenv("HSR_BG")) { sscanf(e, "%f,%f,%f", &bgOverride[0], &bgOverride[1], &bgOverride[2]); clearRGB[0]=bgOverride[0]; clearRGB[1]=bgOverride[1]; clearRGB[2]=bgOverride[2]; } else bgOverride[0]=0; }
         clearColors[0].color = {{clearRGB[0], clearRGB[1], clearRGB[2], 1.0f}};
         clearColors[1].depthStencil = {0.0f, 0};  // reversed-Z: clear to 0 (far)
         rpInfo.clearValueCount = 2;

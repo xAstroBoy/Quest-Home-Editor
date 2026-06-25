@@ -1676,11 +1676,49 @@ struct Editor {
             size_t nv=md.positions.size()/3; if (nv<3||md.indices.size()<3) continue;
             ExportMesh em; em.name=md.name; em.positions.resize(nv*3);
             for (size_t v=0;v<nv;v++){ float p[3]={md.positions[v*3],md.positions[v*3+1],md.positions[v*3+2]},o[3]; xformPoint(gm.model,p,o); em.positions[v*3]=o[0]; em.positions[v*3+1]=o[1]; em.positions[v*3+2]=o[2]; }
-            em.uvs=md.uvs; em.indices=md.indices; em.blend = gm.useBlend||gm.additive||(gm.alphaTest && !std::getenv("HSR_DIAG_NOCUTBLEND")); em.additive = gm.additive;   // additive (emissive glow) -> cook routes to the opaque-pass shader in the transparent MATL = ADD light (warp/fog visible), not faint alpha. (HSR_DIAG_NOCUTBLEND = A/B test whether the alphaTest->blend routing is what crashes the device load)
-            // alphaTest (OPA "masked"/foliage CUTOUT, alphaTest=true but useBlend=false) MUST cook transparent too: the cook
-            // has no cutout/alpha-test shader, so an OPAQUE cook drops the texture's alpha and the transparent BACKGROUND
-            // renders SOLID (the lakesidepeak "textures have no transparent background" bug). Route to BLEND like the V79
-            // foliage path does (scene_loader sets useBlend=true alongside alphaTest) -> transparent, like the OW planet cards.
+            em.uvs=md.uvs; em.indices=md.indices; em.additive = md.additive;
+            // FAITHFUL SpecIbl diffuse-irradiance bake (the renderer's uploadMesh bake at vk_renderer.h:677, ported to the
+            // cook export — NO texture cheat): a textured *_specibl* mesh (the lake water) is env-lit by the diffuse IBL
+            // cubemap. The cook otherwise ships white vertexColor0 -> device base·white = the DARK water basecolor = black
+            // lake. Bake per-vertex color = diffuseCube(worldN)·ambientIBLTint so the device base·vertexColor0 = the lit
+            // water (= what the preview shows). em.positions are already WORLD-space, so accumulated face normals ARE world
+            // normals (same as the renderer's local `nrm`). View-dependent specular is intentionally omitted (can't bake).
+            // Two cases, exactly matching the renderer's uploadMesh bake (vk_renderer.h:647 / :679):
+            //   (1) the env HAS an IBL diffuse cubemap -> diffuseCube(worldN)·ambientIBLTint;
+            //   (2) NO IBL (lakeside) -> the renderer's HEMISPHERIC AMBIENT fallback (0.55..1.0 by world-up, gently warm)
+            //       — the "honest ambient" that lights an opaque, non-lightmapped, non-blend mesh (the SpecIbl lake water).
+            // Without this the cook ships white vertexColor0 -> device base·white = the DARK water basecolor = the black lake.
+            bool doIbl  = md.iblLit && r->iblDiffuse.ok();
+            bool doHemi = !doIbl && !md.hasLightmap && !md.useBlend && md.colors.empty() && md.iblLit;   // gate to specibl (iblLit) so only the unlit water/specular meshes get the ambient, not every opaque shell
+            if (doIbl || doHemi) {
+                std::vector<float> nrm(nv*3, 0.f);
+                for (size_t t=0;t+2<em.indices.size();t+=3){ uint32_t a=em.indices[t],b=em.indices[t+1],c=em.indices[t+2];
+                    if (a>=nv||b>=nv||c>=nv) continue;
+                    const float* pa=&em.positions[a*3]; const float* pb=&em.positions[b*3]; const float* pc=&em.positions[c*3];
+                    float e1[3]={pb[0]-pa[0],pb[1]-pa[1],pb[2]-pa[2]}, e2[3]={pc[0]-pa[0],pc[1]-pa[1],pc[2]-pa[2]};
+                    float fn[3]={e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]};
+                    for (uint32_t vi : {a,b,c}){ nrm[vi*3]+=fn[0]; nrm[vi*3+1]+=fn[1]; nrm[vi*3+2]+=fn[2]; } }
+                em.iblVertCol.resize(nv*4);
+                auto cl=[](float x){ x=x<0?0:(x>1?1:x); return (uint8_t)(x*255.f+0.5f); };
+                for (size_t v=0;v<nv;v++){ float* nP=&nrm[v*3]; float l=std::sqrt(nP[0]*nP[0]+nP[1]*nP[1]+nP[2]*nP[2]); if(l<1e-6f)l=1.f;
+                    float nx=nP[0]/l, ny=nP[1]/l, nz=nP[2]/l;
+                    if (doIbl) { float irr[3]; ibl::sample(r->iblDiffuse, nx, ny, nz, irr);
+                        em.iblVertCol[v*4]=cl(irr[0]*r->ambientIBLTint[0]); em.iblVertCol[v*4+1]=cl(irr[1]*r->ambientIBLTint[1]); em.iblVertCol[v*4+2]=cl(irr[2]*r->ambientIBLTint[2]); }
+                    else { float t=ny*0.5f+0.5f, amb=0.55f+0.45f*t;   // hemispheric: down 0.55 .. up 1.0, warm
+                        em.iblVertCol[v*4]=cl(amb); em.iblVertCol[v*4+1]=cl(amb*0.98f); em.iblVertCol[v*4+2]=cl(amb*0.93f); }
+                    em.iblVertCol[v*4+3]=255; }
+            }
+            // The cook routes by the AUTHORED MaterialProperties flags (md.*), NOT the renderer's PREVIEW classification
+            // (gm.*). gm.useBlend/gm.alphaTest are mutated by preview-only heuristics (the opaque-fraction "solid scenery
+            // -> alpha-test cutout", the King-Kai taMin>=255 opaque-blend reclassify, computesAlpha) that are RIGHT for the
+            // OPA preview but WRONG to bake: they flipped the Transparent mountain/lakeshore CARDS to gm.alphaTest=true /
+            // gm.useBlend=false, so the cook saw blend=false -> shipped them on the plain unlit (OPAQUE) shader -> their
+            // transparent silhouette rendered BLACK in the cooked env (user: "transparent background rendered black").
+            // md.useBlend = the .mat Transparent||Additive flag; md.alphaTest = the .mat AlphaTest flag -> faithful:
+            //   Transparent (mountain/cliff/lakeshore cards, foliage, fog) -> BLEND (unlitblend) = composites over the SkyDome.
+            //   AlphaTest:true ("_masked" GROUND) -> cutout discard shader. Additive (foam/glow) -> additive.
+            em.alphaTest = md.alphaTest && !md.additive && !std::getenv("HSR_NOCUTOUT");
+            em.blend = (md.useBlend || md.additive) && !em.alphaTest;   // genuine alpha-blend from the authored flag (cutout is the opaque-pass discard shader)
             em.doubleSided = md.doubleSided;   // WAS DROPPED -> cooked single-sided -> flat/open doubleSided meshes (monitor screens, thin panels) back-face-culled on device = see-through HOLES. Carry it so the cook double-sides them (reversed tris). Renderer honors doubleSided (gm.cullBack=!doubleSided) so the live preview already looked right.
             em.wantCollider = isAnimCollider((int)i);   // user marked this animated mesh -> same-entity kinematic collider
             em.skybox = isSkyboxMesh((int)i);            // user marked this as far backdrop -> SkyboxPlatformComponent (far-clip-exempt)
@@ -1791,7 +1829,10 @@ struct Editor {
             }
         }
         // ── auto-install: ROOT -> own package (+auto-select); else back up haven2025 and install the spoof ──
-        if (installAfterCook) {
+        if (installAfterCook && !deviceConnected()) {
+            progress(1.0f, "no device — APKs written");
+            msg += "  || NO DEVICE connected (adb) -> skipped auto-install; the APK files are written. Connect the Quest (USB or `adb connect`) and re-cook, or install the APK manually.";
+        } else if (installAfterCook) {
             progress(0.9f, "detect root");
             bool rooted = deviceIsRooted();
             if (rooted && !finalSystem.empty()) {
@@ -1855,6 +1896,18 @@ struct Editor {
     // True if the device's adb shell can act as root (su works, or adbd itself is root, or it's a userdebug build).
     // ROOT lets us install the proper own-package env and auto-select it via `oculuspreferences --setc`; without it
     // we fall back to the haven2025 spoof (which the user picks manually in the home menu).
+    // TRUE iff an adb device is actually connected/online — checked via `adb get-state` (returns instantly: "device" when
+    // online, "error: no devices/emulators found" otherwise). Gate the whole install flow on this so a cook with NO device
+    // connected SKIPS the device steps cleanly instead of HANGING on `adb wait-for-device` (which blocks forever). Generic:
+    // applies to every env cook (the APK files are still written; only the optional auto-install is skipped).
+    bool deviceConnected() {
+        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
+        if (!wifiIp.empty()) { std::string ip=wifiIp; if(ip.find(':')==std::string::npos) ip+=":5555"; runAdb(ADB,"","connect "+ip); }
+        std::string st = adbCapture(ADB, sel, "get-state");
+        return st.find("error")==std::string::npos && st.find("no devices")==std::string::npos
+            && st.find("offline")==std::string::npos && st.find("device")!=std::string::npos;
+    }
     bool deviceIsRooted() {
         auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);

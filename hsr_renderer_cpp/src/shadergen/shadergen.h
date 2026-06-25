@@ -29,7 +29,7 @@ namespace shadergen {
 //   SCALE    : pos' = pivot + (inPos - pivot)*replay(N sampled per-axis SCALE FACTORS, looped) — FAITHFULLY ports ANY node
 //              SCALE "breathe" track (e.g. Erebor's 12 wisps, NON-UNIFORM per-axis amplitudes) by piecewise-linear
 //              interpolation of the sampled per-axis factor frames (frame0 = (1,1,1)); not a (1-cos) shape guess.
-enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3, TRANSLATE = 4, SCALE = 5 };
+enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3, TRANSLATE = 4, SCALE = 5, CUTOUT = 6 };
 
 struct Inst { int op; std::vector<uint32_t> w; };   // w[0] = header word (recomputed on emit), w[1..] = operands
 struct VStage { int64_t slot, spvOff; uint32_t spvLen; };   // one vertex stage: FlatBuffer uoffset slot, SPIR-V magic, len
@@ -97,6 +97,46 @@ inline bool findFwdVertSpv(const uint8_t* d, size_t N, int64_t& slot, int64_t& s
         int em=-1; size_t nw=b/4, i=5;                                  // EntryPoint exec model 0 = Vertex
         while (i<nw){ uint32_t ins=u32(sd,b,(int64_t)i*4); uint32_t op=ins&0xffff, wc=ins>>16; if (!wc) break; if (op==15){ em=(int)u32(sd,b,(int64_t)(i+1)*4); break; } i+=wc; }
         if (em==0){ slot=sl; spvOff=v+4; spvLen=b; return true; }       // spvOff -> the SPIR-V bytes (the magic word)
+    }
+    return false;
+}
+// Same discovery as findFwdVertSpv but returns the forward pass's FRAGMENT stage (EntryPoint exec model 4) — for the
+// CUTOUT mode, which injects an alpha-test discard into the forward frag (the make_cutout_shader.py job, in-binary).
+inline bool findFwdFragSpv(const uint8_t* d, size_t N, int64_t& slot, int64_t& spvOff, uint32_t& spvLen){
+    int64_t root = u32(d,N,0); int64_t stagesBase=0; int nPasses=0,nStages=0,fwdIdx=-1;
+    for (int fi=0, nf=vt_nf(d,N,root); fi<nf; ++fi){
+        int64_t fp=vt_field(d,N,root,fi); if (!fp || !u32(d,N,fp)) continue;
+        int64_t vec=fp+u32(d,N,fp); if (vec+4>(int64_t)N) continue;
+        uint32_t cnt=u32(d,N,vec); if (!(cnt>0 && cnt<=64)) continue;
+        int64_t base=vec+4; if (base+(int64_t)cnt*4>(int64_t)N) continue;
+        int64_t e0=base+u32(d,N,base);
+        for (int ef=0, m=std::min(vt_nf(d,N,e0),4); ef<m; ++ef){
+            if (str_at(d,N,vt_field(d,N,e0,ef)).rfind("forward",0)==0){
+                nPasses=cnt;
+                for (uint32_t pi=0; pi<cnt; ++pi){ int64_t pt=base+pi*4+u32(d,N,base+pi*4);
+                    for (int pf=0, mm=std::min(vt_nf(d,N,pt),4); pf<mm; ++pf)
+                        if (str_at(d,N,vt_field(d,N,pt,pf))=="forward") fwdIdx=(int)pi; }
+            }
+        }
+        for (int ef=0, m=std::min(vt_nf(d,N,e0),4); ef<m; ++ef){
+            int64_t sp=vt_field(d,N,e0,ef); if (!sp) continue;
+            int64_t sv=sp+u32(d,N,sp); if (sv+4>(int64_t)N) continue;
+            uint32_t L=u32(d,N,sv); if (L>500 && L<2000000 && sv+4+(int64_t)L<=(int64_t)N){ stagesBase=base; nStages=cnt; }
+        }
+    }
+    if (fwdIdx<0 || nStages!=2*nPasses) return false;
+    for (int si : { 2*fwdIdx, 2*fwdIdx+1 }){
+        int64_t se=stagesBase+si*4; int64_t st=se+u32(d,N,se);
+        for (int ef=0, m=std::min(vt_nf(d,N,st),6); ef<m; ++ef){
+            int64_t sp=vt_field(d,N,st,ef); if (!sp) continue;
+            int64_t vv=sp+u32(d,N,sp); if (vv+4>(int64_t)N) continue;
+            uint32_t L=u32(d,N,vv);
+            if (L>500 && vv+4+(int64_t)L<=(int64_t)N && L%4==0 && u32(d,N,vv+4)==0x07230203){
+                const uint8_t* sd=d+vv+4; int em=-1; size_t nw=L/4, i=5;
+                while (i<nw){ uint32_t ins=u32(sd,L,(int64_t)i*4); uint32_t op=ins&0xffff, wc=ins>>16; if(!wc)break; if(op==15){em=(int)u32(sd,L,(int64_t)(i+1)*4);break;} i+=wc; }
+                if (em==4){ slot=sp; spvOff=vv+4; spvLen=L; return true; }   // exec model 4 = Fragment
+            }
+        }
     }
     return false;
 }
@@ -195,12 +235,20 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
     std::vector<Inst> body; uint32_t result=0;
 
     if (mode==UVSCROLL){
+        // uv' = inUv + fract(vec2(ru,rv)*time). The FRACT bounds the scroll offset to one tile: getTime() grows for the
+        // whole home session, so an UNBOUNDED rate*time reaches hundreds of UV units -> float32 loses sub-texel precision
+        // = shimmer/FLASH on the headset (matches the preview's fmod). The texture REPEATs, so fract's 1->0 wrap is a
+        // uniform whole-card shift = seamless (no torn triangle, no mip change). Direction/speed come capped+signed
+        // from uvScrollRate (the device scrolls the SAME way + speed as the live preview).
+        const uint32_t GLSL_FRACT=10;
         uint32_t c_ru=fconst(p0), c_rv=fconst(p1), c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
         uint32_t ratevec=nid(); newConsts.push_back({0x2c,{0,tV2,ratevec,c_ru,c_rv}});
-        uint32_t pt=nid(), t=nid(), off=nid(), uvout=nid(); result=uvout;
+        uint32_t pt=nid(), t=nid(), off=nid(), offf=nid(), uvout=nid(); result=uvout;
         body = {
             {65,{0,pUf,pt,gu,c_time}}, {61,{0,tFloat,t,pt}},
-            {142,{0,tV2,off,ratevec,t}}, {129,{0,tV2,uvout,loadRes,off}},   // uv' = inUv + vec2(ru,rv)*time
+            {142,{0,tV2,off,ratevec,t}},                       // off  = vec2(ru,rv)*time   (unbounded)
+            {12,{0,tV2,offf,glsl,GLSL_FRACT,off}},             // offf = fract(off)          (bounded to one tile)
+            {129,{0,tV2,uvout,loadRes,offf}},                  // uv'  = inUv + fract(rate*time)
         };
     } else if (mode==TRANSLATE){
         // GENERAL node-translation REPLAY: p0=loopSec, tframes = tN vec3 OFFSETS (delta from the baked base) sampled
@@ -269,8 +317,13 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
         uint32_t scl=nid(); body.push_back({133,{0,tV3,scl,rel,acc}});                      // *factor (component-wise)
         uint32_t posOut=nid(); body.push_back({129,{0,tV3,posOut,scl,pivot}}); result=posOut; // pos' = pivot + (inPos-pivot)*factor
     } else if (mode==FLIPBOOK){
-        // p0=cols p1=rows ax=frames ay=fps. uv' = inUv*(1/cols,1/rows) + (col/cols,row/rows) for the time-driven cell.
+        // p0=cols p1=rows ax=frames ay=fps. Two layouts (az = offset-only flag):
+        //   az<=0.5 (SCALE flipbook, spritesheet TV): base UV is the FULL quad -> uv' = inUv*(1/cols,1/rows)+(col/cols,row/rows).
+        //   az >0.5 (OFFSET flipbook, the lakeside waterfall/stream/fog mat.sanim): the mesh UV ALREADY maps to ONE
+        //           cell -> uv' = inUv + (col/cols,row/rows). This matches libshell's BaseTextureMtx play (uv+=offset)
+        //           SNAPPED to the integer cell (STEP) = the frame-snap the preview does. cell scale is skipped.
         const uint32_t GLSL_FLOOR=8;
+        bool offsetOnly = (az>0.5f);
         int ncols=(int)(p0+0.5f), nrows=(int)(p1+0.5f), nframes=(int)(ax+0.5f); float fps=ay;
         if (ncols<1) ncols=1; if (nrows<1) nrows=1; if (nframes<1) nframes=ncols*nrows; if (fps<=0.f) fps=5.f;
         uint32_t c_fps=fconst(fps), c_nf=fconst((float)nframes), c_nc=fconst((float)ncols);
@@ -288,11 +341,15 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
             {12,{0,tFloat,row,glsl,GLSL_FLOOR,rdiv}},    // row = floor(frame/NCOLS)
             {133,{0,tFloat,uo,col,c_invc}},              // uOff = col/NCOLS
             {133,{0,tFloat,vo,row,c_invr}},              // vOff = row/NROWS
-            {80,{0,tV2,cell,c_invc,c_invr}},             // vec2(1/NCOLS,1/NROWS)
             {80,{0,tV2,off,uo,vo}},                      // vec2(uOff,vOff)
-            {133,{0,tV2,scaled,loadRes,cell}},           // inUv * cell
-            {129,{0,tV2,uvout,scaled,off}},              // + off
         };
+        if (offsetOnly) {
+            body.push_back({129,{0,tV2,uvout,loadRes,off}});            // uv' = inUv + off
+        } else {
+            body.push_back({80,{0,tV2,cell,c_invc,c_invr}});           // vec2(1/NCOLS,1/NROWS)
+            body.push_back({133,{0,tV2,scaled,loadRes,cell}});         // inUv * cell
+            body.push_back({129,{0,tV2,uvout,scaled,off}});            // + off
+        }
     } else if (mode==ROTATE){
         uint32_t c_om=fconst(p0), c_one=fconst(1.0f), cax=fconst(ax), cay=fconst(ay), caz=fconst(az);
         uint32_t c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
@@ -346,6 +403,55 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
     return mod;
 }
 
+// CUTOUT: inject an alpha-test DISCARD into a forward-fragment SPIR-V module (the make_cutout_shader.py job, done
+// IN-BINARY so the cook generates it on demand from the stock unlit surface — no NDK spirv-dis/as, no pre-baked .bin,
+// no haveCutout/CWD fragility). Faithful to Meta's unlitfoliage (decompiled via SPIRV-Cross): a mostly-opaque "_alpha"/
+// "_masked" scenery card must DEPTH-WRITE (occlude = no depth issues) AND drop its transparent silhouette (= no black
+// background) — exactly `if (baseColor.a < threshold) discard;` in the depth-writing forward pass. (unlitfoliage also
+// `sharpenAlpha`s the edge for AA-coverage; a hard discard at 0.5 is the no-MSAA equivalent — crisp 1-texel cutout.)
+inline std::vector<uint8_t> editFragCutout(const uint8_t* sd, uint32_t spvLen, float threshold){
+    using namespace detail;
+    size_t nw = spvLen/4;
+    auto W=[&](size_t k){ return u32(sd,spvLen,(int64_t)k*4); };
+    uint32_t version=W(1), generator=W(2), bound=W(3);
+    std::vector<Inst> insts;
+    for (size_t i=5;i<nw;){ uint32_t ins=W(i),wc=ins>>16,op=ins&0xffff; if(!wc)break; Inst t; t.op=(int)op; for(uint32_t k=0;k<wc;++k)t.w.push_back(W(i+k)); insts.push_back(std::move(t)); i+=wc; }
+    auto fbits=[](float f){ uint32_t u; memcpy(&u,&f,4); return u; };
+    uint32_t tFloat=0, tBool=0, c_thr=0, sampleRes=0; int sampleIdx=-1;
+    for (auto& t:insts){ auto&w=t.w;
+        if (t.op==22 && w.size()>=4 && w[3]==32) tFloat=w[1];          // OpTypeFloat 32
+        else if (t.op==20 && w.size()>=2) tBool=w[1];                  // OpTypeBool
+    }
+    for (auto& t:insts){ auto&w=t.w;                                   // reuse an existing 0.5 const if present
+        if (t.op==43 && tFloat && w.size()>=4 && w[1]==tFloat){ float fv; memcpy(&fv,&w[3],4); if (std::fabs(fv-threshold)<1e-6f) c_thr=w[2]; }
+    }
+    for (size_t k=0;k<insts.size();++k){ if (insts[k].op==87 && insts[k].w.size()>=3){ sampleRes=insts[k].w[2]; sampleIdx=(int)k; break; } } // 1st OpImageSampleImplicitLod = basecolor
+    if (!tFloat || sampleIdx<0) return {};
+    uint32_t nidNext=bound; auto nid=[&](){ return nidNext++; };
+    std::vector<Inst> newGlobals;
+    if (!tBool)  { tBool=nid();  newGlobals.push_back({20,{0,tBool}}); }                       // OpTypeBool
+    if (!c_thr)  { c_thr=nid();  newGlobals.push_back({43,{0,tFloat,c_thr,fbits(threshold)}}); } // OpConstant float threshold
+    uint32_t aId=nid(), chk=nid(), killL=nid(), mrgL=nid();
+    std::vector<Inst> body = {
+        {81,{0,tFloat,aId,sampleRes,3}},      // alpha   = baseColor.w
+        {184,{0,tBool,chk,aId,c_thr}},        // chk     = alpha < threshold   (OpFOrdLessThan)
+        {247,{0,mrgL,0}},                     // OpSelectionMerge merge None
+        {250,{0,chk,killL,mrgL}},             // OpBranchConditional chk kill merge
+        {248,{0,killL}}, {252,{0}},           // kill: OpLabel ; OpKill
+        {248,{0,mrgL}},                       // merge: OpLabel  (the rest of the block continues here)
+    };
+    std::vector<Inst> out; bool addedG=false;
+    for (size_t k=0;k<insts.size();++k){
+        if (!addedG && insts[k].op==54){ for(auto&g:newGlobals) out.push_back(g); addedG=true; }   // types/consts before the 1st OpFunction
+        out.push_back(insts[k]);
+        if ((int)k==sampleIdx){ for(auto&b:body) out.push_back(b); }                                // discard right after the basecolor sample
+    }
+    std::vector<uint32_t> words={0x07230203u,version,generator,nidNext,0u};
+    for(auto&t:out){ uint32_t hdr=((uint32_t)t.w.size()<<16)|(uint32_t)t.op; words.push_back(hdr); for(size_t j=1;j<t.w.size();++j)words.push_back(t.w[j]); }
+    std::vector<uint8_t> mod(words.size()*4); memcpy(mod.data(),words.data(),mod.size());
+    return mod;
+}
+
 // Generate an animated shader from a stock RENDSHAD `src`. Returns the new .surface.bin bytes (empty on failure).
 //   ROTATE: p0=omega(rad/s), axis | OSCILLATE: p0=amp(rad), p1=period(s), axis | UVSCROLL: p0=rateU, p1=rateV
 // Animates EVERY vertex stage (all passes) so geometry/UV is consistent across the V205 multi-pass RenderGraph
@@ -355,8 +461,21 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
 inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode, float p0, float p1=0, float ax=0, float ay=1, float az=0,
                                      const std::vector<float>& tframes = {}, int tN = 0){
     using namespace detail;
-    if (mode==ROTATE || mode==OSCILLATE){ float l=std::sqrt(ax*ax+ay*ay+az*az); if (l<=0.f) l=1.f; ax/=l; ay/=l; az/=l; }  // axis -> unit (UVSCROLL/FLIPBOOK/TRANSLATE use these args as params, not an axis)
     const uint8_t* d = src.data(); size_t N = src.size();
+    if (mode==CUTOUT){   // edit the FORWARD FRAGMENT (alpha-test discard); the depth/shadow/motion frags don't need it
+        int64_t slot,spvOff; uint32_t spvLen;
+        if (!detail::findFwdFragSpv(d,N,slot,spvOff,spvLen)) return {};
+        std::vector<uint8_t> mod = editFragCutout(d+spvOff, spvLen, p0>0.f ? p0 : 0.5f);   // p0 = alpha threshold
+        if (mod.empty()) return {};
+        std::vector<uint8_t> o = src;
+        while (o.size()%4) o.push_back(0);
+        uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
+        o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
+        o.insert(o.end(),mod.begin(),mod.end());
+        uint32_t rel=nv-(uint32_t)slot; memcpy(o.data()+slot,&rel,4);   // repoint the forward-frag SPIR-V uoffset
+        return o;
+    }
+    if (mode==ROTATE || mode==OSCILLATE){ float l=std::sqrt(ax*ax+ay*ay+az*az); if (l<=0.f) l=1.f; ax/=l; ay/=l; az/=l; }  // axis -> unit (UVSCROLL/FLIPBOOK/TRANSLATE use these args as params, not an axis)
     std::vector<VStage> stages;
     if (mode==FLIPBOOK){
         // FLIPBOOK edits ONLY the forward vertex stage (exactly like make_flipbook_shader.py). The UV-cell offset doesn't
