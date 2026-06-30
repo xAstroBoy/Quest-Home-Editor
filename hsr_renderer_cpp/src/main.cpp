@@ -1234,8 +1234,16 @@ int main(int argc, char** argv) {
                 em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
                 return;
             }
-            // NON-skinned node TRANSLATION (cars/train) -> 1-joint RIGID HZANIM (faithful arbitrary path). Returns
-            // !ok() for pure spins (no translation), which fall through to the lighter getTime() Rodrigues path.
+            // ⚠ DEFAULT OFF — the 1-joint RIGID HZANIM is a DEGENERATE maxBoneIdx=0 "skin": its bind is the identity
+            // origin (jointPos={0,0,0}), the verts are node-LOCAL, and ALL world placement lives only in the absolute
+            // ACL clip. The device's MeshDefinition::fix rejects / never drives this degenerate skin, so the mesh sits
+            // at the origin-bind = SPAWN (root cause of bluehills "VE_WESTERN animatedGroup MOVED TO SPAWN AFTER COOK":
+            // decoded the cooked HSTF — animatedGroup #2 = AnimatorPlatformComponent + empty {} transform + armature0
+            // = a single joint at (0,0,0); the static sub-meshes #1/#3 are world-baked and render correctly). This path
+            // runs BEFORE the device-proven ShellPoseAnimationComponent below and SHADOWED it for every translating node.
+            // Now node TRANSLATION falls through to that pose path (entity placed at the world centroid + pose lerp,
+            // "NO skin so MeshDefinition::fix can't reject it"). Opt back in (arbitrary curved paths) via HSR_OPARIGIDHZ.
+            if (std::getenv("HSR_OPARIGIDHZ")) {
             auto rg = opa.extractNodeRigidHzAnim(meshIdx);
             if (rg.ok()) {
                 em.hzJointPos=std::move(rg.jointPos); em.hzJointQuat=std::move(rg.jointQuat); em.hzJointScale=std::move(rg.jointScale);
@@ -1244,6 +1252,7 @@ int main(int argc, char** argv) {
                 em.hzJointCount=rg.jointCount; em.hzFrames=rg.frameCount; em.hzFps=rg.fps;
                 em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
                 return;
+            }
             }
             }   // end HSR_OPAHZ gate
             // NODE-SCALE "breathe" (NON-UNIFORM per-axis) -> shadergen::SCALE getTime() shader (faithful per-axis amplitudes).
