@@ -212,6 +212,18 @@ inline M4 m4inv(const M4& m){
     float det=a[0]*inv[0]+a[1]*inv[4]+a[2]*inv[8]+a[3]*inv[12];
     if (std::fabs(det)<1e-20f) return m4id(); det=1.0f/det; for(int i=0;i<16;i++) inv[i]*=det; return inv;
 }
+inline void m4decompose(const M4& m, float q[4]/*xyzw*/, float t[3], float s[3]){
+    t[0]=m[12]; t[1]=m[13]; t[2]=m[14];
+    s[0]=std::sqrt(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]);
+    s[1]=std::sqrt(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]);
+    s[2]=std::sqrt(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]);
+    float ix=s[0]>1e-8f?1.f/s[0]:0.f, iy=s[1]>1e-8f?1.f/s[1]:0.f, iz=s[2]>1e-8f?1.f/s[2]:0.f;
+    float r0=m[0]*ix,r1=m[1]*ix,r2=m[2]*ix, r3=m[4]*iy,r4=m[5]*iy,r5=m[6]*iy, r6=m[8]*iz,r7=m[9]*iz,r8=m[10]*iz;
+    float tr=r0+r4+r8;
+    if(tr>0){float S=std::sqrt(tr+1)*2;q[3]=0.25f*S;q[0]=(r5-r7)/S;q[1]=(r6-r2)/S;q[2]=(r1-r3)/S;}
+    else if(r0>r4&&r0>r8){float S=std::sqrt(1+r0-r4-r8)*2;q[3]=(r5-r7)/S;q[0]=0.25f*S;q[1]=(r3+r1)/S;q[2]=(r6+r2)/S;}
+    else if(r4>r8){float S=std::sqrt(1+r4-r0-r8)*2;q[3]=(r6-r2)/S;q[0]=(r3+r1)/S;q[1]=0.25f*S;q[2]=(r7+r5)/S;}
+    else{float S=std::sqrt(1+r8-r0-r4)*2;q[3]=(r1-r3)/S;q[0]=(r6+r2)/S;q[1]=(r7+r5)/S;q[2]=0.25f*S;} }
 inline void quatAxisAngle(const float ax[3], float ang, float out[4]/*xyzw*/){
     float n=std::sqrt(ax[0]*ax[0]+ax[1]*ax[1]+ax[2]*ax[2]); if(n<1e-9f){out[0]=out[1]=out[2]=0;out[3]=1;return;}
     float s=std::sin(ang*0.5f); out[0]=ax[0]/n*s; out[1]=ax[1]/n*s; out[2]=ax[2]/n*s; out[3]=std::cos(ang*0.5f);
@@ -380,11 +392,24 @@ inline bool exportEnvFull(const std::vector<hslcook::ExportMesh>& meshes, const 
             std::vector<float> times(frames); for(int f=0;f<frames;f++) times[f]=(float)f/fps;
             int timeAcc=addAccF(times,1,true);
             std::string chans, samps; int sCount=0;
+            M4 Tinv=m4inv(T);
             for(int j=0;j<jc;j++){
                 std::vector<float> rot(frames*4),tra(frames*3),scl(frames*3);
+                // Root joint (no parent) trsLocal = WORLD TRS; skinRoot T carries world placement.
+                // Store T^{-1}*world so the joint node's local animation is T-relative (correct glTF skinning).
+                bool isRoot=(j<(int)m.hzParents.size())?m.hzParents[j]<0:(j==0);
                 for(int f=0;f<frames;f++){ size_t b=((size_t)f*jc+j)*10;
-                    if(b+9<m.hzTrsLocal.size()){ for(int k=0;k<4;k++)rot[f*4+k]=m.hzTrsLocal[b+k]; for(int k=0;k<3;k++)tra[f*3+k]=m.hzTrsLocal[b+4+k]; for(int k=0;k<3;k++)scl[f*3+k]=m.hzTrsLocal[b+7+k]; }
-                    else { rot[f*4+3]=1; scl[f*3]=scl[f*3+1]=scl[f*3+2]=1; } }
+                    if(b+9<m.hzTrsLocal.size()){
+                        if(isRoot){
+                            float tq[4]={m.hzTrsLocal[b],m.hzTrsLocal[b+1],m.hzTrsLocal[b+2],m.hzTrsLocal[b+3]};
+                            float tt[3]={m.hzTrsLocal[b+4],m.hzTrsLocal[b+5],m.hzTrsLocal[b+6]};
+                            float ts[3]={m.hzTrsLocal[b+7],m.hzTrsLocal[b+8],m.hzTrsLocal[b+9]};
+                            M4 W=m4trs(tt,tq,ts); M4 L=m4mul(Tinv,W);
+                            float lq[4],lt[3],ls[3]; m4decompose(L,lq,lt,ls);
+                            for(int k=0;k<4;k++) rot[f*4+k]=lq[k]; for(int k=0;k<3;k++) tra[f*3+k]=lt[k]; for(int k=0;k<3;k++) scl[f*3+k]=ls[k];
+                        } else {
+                            for(int k=0;k<4;k++) rot[f*4+k]=m.hzTrsLocal[b+k]; for(int k=0;k<3;k++) tra[f*3+k]=m.hzTrsLocal[b+4+k]; for(int k=0;k<3;k++) scl[f*3+k]=m.hzTrsLocal[b+7+k]; }
+                    } else { rot[f*4+3]=1; scl[f*3]=scl[f*3+1]=scl[f*3+2]=1; } }
                 int rAcc=addAccF(rot,4,false), tAcc=addAccF(tra,3,false), scAcc=addAccF(scl,3,false);
                 int jn=jbase+j;
                 for (auto pr : { std::make_pair(rAcc,"rotation"), std::make_pair(tAcc,"translation"), std::make_pair(scAcc,"scale") }){

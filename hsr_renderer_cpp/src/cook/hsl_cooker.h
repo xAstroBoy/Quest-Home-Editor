@@ -464,6 +464,21 @@ inline std::string entityJson(const std::string& id, const std::string& name,
         comp("MeshPlatformComponent", meshVer, std::string("{\"mesh\":") + refJson(meshRef) + "}") + "," +
         comp("MaterialPlatformComponent", 1, std::string("{\"materials\":[") + mats + "],\"constantParameters\":[],\"textureParameters\":[]}");
     if (skinned) comps += "," + extraComp;   // AnimatorPlatformComponent LAST (exact calming butterfly order)
+    // CULL — THE REAL FIX (horizon::renderer::MeshPartBoundsOverride): the device RECOMPUTES each renderable's cull
+    // bound at runtime (for skinned meshes from the posed skeleton EVERY frame; it IGNORES the cooked RENDMESH AABB and
+    // added mesh verts — the AABB/PART.f6/bounds-vert/anchor attempts all did NOTHING, device-proven via render-trace).
+    // That recomputed bound OSCILLATES with the animation and flickers out of the frustum → "shows then goes invisible".
+    // DEVICE-PROVEN (render-trace dump): the skinned omnidroid pieces that GOT this override read center(0,0,0)/half=1e5
+    // and stay VISIBLE, while any entity WITHOUT it (the omnidroid's body renderable + walls) still oscillates and
+    // FRUSTUM-CULLs → so it must go on EVERY mesh entity, not just `skinned` ones (user: "any animated mesh").
+    // MeshPartBoundsOverride {partIndex, boundsCenter, boundsHalfSize} (IDA: type reg sub_2B712FC, field reflect
+    // sub_2B8CF18) REPLACES the per-part cull bound with a fixed AABB. Emit a SCENE-SPANNING box (center 0, halfSize 1e5)
+    // so the cull bound always covers the view → never frustum/occlusion-culled. partIndex 0 = each entity's single
+    // cooked part (one material per entity). Skip the NavDebug overlay. HSR_NOBOUNDSOVERRIDE disables for A/B.
+    if (name != "NavDebug" && !std::getenv("HSR_NOBOUNDSOVERRIDE"))
+        comps += ",{\"data\":{\"class\":\"horizon::renderer::MeshPartBoundsOverride\",\"version\":1,\"data\":"
+                 "{\"partIndex\":0,\"boundsCenter\":{\"x\":0,\"y\":0,\"z\":0},"
+                 "\"boundsHalfSize\":{\"x\":100000,\"y\":100000,\"z\":100000}}},\"dataType\":\"horizon::DataDefinitionAsset\"}";
     // walkable: collision mesh + static physics body (so locomotion/teleport land on it)
     if (colliderRef.pkg || colliderRef.ing || colliderRef.tgt) {
         comps += "," + comp("ColliderMeshPlatformComponent", 1, std::string("{\"meshAsset\":") + refJson(colliderRef) + "}");
@@ -1011,7 +1026,15 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos_, 
     // skinned bounds span the scene → the frustum/occlusion cull can never drop the mesh. Joint 0 is already in the palette, so
     // the dense palette / maxBoneIdx / verifier are unaffected. HSR_NOBOUNDSVERT disables. (The skin-vertex analogue of HSR_NOCULL.)
     bool skinned_ = boneIdx_.size() >= (pos_.size()/3)*4 && boneWgt_.size() >= (pos_.size()/3)*4;
-    bool bvert = skinned_ && !pos_.empty() && std::getenv("HSR_BOUNDSVERT");   // DEFAULT OFF: device-disproven (the runtime skinned cull bounds ignore mesh verts — see culling memory). Kept opt-in only; default-on shipped ±1e5 out-of-range verts that did nothing.
+    // SKINNED CULL FIX (default ON): weight the ±1e5 bounds verts to the dedicated STATIC ANCHOR joint = the LAST
+    // skeleton joint (the cook appends it: identity bind + identity-translation clip track, unit scale). The device's
+    // skinned cull bound = union of each PALETTE joint's influenced-vertex AABB × posed-joint-matrix, but it SKIPS
+    // JOINT 0 and a SCALING joint collapses far verts to ~0 — so the old "weight to joint 0 / to the highest used
+    // joint" both failed. The anchor is index>=1 (counted), unit-scale (never collapses), so the ±1e5 verts stay
+    // ±1e5 each frame -> the skinned bound spans the scene -> the mesh is never frustum/occlusion-culled (the skin-
+    // path analogue of the static-mesh ±1e5 nocullBounds). HSR_NOBOUNDSVERT disables. Anchor index = last jointId.
+    int anchorBase = (int)jointIds.size() - 6;   // the 6 bounds-anchor joints occupy the LAST 6 palette slots (see jointIds build)
+    bool bvert = skinned_ && !pos_.empty() && anchorBase >= 1 && !std::getenv("HSR_NOBOUNDSVERT");
     std::vector<float> posA, uvA; std::vector<uint32_t> idxA; std::vector<uint8_t> biA, bwA;
     if (bvert) {
         posA = pos_; uvA = uv_; idxA = idx_; biA = boneIdx_; bwA = boneWgt_;
@@ -1049,7 +1072,7 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos_, 
                 posA.push_back(ext[e][1] + (t == 2 ? 1.0f : 0.0f));
                 posA.push_back(ext[e][2]);
                 uvA.push_back(0.f); uvA.push_back(0.f);
-                biA.push_back(0); biA.push_back(0); biA.push_back(0); biA.push_back(0);   // ROOT joint (rigid — doesn't scale/collapse the far verts when the droid unfolds; anchorJoint=spike collapsed them)
+                biA.push_back((uint8_t)(anchorBase + e)); biA.push_back(0); biA.push_back(0); biA.push_back(0);   // weight this triangle to the e-th bounds-anchor joint (at the ±C axis extreme) so THAT anchor is counted in the device's per-joint position bound -> the bound spans ±C symmetrically
                 bwA.push_back(255); bwA.push_back(0); bwA.push_back(0); bwA.push_back(0);
             }
             uint32_t b = base + (uint32_t)e * 3;
@@ -1147,7 +1170,18 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos_, 
         aabb[0] = -maxR; aabb[1] = -maxR; aabb[2] = -maxR; aabb[3] = maxR; aabb[4] = maxR; aabb[5] = maxR;
     }
     float radius = 0; for (int k = 0; k < 3; k++) { float a = aabb[k] < 0 ? -aabb[k] : aabb[k], c = aabb[k+3] < 0 ? -aabb[k+3] : aabb[k+3]; if (a > radius) radius = a; if (c > radius) radius = c; }
-    nocullBounds(aabb, radius);   // HSR_NOCULL: V79-style draw-everything (scene-spanning bounds defeat V205 frustum/occlusion/size cull)
+    // SKINNED meshes must keep the REAL MODEL-LOCAL AABB (computed above from hzRestPos), exactly like every
+    // official skinned mesh (the vista butterfly's RENDMESH AABB is its tiny model-local extent, ~0.1, NOT ±1e5).
+    // The ±1e5 nocullBounds "draw-everything" trick ONLY works for STATIC meshes: V205 frustum-culls those by the
+    // cooked AABB, so a scene-spanning box is never dropped. But for SKINNED meshes the device IGNORES the cooked
+    // AABB and RECOMPUTES the cull bounds per-frame from the skeleton's posed joints — so a ±1e5 AABB does nothing
+    // and a WORLD-BAKED skeleton yields world-placed, animation-oscillating bounds that leave the frustum and cull
+    // the mesh at certain camera angles (device-confirmed via the render-trace MCP; preview renders fine because it
+    // doesn't run V205's skinned cull). The real fix is the model-local skeleton (gltf_loader/opa_loader
+    // butterfly-parity); keeping a model-local AABB here matches the official skinned-mesh shape. HSR_NOCULL_SKIN
+    // forces the old ±1e5 behavior for A/B. [[project_hsr_ondevice_rendertrace]]
+    if (!skinned || std::getenv("HSR_NOCULL_SKIN"))
+        nocullBounds(aabb, radius);   // HSR_NOCULL: V79-style draw-everything (scene-spanning bounds defeat V205 frustum/occlusion/size cull)
     // POS+UV0+NORMAL by default; for VAT the 3rd attr is UV1 (the column) and the format-hash differs (both reversed
     // from real meshes: oceanarium VAT-format VS.f0 = {0x4157E789,0x79BF0758,0}).
     static const uint8_t VSF0_N[12] = { 0x23,0xa5,0xe0,0xdb, 0x22,0x95,0x8f,0xf3, 0,0,0,0 };
@@ -1172,15 +1206,18 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos_, 
         int vsvec = b.createOffsetVector({ vs });
         int matEmb = embeddedMatl.empty() ? 0 : b.createByteVector(embeddedMatl.data(), embeddedMatl.size());
         b.startObject(7); b.addOffset(0, vsvec); b.addOffset(1, ibo); b.addOffset(3, matEmb); b.addStructSlot(4, (const uint8_t*)aabb, 24, 4); b.addStructSlot(5, pf5, 8, 8);   // ALIGNMENT FIX (IDA-proven, V205.2 verify @0xeba93c): part.f5 = murmur64A(IB) is an 8-byte 8-ALIGNED struct. vertexStream.f0/f4 same.
-        // part.f6 (52B) — present on EVERY official V205 vista mesh (oceanarium whale/coral/fish ALL have it); our cook used to
-        // DROP it (the ONLY structural diff between Meta's never-culling vista skinned meshes and our omnidroid). Layout decoded
-        // from the whale: {u32 52, u64 contentHash, u32 0, float[6] aabb(=part.f4), u32 16, u32 pad, u32 ibBytes}. The aabb is a
-        // SECOND bounds copy — emit it SCENE-SPANNING (= part.f4/root.f3) in case the device reads part.f6 (not part.f4) for the
-        // SKINNED-mesh cull bounds. HSR_NOPARTF6 disables.
-        if (std::getenv("HSR_PARTF6")) {   // OPT-IN: device-disproven (V205 ignores part.f6 — "not in mesh schema"; its tail = Meta shared-buffer offsets that don't map to our per-mesh format; adding it did NOT stop the omnidroid culling). Kept for experiments only.
+        // part.f6 (52B) — present on EVERY official V205 vista/skinned mesh (butterfly, whale, coral, fish). Decoded
+        // layout {u32 52, u64 ibHash, u32 0, float[6] aabb, u32 16, u32 f1Val, u32 f0Val}. The float[6] is the per-part
+        // MODEL-LOCAL AABB. The earlier "device-disproven" test was INVALID: it wrote the ±1e5 scene-spanning aabb (the
+        // pre-fix nocullBounds value), so f6 carried garbage bounds. Now that skinned meshes keep their real model-local
+        // aabb (see the nocullBounds skip above), f6 carries the CORRECT model-local AABB — exactly like the official
+        // butterfly (decoded f6 aabb = [-0.091,-0.005,-0.074, 0.091,0.008,0.071] = its model-local extent). The device
+        // reads this per-part model-local bound to seed the SKINNED cull (it can't use the per-frame skeleton sanely
+        // without it). DEFAULT ON for skinned; HSR_NOPARTF6 disables for A/B. [[project_hsr_ondevice_rendertrace]]
+        if (skinned && !std::getenv("HSR_NOPARTF6")) {
             uint8_t partF6[52]; memset(partF6, 0, 52);
             uint32_t f6sz = 52, f6c = 16, f6ib = (uint32_t)p.ib.size();
-            memcpy(partF6, &f6sz, 4); memcpy(partF6 + 4, &ibH, 8); memcpy(partF6 + 16, (const uint8_t*)aabb, 24);
+            memcpy(partF6, &f6sz, 4); memcpy(partF6 + 4, &ibH, 8); memcpy(partF6 + 16, (const uint8_t*)aabb, 24);  // aabb = model-local (skinned)
             memcpy(partF6 + 40, &f6c, 4); memcpy(partF6 + 48, &f6ib, 4);
             b.addStructSlot(6, partF6, 52, 4);
         }
@@ -2062,22 +2099,67 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // skeleton bounds span the scene → the frustum/occlusion cull can never drop it (the skin-path analogue of the
             // HSR_NOCULL mesh bounds). The anchor weights NO vertex (it's absent from the palette/f2/markers), so the skinning
             // and the device MeshDefinition verifier are unaffected. HSR_NOSKELANCHOR disables it.
-            const int   anchorJ = std::getenv("HSR_SKELANCHOR") ? 1 : 0;   // DEFAULT OFF: device-proven the skinned cull bounds come from the SKINNED VERTICES (palette joints), not the skeleton joints — an anchor joint that weights no vertex does NOTHING (omnidroid still culled). Kept opt-in only.
+            // SKINNED CULL FIX — DEVICE-PROVEN, PURE COOK (works UNROOTED): the device builds a skinned mesh's
+            // cull bound from its JOINT POSITIONS (not vertex extents — that's why every ±1e5-vertex attempt failed).
+            // Append 6 STATIC anchor joints at the ±C axis extremes (child of root): the joint-position AABB then spans
+            // ±C SYMMETRICALLY around the mesh, enclosing the player, so the frustum/occlusion cull can never drop it
+            // from ANY angle. (A single far anchor extended the bound but only one way -> still clipped from the back;
+            // 6 symmetric anchors fix it.) Each anchor gets one bounds vertex (see encodeRendMeshParts) so it's counted
+            // in the per-joint loop. C is under the device's 150000 far-clip exclusion even after the ~1.5x root xform.
+            const int   nAnch = std::getenv("HSR_NOSKELANCHOR") ? 0 : 6;   // HSR_NOSKELANCHOR disables
+            const float AC    = 50000.f;
+            const float anchOff[6][3] = { {AC,0,0},{-AC,0,0},{0,AC,0},{0,-AC,0},{0,0,AC},{0,0,-AC} };
             const int   njReal  = m.hzJointCount;
-            const int   nj0  = njReal + anchorJ;            // joint count INCLUDING the bounds anchor — skel + clip BOTH use this
-            const int   nf0  = m.hzFrames;
+            const int   nj0  = njReal + nAnch;              // joint count INCLUDING the 6 bounds anchors — skel + clip BOTH use this
+            // REPEAT loop seam (GROUND TRUTH = the renderer's OPA/glTF playback, opa_loader.h sampleNodeTRS:
+            // `f = fmod(t*fps, nFrames); i1 = (i0+1<nFrames)?i0+1:0` — ALL N frames are distinct and frame[N-1]
+            // INTERPOLATES back to frame[0] over one frame-step = REPEAT). The device's ACL clip is inclusive
+            // [0,(N-1)/fps], so a plain N-frame clip ends AT frame[N-1] and the device's loop wraps frame[N-1]->frame[0]
+            // INSTANTLY (no interpolation step) = the "backward fast" snap the user saw. FIX: append a copy of frame 0 as
+            // the final clip frame so the device interpolates frame[N-1]->frame[0] over a real frame-step = smooth REPEAT,
+            // exactly like the renderer. HSR_NOLOOPWRAP disables.
+            const int   nfSrc   = m.hzFrames;
+            // How far does the clip END drift from its START? (max per-joint local translation delta.) Large => a
+            // ONE-WAY motion (car/train fly-across); ~0 => an in-place spin/door that returns to its start.
+            float endDrift = 0.f;
+            if (nfSrc > 1 && (int)m.hzTrsLocal.size() >= nfSrc*njReal*10) {
+                const float* d0 = &m.hzTrsLocal[0];
+                const float* dL = &m.hzTrsLocal[(size_t)(nfSrc-1)*njReal*10];
+                for (int j=0;j<njReal;j++) for (int c=4;c<7;c++){ float d=d0[j*10+c]-dL[j*10+c]; if(d<0)d=-d; if(d>endDrift)endDrift=d; }
+            }
+            // The REPEAT seam (append a copy of frame 0 so the device INTERPOLATES the wrap) is smooth ONLY when
+            // end~=start: the interpolated wrap is then imperceptible. For a ONE-WAY motion (end drifts far) that
+            // same interpolation is a VISIBLE multi-frame BACKWARD SLIDE on the 90fps device ("speed backward
+            // quickly", train/cars) — whereas a plain clip (no seam) wraps end->start in a SINGLE frame = instant
+            // teleport reset = continuous traffic, matching the desktop renderer's near-instant 1-frame fmod wrap
+            // (it lerps frame[N-1]->frame[0] over one frame-step, ~33ms = 1-2 frames at 30-60fps = a blink). So:
+            // seam for in-place spins/doors, teleport for one-way fly-across. Threshold 5 units cleanly splits
+            // (appliances/doors ~0.18 vs cars/train ~336). HSR_FORCELOOPWRAP overrides (always seam).
+            const bool  oneWay  = endDrift > 5.0f && !std::getenv("HSR_FORCELOOPWRAP");
+            const bool  loopWrap = !std::getenv("HSR_NOLOOPWRAP") && nfSrc > 1 && !oneWay;
+            const int   nf0  = nfSrc + (loopWrap ? 1 : 0);  // +1 = appended copy of frame 0 (the REPEAT seam step)
             const float fps0 = m.hzFps;
             // clip duration (seconds) — preserved across every subsample so playback speed never changes.
             const float dur  = (fps0 > 1e-6f && nf0 > 1) ? (float)(nf0 - 1) / fps0 : 0.f;
             std::vector<int> parentsA(m.hzParents.begin(), m.hzParents.begin() + njReal);
-            if (anchorJ) parentsA.push_back(0);             // anchor parented to root joint 0
-            std::vector<float> trs0((size_t)nf0 * nj0 * 10);   // FULL-res source clip, augmented with the anchor's static FAR track
+            for (int k = 0; k < nAnch; ++k) parentsA.push_back(0);   // each anchor parented to root joint 0
+            std::vector<float> trs0((size_t)nf0 * nj0 * 10);   // FULL-res source clip (+REPEAT seam frame), augmented with the 6 static FAR anchor tracks
             for (int f = 0; f < nf0; ++f) {
-                std::memcpy(&trs0[(size_t)f*nj0*10], &m.hzTrsLocal[(size_t)f*njReal*10], (size_t)njReal*10*sizeof(float));
-                if (anchorJ) { float* a = &trs0[((size_t)f*nj0 + njReal)*10];   // cook layout per joint = {qx,qy,qz,qw, t3, s3}
-                    a[0]=0;a[1]=0;a[2]=0;a[3]=1;            // identity quat (xyzw)
-                    a[4]=1.0e5f;a[5]=0;a[6]=0;              // FAR translation (local to root) → skeleton bound spans 1e5
-                    a[7]=1;a[8]=1;a[9]=1; }                 // unit scale
+                int src = (loopWrap && f == nf0 - 1) ? 0 : f;   // appended final frame == frame 0 -> the device interpolates the REPEAT wrap smoothly
+                std::memcpy(&trs0[(size_t)f*nj0*10], &m.hzTrsLocal[(size_t)src*njReal*10], (size_t)njReal*10*sizeof(float));
+                for (int k = 0; k < nAnch; ++k) { float* a = &trs0[((size_t)f*nj0 + njReal + k)*10];   // cook layout per joint = {qx,qy,qz,qw, t3, s3}
+                    a[0]=0;a[1]=0;a[2]=0;a[3]=1;                       // identity quat (xyzw)
+                    a[4]=anchOff[k][0];a[5]=anchOff[k][1];a[6]=anchOff[k][2];   // FAR static translation = the k-th ±C axis extreme
+                    a[7]=1;a[8]=1;a[9]=1; }                            // unit scale
+            }
+            // LOOPDBG: how far does the source END from its START? (root + max joint local-pos delta). Large => the
+            // source is a ONE-WAY motion (fly-across), so REPEAT inherently zips back; small => seamless circuit.
+            if (std::getenv("HSR_VERBOSE") && nfSrc > 1 && (int)m.hzTrsLocal.size() >= nfSrc*njReal*10) {
+                const float* f0 = &m.hzTrsLocal[0];
+                const float* fL = &m.hzTrsLocal[(size_t)(nfSrc-1)*njReal*10];
+                fprintf(stderr,"[LOOPDBG] '%s' nfSrc=%d root0=(%.2f,%.2f,%.2f) rootLast=(%.2f,%.2f,%.2f) endDrift=%.3f oneWay=%d loop=%s\n",
+                        m.name.c_str(), nfSrc, f0[4],f0[5],f0[6], fL[4],fL[5],fL[6], endDrift, (int)oneWay,
+                        oneWay ? "TELEPORT" : (loopWrap ? "SEAM" : "none"));
             }
             int    nf   = nf0;
             float  fps  = fps0;
@@ -2161,15 +2243,21 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 jt.scale = m.hzJointScale[j];
                 joints.push_back(jt);
             }
-            // FAR bounds-anchor joint (matches the clip's appended track at index njReal) → skeleton bounds span 1e5 so the
-            // skinned mesh is never frustum/occlusion-culled. NOT weighted by any vertex (absent from palette/f2). MUST match
-            // the clip's joint count (nj0) or the device skin build rejects the mesh — both gate on the SAME env var.
-            if (std::getenv("HSR_SKELANCHOR")) {
-                HzJoint a; a.parent = 0; a.name = "bounds_anchor";
-                a.pos[0]=1.0e5f; a.pos[1]=0; a.pos[2]=0;
-                a.quat[0]=1; a.quat[1]=0; a.quat[2]=0; a.quat[3]=0;   // encodeHzSkel writes (w,x,y,z) → identity = (1,0,0,0)
-                a.scale=1;
-                joints.push_back(a);
+            // 6 FAR bounds-anchor joints (match the clip's appended tracks at njReal..njReal+5) → the device's
+            // joint-POSITION skinned cull bound spans ±C SYMMETRICALLY → never frustum/occlusion-culled from any angle.
+            // Each gets ONE bounds vertex (encodeRendMeshParts) so it's counted in the per-joint loop. MUST match the
+            // clip's joint count (nj0) AND the jointIds palette order — all three gate on the SAME env var + same names.
+            if (!std::getenv("HSR_NOSKELANCHOR")) {
+                const float AC = 50000.f;
+                const float anchOff[6][3] = { {AC,0,0},{-AC,0,0},{0,AC,0},{0,-AC,0},{0,0,AC},{0,0,-AC} };
+                for (int k = 0; k < 6; ++k) {
+                    HzJoint a; a.parent = 0;
+                    char nm[20]; snprintf(nm, sizeof nm, "bounds_anchor_%d", k); a.name = nm;
+                    a.pos[0]=anchOff[k][0]; a.pos[1]=anchOff[k][1]; a.pos[2]=anchOff[k][2];   // FAR bind = the k-th ±C axis extreme (matches the clip track)
+                    a.quat[0]=1; a.quat[1]=0; a.quat[2]=0; a.quat[3]=0;   // encodeHzSkel writes (w,x,y,z) → identity = (1,0,0,0)
+                    a.scale=1;
+                    joints.push_back(a);
+                }
             }
             // SHARE one skeleton + one anim across all meshes that use the SAME armature (the omnidroid body + shield are
             // the same skin[0] -> identical encoded skel+anim). GROUND TRUTH: nuxd's prism_wave + motes both reference the
@@ -2210,7 +2298,17 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     // so multiple clips collide in the device animation registry -> std::length_error. Patch THIS shipped copy's
                     // name to a unique "Take NNN"; dedup below stays on the original constant-name motion bytes.
                     auto animShip = anim;
-                    if (animShip.size() >= 40) { char tk[9]; snprintf(tk, sizeof tk, "Take %03zu", animPool.size()); std::memcpy(animShip.data()+32, tk, 8); }
+                    // LOOP FIX (V205 RE, SampleAnimClipNode): the device LOOPS a clip only when it's the default take
+                    // "Take 001" (WrapMode!=3); a non-default take name => play-once => the "backward snap" at reset.
+                    // The cook USED to rename each clip to a unique "Take NNN" to dodge a registry-collision crash, but
+                    // that broke looping. Official envs keep ALL clips "Take 001" (distinct asset PATHS avoid collision —
+                    // which the cook also has: animclipN). Default = "Take 001" (loops); HSR_UNIQUETAKE restores the old
+                    // unique names if the collision crash returns.
+                    if (animShip.size() >= 40) {
+                        char tk[9];
+                        if (std::getenv("HSR_UNIQUETAKE")) { snprintf(tk, sizeof tk, "Take %03zu", animPool.size()); std::memcpy(animShip.data()+32, tk, 8); }
+                        else std::memcpy(animShip.data()+32, "Take 001", 8);   // default take => device loops it
+                    }
                     assets.push_back({ pAnim, anK.tgt, animShip, anK, TYPE_HZAN, TYPE_ANIM });
                     animPool.push_back({ anim, anK });
                 }
@@ -2454,7 +2552,14 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                         j<(int)m.hzJointScale.size()?m.hzJointScale[j]:0.f);
         }
         std::vector<uint32_t> jointIds;   // ROOT.f2 joint-binding table = murmur3(joint name) per skeleton joint (m###.skel order)
-        if (useHz) for (int j = 0; j < m.hzJointCount; ++j) { char jn[24]; snprintf(jn, sizeof jn, "joint_%d", j); jointIds.push_back(murmur3_x86_32(jn, strlen(jn), 0)); }
+        if (useHz) {
+            for (int j = 0; j < m.hzJointCount; ++j) { char jn[24]; snprintf(jn, sizeof jn, "joint_%d", j); jointIds.push_back(murmur3_x86_32(jn, strlen(jn), 0)); }
+            // The cook appends 6 STATIC bounds-anchor joints (skel + clip, indices m.hzJointCount..+5) when !HSR_NOSKELANCHOR;
+            // their ids MUST be in this palette table (same order/names as the skeleton joints) so the 6 bounds verts
+            // (one per anchor, in encodeRendMeshParts) map to them. MUST match the nAnch gate + names above.
+            if (!std::getenv("HSR_NOSKELANCHOR"))
+                for (int k = 0; k < 6; ++k) { char nm[20]; snprintf(nm, sizeof nm, "bounds_anchor_%d", k); jointIds.push_back(murmur3_x86_32(nm, strlen(nm), 0)); }
+        }
         std::vector<float> dbgPos; const std::vector<float>* staticPos = &m.positions;
         if (std::getenv("HSR_DROIDFRONT") && m.hzJointCount > 0) {   // diag: shrink+move the droid right in front of spawn (isolate position/cull vs mesh-reject)
             float c[3]={0,0,0}; size_t np=m.positions.size()/3;

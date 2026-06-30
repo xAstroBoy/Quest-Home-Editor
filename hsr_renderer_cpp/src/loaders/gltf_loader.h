@@ -1250,6 +1250,49 @@ public:
             for (int j=0;j<nj;++j) if (e.parents[j]<0){ e.jointPos[j*3]-=cen[0]; e.jointPos[j*3+1]-=cen[1]; e.jointPos[j*3+2]-=cen[2]; }
             for (int f=0;f<frames;++f) for (int j=0;j<nj;++j) if (e.parents[j]<0){ float* o=&e.trsLocal[((size_t)f*nj+j)*10]; o[4]-=cen[0]; o[5]-=cen[1]; o[6]-=cen[2]; }
         }
+        // ── BUTTERFLY-PARITY (default ON): model-local verts + IDENTITY root bind ───────────────
+        //  DEVICE BUG (confirmed via the render-trace MCP): animated meshes disappear because the
+        //  device computes the skinned mesh's CULL bounds from per-joint vertex extents × the
+        //  ANIMATED joint world matrices. With restPos in WORLD space and the ROOT joint bind = the
+        //  full world transform (the worldM root above + the world-space rest pose), those per-joint
+        //  boxes land ~at the entity world position AND swing with the animation → the cull AABB is
+        //  both MISPLACED (~25m off) and OSCILLATING (±several m/frame) → it leaves the stereo frustum
+        //  → FRUSTUM-CULL → flicker/vanish. Official meshes (e.g. nuxd, the vista butterfly) never do
+        //  this: their verts are MODEL-LOCAL with an IDENTITY root bind and the world placement is
+        //  carried entirely by the animation clip. So normalise to that exact shape: transform restPos
+        //  by inverse(root world-bind) → model-local (everything relative to the single root), and zero
+        //  the root joint's bind TRS to identity. Children already store parent-JOINT-relative local
+        //  binds, and trsLocal is untouched (the root still streams its world transform per frame), so
+        //  the rendered pose is byte-identical — only the cull bounds become model-local-tight and
+        //  correctly placed. Same fix as opa_loader::extractHzAnim. HSR_HZWORLDROOT reverts for A/B.
+        if (!std::getenv("HSR_HZWORLDROOT") && !std::getenv("HSR_HZCENTER")) {
+            int rj = -1; for (int j = 0; j < nj; ++j) if (e.parents[j] < 0) { rj = j; break; }
+            if (rj >= 0) {
+                auto invAff = [](const float* m, float* o){
+                    float a00=m[0],a01=m[4],a02=m[8], a10=m[1],a11=m[5],a12=m[9], a20=m[2],a21=m[6],a22=m[10];
+                    float det=a00*(a11*a22-a12*a21)-a01*(a10*a22-a12*a20)+a02*(a10*a21-a11*a20);
+                    float id=(det>1e-12f||det<-1e-12f)?1.f/det:0.f;
+                    float i00=(a11*a22-a12*a21)*id,i01=(a02*a21-a01*a22)*id,i02=(a01*a12-a02*a11)*id;
+                    float i10=(a12*a20-a10*a22)*id,i11=(a00*a22-a02*a20)*id,i12=(a02*a10-a00*a12)*id;
+                    float i20=(a10*a21-a11*a20)*id,i21=(a01*a20-a00*a21)*id,i22=(a00*a11-a01*a10)*id;
+                    o[0]=i00;o[1]=i10;o[2]=i20;o[3]=0; o[4]=i01;o[5]=i11;o[6]=i21;o[7]=0; o[8]=i02;o[9]=i12;o[10]=i22;o[11]=0;
+                    float tx=m[12],ty=m[13],tz=m[14];
+                    o[12]=-(i00*tx+i01*ty+i02*tz); o[13]=-(i10*tx+i11*ty+i12*tz); o[14]=-(i20*tx+i21*ty+i22*tz); o[15]=1; };
+                float q[4]={e.jointQuat[rj*4+1],e.jointQuat[rj*4+2],e.jointQuat[rj*4+3],e.jointQuat[rj*4]}; // wxyz->xyzw
+                float s3[3]={e.jointScale[rj],e.jointScale[rj],e.jointScale[rj]};
+                float Rw[16]; trsM(&e.jointPos[rj*3], q, s3, Rw);          // root world bind (rootless: local==world)
+                float Rwi[16]; invAff(Rw, Rwi);
+                for (size_t v=0; v+2<e.restPos.size(); v+=3){              // world rest -> model-local (root frame)
+                    float x=e.restPos[v],y=e.restPos[v+1],z=e.restPos[v+2];
+                    e.restPos[v]  =Rwi[0]*x+Rwi[4]*y+Rwi[8]*z +Rwi[12];
+                    e.restPos[v+1]=Rwi[1]*x+Rwi[5]*y+Rwi[9]*z +Rwi[13];
+                    e.restPos[v+2]=Rwi[2]*x+Rwi[6]*y+Rwi[10]*z+Rwi[14]; }
+                e.jointPos[rj*3]=0; e.jointPos[rj*3+1]=0; e.jointPos[rj*3+2]=0;   // root bind = identity
+                e.jointQuat[rj*4]=1; e.jointQuat[rj*4+1]=0; e.jointQuat[rj*4+2]=0; e.jointQuat[rj*4+3]=0;
+                e.jointScale[rj]=1.f;
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[HZMODELLOCAL] mesh%d root j%d: verts->model-local + identity root bind (cull-bounds fix)\n",meshIdx,rj);
+            }
+        }
         // (No geometry perturbation: the verifier reject was the ROOT.f0 marker encoding — an empty vector where the
         // device wants a u16 scalar — NOT the geometry. Positions are free; use the exact centered rest pose.)
         if (std::getenv("HSR_HZDBG")) {
