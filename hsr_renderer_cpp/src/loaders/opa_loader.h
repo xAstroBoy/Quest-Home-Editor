@@ -393,6 +393,29 @@ public:
         for(int f=0;f<nf;f++)for(int j=0;j<nj;j++){ const float* m=clip.mats.data()+((size_t)f*nj+j)*16;
             float q[4],t[3],s[3]; matTrs(m,q,t,s); float* o=e.trsLocal.data()+((size_t)f*nj+j)*10;
             o[0]=q[0];o[1]=q[1];o[2]=q[2];o[3]=q[3]; o[4]=t[0];o[5]=t[1];o[6]=t[2]; o[7]=s[0];o[8]=s[1];o[9]=s[2]; }
+        // BUTTERFLY-PARITY (cook-only, renderer unaffected): transform restPos from world-bind space
+        // (vertices at entity world position E) to model-local (near origin), matching the official
+        // vista butterfly: RENDMESH verts are model-local, root bind = identity, ACL root TRS = world
+        // trajectory (for us = E, constant). The device computes skeleton-derived cull bounds by
+        // applying each joint's current world matrix to its per-joint vertex extent; world-bind verts
+        // cause a double-transform (bw[j] applied to verts already at E → extent at 2E), while
+        // model-local verts transform correctly (bw[j] * near-origin ≈ E). extractNodeRigidHzAnim
+        // already uses this pattern (restPos = node-LOCAL, bind = identity) and was device-proven.
+        if (nj > 0 && have[0]) {
+            float ib0[16]; invAff(bw.data(), ib0);   // invBind for clip joint 0 = inverse(entity world matrix E)
+            for (size_t v = 0; v+2 < e.restPos.size(); v += 3) {
+                float x=e.restPos[v], y=e.restPos[v+1], z=e.restPos[v+2];
+                e.restPos[v]   = ib0[0]*x+ib0[4]*y+ib0[8]*z +ib0[12];
+                e.restPos[v+1] = ib0[1]*x+ib0[5]*y+ib0[9]*z +ib0[13];
+                e.restPos[v+2] = ib0[2]*x+ib0[6]*y+ib0[10]*z+ib0[14]; }
+            // Root bind TRS = identity: T=0, Q=(w=1,x=0,y=0,z=0), S=1.
+            // Child joints keep their existing LOCAL bind TRS (= E^{-1}*bw[j], unchanged).
+            // ACL trsLocal for root keeps its world TRS (= E + anim) — the world "trajectory"
+            // is already encoded in trsLocal[f][0], exactly as in the butterfly ACL clip.
+            e.jointPos[0]=0.f;e.jointPos[1]=0.f;e.jointPos[2]=0.f;
+            e.jointQuat[0]=1.f;e.jointQuat[1]=0.f;e.jointQuat[2]=0.f;e.jointQuat[3]=0.f;
+            e.jointScale[0]=1.f;
+        }
         return e;
     }
 
@@ -408,8 +431,27 @@ public:
         const AnimRec* ar=nullptr; for (auto& a : animRecs) if ((int)a.meshIdx==meshIdx){ ar=&a; break; }
         if (!ar || ar->basePos.size() < 9) return e;
         uint32_t node = ar->nodeIdx;
-        float clipDur = animDuration(); if (clipDur <= 0.f) return e;
-        int NF = animMaxFrames > 64 ? 64 : animMaxFrames; if (NF < 2) return e;
+        // PER-NODE loop period — THE faithful fix (matches the renderer; user-confirmed correct). The renderer loops
+        // each node track at its OWN nFrames (sampleTrack fmod), so a node's motion repeats every max(effFrames) over
+        // its own track + animating ancestors. The GLOBAL animMaxFrames (longest track in the scene = 577 here) is
+        // WRONG for a shorter-period node: e.g. cyberhome car_strip_02 has a 436-frame period but was sampled over
+        // the 577-frame global duration => 1.32 periods => the world position WRAPS mid-clip (sawtooth) => the device
+        // loop reset jumps MID-TILE = "speed backward". Sampling over the node's OWN period => exactly one loop =>
+        // frame[last]≈frame[0] => seamless. (HSR_NOPERNODELOOP restores the old global behavior.)
+        int nodeEff = 0;
+        if (!std::getenv("HSR_NOPERNODELOOP"))
+            for (int g=0, n=(int)node; n>=0 && n<(int)animNodes.size() && g<32; n=animNodes[n].parent, ++g) {
+                auto it=nodeAnim.find(animNodes[n].name);
+                if(it!=nodeAnim.end()){ const NodeTracks&q=it->second;
+                    nodeEff=std::max(nodeEff, std::max(q.t.effFrames, std::max(q.r.effFrames, q.s.effFrames))); }
+            }
+        if (nodeEff < 2) nodeEff = animMaxFrames;   // fallback: no per-node track found -> old global behavior
+        float clipDur = (animFps > 0.f) ? (float)nodeEff / animFps : animDuration(); if (clipDur <= 0.f) return e;
+        // ALL frames: bake the node path at its FULL native resolution (one sample per source track frame). 1-joint
+        // node-rigid clips are tiny, so even hundreds of frames cost little; the clip-section byte budget subsamples
+        // only if something truly enormous shows up. (Was capped at 64 = coarse on long paths.) HSR_NODECAP overrides.
+        int cap = 4096; if (const char* e2=std::getenv("HSR_NODECAP")) { int c=atoi(e2); if (c>1) cap=c; }
+        int NF = nodeEff > cap ? cap : nodeEff; if (NF < 2) return e;
         auto matTrs=[](const float* m,float* q,float* t,float* s){
             t[0]=m[12];t[1]=m[13];t[2]=m[14];
             s[0]=std::sqrt(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]); s[1]=std::sqrt(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]); s[2]=std::sqrt(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]);
@@ -421,7 +463,12 @@ public:
             else if(r4>r8){float S=std::sqrt(1+r4-r0-r8)*2;q[3]=(r6-r2)/S;q[0]=(r3+r1)/S;q[1]=0.25f*S;q[2]=(r7+r5)/S;}
             else{float S=std::sqrt(1+r8-r0-r4)*2;q[3]=(r1-r3)/S;q[0]=(r6+r2)/S;q[1]=(r7+r5)/S;q[2]=0.25f*S;} };
         std::vector<float> trs((size_t)NF*10); float o0[3]={0,0,0}, maxd=0.f;
-        for (int f=0; f<NF; f++) { evalAnimNodes(clipDur * (float)f / (float)(NF-1));
+        // EXCLUSIVE endpoint: sample [0, clipDur) so the frames march MONOTONICALLY through one period (0 -> just
+        // before the wrap) with NO interior wrap. Inclusive [0,clipDur] put the last frame back ON the wrap target
+        // (= frame 0), hiding the wrap at frame[NF-2]->frame[NF-1] INSIDE the clip => the device interpolated that
+        // backward step => "speed backward". With exclusive, the ONLY wrap is the clip-loop (frame[NF-1]->frame[0]),
+        // which the device's time fract-wrap does INSTANTLY (teleport) = the seamless tile-seam crossing.
+        for (int f=0; f<NF; f++) { evalAnimNodes(clipDur * (float)f / (float)NF);
             Mat4 w = (node < nodeWorldAnim.size()) ? nodeWorldAnim[node] : identity();
             float q[4],t[3],s[3]; matTrs(w.m, q, t, s);
             float* p=trs.data()+(size_t)f*10; p[0]=q[0];p[1]=q[1];p[2]=q[2];p[3]=q[3]; p[4]=t[0];p[5]=t[1];p[6]=t[2]; p[7]=s[0];p[8]=s[1];p[9]=s[2];
@@ -429,12 +476,22 @@ public:
             else { float dx=t[0]-o0[0],dy=t[1]-o0[1],dz=t[2]-o0[2]; float d=std::sqrt(dx*dx+dy*dy+dz*dz); if(d>maxd)maxd=d; } }
         animate(0.f);   // restore rest pose (geometry bake reads the renderer's GPU model, this just resets the loader)
         if (maxd < 0.01f) return e;   // node doesn't TRANSLATE → leave pure spins to the getTime() Rodrigues path
+        if (std::getenv("HSR_VERBOSE")) {
+            std::string chain; int nodeEff=0;
+            for (int g=0,n=(int)node; n>=0 && n<(int)animNodes.size() && g<32; n=animNodes[n].parent,++g) {
+                auto it=nodeAnim.find(animNodes[n].name); int te=0,tn=0;
+                if(it!=nodeAnim.end()){ const NodeTracks&q=it->second;
+                    te=std::max(q.t.effFrames,std::max(q.r.effFrames,q.s.effFrames)); tn=std::max(q.t.nFrames,std::max(q.r.nFrames,q.s.nFrames)); }
+                chain += animNodes[n].name+"(n"+std::to_string(tn)+"/e"+std::to_string(te)+") "; nodeEff=std::max(nodeEff,te);
+            }
+            fprintf(stderr,"[NODEANIM] mesh%d node=%u period=%d(nodeEff) globalMax=%d maxd=%.0f chain: %s\n", meshIdx, node, nodeEff, animMaxFrames, maxd, chain.c_str());
+        }
         size_t nv = ar->basePos.size()/3;
         // fps over the DOWNSAMPLED frame count so the device loop = the REAL clipDur (the OPA analogue of the
         // 70274aa warp-speed fix). NF<=64 frames are sampled INCLUSIVELY over [0,clipDur] (line ~414) = NF-1
         // intervals, so fps MUST be (NF-1)/clipDur, NOT the global animFps. With animFps a >64-frame path played
         // in (NF-1)/animFps s (e.g. 63/30=2.1s for a real 10s path = ~5x too fast). clipDur>0 + NF>=2 hold above.
-        e.jointCount=1; e.frameCount=NF; e.fps = (float)(NF-1) / clipDur;
+        e.jointCount=1; e.frameCount=NF; e.fps = (float)NF / clipDur;   // NF frames span [0,clipDur) (exclusive) -> period = NF/fps = clipDur
         e.parents={-1}; e.jointPos={0,0,0}; e.jointQuat={1,0,0,0}; e.jointScale={1};   // identity bind
         e.restPos = ar->basePos;   // node-LOCAL verts (the clip's WORLD transform places them)
         e.boneIdx.assign(nv*4,0); e.boneWgt.assign(nv*4,0); for (size_t v=0;v<nv;v++) e.boneWgt[v*4]=255;

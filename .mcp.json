@@ -12,6 +12,11 @@
       "command": "python",
       "args": ["d:\\Quest Stuff\\Restore Old Envs\\magisk_quest_ctl\\quest_ctl_mcp.py"],
       "env": { "QUESTCTL_SERIAL": "192.168.1.35:5555", "ADB": "C:\\Android\\platform-tools\\adb.exe" }
+    },
+    "hsr-world": {
+      "command": "python",
+      "args": ["d:\\Quest Stuff\\Restore Old Envs\\_hsr_world_mcp\\hsr_world_mcp.py"],
+      "env": { "QUEST_SERIAL": "2G0YC5ZG5P09DS", "HSR_RT_PORT": "27042" }
     }
   }
 }
