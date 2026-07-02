@@ -12,6 +12,8 @@
 #include "cook/hsl_cooker.h"
 #include "io/gltf_export.h"          // Blender round-trip: env -> glTF 2.0 project
 #include "ui/ui_core.h"
+#include "stb_image.h"               // decode PNG/JPG for "set mesh/skybox texture from image"
+#include "stb_image_write.h"         // encode PNG for "export mesh/skybox texture"
 #ifdef _WIN32
   #ifndef NOMINMAX
   #define NOMINMAX
@@ -19,6 +21,8 @@
   #ifndef WIN32_LEAN_AND_MEAN
   #define WIN32_LEAN_AND_MEAN
   #endif
+  #include <winsock2.h>           // MUST precede windows.h (else windows.h pulls winsock v1 -> redefinition); for the Quest-bridge mirror socket
+  #include <ws2tcpip.h>
   #include <windows.h>
   #include <shobjidl.h>            // IFileOpenDialog — the full Explorer folder picker for the Blender export path
 #endif
@@ -31,6 +35,7 @@
 #include <algorithm>
 #include <limits>
 #include <thread>
+#include <chrono>
 #include <atomic>
 #include <mutex>
 
@@ -45,6 +50,45 @@ struct Editor {
     float* animScrub    = nullptr;
     float  animDuration = 0.0f;
     bool   animPlaying  = true;        // the editor OWNS the playback clock -> the timeline playhead advances LIVE
+    // ── QUEST TIMELINE MIRROR: pause/scrub/speed here also drive the on-device bridge (adb forward tcp:27042)
+    //    so the headset freezes/scrubs to the SAME instant. Play/Pause -> `world 1/0`; slider -> `world set <t>`.
+    bool   syncQuest   = false;
+    float  questSpeed  = 1.0f;
+    float  lastSentT   = -1.f;
+    bool   lastSentPlay = true;
+    double lastSendMs  = 0.0;
+    float  questTimeNow = -1.f;         // live device globalUniforms.time (buf+596), polled from the bridge `gtime`
+    double lastQueryMs  = 0.0;
+    // Fire-and-forget a bridge command to 127.0.0.1:27042 (adb forward). Detached so the UI never stalls.
+    void sendQuestCmd(std::string cmd) {
+        std::thread([cmd]{
+#ifdef _WIN32
+            SOCKET s = socket(AF_INET, SOCK_STREAM, 0); if (s == INVALID_SOCKET) return;
+            DWORD to = 250; setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&to, sizeof to); setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&to, sizeof to);
+            sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(27042); a.sin_addr.s_addr = inet_addr("127.0.0.1");
+            if (connect(s, (sockaddr*)&a, sizeof a) == 0) { std::string c = cmd + "\n"; send(s, c.c_str(), (int)c.size(), 0); char rb[64]; recv(s, rb, sizeof rb, 0); }
+            closesocket(s);
+#endif
+        }).detach();
+    }
+    // Poll the device's LIVE clock so the timeline can show "desktop t  vs  Quest t" side-by-side (verify sync).
+    // Detached (300ms timeout); parses `gtime` reply "time(buf+596)=<sec>" into questTimeNow.
+    void pollQuestTime() {
+        std::thread([this]{
+#ifdef _WIN32
+            SOCKET s = socket(AF_INET, SOCK_STREAM, 0); if (s == INVALID_SOCKET) return;
+            DWORD to = 300; setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&to, sizeof to); setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&to, sizeof to);
+            sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(27042); a.sin_addr.s_addr = inet_addr("127.0.0.1");
+            if (connect(s, (sockaddr*)&a, sizeof a) == 0) {
+                const char* c = "gtime\n"; send(s, c, 6, 0);
+                char rb[512]; int n = recv(s, rb, sizeof rb - 1, 0);
+                if (n > 0) { rb[n] = 0; const char* p = strstr(rb, "buf+596)="); if (p) questTimeNow = (float)atof(p + 9); }
+            }
+            closesocket(s);
+#endif
+        }).detach();
+    }
+    double nowMs() { return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     std::vector<MeshData>* sceneMeshes = nullptr;                                  // CPU geometry for Cook
     std::function<std::vector<float>(int,int,int&)> vatBaker;                      // V79 VAT bake hook
     std::function<void(int,int,hslcook::ExportMesh&)> hzAnimExtractor;             // V79 HZANIM skeletal hook
@@ -65,6 +109,179 @@ struct Editor {
     void selectOne(int i){ sel.clear(); if (i>=0) sel.push_back(i); selected=i; r->selectedMesh=i; }
     void toggleSel(int i){ if (i<0) return; for (size_t k=0;k<sel.size();++k) if (sel[k]==i){ sel.erase(sel.begin()+k); selected = sel.empty()?-1:sel.back(); r->selectedMesh=selected; return; } sel.push_back(i); selected=i; r->selectedMesh=i; }
     void deselectAll(){ sel.clear(); selected=-1; r->selectedMesh=-1; }
+
+    // ── mesh DELETE (toggle) — drop the selected mesh(es) from the render AND the cook (non-destructive: the mesh
+    //    stays in gpuMeshes so indices/undo stay valid; persisted as a DELETED line in the .hsledit). Del again restores.
+    void toggleDeleteSelected(){
+        if (sel.empty() || !r) return;
+        bool anyLive=false; for (int m:sel) if (!r->isDeleted((size_t)m)) anyLive=true;
+        for (int m:sel) r->setDeleted((size_t)m, anyLive);
+        setStatus(anyLive ? ("Deleted "+std::to_string(sel.size())+" mesh(es) — removed from render + cook (Del again to restore)")
+                          : ("Restored "+std::to_string(sel.size())+" mesh(es)"));
+    }
+    // ── mesh DUPLICATE (Ctrl+D) — clone the selected mesh(es) into a fresh GPU mesh (its own buffers) offset in place,
+    //    so the copy can be moved/edited/cooked independently WITHOUT re-authoring geometry. Appends to sceneMeshes +
+    //    gpuMeshes; buildExportMeshes ships every mesh, so the clone cooks too.
+    void duplicateSelected(){
+        if (sel.empty() || !r || !sceneMeshes) return;
+        std::vector<int> src=sel; deselectAll(); std::vector<int> made;
+        for (int s : src) {
+            if (s<0 || s>=(int)sceneMeshes->size() || s>=(int)r->gpuMeshes.size()) continue;
+            MeshData cp = (*sceneMeshes)[(size_t)s];          // clone CPU mesh (geometry + textures + material flags)
+            cp.name = cp.name + " copy";
+            sceneMeshes->push_back(cp);
+            size_t ni = r->gpuMeshes.size();
+            r->uploadMesh(sceneMeshes->back());               // creates gpuMeshes[ni] with its own GPU buffers
+            if (r->gpuMeshes.size() != ni+1) continue;        // upload failed -> skip
+            VkGpuMesh& ng = r->gpuMeshes[ni];
+            const VkGpuMesh& og = r->gpuMeshes[(size_t)s];    // (both refs taken AFTER the push -> valid)
+            memcpy(ng.editT, og.editT, sizeof ng.editT); memcpy(ng.editR, og.editR, sizeof ng.editR); memcpy(ng.editS, og.editS, sizeof ng.editS);
+            ng.editT[0] += 0.5f; ng.editT[2] += 0.5f;         // offset so the copy is visible next to the original
+            recomputeModel(ng);
+            made.push_back((int)ni);
+        }
+        r->hiddenMeshes.resize(r->gpuMeshes.size(), false);   // keep the hide/delete bitsets sized to the grown list
+        r->deletedMeshes.resize(r->gpuMeshes.size(), false);
+        sel=made; selected=made.empty()?-1:made.back(); r->selectedMesh=selected; selItem=-1;
+        setStatus("Duplicated "+std::to_string(made.size())+" mesh(es) — move/edit/cook independently");
+    }
+
+    // ── TEXTURE edit: set a mesh's (e.g. the SKYBOX dome's) base texture from a PNG/JPG image, and export it back ──
+    // The decoded RGBA replaces md.texRGBA (what the COOK ships) AND live-re-uploads the GPU texture (preview). The
+    // source path is remembered (texOverride) so it re-applies on session load and cooks from a fresh open.
+    std::map<int,std::string> texOverride;
+    bool setMeshTexture(int mi, const std::string& path){
+        if(!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size()){ setStatus("set texture: bad mesh "+std::to_string(mi)); return false; }
+        FILE* f=fopen(path.c_str(),"rb"); if(!f){ setStatus("texture load FAILED (open): "+path); return false; }
+        fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+        std::vector<uint8_t> bytes((size_t)(sz>0?sz:0)); if(sz>0){ size_t rd=fread(bytes.data(),1,(size_t)sz,f); (void)rd; } fclose(f);
+        int w=0,h=0,n=0; unsigned char* px=stbi_load_from_memory(bytes.data(),(int)bytes.size(),&w,&h,&n,4);
+        if(!px){ setStatus("texture decode FAILED (PNG/JPG only): "+path); return false; }
+        MeshData& md=(*sceneMeshes)[mi];
+        md.texRGBA.assign(px, px+(size_t)w*h*4); md.texW=w; md.texH=h; md.hasTexture=true;
+        stbi_image_free(px);
+        bool ok = r->replaceMeshTexture((size_t)mi, *sceneMeshes);   // live preview re-upload + descriptor rebind
+        texOverride[mi]=path;
+        setStatus(ok ? ("Set texture ["+std::to_string(mi)+"] "+std::to_string(w)+"x"+std::to_string(h)+" from "+path+"  (previews + cooks)")
+                     : ("Texture set on CPU (will cook) but preview re-upload failed: "+path));
+        return true;
+    }
+    bool exportMeshTexture(int mi, const std::string& path){
+        if(!sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size()){ setStatus("export texture: bad mesh "+std::to_string(mi)); return false; }
+        const MeshData& md=(*sceneMeshes)[mi];
+        if(!md.hasTexture || md.texRGBA.size()<(size_t)md.texW*md.texH*4 || md.texW<1||md.texH<1){ setStatus("export texture: mesh "+std::to_string(mi)+" has none"); return false; }
+        int ok=stbi_write_png(path.c_str(), md.texW, md.texH, 4, md.texRGBA.data(), md.texW*4);
+        setStatus(ok ? ("Exported texture ["+std::to_string(mi)+"] "+std::to_string(md.texW)+"x"+std::to_string(md.texH)+" -> "+path)
+                     : ("texture export FAILED: "+path));
+        return ok!=0;
+    }
+    // re-apply saved texture overrides after a session load (so the swapped skybox/texture previews + cooks)
+    void applyTexOverrides(){ auto ov=texOverride; for(auto& kv:ov) setMeshTexture(kv.first, kv.second); }
+
+    // ── GENERAL SKYBOX color (works for ANY env): drives the renderer BACKGROUND (clearRGB) for the live preview and
+    //    persists in the session. skyColor[0] < 0 => "unset" (keep the env's own sky). The cook target is a
+    //    SkyboxPlatformComponent whose colorTexture is a solid-color (or image) texture — see project_hsr_v205_skybox_system.
+    float skyColor[3] = {-1.f,-1.f,-1.f};
+    bool skyColorSet() const { return skyColor[0] >= 0.f; }
+    // Set ONLY the background/skybox color (clearRGB). Does NOT touch any env mesh — the env's own dome/geometry
+    // stays exactly as authored; the skybox color is the SEPARATE background layer behind everything (cook target =
+    // a SkyboxPlatformComponent, see project_hsr_v205_skybox_system). General: applies to ANY env's background.
+    void setSkyColor(float rr,float gg,float bb){
+        skyColor[0]=rr; skyColor[1]=gg; skyColor[2]=bb;
+        if(r){ r->clearRGB[0]=rr; r->clearRGB[1]=gg; r->clearRGB[2]=bb; }
+        char b[112]; snprintf(b,sizeof b,"Skybox/background color = (%.3f, %.3f, %.3f) — background layer only, env meshes untouched",rr,gg,bb);
+        setStatus(b);
+    }
+    void clearSkyColor(){ skyColor[0]=skyColor[1]=skyColor[2]=-1.f; setStatus("Skybox color cleared"); }
+    // Optional SKYBOX IMAGE (equirect panorama) — cooked as the texture on a large inward sky sphere (general, any env).
+    std::vector<uint8_t> skyImageRGBA; int skyImageW=0, skyImageH=0; std::string skyImagePath;
+    bool setSkyImage(const std::string& path){
+        FILE* f=fopen(path.c_str(),"rb"); if(!f){ setStatus("skybox image FAILED (open): "+path); return false; }
+        fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+        std::vector<uint8_t> bytes((size_t)(sz>0?sz:0)); if(sz>0){ size_t rd=fread(bytes.data(),1,(size_t)sz,f); (void)rd; } fclose(f);
+        int w=0,h=0,n=0; unsigned char* px=stbi_load_from_memory(bytes.data(),(int)bytes.size(),&w,&h,&n,4);
+        if(!px){ setStatus("skybox image decode FAILED (PNG/JPG): "+path); return false; }
+        skyImageRGBA.assign(px,px+(size_t)w*h*4); skyImageW=w; skyImageH=h; stbi_image_free(px); skyImagePath=path;
+        previewSkybox();
+        setStatus("Skybox image set "+std::to_string(w)+"x"+std::to_string(h)+" (equirect) — previews + cooks onto a sky sphere");
+        return true;
+    }
+    void clearSkyImage(){ skyImageRGBA.clear(); skyImageW=skyImageH=0; skyImagePath.clear(); previewSkybox(); setStatus("Skybox image cleared"); }
+    // Skybox from an EXISTING TEXTURE — reuse any mesh's texture (e.g. the env's own sky dome, mesh 7) as the skybox,
+    // no external file needed. This is the "skybox could be a TEXTURE" path (vs an imported image or a flat color).
+    bool setSkyImageFromMesh(int mi){
+        if(!sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size()){ setStatus("skybox-from-texture: bad mesh "+std::to_string(mi)); return false; }
+        const MeshData& md=(*sceneMeshes)[mi];
+        if(!md.hasTexture || md.texRGBA.size()<(size_t)md.texW*md.texH*4 || md.texW<1||md.texH<1){ setStatus("mesh "+std::to_string(mi)+" has no texture to use as skybox"); return false; }
+        skyImageRGBA=md.texRGBA; skyImageW=md.texW; skyImageH=md.texH; skyImagePath="mesh:"+std::to_string(mi);
+        previewSkybox();
+        setStatus("Skybox = texture of mesh ["+std::to_string(mi)+"] "+std::to_string(md.texW)+"x"+std::to_string(md.texH)+" — previews + cooks onto a sky sphere");
+        return true;
+    }
+    // Export the CURRENT skybox texture (imported image / reused texture) to a PNG. "export skybox texture if any."
+    bool exportSkyImage(const std::string& path){
+        if(skyImageRGBA.size()<(size_t)skyImageW*skyImageH*4 || skyImageW<1||skyImageH<1){ setStatus("no skybox texture to export"); return false; }
+        int ok=stbi_write_png(path.c_str(), skyImageW, skyImageH, 4, skyImageRGBA.data(), skyImageW*4);
+        setStatus(ok?("Exported skybox texture "+std::to_string(skyImageW)+"x"+std::to_string(skyImageH)+" -> "+path):("skybox export FAILED: "+path));
+        return ok!=0;
+    }
+    bool skyboxSet() const { return skyColorSet() || !skyImageRGBA.empty(); }
+    // Build the GENERAL skybox mesh (a large inward-facing UV sphere with the solid color / equirect image) as an
+    // ExportMesh — appended to the cook so it ships as a NORMAL far mesh (behind everything; the 150000 farClip covers
+    // it; avoids the SkyboxPlatformComponent cubemap-black issue). Renders in preview too (it's a normal mesh).
+    void appendSkyboxMesh(std::vector<hslcook::ExportMesh>& ems){
+        if(!skyboxSet()) return;
+        using namespace hslcook; ExportMesh sky; sky.name="generated_skybox"; sky.doubleSided=true;
+        const int LAT=24, LON=48; const float R=8000.f; const float PI=3.14159265358979f;
+        for(int y=0;y<=LAT;y++){ float v=(float)y/LAT, th=v*PI;
+            for(int x=0;x<=LON;x++){ float u=(float)x/LON, ph=u*2.f*PI;
+                sky.positions.push_back(sinf(th)*cosf(ph)*R); sky.positions.push_back(cosf(th)*R); sky.positions.push_back(sinf(th)*sinf(ph)*R);
+                sky.uvs.push_back(u); sky.uvs.push_back(v); } }
+        for(int y=0;y<LAT;y++) for(int x=0;x<LON;x++){ uint32_t a=y*(LON+1)+x,b=a+1,c=a+(LON+1),d=c+1;
+            sky.indices.push_back(a); sky.indices.push_back(b); sky.indices.push_back(c);
+            sky.indices.push_back(b); sky.indices.push_back(d); sky.indices.push_back(c); }
+        if(!skyImageRGBA.empty()){ sky.rgba=skyImageRGBA; sky.w=skyImageW; sky.h=skyImageH; }
+        else { const int N=8; sky.w=N; sky.h=N; sky.rgba.resize((size_t)N*N*4);
+            uint8_t cr=(uint8_t)(skyColor[0]*255.f+0.5f),cg=(uint8_t)(skyColor[1]*255.f+0.5f),cb=(uint8_t)(skyColor[2]*255.f+0.5f);
+            for(int p=0;p<N*N;p++){ sky.rgba[p*4]=cr; sky.rgba[p*4+1]=cg; sky.rgba[p*4+2]=cb; sky.rgba[p*4+3]=255; } }
+        ems.push_back(std::move(sky));
+    }
+    // ── LIVE PREVIEW of the skybox image/texture: upload the sky sphere as a real gpuMesh so it shows in the viewport
+    //    (a flat color already previews via clearRGB; an image/texture needs the sphere). Re-set just swaps the texture.
+    int skyPreviewMesh=-1;   // gpuMesh index of the live skybox sphere (-1 = none); when >=0 the cook uses IT (no double-emit)
+    void previewSkybox(){
+        if(!r || !sceneMeshes) return;
+        if(skyImageRGBA.empty()){ if(skyPreviewMesh>=0) r->setDeleted((size_t)skyPreviewMesh,true); return; }   // image/texture only; color = clearRGB
+        // (re)build the texture; geometry is fixed so re-set just replaces the texture on the existing sphere
+        if(skyPreviewMesh>=0 && skyPreviewMesh<(int)sceneMeshes->size()){
+            MeshData& pm=(*sceneMeshes)[(size_t)skyPreviewMesh];
+            pm.texRGBA=skyImageRGBA; pm.texW=skyImageW; pm.texH=skyImageH; pm.hasTexture=true;
+            r->setDeleted((size_t)skyPreviewMesh,false);
+            r->replaceMeshTexture((size_t)skyPreviewMesh, *sceneMeshes);
+            return;
+        }
+        if(sceneMeshes->empty()) return;
+        // CLONE a working static mesh as the template (fully-initialized fields), then OVERWRITE geometry+texture.
+        // (A hand-built MeshData crashed uploadMesh — a field it dereferences was empty; cloning avoids that, like dupmesh.)
+        MeshData md=(*sceneMeshes)[0];
+        md.name="generated_skybox"; md.doubleSided=true; md.hasTexture=true;
+        md.colors.clear(); md.uvs2.clear(); md.normalRGBA.clear(); md.hasNormal=false; md.lmRGBA.clear(); md.hasLightmap=false;
+        md.emissiveRGBA.clear(); md.hasEmissive=false; md.astcRaw.clear(); md.vatRaw.clear(); md.hasVat=false;
+        md.boneIndices.clear(); md.boneWeights.clear(); md.hasBones=false; md.bonePalette.clear();
+        md.useBlend=false; md.additive=false; md.alphaTest=false; md.dynamicVerts=false;
+        md.positions.clear(); md.uvs.clear(); md.indices.clear();
+        const int LAT=24,LON=48; const float R=8000.f, PI=3.14159265358979f;
+        for(int y=0;y<=LAT;y++){ float v=(float)y/LAT, th=v*PI; for(int x=0;x<=LON;x++){ float u=(float)x/LON, ph=u*2*PI;
+            md.positions.push_back(sinf(th)*cosf(ph)*R); md.positions.push_back(cosf(th)*R); md.positions.push_back(sinf(th)*sinf(ph)*R);
+            md.uvs.push_back(u); md.uvs.push_back(v); } }
+        for(int y=0;y<LAT;y++) for(int x=0;x<LON;x++){ uint32_t a=y*(LON+1)+x,b=a+1,c=a+(LON+1),d=c+1;
+            md.indices.push_back(a); md.indices.push_back(b); md.indices.push_back(c);
+            md.indices.push_back(b); md.indices.push_back(d); md.indices.push_back(c); }
+        md.texRGBA=skyImageRGBA; md.texW=skyImageW; md.texH=skyImageH;
+        sceneMeshes->push_back(md); skyPreviewMesh=(int)r->gpuMeshes.size();
+        r->uploadMesh(sceneMeshes->back());
+        r->hiddenMeshes.resize(r->gpuMeshes.size(),false); r->deletedMeshes.resize(r->gpuMeshes.size(),false);
+    }
     // ── per-mesh "skybox backdrop" marks: cooked as SkyboxPlatformComponent (far-clip-EXEMPT, escapes the PortalStereoCamera
     //    far=5000 clip). Set via right-click; multi-select applies to the whole selection. [[project_hsr_eye_subcamera_farclip]]
     std::vector<int> skyboxMeshes;
@@ -302,6 +519,10 @@ struct Editor {
         }
         if(!animColliders.empty()){ s+="COLLIDERS "+std::to_string(animColliders.size()); for(int m:animColliders){ snprintf(b,sizeof b," %d",m); s+=b; } s+="\n"; }
         if(!skyboxMeshes.empty()){ s+="SKYBOX "+std::to_string(skyboxMeshes.size()); for(int m:skyboxMeshes){ snprintf(b,sizeof b," %d",m); s+=b; } s+="\n"; }
+        if(r->deletedCount()>0){ s+="DELETED "+std::to_string(r->deletedCount()); for(int i=0;i<(int)r->gpuMeshes.size();++i) if(r->isDeleted(i)){ snprintf(b,sizeof b," %d",i); s+=b; } s+="\n"; }
+        for(auto& kv:texOverride){ s += "TEXOVR "+std::to_string(kv.first)+" "+kv.second+"\n"; }   // swapped mesh/skybox textures (re-loaded from the image path on open)
+        if(skyColorSet()){ snprintf(b,sizeof b,"SKYCOL %.4f %.4f %.4f\n", skyColor[0],skyColor[1],skyColor[2]); s+=b; }   // general skybox background color
+        if(!skyImagePath.empty()){ s += "SKYIMG "+skyImagePath+"\n"; }   // skybox image file path OR "mesh:N" (reused texture)
         { int n=0; for(auto& it:items) if(it.hidden) n++; if(n){ s+="IHIDE "+std::to_string(n); for(int i=0;i<(int)items.size();++i) if(items[i].hidden){ snprintf(b,sizeof b," %d",i); s+=b; } s+="\n"; } }
         return s;
     }
@@ -311,6 +532,9 @@ struct Editor {
         FILE* f=fopen(target.c_str(),"wb"); if(!f){ setStatus("SAVE FAILED: "+target); return; }
         sessionPath=target;   // future saves/loads round-trip to here
         fwrite(s.data(),1,s.size(),f); fclose(f);
+        lastSessionSnap = std::move(s);   // auto-save dirty baseline = what was just saved
+        { std::error_code ec; std::filesystem::remove(target + ".autosave", ec); }   // state is properly saved -> the crash-recovery autosave is obsolete
+        recoverOffer = false;
         setStatus("Saved -> "+target);
     }
     // Read assets/_editor_session.hsledit that the cook EMBEDDED inside this APK — so an ORPHAN cooked APK (its source
@@ -333,11 +557,21 @@ struct Editor {
         if(f){ sessionPath=used; fprintf(stderr,"[EDIT] loaded session: %s\n", used.c_str());
                fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ all.resize(n); fread(&all[0],1,n,f);} fclose(f); }
         else { all = extractEmbeddedSession();   // ORPHAN cooked APK: no saved/<env>.hsledit on disk -> read the session the cook EMBEDDED inside the APK ("extract em")
-               if(all.empty()){ fprintf(stderr,"[EDIT] no saved session (disk) and no _editor_session.hsledit embedded in the APK\n"); return; }
+               if(all.empty()){ fprintf(stderr,"[EDIT] no saved session (disk) and no _editor_session.hsledit embedded in the APK\n");
+                                checkAutosaveRecovery(); return; }   // a crash before the FIRST save still leaves an .autosave -> offer it
                sessionPath.clear(); fprintf(stderr,"[EDIT] loaded EMBEDDED session from cooked APK (%zu bytes)\n", all.size()); }
+        int meshN=0, itemN=0; applySessionText(all, meshN, itemN);
+        didAutoSel = true;   // a session was restored -> don't let frame-1 auto-focus clobber the restored camera
+        applyTexOverrides();   // re-load any swapped mesh/skybox textures from their image paths (preview + cook)
+        lastSessionSnap = serializeSession();   // auto-save dirty baseline = the state just restored (don't re-write an unchanged session)
+        setStatus("Loaded "+std::to_string(meshN)+" mesh edits + "+std::to_string(itemN)+" items from "+sessionPath);
+        checkAutosaveRecovery();   // an .autosave NEWER than the session = edits lost to a crash/close -> offer to restore them
+    }
+    // Parse + apply a .hsledit session text (shared by loadProject and the auto-save recovery banner).
+    void applySessionText(const std::string& all, int& meshN, int& itemN){
         items.clear(); selItem=-1; deselectAll(); animColliders.clear(); skyboxMeshes.clear();
         const bool cooked = envIsCookedApk();   // a cook OUTPUT: take the session's scene ITEMS but NOT its index-based MESH transforms (already baked into the cook) — re-derive the navmesh from THIS env's ground by name
-        size_t p=0; int meshN=0, itemN=0;
+        size_t p=0; meshN=0; itemN=0;
         while(p<all.size()){
             size_t e=all.find('\n',p); std::string line=all.substr(p, e==std::string::npos?std::string::npos:e-p); p=(e==std::string::npos)?all.size():e+1;
             auto t=tokenize(line); if(t.empty()) continue;
@@ -362,10 +596,56 @@ struct Editor {
             else if(t[0]=="COLLIDERS" && !cooked){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) animColliders.push_back(atoi(t[2+k].c_str())); }
             else if(t[0]=="SKYBOX" && !cooked){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) skyboxMeshes.push_back(atoi(t[2+k].c_str())); }   // restore far-backdrop skybox marks
             else if(t[0]=="IHIDE"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k){ int idx=atoi(t[2+k].c_str()); if(idx>=0&&idx<(int)items.size()) items[idx].hidden=true; } }   // restore per-item visibility eyes
+            else if(t[0]=="DELETED"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k){ int idx=atoi(t[2+k].c_str()); if(idx>=0) r->setDeleted(idx,true); } }   // restore editor mesh deletions (dropped from render + cook)
+            else if(t[0]=="TEXOVR" && (int)t.size()>=3){ int mi=atoi(t[1].c_str()); std::string p=t[2]; for(size_t k=3;k<t.size();++k) p+=" "+t[k]; if(mi>=0) texOverride[mi]=p; }   // remember swapped textures; applyTexOverrides() re-loads them below
+            else if(t[0]=="SKYCOL" && (int)t.size()>=4){ setSkyColor((float)atof(t[1].c_str()),(float)atof(t[2].c_str()),(float)atof(t[3].c_str())); }   // general skybox color -> drives clearRGB
+            else if(t[0]=="SKYIMG" && (int)t.size()>=2){ std::string p=t[1]; for(size_t k=2;k<t.size();++k) p+=" "+t[k]; if(p.rfind("mesh:",0)==0) setSkyImageFromMesh(atoi(p.c_str()+5)); else setSkyImage(p); }   // restore skybox image/texture
         }
-        didAutoSel = true;   // a session was restored -> don't let frame-1 auto-focus clobber the restored camera
-        setStatus("Loaded "+std::to_string(meshN)+" mesh edits + "+std::to_string(itemN)+" items from "+sessionPath);
     }
+    // ── AUTO-SAVE (Phase-1 crash resistance): every autoSaveIntervalS seconds, if the session text changed since the
+    //    last save/auto-save, write it to "<session>.hsledit.autosave". saveProject deletes the .autosave (state is now
+    //    properly saved); loadProject offers a RECOVERY banner when an .autosave is NEWER than the saved session (= the
+    //    editor crashed/closed with unsaved edits). Toggle lives in the Scene tab. ──
+    bool   autoSaveOn = true;
+    float  autoSaveIntervalS = 30.f;
+    double lastAutoSaveT = 0.0;
+    std::string lastSessionSnap;                 // last text persisted (save OR auto-save) — the dirty check
+    bool recoverOffer = false; std::string recoverPath;
+    void autoSaveTick(double now){
+        if (!autoSaveOn || cooking || !r || r->gpuMeshes.empty()) return;
+        if (lastAutoSaveT == 0.0) { lastAutoSaveT = now;               // first tick arms the timer + captures the dirty
+            if (lastSessionSnap.empty()) lastSessionSnap = serializeSession(); return; }   // baseline (no-session envs: don't autosave an untouched scene)
+        if (now - lastAutoSaveT < autoSaveIntervalS) return;
+        lastAutoSaveT = now;
+        std::string s = serializeSession();
+        if (s == lastSessionSnap) return;                              // nothing changed -> don't churn the disk
+        std::string ap = saveTargetFile() + ".autosave";
+        FILE* f=fopen(ap.c_str(),"wb"); if(!f) return;
+        fwrite(s.data(),1,s.size(),f); fclose(f);
+        lastSessionSnap = std::move(s);
+        fprintf(stderr,"[EDIT] auto-saved -> %s\n", ap.c_str());
+    }
+    void checkAutosaveRecovery(){
+        namespace fs=std::filesystem; std::error_code ec;
+        std::string ap = saveTargetFile() + ".autosave";
+        if (!fs::exists(ap, ec)) return;
+        if (!sessionPath.empty()) {   // stale autosave (session was saved AFTER it) -> silently clean it up
+            auto at = fs::last_write_time(ap, ec);
+            std::error_code ec2; auto st = fs::last_write_time(sessionPath, ec2);
+            if (!ec && !ec2 && at <= st) { fs::remove(ap, ec); return; }
+        }
+        recoverPath = ap; recoverOffer = true;
+        fprintf(stderr,"[EDIT] auto-save recovery available: %s\n", ap.c_str());
+    }
+    void restoreAutosave(){
+        FILE* f=fopen(recoverPath.c_str(),"rb"); if(!f){ recoverOffer=false; return; }
+        std::string all; fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ all.resize(n); fread(&all[0],1,n,f);} fclose(f);
+        int meshN=0, itemN=0; applySessionText(all, meshN, itemN);
+        didAutoSel = true; applyTexOverrides();
+        lastSessionSnap = std::move(all); recoverOffer = false;
+        setStatus("Recovered auto-save ("+std::to_string(meshN)+" mesh edits + "+std::to_string(itemN)+" items) — Save to keep it");
+    }
+    void dismissAutosave(){ std::error_code ec; std::filesystem::remove(recoverPath, ec); recoverOffer=false; }
     // V79 stores NO navmesh file — the LocomotionSystem generates it from the walkable ground geometry at runtime.
     // So auto-add a NAVMESH item sourced from the env's ground/floor/terrain meshes (the faithful re-creation; the
     // cook PhysX-cooks them into a V203 ColliderMesh). Returns the mesh count (0 = none found -> user picks manually).
@@ -405,6 +685,7 @@ struct Editor {
     int  gizmoOp = 0;            // 0=move 1=rotate 2=scale
     bool gizmoLocal = true;      // local vs world axes
     int  gizmoAxis = -1;         // axis being dragged (0..2), -1 = none
+    bool lockAxis[3] = {false,false,false};   // per-axis gizmo lock (viewport X/Y/Z pills, Shift+X/Y/Z): a locked axis draws dimmed and can't be grabbed
     bool gizmoDrag = false; std::vector<int> gizmoSel; std::vector<Xform> gizmoBeforeV;
     bool gzVisible = false; float gzOrigin[2]={0,0}, gzTip[3][2]={{0,0},{0,0},{0,0}};
     float gzAxisW[3][3];         // cached world-space axis directions
@@ -580,7 +861,13 @@ struct Editor {
             pushItemUndo(items); sitem::Item it=items[selItem]; it.pos[0]+=0.5f; it.pos[2]+=0.5f; it.name+=" copy";
             deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; }
         if (key=='P' && !(mods&GLFW_MOD_CONTROL)) { if(playSim) stopSim(); else startSim(); }   // toggle WALK mode (player sim)
-        if (key==GLFW_KEY_DELETE && selItem>=0) deleteSelItem();   // remove the selected scene item
+        if ((mods&GLFW_MOD_SHIFT) && !(mods&GLFW_MOD_CONTROL)) {   // Shift+X/Y/Z = toggle the per-axis gizmo lock (viewport pills)
+            if (key=='X') lockAxis[0]=!lockAxis[0];
+            if (key=='Y') lockAxis[1]=!lockAxis[1];
+            if (key=='Z') lockAxis[2]=!lockAxis[2];
+        }
+        if (key==GLFW_KEY_DELETE) { if (selItem>=0) deleteSelItem(); else if (!sel.empty()) toggleDeleteSelected(); }   // Del: remove selected scene item, else delete/restore selected mesh(es)
+        if ((mods&GLFW_MOD_CONTROL) && key=='D' && selItem<0 && !sel.empty()) duplicateSelected();   // Ctrl+D on meshes = duplicate (clone + offset), editable independently
     }
     int winW() const { int w=0,h=0; glfwGetWindowSize(win,&w,&h); return w; }
     int winH() const { int w=0,h=0; glfwGetWindowSize(win,&w,&h); return h; }
@@ -631,6 +918,13 @@ struct Editor {
                 r->cam.pos[0]=it.pos[0]; r->cam.pos[1]=it.pos[1]+1.6f; r->cam.pos[2]=it.pos[2]; r->cam.yaw=std::atan2(o[0],-o[2]); r->cam.pitch=0; break; }
         }
         if (playSim) simulatePlayer(dt);                        // walk mode: glue the cam to the walkable surface
+        // ── WYSIWYG scene config, EVERY frame (was Cook-tab-only, so fog/far reverted when the tab closed):
+        //    the live preview always shows the SAME fog + far-clip the cook ships. HSR_CLIP (device-clip replica
+        //    diagnostics) keeps ownership of farZ when set.
+        { float fcol[4]={cfgFogColor[0],cfgFogColor[1],cfgFogColor[2],1.f};
+          r->setSceneFog(fcol, cfgFogStart, cfgFog?cfgFogDensity:0.f, 0.f, 1500.f);
+          static const bool devClip = std::getenv("HSR_CLIP")!=nullptr;
+          if (!devClip) { float f=cfgFar; if (f < r->cam.nearZ+1.f) f = r->cam.nearZ+1.f; r->cam.farZ = f; } }
         r->uiViewportRect = rcViewport;                         // the 3D scene scissors to the Viewport pane
         dl.begin(fbW, fbH, &font, uiDraw.whiteU, uiDraw.whiteV);
         cx.dl = &dl; cx.hot = 0;                                // hot recomputed each frame
@@ -660,6 +954,8 @@ struct Editor {
             dl.popClip();
         }
         drawHeader();
+        drawRecoverBanner();                                    // crash-recovery offer strip (under the header)
+        autoSaveTick(now);                                      // periodic dirty-checked session autosave
         drawOutliner();
         drawProperties();
         drawTimeline();
@@ -717,15 +1013,44 @@ struct Editor {
         cx.textAligned(x+8*uiScale, y, 120*uiScale, hh, "Timeline", th.textDim, 0);
         if (!animOverride || !animScrub) { cx.textAligned(x+8*uiScale, y+hh, 320*uiScale, h-hh, "(no animation in this scene)", th.textDim, 0); return; }
         float bx=x+8*uiScale, by=y+hh+6*uiScale, bw=58*uiScale, bh=std::max(16.f, h-hh-12*uiScale);
-        if (cx.button(ui::hashId("tlplay"), bx, by, bw, bh, animPlaying?"Pause":"Play")) animPlaying = !animPlaying;
-        float tx=bx+bw+10*uiScale, tw=std::max(20.f, w-(tx-x)-120*uiScale), ty=by+bh*0.5f-3*uiScale;
         float dur=animDuration>0?animDuration:1.f, frac=std::clamp(*animScrub/dur, 0.f, 1.f);
+        // Quest mirror helpers: PAUSE/scrub -> pin the headset on the SAME timeline phase; PLAY -> run at speed.
+        auto qPin  = [&]{ if (syncQuest) {   // pin BOTH device clocks to this timeline instant
+            sendQuestCmd("world setphase "+std::to_string(std::clamp(*animScrub/dur,0.f,1.f)));   // HzAnim (comet/birds)
+            sendQuestCmd("world settime "+std::to_string(*animScrub)); } };                        // getTime shaders (flipbooks/train/uvscroll)
+        auto qPlay = [&]{ if (syncQuest) sendQuestCmd("world "+std::to_string(questSpeed)); };
+        if (cx.button(ui::hashId("tlplay"), bx, by, bw, bh, animPlaying?"Pause":"Play")) {
+            animPlaying = !animPlaying;
+            if (animPlaying) qPlay(); else qPin();   // pause here -> headset FREEZES on this exact instant
+        }
+        // ── →Quest mirror toggle: pause/scrub/speed also drive the headset (world cmd over the adb-forwarded bridge)
+        float qbx=bx+bw+6*uiScale, qbw=70*uiScale;
+        if (cx.button(ui::hashId("tlquest"), qbx, by, qbw, bh, syncQuest?"Quest: ON":"Quest: off")) {
+            syncQuest = !syncQuest;
+            if (syncQuest) {
+#ifdef _WIN32
+                system("adb forward tcp:27042 tcp:27042 >nul 2>&1");   // ensure the bridge port is reachable
+#endif
+                if (animPlaying) qPlay(); else qPin();
+            } else sendQuestCmd("world off");
+        }
+        float tx=qbx+qbw+10*uiScale, tw=std::max(20.f, w-(tx-x)-120*uiScale), ty=by+bh*0.5f-3*uiScale;
         dl.rect(tx,ty,tw,6*uiScale, th.field); dl.border(tx,ty,tw,6*uiScale, th.border);
         dl.rect(tx,ty,tw*frac,6*uiScale, th.accent);
         dl.rect(tx+tw*frac-3*uiScale, by, 6*uiScale, bh, th.textSel);             // playhead (advances live while playing)
-        if (cx.hover(tx,by,tw,bh) && cx.in.down[0]) { *animScrub = std::clamp((cx.in.mx-tx)/tw,0.f,1.f)*dur; *animOverride=true; }   // scrub
-        char b[48]; snprintf(b,sizeof b,"%.2f / %.2fs", *animScrub, dur);
-        cx.textAligned(x+w-112*uiScale, y, 104*uiScale, hh, b, th.textDim, 2);
+        if (cx.hover(tx,by,tw,bh) && cx.in.down[0]) { *animScrub = std::clamp((cx.in.mx-tx)/tw,0.f,1.f)*dur; *animOverride=true; animPlaying=false;   // scrub = pause+seek
+            if (syncQuest) { double now=nowMs(); if (now-lastSendMs>66.0) { lastSendMs=now; qPin(); } } }   // headset jumps to the same time (throttled)
+        // Live device-clock read-back so you can SEE the desktop time vs the Quest time (confirm they match).
+        // Right-aligned across the WHOLE header width (minus the "Timeline" title) so the number never clips.
+        if (syncQuest) { double now=nowMs(); if (now-lastQueryMs>250.0) { lastQueryMs=now; pollQuestTime(); } }
+        char b[128];
+        if (syncQuest) {
+            bool matched = questTimeNow>=0.f && fabsf(questTimeNow-*animScrub)<0.5f;   // after settime, device == desktop
+            if (questTimeNow<0.f) snprintf(b,sizeof b,"set %.2f/%.0fs  Quest=? (no reply)", *animScrub, dur);
+            else snprintf(b,sizeof b,"set %.2f/%.0fs  Quest=%.2fs %s", *animScrub, dur, questTimeNow,
+                          matched?"[SYNC]":(animPlaying?"[play]":"[pin]"));
+        } else snprintf(b,sizeof b,"%.2f / %.2fs", *animScrub, dur);
+        cx.textAligned(x+128*uiScale, y, w-136*uiScale, hh, b, th.textDim, 2);
     }
 
     // Floating object context menu (right-click in the viewport). Items act on ctxMesh.
@@ -825,7 +1150,23 @@ struct Editor {
             float bex = bx-2*sw-12*uiScale-blw;
             if (cx.button(ui::hashId("hdrblend"),  bex, 4*uiScale, blw, bh, "-> Blender")) exportBlender();
             if (cx.button(ui::hashId("hdrimport"), bex-blw-4*uiScale, 4*uiScale, blw, bh, "Blender ->")) importBlender();
+            { const char* s = autoSaveOn ? "Auto-save: On" : "Auto-save: Off"; float aw = dl.textW(s)+14*uiScale;   // crash-resistance: periodic .autosave + recovery on reopen
+              float ax = bex-2*blw-8*uiScale-aw; float ay0=4*uiScale;
+              if (cx.tab(ui::hashId("hdrautosave"), ax, ay0, aw, bh, s, autoSaveOn)) autoSaveOn = !autoSaveOn;
+              cx.tip(ax, ay0, aw, bh, "Auto-save the session to <env>.hsledit.autosave every 30s\n(only when something changed). If the editor crashes or closes\nwith unsaved edits, reopening offers to restore them.\nSave (Ctrl+S) still writes the real .hsledit."); }
         }
+    }
+
+    // Crash-recovery strip: an .autosave newer than the saved session was found on load — offer Restore / Dismiss.
+    void drawRecoverBanner() {
+        if (!recoverOffer) return;
+        auto& th = cx.th; float y = (float)rcHeader.extent.height, h = 26*uiScale;
+        float W = (float)rcViewport.extent.width;   // span the viewport pane; the right column stays usable
+        dl.rect(0, y, W, h, ui::rgba(115,85,20,240)); dl.rect(0, y+h-1, W, 1, th.splitLine);
+        cx.textAligned(8*uiScale, y, W-190*uiScale, h, "Auto-save found (newer than your last save) — restore the recovered session?", ui::rgba(255,232,170), 0);
+        float bw = 84*uiScale, bh = h-6*uiScale;
+        if (cx.button(ui::hashId("asrest"), W-2*bw-16*uiScale, y+3*uiScale, bw, bh, "Restore", true)) restoreAutosave();
+        if (cx.button(ui::hashId("asdism"), W-bw-8*uiScale,    y+3*uiScale, bw, bh, "Dismiss")) dismissAutosave();
     }
 
     void drawViewportOverlay() {
@@ -839,11 +1180,17 @@ struct Editor {
         const char* ops[]={"Move","Rotate","Scale"}; float px=v.offset.x+90*uiScale;
         for (int i=0;i<3;i++){ float w=dl.textW(ops[i])+14*uiScale; if (cx.tab(ui::hashId(2000+i, 7), px, v.offset.y, w, bh, ops[i], gizmoOp==i)) gizmoOp=i; px+=w; }
         { const char* s = gizmoLocal?"Local":"World"; float w=dl.textW(s)+14*uiScale; if (cx.tab(ui::hashId("axspace"), px+6*uiScale, v.offset.y, w, bh, s, false)) gizmoLocal=!gizmoLocal; px+=w+6*uiScale; }
+        // per-axis gizmo locks (Shift+X/Y/Z): a lit pill = that axis is LOCKED (dimmed on the gizmo, can't be grabbed)
+        { const char* axn[3]={"X","Y","Z"}; px+=4*uiScale;
+          for (int k=0;k<3;k++){ float w=dl.textW(axn[k])+10*uiScale;
+              if (cx.tab(ui::hashId(2300+k, 11), px, v.offset.y, w, bh, axn[k], lockAxis[k])) lockAxis[k]=!lockAxis[k];
+              cx.tip(px, (float)v.offset.y, w, bh, k==0?"Lock the X axis (Shift+X): the gizmo ignores it while lit.":k==1?"Lock the Y axis (Shift+Y): the gizmo ignores it while lit.":"Lock the Z axis (Shift+Z): the gizmo ignores it while lit.");
+              px+=w+2*uiScale; } px+=4*uiScale; }
         { const char* s = playSim?"Stop (P)":"Walk (P)"; float w=dl.textW(s)+16*uiScale; if (cx.tab(ui::hashId("walksim"), px+10*uiScale, v.offset.y, w, bh, s, playSim)) { if(playSim) stopSim(); else startSim(); } px+=w+16*uiScale; }
         // camera fly speed (drag or type) — in the header strip so it never fires a viewport pick
         { cx.textAligned(px, v.offset.y, 34*uiScale, bh, "Spd", th.textDim, 0); cx.dragFloat(ui::hashId("camspd"), px+34*uiScale, v.offset.y+1*uiScale, 54*uiScale, bh-2*uiScale, r->cam.speed, 0.1f, "%.1f"); px+=92*uiScale; }
         // PC PREVIEW AUDIO — front-and-center toggle (was buried in cook options). Mutes/unmutes the desktop background loop.
-        { const char* s = previewAudio?"\xF0\x9F\x94\x8A Audio On":"\xF0\x9F\x94\x87 Audio Off"; float w=dl.textW(s)+16*uiScale;
+        { const char* s = previewAudio?"Audio: On":"Audio: Off"; float w=dl.textW(s)+16*uiScale;   // ASCII — the UI font has no emoji glyphs (the speaker emoji rendered as "????")
           if (cx.tab(ui::hashId("hdraudio"), px+8*uiScale, v.offset.y, w, bh, s, previewAudio)) { previewAudio=!previewAudio; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); } px+=w+8*uiScale; }
         // ALWAYS-ON-TOP toggle (window is NOT pinned by default now). "Pin" = keep the editor above other windows.
         { const char* s = alwaysOnTop?"Pin: On":"Pin: Off"; float w=dl.textW(s)+16*uiScale;
@@ -1106,7 +1453,43 @@ struct Editor {
             y+=rh+1*uiScale;
             cx.textAligned(x+40*uiScale, y, w-44*uiScale, rh*0.85f, sitem::metaName(t), th.textDim, 0, mono.ok?&mono:&font); y+=rh*0.85f+6*uiScale;
         }
+        // ── SKYBOX / BACKGROUND — the UI for the (long-existing) skybox backend: solid color, equirect image,
+        //    or any mesh's texture. Previews live (clearRGB / sky sphere) AND cooks as the SkyboxPlatformComponent. ──
+        y+=6*uiScale; dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
+        cx.label(x,y,w,rh,"Skybox / Background",th.text); y+=rh+2*uiScale;
+        float y0;
+        // color: "r,g,b" 0..1 + Apply/Clear (Apply-on-button, not per-keystroke — setSkyColor logs + rebuilds preview)
+        if (skyColUI.empty() && skyColorSet()) { char b[48]; snprintf(b,sizeof b,"%.3f,%.3f,%.3f",skyColor[0],skyColor[1],skyColor[2]); skyColUI=b; }
+        y0=y; cx.label(x,y,86*uiScale,rh,"Color r,g,b",th.textDim);
+        cx.textField(ui::hashId("skycolf"), x+88*uiScale, y, w-88*uiScale-110*uiScale, rh, skyColUI);
+        if (cx.button(ui::hashId("skycolap"), x+w-108*uiScale, y, 52*uiScale, rh, "Apply", true)) {
+            float rr,gg,bb; if (sscanf(skyColUI.c_str(),"%f,%f,%f",&rr,&gg,&bb)==3) setSkyColor(rr,gg,bb);
+            else setStatus("Skybox color: type r,g,b in 0..1 (e.g. 0.35,0.55,0.9)"); }
+        if (cx.button(ui::hashId("skycolcl"), x+w-52*uiScale, y, 52*uiScale, rh, "Clear")) { clearSkyColor(); skyColUI.clear(); }
+        cx.tip(x,y0,w,rh,"Solid background/skybox color (0..1 floats). Previews as the\nviewport background AND cooks as a SkyboxPlatformComponent\nsolid-color texture. Env meshes are untouched."); y+=rh+4*uiScale;
+        // image: path + Browse/Set/Clear (equirect panorama PNG/JPG -> inward sky sphere)
+        y0=y; cx.label(x,y,86*uiScale,rh,"Image",th.textDim);
+        cx.textField(ui::hashId("skyimgf"), x+88*uiScale, y, w-88*uiScale-110*uiScale, rh, skyImgUI);
+        if (cx.button(ui::hashId("skyimgbr"), x+w-108*uiScale, y, 52*uiScale, rh, "Browse")) {
+            std::string p = pickFileWin32(L"Choose a skybox panorama image (PNG / JPG, equirect)");
+            if (!p.empty()) { skyImgUI = p; setSkyImage(p); } }
+        if (cx.button(ui::hashId("skyimgcl"), x+w-52*uiScale, y, 52*uiScale, rh, "Clear")) { clearSkyImage(); skyImgUI.clear(); }
+        cx.tip(x,y0,w,rh,"Equirect panorama image (PNG/JPG). Previews + cooks onto a large\ninward-facing sky sphere behind everything. Browse picks a file;\nor type/paste a path and press Set."); y+=rh+2*uiScale;
+        if (cx.button(ui::hashId("skyimgset"), x+88*uiScale, y, 52*uiScale, rh, "Set") && !skyImgUI.empty()) setSkyImage(skyImgUI);
+        // reuse ANY selected mesh's texture as the skybox (no external file needed)
+        { bool have = selected>=0 && sceneMeshes && selected<(int)sceneMeshes->size();
+          y0=y; if (cx.button(ui::hashId("skyfromsel"), x+88*uiScale+56*uiScale, y, w-88*uiScale-56*uiScale, rh,
+                have?"Use selected mesh's texture":"Use selected mesh's texture (select a mesh first)") && have) setSkyImageFromMesh(selected);
+          cx.tip(x,y0,w,rh,"Reuse the SELECTED mesh's texture as the skybox (e.g. the env's\nown sky dome texture) — no external image file needed."); }
+        y+=rh+4*uiScale;
+        // current state line
+        { std::string cur = "current: ";
+          if (!skyImagePath.empty()) cur += (skyImagePath.rfind("mesh:",0)==0 ? ("texture of mesh "+skyImagePath.substr(5)) : skyImagePath) + (" ("+std::to_string(skyImageW)+"x"+std::to_string(skyImageH)+")");
+          else if (skyColorSet()) { char b[48]; snprintf(b,sizeof b,"solid color %.2f,%.2f,%.2f",skyColor[0],skyColor[1],skyColor[2]); cur += b; }
+          else cur += "none (env's own background)";
+          cx.textAligned(x, y, w, rh*0.9f, cur.c_str(), th.textDim, 0); y+=rh; }
     }
+    std::string skyColUI, skyImgUI;   // Scene-tab skybox field buffers (UI state only; the applied state lives in skyColor/skyImagePath)
 
     void drawProperties() {
         auto& th = cx.th; VkRect2D a = rcProps;
@@ -1314,9 +1697,7 @@ struct Editor {
           char fcb[32]; snprintf(fcb,sizeof fcb,"%.0f",cfgFar); std::string fcss=fcb;
           cx.textField(ui::hashId("cfgfar"), x+152*uiScale, y, w-152*uiScale, th.rowH, fcss); cfgFar=(float)atof(fcss.c_str()); if(cfgFar<1.f)cfgFar=150000.f;
           cx.tip(x,y0,w,th.rowH,"ScenePlatformComponent farClippingPlane. The device default is 5000m;\nthe cook extends it to this. Use the viewport 'Far-clip' overlay to\nsee the 5000m default boundary."); y+=th.rowH+6*uiScale; }
-        // Live WYSIWYG: push the fog config into the renderer so the preview matches the cooked look (density 0 when off).
-        if (r) { float fcol[4]={cfgFogColor[0],cfgFogColor[1],cfgFogColor[2],1.f};
-                 r->setSceneFog(fcol, cfgFogStart, cfgFog?cfgFogDensity:0.f, 0.f, 1500.f); }
+        // (fog + far-clip WYSIWYG binding moved to buildFrame — applies EVERY frame, not just while this tab is open)
         // ── Install to headset (USB or Wi-Fi adb); the installer auto-detects root and picks spoofed vs unspoofed ──
         y0=y; cx.checkbox(ui::hashId("install"), x, y, "Install to headset after cook (auto)", installAfterCook);
         cx.tip(x,y0,w,th.rowH,"After cooking, install over adb. The installer detects root:\n  ROOT  -> install the UNSPOOFED APK + auto-select it.\n  NO root-> back up the real haven2025, install the SPOOF,\n           and relaunch the shell. The spoof REPLACES Haven 2025\n           in place (unrooted Quests can't switch envs).\nNeeds adb bundled beside the exe or on PATH."); y+=th.rowH+2*uiScale;
@@ -1556,11 +1937,12 @@ struct Editor {
         if (!gzVisible) return -1; int best=-1;
         if (gizmoOp==1){   // rotate: nearest projected ring segment within tolerance
             float bestD=11*uiScale;
-            for (int k=0;k<3;k++) for (int s=0;s<32;s++){ float d=distToSeg(mx,my, gzRing[k][s][0],gzRing[k][s][1], gzRing[k][s+1][0],gzRing[k][s+1][1]); if (d<bestD){bestD=d;best=k;} }
+            for (int k=0;k<3;k++){ if (lockAxis[k]) continue;   // a locked axis can't be grabbed
+                for (int s=0;s<32;s++){ float d=distToSeg(mx,my, gzRing[k][s][0],gzRing[k][s][1], gzRing[k][s+1][0],gzRing[k][s+1][1]); if (d<bestD){bestD=d;best=k;} } }
             return best;
         }
         float bestD=14*uiScale;
-        for (int k=0;k<3;k++){ float d=distToSeg(mx,my, gzOrigin[0],gzOrigin[1], gzTip[k][0],gzTip[k][1]); if (d<bestD){bestD=d;best=k;} }
+        for (int k=0;k<3;k++){ if (lockAxis[k]) continue; float d=distToSeg(mx,my, gzOrigin[0],gzOrigin[1], gzTip[k][0],gzTip[k][1]); if (d<bestD){bestD=d;best=k;} }
         return best;
     }
     static float distToSeg(float px,float py,float ax,float ay,float bx,float by){
@@ -1606,7 +1988,7 @@ struct Editor {
                     float wp[3]={ origin[0]+len*(ca*ax[u][0]+sa*ax[v][0]), origin[1]+len*(ca*ax[u][1]+sa*ax[v][1]), origin[2]+len*(ca*ax[u][2]+sa*ax[v][2]) };
                     float sp[2]; bool ok=worldToScreen(wp,sp[0],sp[1]); gzRing[k][s][0]=ok?sp[0]:os[0]; gzRing[k][s][1]=ok?sp[1]:os[1]; } }
             int hk=gizmoHitTest((float)cx.in.mx,(float)cx.in.my);
-            for (int k=0;k<3;k++){ bool hot=(hk==k)||(gizmoDrag&&gizmoAxis==k); uint32_t c=hot?ui::rgba(255,235,80):col[k];
+            for (int k=0;k<3;k++){ bool hot=(hk==k)||(gizmoDrag&&gizmoAxis==k); uint32_t c=lockAxis[k]?ui::rgba(110,110,110,150):(hot?ui::rgba(255,235,80):col[k]);
                 for (int s=0;s<32;s++) dl.line(gzRing[k][s][0],gzRing[k][s][1],gzRing[k][s+1][0],gzRing[k][s+1][1], c, hot?3.f:2.f);
                 gzTip[k][0]=gzRing[k][0][0]; gzTip[k][1]=gzRing[k][0][1];
                 cx.textAligned(gzRing[k][0][0]+4*uiScale, gzRing[k][0][1]-8*uiScale, 14*uiScale,16*uiScale, axn[k], c, 0); }
@@ -1616,7 +1998,7 @@ struct Editor {
                 float ts[2]; if (!worldToScreen(tip, ts[0], ts[1])) { gzTip[k][0]=os[0]; gzTip[k][1]=os[1]; continue; }
                 gzTip[k][0]=ts[0]; gzTip[k][1]=ts[1];
                 bool hot = (gizmoHitTest((float)cx.in.mx,(float)cx.in.my)==k) || (gizmoDrag&&gizmoAxis==k);
-                uint32_t c = hot ? ui::rgba(255,235,80) : col[k];
+                uint32_t c = lockAxis[k] ? ui::rgba(110,110,110,150) : (hot ? ui::rgba(255,235,80) : col[k]);
                 dl.line(os[0],os[1],ts[0],ts[1], c, hot?4.f:3.f);
                 float hs=(gizmoOp==2?6.f:7.f)*uiScale;
                 if (gizmoOp==2) { dl.rect(ts[0]-hs,ts[1]-hs,hs*2,hs*2,c); dl.border(ts[0]-hs,ts[1]-hs,hs*2,hs*2, ui::rgba(20,20,20), 1.5f); }  // scale = colored box handle
@@ -1632,6 +2014,7 @@ struct Editor {
     }
     void applyGizmoDrag(float len) {
         int k=gizmoAxis; float* A=gzAxisW[k];
+        if (lockAxis[k]) return;   // axis locked mid-drag (Shift+X/Y/Z during a grab) -> freeze it
         bool exitMode = editExit && selItem>=0 && selItem<(int)items.size() && items[selItem].type==sitem::CHAIR;
         if (gizmoOp==1) {   // ── ROTATE: tangential mouse drag about world axis A (item euler OR mesh quat) ──
             if (exitMode) return;   // the exit point has no rotation
@@ -1687,6 +2070,7 @@ struct Editor {
             // isHidden is the EDITOR-ONLY visibility eye (a working aid) — hidden meshes MUST still ship in the cook
             // (user-confirmed). Deleted/removed items are already absent from sceneMeshes, so there's nothing to skip
             // here. (Was: `if (r->isHidden((int)i)) continue;` which wrongly dropped hidden geometry from the home.)
+            if (r->isDeleted(i)) continue;   // editor DELETE: drop this mesh from the cooked home (non-destructive, persisted)
             const MeshData& md=(*sceneMeshes)[i]; const VkGpuMesh& gm=r->gpuMeshes[i];
             size_t nv=md.positions.size()/3; if (nv<3||md.indices.size()<3) continue;
             ExportMesh em; em.name=md.name; em.positions.resize(nv*3);
@@ -1758,6 +2142,7 @@ struct Editor {
             if (md.hasTexture && md.texRGBA.size()>=(size_t)md.texW*md.texH*4){ em.rgba=md.texRGBA; em.w=md.texW; em.h=md.texH; }
             ems.push_back(std::move(em));
         }
+        if(skyPreviewMesh<0) appendSkyboxMesh(ems);   // GENERAL skybox -> far sky sphere in the cook (if a live preview sphere exists it's already in sceneMeshes, so don't double-emit)
         return ems;
     }
     static std::string cookShellPath() { const char* v=std::getenv("HSR_COOK_SHELL"); return v?v:"(embedded shell)"; }   // donor is baked in; path is a label only

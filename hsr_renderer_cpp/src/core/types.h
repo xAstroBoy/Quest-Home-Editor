@@ -302,6 +302,12 @@ struct MeshData {
     // animated OPACITY (alpha 0..~0.22) that keeps the fog faint and pulsing. animate(t) updates
     // it; the renderer pushes it as the fragment shader's UniformColor (frag = texture * tint).
     float curTint[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+    // Set when this mesh has an animated MaterialTint ALPHA fade (fog/dust: alpha sweeps 0→peak→0).
+    // A fading alpha is definitionally an ALPHA-BLEND (the fade only shows through SRC_ALPHA blending),
+    // so the renderer must NOT auto-promote it to the hard-additive (src=ONE) pipeline — that ignores
+    // alpha and freezes the dust at full brightness (the "fade not decoded" bug). See vk_renderer premultAdd.
+    bool animatedTintAlpha = false;
 };
 
 // RENDTXTR format codes → ASTC block sizes
