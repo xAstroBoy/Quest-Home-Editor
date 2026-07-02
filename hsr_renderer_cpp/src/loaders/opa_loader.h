@@ -1358,6 +1358,29 @@ public:
                 }
                 p += adv; continue;   // bogus header -> resync by scanning for the next name marker
             }
+            if (nm == "UVTransform") {
+                // Per-frame 2x3 UV affine [a,b,c, d,e,f] (6 floats/frame) authored INSIDE the node
+                // sanim — the material UV scroll / flipbook (fire, smoke, aurora, water). The old
+                // parser handled ONLY Translation/Rotation/Scale and silently DROPPED UVTransform,
+                // so every such material rendered STATIC ("animations left out": winterwonderland
+                // smoke_Geo*, fire_a_placement_*, aurora_noise, pSphere*). Feed matUVAnim[node] so the
+                // SAME UV-anim path the .mat.sanim.opa uses (renderer animate() + cook uvscroll/flipbook)
+                // drives them — GLOBAL, one code path for every env whose sanim carries UVTransform.
+                size_t kp = p + adv;
+                if (kp + 12 > sa.size()) { p += adv; continue; }
+                uint32_t nKeys, nVals;
+                memcpy(&nKeys, sa.data()+kp+4, 4); memcpy(&nVals, sa.data()+kp+8, 4); (void)nKeys;
+                size_t trackEnd = kp + 12 + (size_t)nVals*4;
+                if (!curNode.empty() && trackEnd <= sa.size() && nVals >= 6 && (nVals % 6) == 0) {
+                    UVTrack tr; tr.nFrames = (int)(nVals / 6); tr.m.resize(nVals);
+                    memcpy(tr.m.data(), sa.data()+kp+12, (size_t)nVals*4);
+                    if (std::getenv("HSR_SANIMDBG"))
+                        fprintf(stderr, "[SANIM-UV] node='%s' UVTransform frames=%d\n", curNode.c_str(), tr.nFrames);
+                    matUVAnim[curNode] = std::move(tr);
+                    p = trackEnd; continue;
+                }
+                p += adv; continue;
+            }
             curNode = nm; p += adv;     // a node name
         }
         // SYNC each node's channels: loop ALL of T/R/S on the SAME length = the latest frame ANY of
@@ -1379,8 +1402,17 @@ public:
             clampN(nt.t); clampN(nt.r); clampN(nt.s);
             if (e > animMaxFrames) animMaxFrames = e;
         }
-        log("sanim: %zu animated nodes, maxFrames=%d (%.1fs @%.0ffps)",
-            nodeAnim.size(), animMaxFrames, animDuration(), animFps);
+        // UVTransform tracks parsed from the NODE sanim above ALSO define animation length. Without
+        // this, a UV-ONLY env (rockquarry fc_environment: the sanim carries the waterfall/fire/mist
+        // UVTransform flipbooks but few/no T/R/S node tracks) leaves animMaxFrames<=1 -> hasAnimation()
+        // returns FALSE -> the ENTIRE OPA animate/stream block is skipped and NOTHING animates (the
+        // "waterfalls are animated yet don't animate in render" bug). The reset above recomputes
+        // animMaxFrames from nodeAnim ONLY, wiping the per-track bump; fold the UV/tint tracks back in.
+        // (.mat.sanim.opa tracks raise animMaxFrames in loadMatAnim, which runs right after this.)
+        for (auto& kv : matUVAnim)   if (kv.second.nFrames > animMaxFrames) animMaxFrames = kv.second.nFrames;
+        for (auto& kv : matTintAnim) if (kv.second.nFrames > animMaxFrames) animMaxFrames = kv.second.nFrames;
+        log("sanim: %zu animated nodes, %zu UV tracks, maxFrames=%d (%.1fs @%.0ffps)",
+            nodeAnim.size(), matUVAnim.size(), animMaxFrames, animDuration(), animFps);
     }
 
     // Parse *.mat.sanim.opa -> matUVAnim: per geo/node a "UVTransform" track = nFrames x 2x3 UV
@@ -2131,11 +2163,42 @@ private:
                 if (cnt == (uint32_t)nJ) { skinInvBind.resize((size_t)nJ*16); memcpy(skinInvBind.data(), file.data()+cntOff+4, (size_t)nJ*64); }
             }
         }
+        // ── Pick the clip that best matches THIS skin's OWN joint set — NOT the last-writer-wins
+        //    jointToClip map. When a full-scene skeleton (e.g. winterwonderland `rootnode`, which
+        //    duplicates every banner + stringlight joint) is loaded AFTER a mesh's dedicated
+        //    sub-skeleton (`banners_VFX`, `strings_lights`), the shared joint names overwrote
+        //    jointToClip and bound the skin to the WRONG (superset) clip. Composing the skin's
+        //    banners_VFX-bind invBind against the rootnode clip's differently-indexed joints
+        //    COLLAPSED the banner to the origin (measured frame-0 centroid (-0.17,-0.07,-1.46)
+        //    vs the correct (-5.06,-2.63,-42.71) under banners_VFX) — the "banners broken" +
+        //    "stringlights don't animate" bug. The V79 entity graph pairs each CoSkinnedMesh with
+        //    its parent CoSkeleton's clip; the joint-set best-match reproduces that GLOBALLY (the
+        //    dedicated clip is the one containing all the skin's bones with the FEWEST extras).
+        //    HSR_SKINCLIP_NAMEMAP restores the old behavior.
         int skinClip = -1;
         std::vector<int> boneToClipJoint(skinJoints.size(), -1);
-        for (size_t b = 0; b < skinJoints.size(); ++b) {
-            auto it = jointToClip.find(skinJoints[b]);
-            if (it != jointToClip.end()) { boneToClipJoint[b] = it->second.second; if (skinClip < 0) skinClip = it->second.first; }
+        static int nameMap = -1; if (nameMap < 0) nameMap = std::getenv("HSR_SKINCLIP_NAMEMAP") ? 1 : 0;
+        if (nameMap) {
+            for (size_t b = 0; b < skinJoints.size(); ++b) {
+                auto it = jointToClip.find(skinJoints[b]);
+                if (it != jointToClip.end()) { boneToClipJoint[b] = it->second.second; if (skinClip < 0) skinClip = it->second.first; }
+            }
+        } else {
+            int bestClip = -1, bestCover = 0, bestExtra = 0;
+            for (int ci = 0; ci < (int)clips.size(); ++ci) {
+                const AnimClip& cl = clips[ci];
+                int cover = 0;
+                for (auto& jn : skinJoints)
+                    for (int j = 0; j < (int)cl.joints.size(); ++j) if (cl.joints[j] == jn) { ++cover; break; }
+                if (cover == 0) continue;
+                int extra = (int)cl.joints.size() - cover;
+                if (cover > bestCover || (cover == bestCover && extra < bestExtra)) { bestCover = cover; bestExtra = extra; bestClip = ci; }
+            }
+            if (bestClip >= 0) {
+                skinClip = bestClip; const AnimClip& cl = clips[bestClip];
+                for (size_t b = 0; b < skinJoints.size(); ++b)
+                    for (int j = 0; j < (int)cl.joints.size(); ++j) if (cl.joints[j] == skinJoints[b]) { boneToClipJoint[b] = j; break; }
+            }
         }
         bool canSkin = (skinClip >= 0) && !skinInvBind.empty();
         int emitted = 0;
