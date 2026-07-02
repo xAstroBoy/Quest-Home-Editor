@@ -362,11 +362,17 @@ public:
     // *_specular.dds.opa bytes via setSpecularCubemap().
     VkImage iblSpecImage = VK_NULL_HANDLE; VkDeviceMemory iblSpecMem = VK_NULL_HANDLE;
     VkImageView iblSpecView = VK_NULL_HANDLE;
-    std::vector<bool> hiddenMeshes;             // editor multi-hide: true => skip this mesh in draw
+    std::vector<bool> hiddenMeshes;             // editor multi-hide: true => skip this mesh in draw (STILL ships in the cook)
     bool isHidden(size_t mi) const { return mi < hiddenMeshes.size() && hiddenMeshes[mi]; }
     void setHidden(size_t mi, bool h) { if (hiddenMeshes.size() < gpuMeshes.size()) hiddenMeshes.resize(gpuMeshes.size(), false); if (mi < hiddenMeshes.size()) hiddenMeshes[mi] = h; }
     void unhideAll() { hiddenMeshes.assign(gpuMeshes.size(), false); }
     int hiddenCount() const { int n=0; for (bool b : hiddenMeshes) if (b) ++n; return n; }
+    // editor DELETE (distinct from hide): skip in draw AND drop from the cook (buildExportMeshes). Non-destructive
+    // (the mesh stays in gpuMeshes so indices/undo are stable) + persisted in the .hsledit session. Restorable.
+    std::vector<bool> deletedMeshes;
+    bool isDeleted(size_t mi) const { return mi < deletedMeshes.size() && deletedMeshes[mi]; }
+    void setDeleted(size_t mi, bool d) { if (deletedMeshes.size() < gpuMeshes.size()) deletedMeshes.resize(gpuMeshes.size(), false); if (mi < deletedMeshes.size()) deletedMeshes[mi] = d; }
+    int deletedCount() const { int n=0; for (bool b : deletedMeshes) if (b) ++n; return n; }
     // Editor overlay hooks (set by editor.h): overlayBegin() builds the UI each frame; overlayDraw(cmd)
     // records the ImGui draw data inside the active render pass (just before it ends).
     std::function<void()> overlayBegin;
@@ -849,6 +855,10 @@ public:
             texFmt = astcVkFormat(md.astcBw, md.astcBh);
             createTextureImageRaw(md.astcRaw.data(), (u32)md.astcRaw.size(),
                                   md.texW, md.texH, texFmt, gm.texImage, gm.texMem);
+        } else if (md.useBlend) {
+            // BLEND texture: alpha-weighted mips so transparent "garbage" RGB (e.g. dust's white α=0
+            // texels) can't bleed a bright halo onto the card silhouette at minified/grazing edges.
+            createTextureImageAW(md.texRGBA.data(), md.texW, md.texH, gm.texImage, gm.texMem);
         } else {
             createTextureImage(md.texRGBA.data(), md.texW, md.texH, gm.texImage, gm.texMem);
         }
@@ -1388,7 +1398,7 @@ public:
           // over low alpha -> rgb>a. The desktop additive pipeline is SRC_ALPHA/ONE (soft, correct for RAW); a PREMULT texture
           // there double-attenuates (rgb*a*a) -> the cooked warp rendered weak/sparse. So premult meshes use a HARD additive
           // pipeline (premult*ONE = rgb*a = the same soft glow). Auto-detected so source + cooked + Meta VFX all match.
-          gm.premultAdd = gm.useBlend && taN>0 && taMin<250 && (taRgbOverA*50 < taN);   // blend + VARYING alpha (a glow, not an opaque tex) + <2% rgb>a -> a PREMULTIPLIED additive glow (the cook premults ONLY additive textures), even if the cooked MATL didn't re-flag it additive
+          gm.premultAdd = gm.useBlend && taN>0 && taMin<250 && (taRgbOverA*50 < taN) && !md.animatedTintAlpha;   // blend + VARYING alpha (a glow, not an opaque tex) + <2% rgb>a -> a PREMULTIPLIED additive glow (the cook premults ONLY additive textures), even if the cooked MATL didn't re-flag it additive. EXCLUDE meshes with an animated tint-ALPHA FADE (fog/dust): the fade IS the alpha-blend, so hard-additive (src=ONE, ignores alpha) would freeze it at full opacity.
           // A mesh flagged blend (glTF alphaMode=BLEND / cooked mdBlend) whose texture is FULLY OPAQUE
           // (min alpha 255) has nothing to blend — the no-depth-write blend pass made it see-through
           // (King Kai / snakeway: his front didn't occlude his back -> scrambled black blob). Treat it
@@ -1429,6 +1439,37 @@ public:
             (int)md.useBlend, (int)gm.useBlend, (int)gm.alphaTest, (int)gm.additive, (int)gm.isSkinned, gm.vboStride, gm.uvOffset,
             taMin, taN?taSum/taN:0.0, taMax, gm.centroid[0],gm.centroid[1],gm.centroid[2]); }
         gpuMeshes.push_back(gm);
+    }
+
+    // ── Live base-texture replace (editor: set a mesh's / the skybox's texture from an image) ──────────────────
+    // Rebuild the GPU image from the (caller-updated) md.texRGBA and re-point THIS mesh's descriptor base-color slot
+    // at the new view. The CPU md.texRGBA is exactly what buildExportMeshes ships, so the swap also cooks into the
+    // home (set skybox texture -> preview AND cook). Returns false if the mesh/texture is invalid.
+    bool replaceMeshTexture(size_t mi, const std::vector<MeshData>& meshes) {
+        if (mi >= gpuMeshes.size() || mi >= meshes.size()) return false;
+        VkGpuMesh& gm = gpuMeshes[mi]; const MeshData& md = meshes[mi];
+        if (md.texRGBA.size() < (size_t)md.texW*md.texH*4 || md.texW < 1 || md.texH < 1) return false;
+        vkDeviceWaitIdle(device);   // safe: called from the editor between frames, no work in flight
+        // ORPHAN (don't free) the old GPU texture: its VkImageView is still referenced by whichever set2 slot
+        // uploadMesh bound BY SHADER-REFLECTION NAME (not a fixed binding), and re-deriving that exact slot here is
+        // fragile — freeing it risked a device-lost. A per-swap orphan is a tiny, bounded leak (a few edits/session);
+        // we then rebuild the descriptor for THIS mesh so the new texture is what draws. (Full descriptor rebuild
+        // below re-points every slot, so the orphan is never sampled again.)
+        gm.texView = VK_NULL_HANDLE; gm.texImage = VK_NULL_HANDLE; gm.texMem = VK_NULL_HANDLE;
+        if (md.useBlend) createTextureImageAW(md.texRGBA.data(), md.texW, md.texH, gm.texImage, gm.texMem);
+        else             createTextureImage(md.texRGBA.data(), md.texW, md.texH, gm.texImage, gm.texMem);
+        gm.texView = createImageView(gm.texImage, VK_FORMAT_R8G8B8A8_SRGB, lastTexMip);
+        // Re-point the base-color slot at the new view. The old image is ORPHANED (not freed), so even if a shader
+        // binds base at a different slot than s2base this never dereferences freed memory (no crash) — worst case the
+        // live preview keeps the old texture, but the COOK always ships the new md.texRGBA.
+        const int s2base = (gm.progIdx>=0) ? programs[gm.progIdx].set2BaseColorBinding : set2BaseColorBinding;
+        VkDescriptorImageInfo ii{ VK_NULL_HANDLE, gm.texView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        VkWriteDescriptorSet w{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        w.dstBinding = (u32)(s2base >= 0 ? s2base : 1); w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; w.pImageInfo = &ii;
+        if (gm.descSet2)     { w.dstSet = gm.descSet2;     vkUpdateDescriptorSets(device, 1, &w, 0, nullptr); }
+        if (gm.descSet2Skin) { w.dstSet = gm.descSet2Skin; vkUpdateDescriptorSets(device, 1, &w, 0, nullptr); }
+        return true;
     }
 
     // ── Render frame ────────────────────────────────────────────
@@ -1537,7 +1578,7 @@ public:
                 if (hideAllGeom) continue;
                 if (soloMesh >= 0 && (int)mi != soloMesh) continue;
                 if (hideMesh >= 0 && (int)mi == hideMesh) continue;
-                if (isHidden(mi)) continue;
+                if (isHidden(mi) || isDeleted(mi)) continue;
                 if (!hideMat.empty() && gm.name.find(hideMat) != std::string::npos) continue;
                 if (!soloMat.empty() && gm.name.find(soloMat) == std::string::npos) continue;
                 if (gm.culled) continue;     // V205 frustum+far cull (HSR_CLIP) — false unless culling toggled ON
@@ -1572,7 +1613,7 @@ public:
                 if (hideAllGeom) continue;
                 if (soloMesh >= 0 && (int)mi != soloMesh) continue;
                 if (hideMesh >= 0 && (int)mi == hideMesh) continue;
-                if (isHidden(mi)) continue;
+                if (isHidden(mi) || isDeleted(mi)) continue;
                 if (!hideMat.empty() && gm.name.find(hideMat) != std::string::npos) continue;
                 if (!soloMat.empty() && gm.name.find(soloMat) == std::string::npos) continue;
                 if (gm.culled) continue;     // V205 frustum+far cull (HSR_CLIP)
@@ -3586,6 +3627,70 @@ public:
     }
 
     u32 lastTexMip = 1;   // mip count of the most recent createTextureImage (for the view)
+
+    // ── Alpha-weighted mip chain for BLEND textures ──────────────────────────────────────────
+    // The GPU blit mip-chain (generateMipmaps) box-averages RGB with STRAIGHT alpha, so texels that
+    // are fully TRANSPARENT (alpha≈0) but carry bright "garbage" RGB bleed into the small mips. The
+    // dust atlas is 21% alpha≈0 and some of those texels are pure white (255,255,255) — at the card's
+    // minified/grazing silhouette the GPU picks those polluted mips and draws a bright neutral halo:
+    // the "white border" that is NOT present on the V79 device (which samples correctly-authored mips).
+    // Fix: build the mips on the CPU with color weighted by alpha (a premultiplied downsample stored
+    // back as straight alpha): mipRGB = Σ(rgb·a)/Σa. Invisible texels contribute ZERO color → no bleed.
+    // mip0 is byte-identical to the input (visible pixels unchanged); only the down-mips differ. For a
+    // fully-opaque texture (a≡255) this equals the plain box filter, so it's safe/identical there too.
+    void createTextureImageAW(const u8* rgba, u32 w, u32 h, VkImage& image, VkDeviceMemory& mem,
+                              VkFormat fmt = VK_FORMAT_R8G8B8A8_SRGB) {
+        u32 mipLevels = 1u + (u32)std::floor(std::log2((float)std::max(w, h)));
+        lastTexMip = mipLevels;
+        std::vector<std::vector<u8>> lv(mipLevels);
+        std::vector<u32> lw(mipLevels), lh(mipLevels);
+        lw[0] = w; lh[0] = h; lv[0].assign(rgba, rgba + (size_t)w * h * 4);
+        for (u32 i = 1; i < mipLevels; ++i) {
+            u32 pw = lw[i-1], ph = lh[i-1];
+            u32 cw = pw > 1 ? pw/2 : 1, ch = ph > 1 ? ph/2 : 1;
+            lw[i] = cw; lh[i] = ch; lv[i].resize((size_t)cw*ch*4);
+            const u8* s = lv[i-1].data(); u8* d = lv[i].data();
+            for (u32 y = 0; y < ch; ++y) for (u32 x = 0; x < cw; ++x) {
+                u32 x0 = x*2, y0 = y*2, x1 = (x0+1<pw)?x0+1:x0, y1 = (y0+1<ph)?y0+1:y0;
+                const u8* p[4] = { s+((size_t)y0*pw+x0)*4, s+((size_t)y0*pw+x1)*4,
+                                   s+((size_t)y1*pw+x0)*4, s+((size_t)y1*pw+x1)*4 };
+                float aw = (float)p[0][3] + p[1][3] + p[2][3] + p[3][3];
+                float r, g, b;
+                if (aw > 0.f) {
+                    r = (p[0][0]*(float)p[0][3] + p[1][0]*(float)p[1][3] + p[2][0]*(float)p[2][3] + p[3][0]*(float)p[3][3]) / aw;
+                    g = (p[0][1]*(float)p[0][3] + p[1][1]*(float)p[1][3] + p[2][1]*(float)p[2][3] + p[3][1]*(float)p[3][3]) / aw;
+                    b = (p[0][2]*(float)p[0][3] + p[1][2]*(float)p[1][3] + p[2][2]*(float)p[2][3] + p[3][2]*(float)p[3][3]) / aw;
+                } else { r = g = b = 0.f; }
+                float a = aw * 0.25f;
+                u8* o = d + ((size_t)y*cw+x)*4;
+                o[0]=(u8)(r+0.5f); o[1]=(u8)(g+0.5f); o[2]=(u8)(b+0.5f); o[3]=(u8)(a+0.5f);
+            }
+        }
+        std::vector<VkDeviceSize> off(mipLevels); VkDeviceSize total = 0;
+        for (u32 i = 0; i < mipLevels; ++i) { off[i] = total; total += (VkDeviceSize)lw[i]*lh[i]*4; }
+        VkBuffer staging; VkDeviceMemory stagingMem;
+        createBuffer(total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, staging, stagingMem);
+        void* ptr; vkMapMemory(device, stagingMem, 0, total, 0, &ptr);
+        for (u32 i = 0; i < mipLevels; ++i) memcpy((u8*)ptr + off[i], lv[i].data(), lv[i].size());
+        vkUnmapMemory(device, stagingMem);
+        createImage(w, h, fmt, VK_IMAGE_TILING_OPTIMAL,
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, image, mem, mipLevels);
+        transitionImageLayout(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels);
+        VkCommandBuffer cmd = beginSingleTimeCommands();
+        std::vector<VkBufferImageCopy> regions(mipLevels);
+        for (u32 i = 0; i < mipLevels; ++i) {
+            VkBufferImageCopy r = {}; r.bufferOffset = off[i];
+            r.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; r.imageSubresource.mipLevel = i;
+            r.imageSubresource.baseArrayLayer = 0; r.imageSubresource.layerCount = 1;
+            r.imageExtent = { lw[i], lh[i], 1 }; regions[i] = r;
+        }
+        vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels, regions.data());
+        endSingleTimeCommands(cmd);
+        transitionImageLayout(image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, mipLevels);
+        vkDestroyBuffer(device, staging, nullptr); vkFreeMemory(device, stagingMem, nullptr);
+    }
 
     void generateMipmaps(VkImage image, int32_t w, int32_t h, u32 mipLevels) {
         VkCommandBuffer cmd = beginSingleTimeCommands();

@@ -401,20 +401,81 @@ public:
         // cause a double-transform (bw[j] applied to verts already at E → extent at 2E), while
         // model-local verts transform correctly (bw[j] * near-origin ≈ E). extractNodeRigidHzAnim
         // already uses this pattern (restPos = node-LOCAL, bind = identity) and was device-proven.
-        if (nj > 0 && have[0]) {
-            float ib0[16]; invAff(bw.data(), ib0);   // invBind for clip joint 0 = inverse(entity world matrix E)
-            for (size_t v = 0; v+2 < e.restPos.size(); v += 3) {
+        if (nj == 1 && have[0]) {
+            // 1-JOINT skin whose WORLD placement may live in the BIND, not in the clip trajectory (a SPIN-IN-PLACE:
+            // bluehills VE_WESTERN windmill_blades_GEO — clip root T=(0,0,0), the -22 world offset is only in the
+            // inverse-bind). Butterfly-parity below (model-local verts + identity root bind + clip-carried world)
+            // ASSUMES the clip root carries the world trajectory; for a spin-in-place clip it left the mesh at
+            // inv(E)·basePos = model ORIGIN = SPAWN whenever the device was NOT actively driving the 1-joint clip
+            // (the "animatedGroup moved to spawn after cook" bug). ROBUST relative form — verts WORLD-baked into the
+            // frame-0 rest, identity bind, clip RELATIVE to frame-0 — reproduces the renderer EXACTLY when driven and
+            // lands at the correct WORLD rest when frozen/un-driven (identical to extractNodeRigidHzAnim's fix):
+            //   R(f) = clip.mats[f][0]·invBind_rep ;  restPos = R(0)·basePos ;  trsLocal[f][0] = clip.mats[f][0]·inv(clip.mats[0][0])
+            //   driven:        trsLocal[f][0]·restPos = clip.mats[f][0]·invBind_rep·basePos = renderer (= old butterfly driven)
+            //   frozen→identity: restPos = R(0)·basePos = the renderer's frame-0 WORLD rest (the FIX; butterfly gave model-origin)
+            float ib0[16]; invAff(bw.data(), ib0);                    // invBind_rep = inverse(bindWorld[0]) = inv(E)
+            const float* C0 = clip.mats.data();                       // clip.mats[0][0] (root joint, frame 0)
+            float R0[16]; mul16(C0, ib0, R0);                         // R(0) = clip.mats[0][0]·invBind_rep
+            for (size_t v = 0; v+2 < e.restPos.size(); v += 3) {      // verts -> frame-0 WORLD rest
                 float x=e.restPos[v], y=e.restPos[v+1], z=e.restPos[v+2];
-                e.restPos[v]   = ib0[0]*x+ib0[4]*y+ib0[8]*z +ib0[12];
-                e.restPos[v+1] = ib0[1]*x+ib0[5]*y+ib0[9]*z +ib0[13];
-                e.restPos[v+2] = ib0[2]*x+ib0[6]*y+ib0[10]*z+ib0[14]; }
-            // Root bind TRS = identity: T=0, Q=(w=1,x=0,y=0,z=0), S=1.
-            // Child joints keep their existing LOCAL bind TRS (= E^{-1}*bw[j], unchanged).
-            // ACL trsLocal for root keeps its world TRS (= E + anim) — the world "trajectory"
-            // is already encoded in trsLocal[f][0], exactly as in the butterfly ACL clip.
+                e.restPos[v]   = R0[0]*x+R0[4]*y+R0[8]*z +R0[12];
+                e.restPos[v+1] = R0[1]*x+R0[5]*y+R0[9]*z +R0[13];
+                e.restPos[v+2] = R0[2]*x+R0[6]*y+R0[10]*z+R0[14]; }
+            float invC0[16]; invAff(C0, invC0);                       // inv(clip.mats[0][0])
+            for (int f = 0; f < nf; ++f) {                            // root clip -> RELATIVE to frame-0 world rest
+                const float* Cf = clip.mats.data() + (size_t)f*16;    // nj==1 -> joint 0 at frame f
+                float rel[16]; mul16(Cf, invC0, rel);
+                float q[4],t[3],s[3]; matTrs(rel,q,t,s); float* o=e.trsLocal.data()+(size_t)f*10;
+                o[0]=q[0];o[1]=q[1];o[2]=q[2];o[3]=q[3]; o[4]=t[0];o[5]=t[1];o[6]=t[2]; o[7]=s[0];o[8]=s[1];o[9]=s[2]; }
             e.jointPos[0]=0.f;e.jointPos[1]=0.f;e.jointPos[2]=0.f;
             e.jointQuat[0]=1.f;e.jointQuat[1]=0.f;e.jointQuat[2]=0.f;e.jointQuat[3]=0.f;
             e.jointScale[0]=1.f;
+        }
+        // ROBUST nj>1 (rest-relative reskinning) — GENERALIZES the nj==1 fix above to MULTI-joint skins.
+        // The old butterfly-parity baked restPos = inv(E)·basePos (model-LOCAL, near origin). That is only
+        // safe when the device is actively DRIVING the clip; whenever it is NOT, the skinning falls back to
+        // IDENTITY and those verts render at model ORIGIN ≈ spawn (the bluehills chicken / owl / centralBanner
+        // "gray collapsed blob at spawn" bug — m164/m172/m173, whose skeleton roots are world-offset so
+        // inv(E)·basePos lands at origin; flags whose roots sit near origin happened to survive). FIX: bake
+        // restPos = the fully-skinned FRAME-0 WORLD pose (exactly the renderer's worldRest = Σ wᵢ·clipJointWorld(0)[cjᵢ]·invBind[bᵢ]·basePos),
+        // and set each joint's BIND world = clipJointWorld(0)[j] so the device skinMatrix(0)=I. Then:
+        //   frozen→identity:  vert = restPos = worldRest                         (correct WORLD placement — THE FIX)
+        //   driven:           skinMatrix(f)[j] = clipJointWorld(f)[j]·inv(clipJointWorld(0)[j])
+        //                     → single-bound vert(f) = clipJointWorld(f)·invBind·basePos = the renderer EXACTLY
+        //                       (multi-bound is the standard rest-relative LBS approximation, visually faithful).
+        // clip.mats are parent-LOCAL; renderer composes clipJointWorld[j]=clipJointWorld[parent]·clip.mats[j]
+        // (opa_loader animate() L864-871). Renderer path is untouched (it reads rec->basePos/invBind directly).
+        else if (nj > 1 && have[0]) {
+            std::vector<float> cw0((size_t)nj*16);                    // clipJointWorld(0)[j] (frame-0, world)
+            for (int j=0;j<nj;j++){ const float* L = clip.mats.data()+(size_t)j*16;   // frame 0, joint j, parent-local
+                int p=e.parents[j];
+                if (p<0||p>=j) memcpy(cw0.data()+(size_t)j*16, L, 64);
+                else mul16(cw0.data()+(size_t)p*16, L, cw0.data()+(size_t)j*16); }     // cw0[p]·L
+            std::vector<float> wr(e.restPos.size());                  // worldRest = renderer's frame-0 skinning
+            size_t nvv = rec->basePos.size()/3;
+            for (size_t vi=0; vi<nvv; vi++){
+                float bx=rec->basePos[vi*3], by=rec->basePos[vi*3+1], bz=rec->basePos[vi*3+2];
+                float ox=0,oy=0,oz=0,ws=0;
+                for(int i=0;i<4;i++){ float w=rec->jw[vi*4+i]; int b=rec->jidx[vi*4+i];
+                    if(w<=0.f||b<0||b>=rec->nJoints) continue;
+                    int cj=(b<(int)rec->boneClip.size())?rec->boneClip[b]:-1; if(cj<0||cj>=nj) continue;
+                    if((size_t)(b*16+16)>rec->invBind.size()) continue;
+                    float M[16]; mul16(cw0.data()+(size_t)cj*16, rec->invBind.data()+(size_t)b*16, M);  // skinMatrix(0)[b]
+                    ox+=w*(M[0]*bx+M[4]*by+M[8]*bz+M[12]);
+                    oy+=w*(M[1]*bx+M[5]*by+M[9]*bz+M[13]);
+                    oz+=w*(M[2]*bx+M[6]*by+M[10]*bz+M[14]); ws+=w; }
+                if(ws<1e-4f){ox=bx;oy=by;oz=bz;} else if(ws<0.999f||ws>1.001f){ox/=ws;oy/=ws;oz/=ws;}
+                wr[vi*3]=ox; wr[vi*3+1]=oy; wr[vi*3+2]=oz; }
+            e.restPos.swap(wr);
+            // bindWorld[j] := clipJointWorld(0)[j]  → recompute bind LOCAL TRS so device invBind[j]=inv(cw0[j]).
+            for(int j=0;j<nj;j++){ float bl[16]; int p=e.parents[j];
+                if(p>=0&&p<nj){ float ip[16]; invAff(cw0.data()+(size_t)p*16,ip); mul16(ip,cw0.data()+(size_t)j*16,bl); }
+                else memcpy(bl,cw0.data()+(size_t)j*16,64);
+                float q[4],t[3],s[3]; matTrs(bl,q,t,s);
+                e.jointPos[j*3]=t[0];e.jointPos[j*3+1]=t[1];e.jointPos[j*3+2]=t[2];
+                e.jointQuat[j*4]=q[3];e.jointQuat[j*4+1]=q[0];e.jointQuat[j*4+2]=q[1];e.jointQuat[j*4+3]=q[2];
+                e.jointScale[j]=(s[0]>1e-4f||s[0]<-1e-4f)?s[0]:1.f; }
+            // trsLocal already = absolute parent-local clip (emitted above), unchanged.
         }
         return e;
     }
@@ -462,7 +523,7 @@ public:
             else if(r0>r4&&r0>r8){float S=std::sqrt(1+r0-r4-r8)*2;q[3]=(r5-r7)/S;q[0]=0.25f*S;q[1]=(r3+r1)/S;q[2]=(r6+r2)/S;}
             else if(r4>r8){float S=std::sqrt(1+r4-r0-r8)*2;q[3]=(r6-r2)/S;q[0]=(r3+r1)/S;q[1]=0.25f*S;q[2]=(r7+r5)/S;}
             else{float S=std::sqrt(1+r8-r0-r4)*2;q[3]=(r1-r3)/S;q[0]=(r6+r2)/S;q[1]=(r7+r5)/S;q[2]=0.25f*S;} };
-        std::vector<float> trs((size_t)NF*10); float o0[3]={0,0,0}, maxd=0.f;
+        std::vector<Mat4> mats((size_t)NF); float o0[3]={0,0,0}, maxd=0.f; Mat4 W0 = identity();
         // EXCLUSIVE endpoint: sample [0, clipDur) so the frames march MONOTONICALLY through one period (0 -> just
         // before the wrap) with NO interior wrap. Inclusive [0,clipDur] put the last frame back ON the wrap target
         // (= frame 0), hiding the wrap at frame[NF-2]->frame[NF-1] INSIDE the clip => the device interpolated that
@@ -470,10 +531,9 @@ public:
         // which the device's time fract-wrap does INSTANTLY (teleport) = the seamless tile-seam crossing.
         for (int f=0; f<NF; f++) { evalAnimNodes(clipDur * (float)f / (float)NF);
             Mat4 w = (node < nodeWorldAnim.size()) ? nodeWorldAnim[node] : identity();
-            float q[4],t[3],s[3]; matTrs(w.m, q, t, s);
-            float* p=trs.data()+(size_t)f*10; p[0]=q[0];p[1]=q[1];p[2]=q[2];p[3]=q[3]; p[4]=t[0];p[5]=t[1];p[6]=t[2]; p[7]=s[0];p[8]=s[1];p[9]=s[2];
-            if (f==0){ o0[0]=t[0];o0[1]=t[1];o0[2]=t[2]; }
-            else { float dx=t[0]-o0[0],dy=t[1]-o0[1],dz=t[2]-o0[2]; float d=std::sqrt(dx*dx+dy*dy+dz*dz); if(d>maxd)maxd=d; } }
+            mats[f]=w; float tx=w.m[12],ty=w.m[13],tz=w.m[14];
+            if (f==0){ o0[0]=tx;o0[1]=ty;o0[2]=tz; W0=w; }
+            else { float dx=tx-o0[0],dy=ty-o0[1],dz=tz-o0[2]; float d=std::sqrt(dx*dx+dy*dy+dz*dz); if(d>maxd)maxd=d; } }
         animate(0.f);   // restore rest pose (geometry bake reads the renderer's GPU model, this just resets the loader)
         if (maxd < 0.01f) return e;   // node doesn't TRANSLATE → leave pure spins to the getTime() Rodrigues path
         if (std::getenv("HSR_VERBOSE")) {
@@ -485,17 +545,76 @@ public:
                 chain += animNodes[n].name+"(n"+std::to_string(tn)+"/e"+std::to_string(te)+") "; nodeEff=std::max(nodeEff,te);
             }
             fprintf(stderr,"[NODEANIM] mesh%d node=%u period=%d(nodeEff) globalMax=%d maxd=%.0f chain: %s\n", meshIdx, node, nodeEff, animMaxFrames, maxd, chain.c_str());
+            // RAW keyframe range of the node's OWN T/R/S tracks — is the huge sweep authored or a decode over-scale?
+            { auto it=nodeAnim.find(animNodes[node].name);
+              if(it!=nodeAnim.end()){ const auto& q=it->second;
+                if(q.t.nFrames>0){ float mn[3]={1e30f,1e30f,1e30f},mx[3]={-1e30f,-1e30f,-1e30f};
+                  for(int f=0;f<q.t.nFrames;f++)for(int c=0;c<3;c++){ float v=q.t.v[(size_t)f*3+c]; if(v<mn[c])mn[c]=v; if(v>mx[c])mx[c]=v; }
+                  fprintf(stderr,"[TRACKRAW] node=%s T(%df) X[%.1f,%.1f] Y[%.1f,%.1f] Z[%.1f,%.1f]  R.nf=%d S.nf=%d\n",
+                    animNodes[node].name.c_str(), q.t.nFrames, mn[0],mx[0], mn[1],mx[1], mn[2],mx[2], q.r.nFrames, q.s.nFrames); }
+                else fprintf(stderr,"[TRACKRAW] node=%s NO T track (R.nf=%d S.nf=%d) -> sweep from rotation/scale/parent\n",
+                    animNodes[node].name.c_str(), q.r.nFrames, q.s.nFrames); } }
         }
         size_t nv = ar->basePos.size()/3;
         // fps over the DOWNSAMPLED frame count so the device loop = the REAL clipDur (the OPA analogue of the
         // 70274aa warp-speed fix). NF<=64 frames are sampled INCLUSIVELY over [0,clipDur] (line ~414) = NF-1
         // intervals, so fps MUST be (NF-1)/clipDur, NOT the global animFps. With animFps a >64-frame path played
         // in (NF-1)/animFps s (e.g. 63/30=2.1s for a real 10s path = ~5x too fast). clipDur>0 + NF>=2 hold above.
-        e.jointCount=1; e.frameCount=NF; e.fps = (float)NF / clipDur;   // NF frames span [0,clipDur) (exclusive) -> period = NF/fps = clipDur
-        e.parents={-1}; e.jointPos={0,0,0}; e.jointQuat={1,0,0,0}; e.jointScale={1};   // identity bind
-        e.restPos = ar->basePos;   // node-LOCAL verts (the clip's WORLD transform places them)
-        e.boneIdx.assign(nv*4,0); e.boneWgt.assign(nv*4,0); for (size_t v=0;v<nv;v++) e.boneWgt[v*4]=255;
-        e.trsLocal = std::move(trs);
+        // ── TWO JOINTS: a STATIC root (joint 0) + a MOVING child (joint 1) that carries the whole path. ──────────────
+        // THE "train/cars FROZEN on device" fix. A 1-joint clip put the entire node TRANSLATION on the ROOT joint, but
+        // V205's AnimatorPlatformComponent does ROOT-MOTION EXTRACTION (libshell strings applyRootMotion /
+        // forceRootMotionOnEntityTransform on AnimatorPlatformComponentTranslatorV10): the root joint's TRANSLATION is
+        // pulled OUT of the skin pose and applied to the ENTITY transform instead. We cook the entity STATIC, so the
+        // extracted translation goes nowhere → the mesh skins at its frame-0 rest every frame = FROZEN IN PLACE (while
+        // root-ROTATION clips — spinning discs/doors — animate fine, because root motion only diverts translation+yaw).
+        // GROUND TRUTH for the asymmetry: root-rotation cooks loop on device, root-translation cooks freeze. Putting the
+        // motion on a CHILD joint (root stays identity) means there is NO root motion to extract → the child bone skins
+        // the verts along the full faithful path. HSR_RIGID1JOINT restores the old 1-joint clip.
+        bool oneJoint = std::getenv("HSR_RIGID1JOINT") != nullptr;
+        e.frameCount=NF; e.fps = (float)NF / clipDur;   // NF frames span [0,clipDur) (exclusive) -> period = NF/fps = clipDur
+        // BIND = IDENTITY (both joints at origin), clip = RELATIVE to frame-0 (W(t)·inv(W0)) on the MOVING joint, verts
+        // WORLD-baked into W0. invBind = inverse(bind) = identity, rest = W0·basePos, motion joint world = W(t)·inv(W0):
+        //   driven:           vert = W(t)·inv(W0) · (W0·basePos) = W(t)·basePos     (correct full-path anim)
+        //   frozen→identity:  vert = I            · (W0·basePos)  = W0·basePos = world rest  (placed correctly when un-driven)
+        // (Identical math to the old 1-joint clip, only the motion now lives on a child bone so it survives root-motion extraction.)
+        float invW0[16]; mat4affineInverse(W0.m, invW0);
+        // ── ACL-CLEAN clip (the "comet thrashes to nonsense positions on device" fix) ────────────────────────────────
+        // The old clip stored the mover joint's LOCAL transform as rel = W(f)·inv(W0) against an IDENTITY bind. For a
+        // node that ROTATES while offset from the origin (the comets orbit a distant pivot) that decomposition is
+        // numerically vicious: rel.translation blows up to THOUSANDS of units (m006 mover maxAbs=10592) with a rotation
+        // that exactly cancels it. ACL quantizes translation & rotation SEPARATELY, so a tiny rotation-quat error times
+        // the huge offset = wild ±1000u vertex thrash → the comet skins to garbage positions (looked "not animated").
+        // FIX: store the mover clip-local as the node's ACTUAL world matrix W(f) (modest translation ~node position) and
+        // put W0 in the mover's BIND pose. The device then computes invBind = inv(W0), so skinMatrix = jointWorld(f)·invBind
+        // = W(f)·inv(W0) — the SAME skin matrix as before — but the encoded clip now holds small, ACL-friendly numbers.
+        // Un-driven fallback stays correct too: skinMatrix = bindWorld·invBind = W0·inv(W0) = I → vert = W0·basePos = world rest.
+        // HSR_RIGIDRELBIND restores the old identity-bind / rel-clip encoding.
+        float w0q[4], w0t[3], w0s[3]; matTrs(W0.m, w0q, w0t, w0s);
+        const bool cleanBind = !oneJoint && !std::getenv("HSR_RIGIDRELBIND");
+        const float w0su = (w0s[0]+w0s[1]+w0s[2]) / 3.f;   // bind uses one uniform scale per joint (billboard nodes are ~unit/uniform)
+        if (oneJoint)        { e.jointCount=1; e.parents={-1}; e.jointPos={0,0,0}; e.jointQuat={1,0,0,0}; e.jointScale={1}; }
+        else if (cleanBind)  { e.jointCount=2; e.parents={-1,0};
+                               e.jointPos={0,0,0, w0t[0],w0t[1],w0t[2]};
+                               e.jointQuat={1,0,0,0, w0q[3],w0q[0],w0q[1],w0q[2]};   // hzJointQuat is (w,x,y,z); matTrs q is (x,y,z,w)
+                               e.jointScale={1, w0su}; }
+        else                 { e.jointCount=2; e.parents={-1,0}; e.jointPos={0,0,0, 0,0,0}; e.jointQuat={1,0,0,0, 1,0,0,0}; e.jointScale={1,1}; }
+        const int nj = e.jointCount;                       // 1 (root only) or 2 (static root + moving child)
+        const int mj = nj - 1;                             // the MOVING joint index (child if 2-joint, else the root)
+        std::vector<float> trsv((size_t)NF*nj*10);
+        for (int f=0; f<NF; f++) {
+            float q[4],t[3],s[3];
+            if (cleanBind) { matTrs(mats[f].m, q, t, s); }                       // clip-local = the node's ACTUAL world matrix W(f) (ACL-clean)
+            else { float rel[16]; mat4mul(mats[f].m, invW0, rel); matTrs(rel, q, t, s); }   // legacy rel = W(f)·inv(W0)
+            if (nj==2) { float* r=trsv.data()+(size_t)(f*nj+0)*10; r[0]=0;r[1]=0;r[2]=0;r[3]=1; r[4]=0;r[5]=0;r[6]=0; r[7]=1;r[8]=1;r[9]=1; }  // joint0 = STATIC identity (no root motion)
+            float* p=trsv.data()+(size_t)(f*nj+mj)*10; p[0]=q[0];p[1]=q[1];p[2]=q[2];p[3]=q[3]; p[4]=t[0];p[5]=t[1];p[6]=t[2]; p[7]=s[0];p[8]=s[1];p[9]=s[2];
+        }
+        e.restPos.resize(nv*3);                            // verts WORLD-baked into the frame-0 rest (model space == world rest)
+        for (size_t v=0; v<nv; v++) { const float* b=&ar->basePos[v*3]; float* o=&e.restPos[v*3];
+            o[0]=W0.m[0]*b[0]+W0.m[4]*b[1]+W0.m[8]*b[2]+W0.m[12];
+            o[1]=W0.m[1]*b[0]+W0.m[5]*b[1]+W0.m[9]*b[2]+W0.m[13];
+            o[2]=W0.m[2]*b[0]+W0.m[6]*b[1]+W0.m[10]*b[2]+W0.m[14]; }
+        e.boneIdx.assign(nv*4,0); e.boneWgt.assign(nv*4,0); for (size_t v=0;v<nv;v++){ e.boneIdx[v*4]=(uint8_t)mj; e.boneWgt[v*4]=255; }  // weight every vert to the MOVING joint
+        e.trsLocal = std::move(trsv);
         return e;
     }
 
@@ -552,6 +671,101 @@ public:
         animate(0.f);
         return maxDev > 1e-3f;   // actually breathes
     }
+
+    // COOK: does this mesh's node (or any animating ancestor) actually ROTATE or SCALE (beyond identity)? Effect cards
+    // (fog/dust) with a UV flipbook AND a node R/S can't be faithfully ported by the getTime translate shader (it only
+    // translates; a hierarchical/rotating/far-pivot scale would FLING the card). Such cards take the RIGID-HZANIM path
+    // (exact per-frame WORLD matrix via a skeleton) WITH the UV/fade baked into the SKINNED material shader. Pure-translate
+    // cards stay on the lighter getTime translate+flipbook+fade path. ── returns true iff a real R or S track is present.
+    bool nodeAnimatesRotOrScale(int meshIdx) {
+        const AnimRec* ar=nullptr; for (auto& a : animRecs) if ((int)a.meshIdx==meshIdx){ ar=&a; break; }
+        if (!ar) return false;
+        for (int n=(int)ar->nodeIdx, g=0; n>=0 && n<(int)animNodes.size() && g<32; n=animNodes[n].parent, ++g) {
+            auto it = nodeAnim.find(animNodes[n].name);
+            if (it == nodeAnim.end()) continue;
+            const NodeTracks& q = it->second;
+            if (q.s.nFrames>1 && q.s.comps==3) {   // scale breathe (per-axis range > 2%)
+                float mn[3]={1e9f,1e9f,1e9f}, mx[3]={-1e9f,-1e9f,-1e9f};
+                for (int f=0; f<q.s.nFrames; ++f) for (int c=0;c<3;c++){ float v=q.s.v[(size_t)f*3+c]; if(v<mn[c])mn[c]=v; if(v>mx[c])mx[c]=v; }
+                for (int c=0;c<3;c++) if (mx[c]-mn[c] > 0.02f) return true;
+            }
+            if (q.r.nFrames>1 && q.r.comps==4) {   // rotation quaternion actually varies
+                float maxd=0.f; for (int f=1; f<q.r.nFrames; ++f){ float d=0.f; for(int c=0;c<4;c++){ float e=q.r.v[(size_t)f*4+c]-q.r.v[c]; d+=e*e; } if(d>maxd)maxd=d; }
+                if (maxd > 1e-3f) return true;
+            }
+        }
+        return false;
+    }
+    // node index of a node-animated mesh (-1 if none), and a node's parent — so the cook can find the TRAIN BODY (the
+    // direct PARENT node of the train STEAM's node) and route it to the same getTime() clock so the two stay attached.
+    int animNodeOf(int meshIdx) const { for (auto& a:animRecs) if ((int)a.meshIdx==meshIdx) return (int)a.nodeIdx; return -1; }
+    int animNodeParentOf(int node) const { return (node>=0 && node<(int)animNodes.size()) ? animNodes[node].parent : -1; }
+
+    // ── COOK: node TRANSLATION (train STEAM / drifting FOG) → N WORLD-space OFFSET frames (delta from the frame-0 world
+    //    position, frame0=(0,0,0)) sampled over the node's OWN period, for a shadergen::TRANSLATE getTime() shader. The
+    //    device-PROVEN self-looping getTime() VERTEX family (same as ROTATE/SCALE) — used to give a flipbook card its node
+    //    motion WITHOUT the skinned (useHz) path that froze the texture. Verts stay world-baked; the shader adds offset(t).
+    //    Mirrors the glTF extractNodeTranslation (WORLD delta so the parent scale is honored). Returns false if it doesn't move. ──
+    bool cookExtractNodeTranslateFrames(int meshIdx, int N, std::vector<float>& frameOffs, float& loopSec, float forceLoopSec=-1.f) {
+        frameOffs.clear(); loopSec = 0.f;
+        if (animMaxFrames < 2 || N < 2) return false;
+        const AnimRec* ar=nullptr; for (auto& a : animRecs) if ((int)a.meshIdx==meshIdx){ ar=&a; break; }
+        if (!ar) return false;
+        uint32_t node=ar->nodeIdx; if (node >= animNodes.size()) return false;
+        // PER-NODE period (matches the renderer's per-track loop + extractNodeRigidHzAnim): max effFrames up the chain.
+        int nodeEff=0;
+        if (!std::getenv("HSR_NOPERNODELOOP"))
+            for (int g=0,n=(int)node; n>=0 && n<(int)animNodes.size() && g<32; n=animNodes[n].parent,++g){
+                auto it=nodeAnim.find(animNodes[n].name);
+                if(it!=nodeAnim.end()){ const NodeTracks&q=it->second;
+                    nodeEff=std::max(nodeEff, std::max(q.t.effFrames, std::max(q.r.effFrames, q.s.effFrames))); } }
+        if (nodeEff < 2) nodeEff = animMaxFrames;
+        loopSec = (animFps>0.f) ? (float)nodeEff/animFps : animDuration();
+        // SYNC: effect cards (fog/dust) drive UV-flipbook + fade + movement off ONE mat.sanim clock in V79 — pass the
+        // mat.sanim loopSec here so the node MOVEMENT is sampled over the SAME period (evalAnimNodes still loops the
+        // node's own track internally), locking movement to the fade/flipbook. Fixes desync ("moves too fast / doesn't
+        // follow its animation" when translate looped at 3.37s vs UV/fade 5.03s).
+        if (forceLoopSec > 1e-4f) loopSec = forceLoopSec;
+        if (loopSec <= 1e-4f) return false;
+        evalAnimNodes(0.f);
+        float w0[3]={0,0,0}; if (node<nodeWorldAnim.size()){ w0[0]=nodeWorldAnim[node].m[12]; w0[1]=nodeWorldAnim[node].m[13]; w0[2]=nodeWorldAnim[node].m[14]; }
+        frameOffs.assign((size_t)N*3, 0.f); float maxd=0.f;
+        for (int fi=0; fi<N; ++fi){ evalAnimNodes(loopSec*(float)fi/(float)N);   // EXCLUSIVE endpoint [0,loopSec) -> one clean monotonic period
+            if (node>=nodeWorldAnim.size()) continue;
+            for(int c=0;c<3;c++){ float o=nodeWorldAnim[node].m[12+c]-w0[c]; frameOffs[(size_t)fi*3+c]=o; float ad=o<0?-o:o; if(ad>maxd)maxd=ad; } }
+        // DESPIKE lone "there-and-back" outliers: sampleTrack does LINEAR quaternion interp, which between two
+        // far-apart key rotations produces a WRONG intermediate orientation for a single sample -> one frame that
+        // flings a far-offset node (the comet's t2=-237 blip: t1->t2->t3 deltas point OPPOSITE ways). The desktop's
+        // 90fps continuous playback flickers past it, but a cooked N-frame getTime replay would show a teleport.
+        // Replace ONLY a frame whose in/out deltas oppose (a there-and-back reversal), both large -> neighbor midpoint.
+        // Smooth / monotonic / hold+teleport paths (aligned or ~zero deltas) are untouched. HSR_NODESPIKE disables.
+        if (!std::getenv("HSR_NODESPIKE")) for (int fi=1; fi+1<N; ++fi){
+            float* c=&frameOffs[(size_t)fi*3]; const float* p=&frameOffs[(size_t)(fi-1)*3]; const float* n=&frameOffs[(size_t)(fi+1)*3];
+            float d1[3]={c[0]-p[0],c[1]-p[1],c[2]-p[2]}, d2[3]={n[0]-c[0],n[1]-c[1],n[2]-c[2]};
+            float l1=std::sqrt(d1[0]*d1[0]+d1[1]*d1[1]+d1[2]*d1[2]), l2=std::sqrt(d2[0]*d2[0]+d2[1]*d2[1]+d2[2]*d2[2]);
+            float dot=d1[0]*d2[0]+d1[1]*d2[1]+d1[2]*d2[2];
+            if (l1 > 0.1f*maxd && l2 > 0.1f*maxd && dot < -0.3f*l1*l2)   // clearly opposing (>~107 deg) + both large
+                { c[0]=0.5f*(p[0]+n[0]); c[1]=0.5f*(p[1]+n[1]); c[2]=0.5f*(p[2]+n[2]); }
+        }
+        maxd=0.f; for (size_t k=0;k<frameOffs.size();++k){ float a=std::fabs(frameOffs[k]); if(a>maxd)maxd=a; }   // recompute after despike
+        animate(0.f);
+        return maxd > 1e-3f;   // actually translates (WORLD space)
+    }
+    // ── COOK: the mat.sanim MaterialTint ALPHA track (per-frame opacity, 0..~0.22 for fog/dust) — the FADE curve the
+    //    fragment shader replays so the card fades IN/OUT over the loop (hiding a one-way node-translate's reset +
+    //    underground tail). Returns all nFrames alpha values + the track's natural loop seconds. ──
+    bool cookExtractTintAlpha(int meshIdx, std::vector<float>& alpha, float& loopSec) {
+        alpha.clear(); loopSec = 0.f;
+        const TintRec* tr=nullptr; for (auto& r : tintRecs) if ((int)r.meshIdx==meshIdx){ tr=&r; break; }
+        if (!tr) return false;
+        auto it = matTintAnim.find(tr->node);
+        if (it == matTintAnim.end() || it->second.nFrames < 2) return false;
+        const TintTrack& tt = it->second;
+        alpha.resize(tt.nFrames);
+        float amax=0.f; for (int f=0;f<tt.nFrames;f++){ alpha[f]=tt.rgba[(size_t)f*4+3]; if(alpha[f]>amax)amax=alpha[f]; }
+        loopSec = (animFps>0.f) ? (float)tt.nFrames/animFps : 0.f;
+        return amax > 1e-4f && loopSec > 1e-4f;   // a real (non-zero) fade
+    }
     // ── COOK: batch-fit every node-animated mesh to a SPIN/SWAY about an axis (the V79->V203 port). Samples each
     //    animated mesh's WORLD positions across the clip via animate(t), runs the shared noderot::fit, and returns
     //    meshIdx -> Result. Leaves the meshes at REST (animate(0)) so the static geometry bake is the t=0 pose. The
@@ -560,31 +774,77 @@ public:
     void cookExtractRotations(std::unordered_map<size_t, noderot::Result>& out) {
         out.clear();
         if (animRecs.empty() || animMaxFrames < 2) return;
-        float clipDur = animDuration(); if (clipDur <= 0.f) return;
+        float globalDur = animDuration(); if (globalDur <= 0.f) return;
         const int NS = 24;
         const size_t budget = 48000000;                  // ≤ ~190MB of position floats in flight at once (no swap/softlock)
         const size_t maxNv  = budget / ((size_t)(NS+1)*3);   // a single mesh bigger than this cooks static (huge meshes aren't the spinning ones)
-        struct M { size_t idx; size_t nv; uint32_t node; const std::vector<float>* base; float pivot[3]; };
+        // ── PER-NODE PERIOD (THE fix for the windmill_tails "in place but not moving" cook bug) ──────────────────────
+        // The fit MUST sample one clean rotation. Sampling a node over the GLOBAL clip (animMaxFrames=2501f/83.4s) when
+        // its OWN rotation period is short (windmill spin = 305f/~10s) packs ~8 turns into NS=24 samples → the angles
+        // alias and noderot::fit degenerates to a 4°/83s "sway" → the cooked getTime() shader barely moves on device
+        // (desktop preview animated fine because it drives the node directly). Sample each mesh over its node's OWN
+        // period (max track effFrames up its chain — identical to extractNodeRigidHzAnim/the renderer's per-node loop)
+        // → exactly one period → fit recovers the true SPIN. HSR_NOPERNODELOOP restores the old global behavior.
+        auto nodePeriodFrames = [&](uint32_t node)->int{
+            int eff=0;
+            if (!std::getenv("HSR_NOPERNODELOOP"))
+                for (int g=0,n=(int)node; n>=0 && n<(int)animNodes.size() && g<32; n=animNodes[n].parent,++g){
+                    auto it=nodeAnim.find(animNodes[n].name);
+                    if(it!=nodeAnim.end()){ const NodeTracks&q=it->second;
+                        eff=std::max(eff, std::max(q.t.effFrames, std::max(q.r.effFrames, q.s.effFrames))); } }
+            if (eff < 2) eff = animMaxFrames;
+            return eff;
+        };
+        struct M { size_t idx; size_t nv; uint32_t node; const std::vector<float>* base; float pivot[3]; float dur; };
         std::vector<M> ms; std::unordered_map<size_t,int> seen;
         for (auto& ar : animRecs) { size_t nv = ar.basePos.size()/3; if (nv < 3 || nv > maxNv) continue; if (seen.count(ar.meshIdx)) continue;
-            seen[ar.meshIdx]=1; ms.push_back({ar.meshIdx, nv, ar.nodeIdx, &ar.basePos, {0,0,0}}); }
+            seen[ar.meshIdx]=1; int eff=nodePeriodFrames(ar.nodeIdx); float dur=(animFps>0.f)?(float)eff/animFps:globalDur; if(dur<=0.f)dur=globalDur;
+            ms.push_back({ar.meshIdx, nv, ar.nodeIdx, &ar.basePos, {0,0,0}, dur}); }
         if (ms.empty()) { animate(0.f); return; }
         evalAnimNodes(0.f);   // rest pose -> each node's world origin = its pivot
         for (auto& m : ms) if (m.node < nodeWorldAnim.size()) { m.pivot[0]=nodeWorldAnim[m.node].m[12]; m.pivot[1]=nodeWorldAnim[m.node].m[13]; m.pivot[2]=nodeWorldAnim[m.node].m[14]; }
-        // MEMORY-BOUNDED chunks: sample NS frames for a chunk of meshes (node-only eval), fit, free, repeat.
-        size_t i0 = 0;
-        while (i0 < ms.size()) {
-            size_t i1 = i0, cv = 0;
-            while (i1 < ms.size() && (cv + ms[i1].nv) * (size_t)(NS+1) * 3 <= budget) { cv += ms[i1].nv; ++i1; }
-            if (i1 == i0) i1 = i0 + 1;
-            std::vector<std::vector<std::vector<float>>> fr(i1 - i0);
-            for (size_t k=i0;k<i1;k++) fr[k-i0].resize(NS+1);
-            for (int f=0; f<=NS; f++) { evalAnimNodes(clipDur * (float)f / (float)NS);
-                for (size_t k=i0;k<i1;k++){ M& m=ms[k]; auto& F=fr[k-i0][f]; F.resize(m.nv*3); Mat4 w=(m.node<nodeWorldAnim.size())?nodeWorldAnim[m.node]:identity();
-                    for (size_t v=0; v<m.nv; v++){ float o[3]; xform(w,(*m.base)[v*3],(*m.base)[v*3+1],(*m.base)[v*3+2],o); F[v*3]=o[0];F[v*3+1]=o[1];F[v*3+2]=o[2]; } } }
-            for (size_t k=i0;k<i1;k++){ M& m=ms[k]; std::vector<const float*> fp(NS+1); for (int f=0;f<=NS;f++) fp[f]=fr[k-i0][f].data();
-                noderot::Result r = noderot::fit(fp, m.nv, m.pivot, clipDur); if (r.rotAnim) out[m.idx] = r; }
-            i0 = i1;
+        // Sample EACH mesh over its OWN period (per-mesh node eval — a handful of spin meshes × NS calls, cheap).
+        std::vector<std::vector<float>> fr(NS+1);
+        for (auto& m : ms) {
+            for (int f=0; f<=NS; f++) { evalAnimNodes(m.dur * (float)f / (float)NS);
+                Mat4 w=(m.node<nodeWorldAnim.size())?nodeWorldAnim[m.node]:identity();
+                fr[f].resize(m.nv*3);
+                for (size_t v=0; v<m.nv; v++){ float o[3]; xform(w,(*m.base)[v*3],(*m.base)[v*3+1],(*m.base)[v*3+2],o); fr[f][v*3]=o[0];fr[f][v*3+1]=o[1];fr[f][v*3+2]=o[2]; } }
+            std::vector<const float*> fp(NS+1); for (int f=0;f<=NS;f++) fp[f]=fr[f].data();
+            noderot::Result r = noderot::fit(fp, m.nv, m.pivot, m.dur); if (r.rotAnim) out[m.idx] = r;
+            if (std::getenv("HSR_ROTDIAG")) {
+                // DECISIVE diagnostic (exact eval path): node track frame counts + RAW swept angle of the
+                // farthest-from-pivot probe vertex over the SAMPLED period (m.dur) AND over the GLOBAL clip.
+                // Reveals whether a real spin is being aliased to a tiny "sway" by a wrong period.
+                auto rawSweep=[&](float dur)->std::pair<float,float>{ // {accumulated total, peak-from-frame0} radians
+                    int ai=-1; float aR=0; const float* P0=nullptr;
+                    std::vector<std::vector<float>> g(NS+1);
+                    for (int f=0; f<=NS; f++){ evalAnimNodes(dur*(float)f/(float)NS);
+                        Mat4 w=(m.node<nodeWorldAnim.size())?nodeWorldAnim[m.node]:identity(); g[f].resize(m.nv*3);
+                        for (size_t v=0; v<m.nv; v++){ float o[3]; xform(w,(*m.base)[v*3],(*m.base)[v*3+1],(*m.base)[v*3+2],o); g[f][v*3]=o[0];g[f][v*3+1]=o[1];g[f][v*3+2]=o[2]; } }
+                    P0=g[0].data();
+                    for (size_t v=0;v<m.nv;v++){ float d[3]={P0[v*3]-m.pivot[0],P0[v*3+1]-m.pivot[1],P0[v*3+2]-m.pivot[2]}; float rr=d[0]*d[0]+d[1]*d[1]+d[2]*d[2]; if(rr>aR){aR=rr;ai=(int)v;} }
+                    if (ai<0) return {0.f,0.f};
+                    float ax[3]={0,1,0}; // estimate axis from angular momentum at fastest step
+                    { int ti=0; float bv=0; for(int f=0;f<NS;f++){ float dx=g[f+1][ai*3]-g[f][ai*3],dy=g[f+1][ai*3+1]-g[f][ai*3+1],dz=g[f+1][ai*3+2]-g[f][ai*3+2]; float s=dx*dx+dy*dy+dz*dz; if(s>bv){bv=s;ti=f;} }
+                      double C[3]={0,0,0}; for(size_t v=0;v<m.nv;v++){C[0]+=g[ti][v*3];C[1]+=g[ti][v*3+1];C[2]+=g[ti][v*3+2];} C[0]/=m.nv;C[1]/=m.nv;C[2]/=m.nv;
+                      double aa[3]={0,0,0}; for(size_t v=0;v<m.nv;v++){ float ri[3]={(float)(g[ti][v*3]-C[0]),(float)(g[ti][v*3+1]-C[1]),(float)(g[ti][v*3+2]-C[2])}, vi[3]={g[ti+1][v*3]-g[ti][v*3],g[ti+1][v*3+1]-g[ti][v*3+1],g[ti+1][v*3+2]-g[ti][v*3+2]}; aa[0]+=ri[1]*vi[2]-ri[2]*vi[1];aa[1]+=ri[2]*vi[0]-ri[0]*vi[2];aa[2]+=ri[0]*vi[1]-ri[1]*vi[0]; }
+                      float l=(float)std::sqrt(aa[0]*aa[0]+aa[1]*aa[1]+aa[2]*aa[2]); if(l>1e-9f){ax[0]=(float)(aa[0]/l);ax[1]=(float)(aa[1]/l);ax[2]=(float)(aa[2]/l);} }
+                    auto sang=[&](const float* a,const float* b){ float da=a[0]*ax[0]+a[1]*ax[1]+a[2]*ax[2], db=b[0]*ax[0]+b[1]*ax[1]+b[2]*ax[2]; float pa[3]={a[0]-da*ax[0],a[1]-da*ax[1],a[2]-da*ax[2]},pb[3]={b[0]-db*ax[0],b[1]-db*ax[1],b[2]-db*ax[2]}; float c[3]={pa[1]*pb[2]-pa[2]*pb[1],pa[2]*pb[0]-pa[0]*pb[2],pa[0]*pb[1]-pa[1]*pb[0]}; return std::atan2(c[0]*ax[0]+c[1]*ax[1]+c[2]*ax[2], pa[0]*pb[0]+pa[1]*pb[1]+pa[2]*pb[2]); };
+                    float tot=0,peak=0; float r0[3]={g[0][ai*3]-m.pivot[0],g[0][ai*3+1]-m.pivot[1],g[0][ai*3+2]-m.pivot[2]};
+                    for(int f=1;f<=NS;f++){ float pr[3]={g[f-1][ai*3]-m.pivot[0],g[f-1][ai*3+1]-m.pivot[1],g[f-1][ai*3+2]-m.pivot[2]}, cu[3]={g[f][ai*3]-m.pivot[0],g[f][ai*3+1]-m.pivot[1],g[f][ai*3+2]-m.pivot[2]}; tot+=sang(pr,cu); float th=sang(r0,cu); if(std::fabs(th)>std::fabs(peak))peak=th; }
+                    return {tot,peak};
+                };
+                std::string nm = (m.idx<meshes.size())?meshes[m.idx].name:std::string();
+                int rn=0,re=0; std::string chain;
+                for (int g2=0,n=(int)m.node; n>=0 && n<(int)animNodes.size() && g2<32; n=animNodes[n].parent,++g2){
+                    auto it=nodeAnim.find(animNodes[n].name);
+                    if(it!=nodeAnim.end()){ const NodeTracks&q=it->second; rn=std::max(rn,q.r.nFrames);re=std::max(re,q.r.effFrames);
+                        chain += animNodes[n].name+"(r"+std::to_string(q.r.nFrames)+"/e"+std::to_string(q.r.effFrames)+") "; } }
+                auto pNode=rawSweep(m.dur); auto pGlob=rawSweep(globalDur);
+                fprintf(stderr,"[ROTDIAG] mesh%zu '%s' node=%u dur=%.2fs(rN=%d/rE=%d) FIT{osc=%d omega=%.3f amp=%.1fdeg per=%.2fs} | rawNode tot=%.1fdeg peak=%.1fdeg | rawGlobal(%.1fs) tot=%.1fdeg peak=%.1fdeg | chain: %s\n",
+                    m.idx, nm.c_str(), m.node, m.dur, rn, re, (int)r.isOsc, r.omega, r.amp*57.2958f, r.period, pNode.first*57.2958f, pNode.second*57.2958f, globalDur, pGlob.first*57.2958f, pGlob.second*57.2958f, chain.c_str());
+            }
         }
         animate(0.f);   // FULL restore (skinning/UV too) -> leave every mesh at rest for the geometry bake
     }
@@ -612,16 +872,8 @@ public:
             sdu += dc; sdv += df; ++n;
         }
         if (n < 1) return false;
-        // FLIPBOOK ATLAS detect (the real fix for the lakeside waterfall/stream/fog): the texture is an N×N grid of
-        // sprite frames (waterfall.png = 8×8 = 64 cells) and the mesh's base UV maps to ONE cell; the track STEPS the
-        // UV by ~1/cols PER FRAME (waterfall dc=0.125=1/8, fog dc≈0.1=1/10) to flip through cells. The 2×2 stays
-        // identity so the old "identity ⇒ continuous scroll" test mis-played it as a smooth scroll → the cells SMEAR
-        // into each other = "all messed", and at 0.125·30fps=3.75 cells/s it's "way too fast". A genuine continuous
-        // water scroll (lake) has a TINY per-frame delta (~0.0001). So: a LARGE per-frame step = a flipbook → return
-        // false here, routing it to animate()'s frame-SNAP path (one whole cell per frame, no smear). cook routes
-        // flipbooks to the spritesheet shader, not uvscroll.
         double avgDu = sdu / n, avgDv = sdv / n;
-        if (std::fabs(avgDu) > 0.04 || std::fabs(avgDv) > 0.04) return false;   // cell-stepping flipbook, not a scroll
+        if (std::fabs(avgDu) > 0.04 || std::fabs(avgDv) > 0.04) return false;   // cell-stepping flipbook, not a scroll (texture names confirm: *_flipbook / *_spritesheet)
         ru = (float)(avgDu * animFps); rv = (float)(avgDv * animFps);   // UV/sec = the track's AUTHORED visible speed at the base fps
         // FAITHFUL: libshell plays the mat.sanim UVTransform by feeding the per-frame 2x3 matrix into the vertex
         // shader's `BaseTextureMtx[2]` uniform (captured MeshShellEnv_runtime.vert) and computing oBaseTexCoord =
@@ -663,13 +915,13 @@ public:
     void cookExtractFlipbook(std::unordered_map<size_t, FlipRec>& out) {
         out.clear();
         if (uvAnimRecs.empty() || animFps <= 0.f) return;
+        bool fdbg = std::getenv("HSR_FLIPDBG") != nullptr;
         for (auto& ur : uvAnimRecs) {
             if (out.count(ur.meshIdx)) continue;
             auto it = matUVAnim.find(ur.node);
             if (it == matUVAnim.end() || it->second.nFrames < 2) continue;
             const UVTrack& tr = it->second;
             const float* M0 = tr.m.data();
-            if (std::fabs(M0[0]-1.f)>0.05f || std::fabs(M0[4]-1.f)>0.05f) continue;   // not an identity-offset track
             int win = tr.nFrames-1; if (win>256) win=256;
             double sdu=0, sdv=0; int n=0;
             for (int f=0; f<win; f++) {
@@ -678,16 +930,53 @@ public:
                 if (std::fabs(dc)>0.5f || std::fabs(df)>0.5f) continue;
                 sdu+=dc; sdv+=df; ++n;
             }
+            double du = n? std::fabs(sdu/n):0.0, dv = n? std::fabs(sdv/n):0.0;
+            if (fdbg) { std::string nm=(ur.meshIdx<meshes.size())?meshes[ur.meshIdx].name:std::string();
+                fprintf(stderr,"[FLIPDBG] mesh%zu '%s' node='%s' nF=%d 2x2=[%.3f %.3f; %.3f %.3f] du=%.4f dv=%.4f signed(du=%.4f dv=%.4f)\n",
+                    ur.meshIdx, nm.c_str(), ur.node.c_str(), tr.nFrames, M0[0],M0[1],M0[3],M0[4], du,dv, n?sdu/n:0.0, n?sdv/n:0.0); }
+            if (std::fabs(M0[0]-1.f)>0.05f || std::fabs(M0[4]-1.f)>0.05f) continue;   // not an identity-offset track
             if (n < 1) continue;
-            double du=std::fabs(sdu/n), dv=std::fabs(sdv/n);
-            if (du <= 0.04 && dv <= 0.04) continue;   // continuous scroll, NOT a cell-stepping flipbook
+            float ru0,rv0; if (uvScrollRate(tr, ru0, rv0)) continue;   // a CONTINUOUS scroll -> NOT a flipbook (cooked as uvscroll). Only cell-stepping grids remain.
             FlipRec fr;
             fr.cols   = (du>1e-4) ? (int)llround(1.0/du) : 1;  if (fr.cols<1) fr.cols=1;
             fr.frames = tr.nFrames;
-            fr.rows   = (int)std::ceil((double)fr.frames/(double)fr.cols);  if (fr.rows<1) fr.rows=1;
+            // rows = ROUND(frames/cols), NOT ceil. The fog "flashing" bug: a 15-col / 151-frame sheet is a 15×10 grid
+            // (15×10=150 +1 loop-seam frame), but ceil(151/15)=11 made the shader divide the V offset by 11 → every cell
+            // landed on the wrong row = vertical smear/flash. round(151/15)=10 = the true row count, so row/rows aligns.
+            fr.rows   = (int)llround((double)fr.frames/(double)fr.cols);  if (fr.rows<1) fr.rows=1;
             fr.fps    = animFps;
             out[ur.meshIdx] = fr;
         }
+    }
+
+    // ── COOK: EXACT per-frame UV (c,f) OFFSETS from a mat.sanim track (the fog/dust "flashing wrong everything" fix).
+    //    Instead of deriving a cols×rows grid from the avg step (which mis-grids a fog_spritesheet that isn't a clean
+    //    grid, and MISSES large-step cell jumps where the dust offset moves >0.5/frame), replay the track's ACTUAL
+    //    per-frame c,f offsets — exactly what the desktop's animate() flipbook branch applies (uv' = baseUV + (c,f)).
+    //    ABSOLUTE offsets (not relative), subsampled to N, frame-snapped on device. loopSec = nFrames/animFps. ──
+    // ── COOK: the EXACT per-frame FULL 2x3 UV matrices from a mat.sanim track — the SAME data the desktop's animate()
+    //    plays (opa_loader animate() flipbook branch: uv' = M[frame]·baseUV, frame = floor(fract(t/loopSec)·nFrames)).
+    //    Pass ALL frames (cap maxN) so the device replays the source VERBATIM (no derived cols/rows grid to mis-guess):
+    //    handles continuous scroll, sprite-cell atlases AND 2x2 SCALE (dust) uniformly. loopSec = nFrames/animFps (the
+    //    desktop's flipSlow=1 rate). Returns false if the matrix doesn't change across frames (a still track). ──
+    bool cookExtractUVMatrices(int meshIdx, int maxN, std::vector<float>& mats, int& N, float& loopSec) {
+        mats.clear(); N=0; loopSec=0.f;
+        if (maxN < 2 || animFps <= 0.f) return false;
+        const UVAnimRec* ar=nullptr; for (auto& a : uvAnimRecs) if ((int)a.meshIdx==meshIdx){ ar=&a; break; }
+        if (!ar) return false;
+        auto it = matUVAnim.find(ar->node);
+        if (it == matUVAnim.end() || it->second.nFrames < 2) return false;
+        const UVTrack& tr = it->second; int nf = tr.nFrames;
+        loopSec = (float)nf / animFps; if (loopSec <= 1e-4f) return false;
+        N = nf <= maxN ? nf : maxN;   // ALL source frames (no cell-skipping subsample) unless enormous
+        mats.assign((size_t)N*6, 0.f);
+        bool anim=false;
+        for (int i=0; i<N; i++) {
+            int src = (nf==N) ? i : (int)((double)i * nf / (double)N); if (src>=nf) src=nf-1;
+            for (int k=0;k<6;k++){ float v = tr.m[(size_t)src*6+k]; mats[(size_t)i*6+k]=v;
+                if (i>0 && std::fabs(v - mats[(size_t)k]) > 1e-5f) anim=true; }
+        }
+        return anim;   // the matrix actually changes across frames
     }
 
     // ── Per-clip frame-rate READ FROM THE COOKED DATA, not hardcoded ─────────────────────────
@@ -857,7 +1146,38 @@ public:
             size_t nuv = ur.baseUV.size() / 2;
             if (md.uvs.size() < nuv*2) md.uvs.resize(nuv*2);
             float ru, rv;
-            if (uvScrollRate(tr, ru, rv)) {
+            bool isScroll = uvScrollRate(tr, ru, rv);
+            // FAITHFUL per-animation speed (V79 AnimationLayer sub_1BC7118: phase += speed*dt/clipDuration —
+            // EACH clip, node OR texture, advances on its OWN duration/speed). The UV clip's authored
+            // duration = its own frame count / the sanim FrameRate. NO artificial cap/stretch (uvMaxLoopSec/
+            // flipSlow distorted the authored speed = the "moves too fast / doesn't follow" bug). Sync with
+            // the node movement + tint fade is EMERGENT (fog authors node/UV/tint at matching durations),
+            // exactly like the device — not forced. Loop = fract (recycle mode!=0 = repeat, sub_1BC70B8).
+            float clipSec = (animFps > 0.f) ? (float)tr.nFrames / animFps : 0.f;
+            static int legacyAnim = -1; if (legacyAnim<0) legacyAnim = std::getenv("HSR_LEGACYANIM")?1:0;
+            if (clipSec > 1e-4f && !legacyAnim) {
+                float phase = fmodf(t / clipSec, 1.0f) * (float)tr.nFrames;
+                if (phase < 0.0f) phase += (float)tr.nFrames;
+                int f0 = (int)phase; if (f0 >= tr.nFrames) f0 = tr.nFrames - 1; if (f0 < 0) f0 = 0;
+                int f1 = (f0 + 1 < tr.nFrames) ? f0 + 1 : 0;
+                float frac = phase - (float)f0; if (frac < 0.f) frac = 0.f; if (frac > 1.f) frac = 1.f;
+                const float* M0 = tr.m.data() + (size_t)f0 * 6;
+                const float* M1 = tr.m.data() + (size_t)f1 * 6;
+                // LERP a continuous scroll/warp (smooth flow); SNAP a sprite-atlas flipbook (lerp = double image).
+                float M[6];
+                if (isScroll) for (int k=0;k<6;k++) M[k] = M0[k]*(1.0f-frac) + M1[k]*frac;
+                else          for (int k=0;k<6;k++) M[k] = M0[k];
+                for (size_t i = 0; i < nuv; ++i) {
+                    float u0 = ur.baseUV[i*2], v0 = ur.baseUV[i*2+1];
+                    md.uvs[i*2]   = M[0]*u0 + M[1]*v0 + M[2];
+                    md.uvs[i*2+1] = M[3]*u0 + M[4]*v0 + M[5];
+                }
+                static int matdbg = -1; if (matdbg<0) matdbg = std::getenv("HSR_MATDBG")?1:0;
+                if (matdbg && nuv>0) fprintf(stderr, "[MATDBG] t=%.2f mesh#%zu '%s' CLIP fr=%d/%d clip=%.2fs %s off=(%.3f,%.3f) uv0=(%.4f,%.4f)\n",
+                    t, ur.meshIdx, ur.node.c_str(), f0, tr.nFrames, clipSec, isScroll?"scroll":"atlas", M[2],M[5], md.uvs[0], md.uvs[1]);
+                continue;
+            }
+            if (isScroll) {
                 // CONTINUOUS linear UV scroll (deconstructed from lakesidepeak.apk mat.sanim: fog/fogB/smoke/
                 // waterfall_fog/waterfall/stream/lake all have an IDENTITY 2x2 + a constant-velocity offset, e.g.
                 // fog dc=0.1/fr & smoke dc=0.125/fr — NOT atlas flipbooks). The faithful play is uv = baseUV + rate*t
@@ -910,10 +1230,22 @@ public:
             auto it = matTintAnim.find(tr.node);
             if (it == matTintAnim.end() || it->second.nFrames < 1) continue;
             const TintTrack& tt = it->second;
-            static float matLoopMaxT = -1.f;
-            if (matLoopMaxT < 0.f) { const char* e = std::getenv("HSR_MATLOOP"); matLoopMaxT = e ? (float)atof(e) : 5.0f; }
-            float loopSecT = (animFps > 0.f) ? (float)tt.nFrames / animFps : 0.f;
-            if (matLoopMaxT > 0.f && loopSecT > matLoopMaxT) loopSecT = matLoopMaxT;
+            if (std::getenv("HSR_TINTDBG")) { static std::set<std::string> seen;
+                if (!seen.count(tr.node)) { seen.insert(tr.node);
+                    float amn=1e9f,amx=-1e9f; for(int f=0;f<tt.nFrames;f++){float a=tt.rgba[(size_t)f*4+3]; if(a<amn)amn=a; if(a>amx)amx=a;}
+                    auto A=[&](float p){int f=(int)(p*(tt.nFrames-1)+0.5f); return tt.rgba[(size_t)f*4+3];};
+                    fprintf(stderr,"[TINTDBG] '%s' nf=%d alpha[min=%.3f max=%.3f]  @0=%.3f @25=%.3f @50=%.3f @75=%.3f @100=%.3f\n",
+                        tr.node.c_str(), tt.nFrames, amn,amx, A(0),A(.25f),A(.5f),A(.75f),A(1)); } }
+            static int legacyAnimT = -1; if (legacyAnimT<0) legacyAnimT = std::getenv("HSR_LEGACYANIM")?1:0;
+            float loopSecT;
+            if (animFps > 0.f && tt.nFrames > 1 && !legacyAnimT) {
+                loopSecT = (float)tt.nFrames / animFps;  // FAITHFUL: the fade plays at ITS OWN authored duration/speed (no 5s cap) — sub_1BC7118 per-clip rate
+            } else {
+                static float matLoopMaxT = -1.f;
+                if (matLoopMaxT < 0.f) { const char* e = std::getenv("HSR_MATLOOP"); matLoopMaxT = e ? (float)atof(e) : 5.0f; }
+                loopSecT = (animFps > 0.f) ? (float)tt.nFrames / animFps : 0.f;
+                if (matLoopMaxT > 0.f && loopSecT > matLoopMaxT) loopSecT = matLoopMaxT;
+            }
             float phase = (loopSecT > 1e-4f) ? fmodf(t / loopSecT, 1.0f) * (float)tt.nFrames
                                              : fmodf(t * animFps, (float)tt.nFrames);
             if (phase < 0.0f) phase += (float)tt.nFrames;
@@ -987,6 +1319,9 @@ public:
                 if (kp + 12 > sa.size()) { p += adv; continue; }
                 uint32_t nKeys, nVals;
                 memcpy(&nKeys, sa.data()+kp+4, 4); memcpy(&nVals, sa.data()+kp+8, 4);
+                if (std::getenv("HSR_SANIMDBG")) { uint32_t f0; memcpy(&f0, sa.data()+kp, 4);
+                    fprintf(stderr,"[SANIM] node='%s' ch=%s hdr@kp[+0]=0x%08X(%u) nKeys=%u nVals=%u  bytes[+0..+3]=%02X %02X %02X %02X\n",
+                        curNode.c_str(), nm.c_str(), f0, f0, nKeys, nVals, sa[kp],sa[kp+1],sa[kp+2],sa[kp+3]); }
                 // comps come from the CHANNEL, not nKeys: Translation/Scale=3, Rotation=4 (quat); the
                 // value block is nVals floats right after the 12B header. Deriving frames from nKeys+1
                 // is wrong for flag=1 tracks (the bird's path: nVals=6000, nKeys+1=2001 -> 2001*3≠6000,
@@ -2336,6 +2671,11 @@ private:
                     const TintTrack& tt = matTintAnim[nodes[nodeIdx].name];
                     if (tt.nFrames > 0) { md.curTint[0]=tt.rgba[0]; md.curTint[1]=tt.rgba[1];
                                           md.curTint[2]=tt.rgba[2]; md.curTint[3]=tt.rgba[3]; }
+                    // If the tint ALPHA actually fades (min≈0, real swing), this is an ALPHA-BLEND that
+                    // relies on alpha — flag it so the renderer never routes it to the hard-additive
+                    // (src=ONE) pipeline (which ignores alpha and freezes the fog/dust at full opacity).
+                    { float amn=1e9f, amx=-1e9f; for (int f=0; f<tt.nFrames; ++f) { float a=tt.rgba[(size_t)f*4+3]; if(a<amn)amn=a; if(a>amx)amx=a; }
+                      if (tt.nFrames > 1 && amx - amn > 0.05f) md.animatedTintAlpha = true; }
                 }
                 // VAT: keep LOCAL basePos + per-vertex column; animate() adds the per-frame offset
                 // and applies the instance world matrix (animate(0) places them at the rest pose).

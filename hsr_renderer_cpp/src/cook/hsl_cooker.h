@@ -270,7 +270,13 @@ enum : uint32_t { TGT_MESH = 0x4D455348, TGT_TEX = 0x6E4CC522, TGT_SURFACE = 0xA
 // formatCode = color/pixel format enum (11 = sRGB albedo, like nuxd's tx_dome). f2 = ASTC block enum
 // (6x6->18, 8x8->20, 12x12->24). The device GPU-uploads the full mip chain (ErrorInvalidArg without it / with a
 // bad format). A box-filtered RGBA mip chain down to 1x1, each level ASTC-encoded and concatenated into f9.
-inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, int bw = 8, int bh = 8, uint8_t formatCode = 11) {
+inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, int bw = 8, int bh = 8, uint8_t formatCode = 11, bool alphaWeighted = false) {
+    // alphaWeighted: for BLEND (transparent) textures, downsample mip RGB weighted by alpha
+    // (mipRGB = Σ rgb·a / Σ a) instead of a straight box average. Straight-box lets fully-transparent
+    // "garbage" RGB (the dust atlas is 21% α≈0 and some of those texels are pure white) bleed into the
+    // small mips, so the device draws a bright halo tracing the card silhouette at minified/grazing
+    // edges (the "white border"). Alpha-weighting gives invisible texels ZERO color weight = no bleed.
+    // Matches the desktop renderer's createTextureImageAW so cook (device) == preview.
     // ── CONTENT-HASH DISK CACHE: re-encoding the same texture every re-cook is the dominant cost (lakeside = many
     //    2048² ASTC encodes ≈ the whole ~10min). Cache the ASTC mip chain by an FNV-1a hash of the FINAL RGBA (+dims+
     //    block), so re-cooks that change shaders/routing but NOT textures (i.e. every iteration here) skip the encode
@@ -278,7 +284,7 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
     uint64_t hsh = 1469598103934665603ull; auto mix=[&](uint64_t v){ hsh=(hsh^v)*1099511628211ull; };
     { size_t nb=(size_t)w*h*4, n64=nb/8; const uint64_t* p=(const uint64_t*)rgba;
       for (size_t k=0;k<n64;k++) mix(p[k]); for (size_t k=n64*8;k<nb;k++) mix(rgba[k]);
-      mix(((uint64_t)(uint32_t)w<<32)|(uint32_t)h); mix(((uint64_t)bw<<8)|(uint32_t)bh); }
+      mix(((uint64_t)(uint32_t)w<<32)|(uint32_t)h); mix(((uint64_t)bw<<8)|(uint32_t)bh); mix(alphaWeighted?0x4157u:0u); }
     std::error_code _ec; std::filesystem::path cdir = std::filesystem::temp_directory_path()/"hsr_texcache";
     bool useCache = !std::getenv("HSR_NOTEXCACHE");
     if (useCache) std::filesystem::create_directories(cdir,_ec);
@@ -309,11 +315,20 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
             astcenc_compress_reset(ctx);                        // reuse the (multi-thread) context for the next mip
             int nw = cw > 1 ? cw / 2 : 1, nh = ch > 1 ? ch / 2 : 1;
             std::vector<uint8_t> nx((size_t)nw * nh * 4);
-            for (int y = 0; y < nh; y++) for (int x = 0; x < nw; x++) for (int c = 0; c < 4; c++) {
+            for (int y = 0; y < nh; y++) for (int x = 0; x < nw; x++) {
                 int sx = x * 2, sy = y * 2, sx1 = sx + 1 < cw ? sx + 1 : sx, sy1 = sy + 1 < ch ? sy + 1 : sy;
-                int a = cur[((size_t)sy * cw + sx) * 4 + c], b2 = cur[((size_t)sy * cw + sx1) * 4 + c];
-                int c2 = cur[((size_t)sy1 * cw + sx) * 4 + c], d2 = cur[((size_t)sy1 * cw + sx1) * 4 + c];
-                nx[((size_t)y * nw + x) * 4 + c] = (uint8_t)((a + b2 + c2 + d2 + 2) / 4);
+                const uint8_t* p[4] = { &cur[((size_t)sy*cw+sx)*4], &cur[((size_t)sy*cw+sx1)*4],
+                                        &cur[((size_t)sy1*cw+sx)*4], &cur[((size_t)sy1*cw+sx1)*4] };
+                uint8_t* o = &nx[((size_t)y*nw+x)*4];
+                int aA = p[0][3], aB = p[1][3], aC = p[2][3], aD = p[3][3];
+                o[3] = (uint8_t)((aA + aB + aC + aD + 2) / 4);               // alpha = plain box
+                if (alphaWeighted) {
+                    int wsum = aA + aB + aC + aD;
+                    if (wsum > 0) for (int c = 0; c < 3; c++)
+                        o[c] = (uint8_t)((p[0][c]*aA + p[1][c]*aB + p[2][c]*aC + p[3][c]*aD + wsum/2) / wsum);
+                    else o[0] = o[1] = o[2] = 0;                             // fully transparent 2x2 -> no color to carry
+                } else for (int c = 0; c < 3; c++)
+                    o[c] = (uint8_t)((p[0][c] + p[1][c] + p[2][c] + p[3][c] + 2) / 4);
             }
             cur.swap(nx); cw = nw; ch = nh;
         }
@@ -1100,8 +1115,15 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos_, 
         for (size_t i = 0; i < nvTotal * 4 && i < boneIdx.size(); i++) seen[boneIdx[i]] = true;
         for (int j = 0; j < 256; j++) if (seen[j]) { boneRemap[j] = (uint8_t)palette.size(); palette.push_back((uint8_t)j); }
     }
+    // AABB from the REAL geometry (pos_, the ORIGINAL input) — NOT `pos`, which for a skinned mesh has the ±1e5
+    // bounds-anchor triangles appended. Including those blew the skinned mesh's RENDMESH AABB up to ±1e5 (line 1173:
+    // skinned meshes must keep their tiny model-local extent like the butterfly, ~0.1, NOT ±1e5). A ±1e5 AABB on a
+    // 0.34u comet let the device size/precision-scale it down to an invisible speck (the "comet shrunk by the culling
+    // patch" bug). The anchor VERTS still ship in the VB (so the skeleton joint boxes span the scene = nocull); only
+    // the AABB metadata now excludes them.
+    const std::vector<float>& aabbSrc = pos_;
     float mn[3] = { 1e30f,1e30f,1e30f }, mx[3] = { -1e30f,-1e30f,-1e30f };
-    for (size_t i = 0; i + 2 < pos.size(); i += 3) for (int k = 0; k < 3; k++) { float p = pos[i + k]; if (p < mn[k]) mn[k] = p; if (p > mx[k]) mx[k] = p; }
+    for (size_t i = 0; i + 2 < aabbSrc.size(); i += 3) for (int k = 0; k < 3; k++) { float p = aabbSrc[i + k]; if (p < mn[k]) mn[k] = p; if (p > mx[k]) mx[k] = p; }
     size_t ntri = idx.size() / 3;
     size_t t = 0;
     if (ntri == 0) { Part p; parts.push_back(p); }  // degenerate guard
@@ -1311,6 +1333,8 @@ struct ExportMesh {
     int flipFrames = 0;             // total cells cycled (0 -> cols*rows)
     float flipFps = 0.f;            // playback rate (0 -> default 5fps); cook auto-generates the shadergen::FLIPBOOK shader for this grid/fps
     bool flipOffset = false;        // OFFSET flipbook (mat.sanim waterfall/stream/fog): mesh UV maps to ONE cell -> uv'=inUv+(col/cols,row/rows), NO cell scale (vs spritesheet = full-quad scale flipbook)
+    std::vector<float> flipUVMats;   // EXACT per-frame FULL 2x3 UV matrices from the mat.sanim track (flipN frames × 6 = [a,b,c,d,e,f]) — the SAME data the desktop's animate() plays (uv' = M[frame]·uv). Replayed frame-snapped in the fragment so the device matches the desktop VERBATIM (no derived-grid guessing; handles scroll, sprite-cell AND 2x2 SCALE/dust). Empty -> cols/rows grid.
+    int flipN = 0; float flipLoop = 0.f;
     float matTint[4] = {1,1,1,1};   // the mesh's OWN base-color tint (glTF baseColorFactor) for its material params
     std::vector<float> vatOffsets;  // VAT vertex offsets, frames*vertexCount*3 (WORLD space) -> animated via VAT (non-skeletal)
     int vatFrames = 0;
@@ -1322,6 +1346,7 @@ struct ExportMesh {
     bool uvScroll = false; float uvRate[2] = {0.f, 0.f};   // mat.sanim UV-SCROLL (water/foam/waterfall) -> getTime() uv += uvRate*time shader
     // GENERAL node TRANSLATION replay (Star Trek sliding screens etc.) -> shadergen::TRANSLATE getTime() shader (faithful, any track)
     bool transAnim = false; std::vector<float> transFrames; int transN = 0; float transLoop = 0.f;   // transN frames of vec3 OFFSET, loop seconds
+    bool fadeAnim = false; std::vector<float> fadeFrames; int fadeN = 0; float fadeLoop = 0.f;   // mat.sanim MaterialTint ALPHA fade curve replayed in the flipbook frag; fadeLoop synced to transLoop
     // GENERAL node SCALE "breathe" replay (Erebor's 12 wisps, NON-UNIFORM per-axis) -> shadergen::SCALE getTime() shader.
     // scaleFrames = scaleN frames of per-axis FACTOR (= scale(t)/scale(0), frame0=(1,1,1)); scalePivot = node WORLD origin.
     bool scaleAnim = false; std::vector<float> scaleFrames; int scaleN = 0; float scaleLoop = 0.f; float scalePivot[3] = {0,0,0};
@@ -2021,10 +2046,24 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         bool navCand = (navIdx >= 0) ? ((int)i == navIdx)
                      : (mnv >= 100 && !m.blend && m.name.find("sky") == std::string::npos && m.name.find("Sky") == std::string::npos);
         if (navCand) for (size_t v = 0; v + 2 < m.positions.size(); v += 3) for (int k = 0; k < 3; k++) { float p = m.positions[v + k]; if (p < smn[k]) smn[k] = p; if (p > smx[k]) smx[k] = p; }
-        char base[96]; snprintf(base, sizeof base, "%s/m%03zu", MH.c_str(), i);
+        // Embed the SOURCE mesh name (m.name, e.g. "VE_WESTERN...fbx.comet_alpha.mat") into the cook asset id so
+        // the on-device AssetRef name is SEARCHABLE — findmat/findmesh/envdump then show "m005_comet_alpha" instead
+        // of an opaque hash/"m005". Keep the m%03zu prefix for uniqueness/ordering. HSR_NONAMETAG = plain m%03zu.
+        char base[160];
+        if (std::getenv("HSR_NONAMETAG")) { snprintf(base, sizeof base, "%s/m%03zu", MH.c_str(), i); }
+        else {
+            std::string src = m.name; size_t fp = src.rfind(".fbx.");            // strip the common "…fbx." prefix
+            const char* nm = (fp != std::string::npos) ? src.c_str() + fp + 5
+                           : (src.rfind('/') != std::string::npos ? src.c_str() + src.rfind('/') + 1 : src.c_str());
+            char tag[32]; int t = 0; for (const char* c = nm; *c && t < (int)sizeof tag - 1; ++c) { char ch = *c;
+                tag[t++] = ((ch>='a'&&ch<='z')||(ch>='A'&&ch<='Z')||(ch>='0'&&ch<='9')) ? ch : '_'; }
+            tag[t] = 0;
+            snprintf(base, sizeof base, "%s/m%03zu_%s", MH.c_str(), i, tag);
+        }
         std::string pMesh = std::string(base) + ".rendmesh/mesh", pMat = std::string(base) + ".material/material",
                     pTex = std::string(base) + ".tex/tex";
         AssetKey3 meshK = keyForPath(pMesh), matK = keyForPath(pMat);
+        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK-ID] m%03zu '%s' assetId=%016llx%016llx\n", i, m.name.c_str(), (unsigned long long)meshK.ing, (unsigned long long)meshK.pkg);
         AssetKey3 texK{}; std::vector<uint8_t> tex;   // value-init -> tgt==0 means "no texture yet" (used by the white-fallback check)
         // An OPAQUE skinned mesh (e.g. the Incredibles droid: source alphaMode=OPAQUE) is drawn through the
         // unlitblendskinned BLEND shader, so its texture's UV-atlas-mask alpha (alpha 0 outside the islands) would
@@ -2066,7 +2105,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             uint64_t rh = murmur64A(texSrc, (size_t)m.w * m.h * 4);   // dedup identical textures (esp. the chunks a big mesh was split into)
             auto cit = texCache.find(rh);
             if (cit != texCache.end()) { texK = cit->second.first; pTex = cit->second.second; }  // reuse the shared texture; leave `tex` empty so it isn't re-encoded/re-pushed
-            else { texK = keyForPath(pTex); tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, 8, 8); texCache[rh] = { texK, pTex }; }
+            else { texK = keyForPath(pTex); tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, 8, 8, 11, m.blend); texCache[rh] = { texK, pTex }; }  // m.blend -> alpha-weighted mips (no white-border bleed on device)
         }
         if (tex.empty() && texK.tgt == 0) { texK = whiteK; whiteUsed = true; }     // share the white fallback (only when there was NO texture at all, not for a dedup hit)
         // ANIMATED (VAT) mesh -> bake the offset texture + the vatunlitbasecolor MATL (base tex + VAT tex); else
@@ -2190,6 +2229,29 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 fprintf(stderr, "[COOK] m%03zu HZANIM clip %zuB (j=%d f=%d->%d fps=%.2f->%.2f dur=%.2fs budget=%zu) %s\n",
                         i, hzAnimPre.size(), nj0, nf0, nf, fps0, fps, dur, hzMaxBytes,
                         hzClipFits ? (nf != nf0 ? "OK (subsampled)" : "OK") : "-> STATIC (8 frames over budget)");
+            // ── ACL ROUND-TRIP VERIFY (does the DEVICE's clip preserve the motion?): decode the ENCODED clip (exactly
+            //    what ships to device) and print the mover joint's LOCAL translation vs the INPUT. If the decoded sweep
+            //    is flat/clamped while the input sweeps -> ACL lost it (device plays a frozen comet). HSR_ACLVERIFY. ──
+            if ((std::getenv("HSR_ACLVERIFY") || std::getenv("HSR_VERBOSE")) && !hzAnimPre.empty() && njReal >= 1) {
+                int mj = njReal - 1;   // the MOVING joint (last real joint; anchors follow it)
+                const float* inp = trsCur.data();  // the clip actually encoded
+                float in0x = inp[((size_t)0*nj0 + mj)*10+4], in0y = inp[((size_t)0*nj0 + mj)*10+5], in0z = inp[((size_t)0*nj0 + mj)*10+6];
+                float inLx = inp[((size_t)(nf-1)*nj0 + mj)*10+4], inLy = inp[((size_t)(nf-1)*nj0 + mj)*10+5], inLz = inp[((size_t)(nf-1)*nj0 + mj)*10+6];
+                float inMax=0.f; for (int f=0;f<nf;f++){ for(int c=4;c<7;c++){ float v=std::fabs(inp[((size_t)f*nj0+mj)*10+c]); if(v>inMax)inMax=v; } }
+                HzAclClip* vclip = hzAclCreate(hzAnimPre.data(), hzAnimPre.size());
+                fprintf(stderr, "[ACL-VERIFY] m%03zu '%s' mover=j%d  INPUT: t0=(%.1f,%.1f,%.1f) tLast=(%.1f,%.1f,%.1f) maxAbs=%.1f\n",
+                        i, m.name.c_str(), mj, in0x,in0y,in0z, inLx,inLy,inLz, inMax);
+                if (vclip) { float vd = hzAclDuration(vclip); float decMax=0.f;
+                    static float out[256*8];
+                    fprintf(stderr, "    [CLIP] duration=%.3fs sampleRate=%.1ffps  => FULL DECODED PATH (device plays this):\n", vd, hzAclSampleRate(vclip));
+                    for (int s=0;s<=12;s++){ float t = (vd>0?vd*(float)s/12.f:0.f); int n = hzAclSampleLocal(vclip, t, out, 256);
+                        if (mj<n){ for(int c=4;c<7;c++){ float v=std::fabs(out[mj*8+c]); if(v>decMax)decMax=v; }
+                            fprintf(stderr, "    t=%.2fs (%.1f,%.1f,%.1f)\n", t, out[mj*8+4],out[mj*8+5],out[mj*8+6]); } }
+                    fprintf(stderr, "    => INPUT maxAbs=%.1f vs DECODED maxAbs=%.1f  %s\n", inMax, decMax,
+                            (inMax>10.f && decMax < inMax*0.5f) ? "⛔ ACL LOST THE MOTION (device comet FROZEN)" : "ok (motion preserved)");
+                    hzAclDestroy(vclip);
+                } else fprintf(stderr, "    [ACL-VERIFY] decode FAILED (clip invalid)\n");
+            }
         }
         bool useHz  = std::getenv("HSR_HZANIM") && haveSkin && m.hzFrames > 1 && m.hzJointCount > 0
                     && m.hzBoneIdx.size() >= (size_t)vc*4 && m.hzBoneWgt.size() >= (size_t)vc*4
@@ -2224,7 +2286,33 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // f2,f3 PRESENT) but keep the TRANSPARENT skinned MATL (matSkinB, field2=2) -> ADDITIVE blend = bright streaks
                 // on the dark viewscreen (alpha-blend made them near-invisible). Non-emissive blend skinned (a real force-field
                 // glass) still uses unlitBLENDskinned (alpha).
-                const AssetKey3& sk = (m.blend && !m.additive && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
+                AssetKey3 sk = (m.blend && !m.additive && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
+                // ── COMBINED effect card (RIGID-HZANIM + material UV/fade) — NO EXCLUSION ──────────────────────────
+                // A fog/dust card whose node has R/S rides a RIGID-HZANIM skeleton (faithful T+R+S) AND has a UV flipbook
+                // + opacity fade. Bake the UV-matrix replay + fade into a PER-MESH SKINNED shader variant: FLIPBOOK mode
+                // edits ONLY the fragment (base-color UV + alpha), so the vertex SKINNING is untouched. Result: the mesh
+                // deforms via the skeleton (node motion) AND its texture cycles + fades on the same skinned pipeline.
+                bool skFlip = !std::getenv("HSR_NOHZUV") && m.flipbook && m.flipN>=2 && m.flipUVMats.size()>=(size_t)m.flipN*6;
+                if (skFlip) {
+                    const std::vector<uint8_t>& sbase = (m.blend && !shadSkinB.empty()) ? shadSkinB : shadSkin;
+                    bool skFade = m.fadeAnim && m.fadeN>=2 && m.fadeFrames.size()>=(size_t)m.fadeN && m.fadeLoop>1e-4f;
+                    uint32_t hh = 0x811C9DC5u ^ (uint32_t)(long)(m.flipLoop*1000);
+                    for (size_t k=0;k<m.flipUVMats.size();++k) hh = hh*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000);
+                    if (skFade) { hh = hh*16777619u ^ (uint32_t)(long)(m.fadeLoop*1000);
+                        for (size_t k=0;k<m.fadeFrames.size();++k) hh = hh*16777619u ^ (uint32_t)(long)(m.fadeFrames[k]*100000); }
+                    char sfn[168]; snprintf(sfn,sizeof sfn,"cooker/skinuv_%08x%s.surface.bin", hh, m.blend?"_b":"");
+                    auto itc = rotShaders.find(sfn);
+                    if (itc != rotShaders.end()) sk = itc->second;
+                    else {
+                        auto sb = readFileBytes(sfn);
+                        if (sb.empty() && !sbase.empty()) { static const std::vector<float> noFade;
+                            sb = shadergen::generate(sbase, shadergen::FLIPBOOK, m.flipLoop, 0.f,0.f,1.f,0.f, m.flipUVMats, m.flipN,
+                                                     skFade ? m.fadeFrames : noFade, skFade ? m.fadeLoop : 0.f);
+                            if (!sb.empty()) writeFileBytes(sfn, sb); }
+                        if (!sb.empty()) { char sp[184]; snprintf(sp,sizeof sp,"%s/shaders/skinuv_%08x%s.surface/shader", MH.c_str(), hh, m.blend?"_b":"");
+                            sk = keyForPath(sp); assets.push_back({ sp, sk.tgt, sb, sk }); rotShaders[sfn] = sk;
+                            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' RIGID-HZANIM + SKINNED-UV%s shader (combined T+R+S + UV + fade)\n", i, m.name.c_str(), skFade?"+FADE":""); } }
+                }
                 memcpy(matl.data() + 48, &sk.pkg, 8); memcpy(matl.data() + 56, &sk.ing, 8);
                 // texture ref pkg @120 / ing @128 -> THIS mesh's texture; tgt @136 stays 0x6E4CC522 (murmur3"tex").
                 // pkg is NOT implicit: the butterflies template's @120 holds the CALMING package, so leaving it makes the
@@ -2359,22 +2447,43 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // adds the piecewise-linear-interpolated sampled OFFSET to inPos -> FAITHFULLY ports ANY translation track.
             // Generated on demand, hashed by the frames+loop (dedup). Position-anim -> edits all vertex stages (like rot).
             bool tblend = m.blend && haveBlend;
+            // COMBINED TRANSLATE + FLIPBOOK (train STEAM): the card rides the moving train (TRANSLATE, vertex position)
+            // AND its texture is a spritesheet flipbook (FLIPBOOK, fragment sample-UV). The two edit INDEPENDENT stages,
+            // so we chain them — FLIPBOOK on the base first, then TRANSLATE on top — into one shader that moves AND cycles.
+            bool tflip = m.flipbook;
+            bool tscroll = m.uvScroll && !tflip && (m.uvRate[0]!=0.f || m.uvRate[1]!=0.f);
             uint32_t h = (uint32_t)(0x9E3779B9u*(uint32_t)m.transN ^ 0x85EBCA6Bu*(uint32_t)(long)(m.transLoop*1000));
             for (size_t k=0;k<m.transFrames.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.transFrames[k]*10000);
-            char tfn[160]; snprintf(tfn, sizeof tfn, "cooker/trans_%08x%s%s.surface.bin", h, tblend ? "_b" : "", meshFar ? "_dc" : "");
+            if (tflip) { h = h*16777619u ^ (uint32_t)(m.flipCols*73856093 ^ m.flipRows*19349663 ^ m.flipFrames*83492791 ^ (int)(m.flipFps*100));
+                for (size_t k=0;k<m.flipUVMats.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000); }
+            bool tfade = tflip && m.fadeAnim && m.fadeN>=2 && m.fadeFrames.size()>=(size_t)m.fadeN && m.fadeLoop>1e-4f;
+            if (tfade) { h = h*16777619u ^ (uint32_t)(long)(m.fadeLoop*1000);
+                for (size_t k=0;k<m.fadeFrames.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.fadeFrames[k]*100000); }
+            if (tscroll) h = h*16777619u ^ (uint32_t)((long)(m.uvRate[0]*100000) ^ ((long)(m.uvRate[1]*100000)<<1));
+            const char* usuf = tflip?"f":(tscroll?"s":"");
+            char tfn[160]; snprintf(tfn, sizeof tfn, "cooker/trans_%08x%s%s%s.surface.bin", h, usuf, tblend ? "_b" : "", meshFar ? "_dc" : "");
             AssetKey3 transK{}; auto it = rotShaders.find(tfn);
             if (it != rotShaders.end()) transK = it->second;
             else {
                 auto tbytes = readFileBytes(tfn);
                 if (tbytes.empty()) { const std::vector<uint8_t>& gbase = meshFar ? (tblend ? shadBlendDC : shadDC) : (tblend ? shadBlend : shad);
-                    tbytes = shadergen::generate(gbase, shadergen::TRANSLATE, m.transLoop, 0.f, 0.f, 1.f, 0.f, m.transFrames, m.transN);
+                    std::vector<uint8_t> base2 = gbase;
+                    // material UV anim (FRAGMENT) first; node TRANSLATE (vertex position) layered on top — independent stages.
+                    if (tflip) { bool rep = m.flipUVMats.size() >= (size_t)m.flipN*6 && m.flipN >= 2;
+                        static const std::vector<float> noFade;
+                        auto fb = rep ? shadergen::generate(gbase, shadergen::FLIPBOOK, m.flipLoop, 0.f,0.f,1.f,0.f, m.flipUVMats, m.flipN,
+                                            tfade ? m.fadeFrames : noFade, tfade ? m.fadeLoop : 0.f)   // EXACT per-frame matrix replay + opacity fade (matches desktop)
+                                      : shadergen::generate(gbase, shadergen::FLIPBOOK, (float)m.flipCols,(float)m.flipRows,(float)m.flipFrames,m.flipFps, m.flipOffset?1.f:0.f);
+                        if (!fb.empty()) base2 = fb; }
+                    else if (tscroll) { auto fb = shadergen::generate(gbase, shadergen::UVSCROLL, m.uvRate[0], m.uvRate[1]); if (!fb.empty()) base2 = fb; }
+                    tbytes = shadergen::generate(base2, shadergen::TRANSLATE, m.transLoop, 0.f, 0.f, 1.f, 0.f, m.transFrames, m.transN);
                     if (!tbytes.empty()) writeFileBytes(tfn, tbytes); }
-                if (!tbytes.empty()) { char tp[176]; snprintf(tp, sizeof tp, "%s/shaders/trans_%08x%s%s.surface/shader", MH.c_str(), h, tblend ? "_b" : "", meshFar ? "_dc" : "");
+                if (!tbytes.empty()) { char tp[176]; snprintf(tp, sizeof tp, "%s/shaders/trans_%08x%s%s%s.surface/shader", MH.c_str(), h, usuf, tblend ? "_b" : "", meshFar ? "_dc" : "");
                     transK = keyForPath(tp); assets.push_back({ tp, transK.tgt, tbytes, transK }); rotShaders[tfn] = transK; } }
             matl = tblend ? matBlend : matTpl;
-            if (transK.ing) { memcpy(matl.data()+48,&transK.pkg,8); memcpy(matl.data()+56,&transK.ing,8); }   // field7 -> translate shader
+            if (transK.ing) { memcpy(matl.data()+48,&transK.pkg,8); memcpy(matl.data()+56,&transK.ing,8); }   // field7 -> translate(+flipbook/scroll) shader
             memcpy(matl.data()+120,&texK.pkg,8); memcpy(matl.data()+128,&texK.ing,8);                          // base tex
-            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' TRANSLATE %d frames loop=%.2fs %s %s\n", i, m.name.c_str(), m.transN, m.transLoop, tblend ? "BLEND" : "opaque", transK.ing ? "" : "(MISSING -> static)");
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' TRANSLATE%s%s %d frames loop=%.2fs %s %s\n", i, m.name.c_str(), tflip?"+FLIPBOOK":(tscroll?"+UVSCROLL":""), tfade?"+FADE":"", m.transN, m.transLoop, tblend ? "BLEND" : "opaque", transK.ing ? "" : "(MISSING -> static)");
         } else if (useScale) {
             // GENERAL node-SCALE "breathe" replay (Erebor's 12 wisps, NON-UNIFORM per-axis): a shadergen::SCALE getTime()
             // shader that does pos' = pivot + (inPos-pivot)*factor(t), where factor is the piecewise-linear-interpolated
@@ -2463,16 +2572,26 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             int fcols=m.flipCols>0?m.flipCols:3, frows=m.flipRows>0?m.flipRows:3;
             int fframes=m.flipFrames>0?m.flipFrames:fcols*frows; float ffps=m.flipFps>0.f?m.flipFps:5.f;
             float foff = m.flipOffset ? 1.f : 0.f;   // OFFSET flipbook (mat.sanim waterfall: uv'=inUv+cellOff, no scale) vs SCALE spritesheet
-            uint32_t h=(uint32_t)(0x9E3779B9u*(uint32_t)fcols ^ 0xC2B2AE35u*(uint32_t)frows ^ 0x27D4EB2Fu*(uint32_t)fframes ^ 0x85EBCA6Bu*(uint32_t)(long)(ffps*1000) ^ (m.flipOffset?0xA1B2C3D4u:0u));
-            char ffn[160]; snprintf(ffn,sizeof ffn,"cooker/flipbook_%08x%s%s.surface.bin", h, m.flipOffset?"o":"", meshFar?"_dc":"");
+            bool useReplay = m.flipUVMats.size() >= (size_t)m.flipN*6 && m.flipN >= 2;   // EXACT per-frame source matrices present -> replay (fog/dust fix)
+            bool ffade = useReplay && m.fadeAnim && m.fadeN>=2 && m.fadeFrames.size()>=(size_t)m.fadeN && m.fadeLoop>1e-4f;   // opacity fade curve
+            uint32_t h;
+            if (useReplay) { h = (uint32_t)(0x9E3779B9u*(uint32_t)m.flipN ^ 0x85EBCA6Bu*(uint32_t)(long)(m.flipLoop*1000));
+                for (size_t k=0;k<m.flipUVMats.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000); }
+            else h=(uint32_t)(0x9E3779B9u*(uint32_t)fcols ^ 0xC2B2AE35u*(uint32_t)frows ^ 0x27D4EB2Fu*(uint32_t)fframes ^ 0x85EBCA6Bu*(uint32_t)(long)(ffps*1000) ^ (m.flipOffset?0xA1B2C3D4u:0u));
+            if (ffade) { h = h*16777619u ^ (uint32_t)(long)(m.fadeLoop*1000);
+                for (size_t k=0;k<m.fadeFrames.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.fadeFrames[k]*100000); }
+            char ffn[160]; snprintf(ffn,sizeof ffn,"cooker/flipbook_%08x%s%s%s%s.surface.bin", h, useReplay?"r":"", ffade?"a":"", m.flipOffset?"o":"", meshFar?"_dc":"");
             AssetKey3 flipK{}; auto it=rotShaders.find(ffn);
             if (it!=rotShaders.end()) flipK=it->second;
             else {
                 auto fbytes=readFileBytes(ffn);
                 if (fbytes.empty()) { const std::vector<uint8_t>& gbase = meshFar?shadBlendDC:shadBlend;   // unlitblend base (FAR -> depth-clamp remap)
-                    fbytes=shadergen::generate(gbase, shadergen::FLIPBOOK, (float)fcols,(float)frows,(float)fframes,ffps,foff);  // az=foff -> offset-only flipbook
+                    static const std::vector<float> noFade;
+                    fbytes = useReplay ? shadergen::generate(gbase, shadergen::FLIPBOOK, m.flipLoop, 0.f,0.f,1.f,0.f, m.flipUVMats, m.flipN,
+                                             ffade ? m.fadeFrames : noFade, ffade ? m.fadeLoop : 0.f)   // EXACT per-frame matrix replay + opacity fade (desktop data)
+                                       : shadergen::generate(gbase, shadergen::FLIPBOOK, (float)fcols,(float)frows,(float)fframes,ffps,foff);    // grid
                     if(!fbytes.empty()) writeFileBytes(ffn,fbytes); }
-                if(!fbytes.empty()){ char fp2[176]; snprintf(fp2,sizeof fp2,"%s/shaders/flipbook_%08x%s%s.surface/shader", MH.c_str(), h, m.flipOffset?"o":"", meshFar?"_dc":"");
+                if(!fbytes.empty()){ char fp2[176]; snprintf(fp2,sizeof fp2,"%s/shaders/flipbook_%08x%s%s%s%s.surface/shader", MH.c_str(), h, useReplay?"r":"", ffade?"a":"", m.flipOffset?"o":"", meshFar?"_dc":"");
                     flipK=keyForPath(fp2); assets.push_back({fp2, flipK.tgt, fbytes, flipK}); rotShaders[ffn]=flipK; } }
             matl = matBlend;
             if (flipK.ing){ memcpy(matl.data()+48,&flipK.pkg,8); memcpy(matl.data()+56,&flipK.ing,8); }   // field7 -> generated flipbook shader
@@ -2623,7 +2742,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         } else {
             size_t nvc = m.positions.size()/3;
             bool hasLm = m.hasLightmap && !m.lmRGBA.empty() && m.lmW>0 && m.lmH>0 && m.uvs2.size() >= nvc*2;
-            float fr=m.albedoFactor[0]*m.curTint[0], fg=m.albedoFactor[1]*m.curTint[1], fb=m.albedoFactor[2]*m.curTint[2], fa=m.curTint[3];
+            // FADED effect cards (fog/dust): the getTime flipbook shader REPLAYS the mat.sanim tint-alpha curve, so the
+            // per-vertex COLOR_0 alpha must be NEUTRAL 1.0 (else static curTint[3] — 0 at cook phase 0 — ×  shaderFade = 0
+            // = invisible, the "only one fog visible" bug). The shader owns the opacity for these.
+            float fr=m.albedoFactor[0]*m.curTint[0], fg=m.albedoFactor[1]*m.curTint[1], fb=m.albedoFactor[2]*m.curTint[2];
+            float fa=(m.fadeAnim && m.fadeN>=2) ? 1.0f : m.curTint[3];
             bool needCol = hasLm || fr!=1.f||fg!=1.f||fb!=1.f||fa!=1.f;
             if (needCol && nvc>0) {
                 vertCol.resize(nvc*4);
@@ -2662,12 +2785,22 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // even though the editor preview (which honors doubleSided = no cull) showed them. Geometry-only, no z-fight (for
         // any pixel exactly one of the coincident tris is front-facing). Skinned (own doublesided shader) / VAT+rot+flip
         // billboards (intentionally single-sided, face the player) keep their own handling.
-        if ((m.skybox || (m.doubleSided && !useVat && !useRot && !useTrans && !usePulse && !useUvScroll && !usePose && !m.flipbook)) && !useHz) {
-            dsIdx = m.indices; dsIdx.reserve(m.indices.size()*2);
-            for (size_t t=0; t+2<m.indices.size(); t+=3) { dsIdx.push_back(m.indices[t]); dsIdx.push_back(m.indices[t+2]); dsIdx.push_back(m.indices[t+1]); }
-            sIdx = &dsIdx;
+        // DOUBLE-SIDED billboard cards (the fog/dust/smoke/steam/comet "invisible + not animating" fix): a single-sided
+        // quad viewed from its BACK is back-face-culled = INVISIBLE (and its texture animation can't be seen). Append
+        // reversed-winding tris (INDEX-ONLY, reuses the same verts → same skin weights, geometry-only, no z-fight) so
+        // both faces draw. Now applies to the ANIMATED card meshes too (flipbook/useTrans/useRot/useVat AND the useHz
+        // node-rigid comet) — the old gate excluded exactly those, hiding them. HSR_NODBLCARD disables. skybox dome too.
+        bool wantDouble = !std::getenv("HSR_NODBLCARD") &&
+            (m.skybox || m.doubleSided || m.flipbook || useTrans || useRot || useUvScroll || useVat || (useHz && m.blend));
+        std::vector<uint32_t> dsIdxHz;
+        if (wantDouble) {
+            std::vector<uint32_t>& dst = useHz ? dsIdxHz : dsIdx;
+            dst = m.indices; dst.reserve(m.indices.size()*2);
+            for (size_t t=0; t+2<m.indices.size(); t+=3) { dst.push_back(m.indices[t]); dst.push_back(m.indices[t+2]); dst.push_back(m.indices[t+1]); }
+            if (!useHz) sIdx = &dsIdx;
         }
-        auto mesh = useHz ? encodeRendMeshParts(hzMeshPos, m.uvs, m.indices, matl, 0, m.hzBoneIdx, m.hzBoneWgt, jointIds, false, vertCol)
+        const std::vector<uint32_t>& hzIdx = (wantDouble && useHz) ? dsIdxHz : m.indices;
+        auto mesh = useHz ? encodeRendMeshParts(hzMeshPos, m.uvs, hzIdx, matl, 0, m.hzBoneIdx, m.hzBoneWgt, jointIds, false, vertCol)
                           : encodeRendMeshParts(*posPtr, m.uvs, *sIdx, matl, useVat ? vc : 0, {}, {}, {}, useRot, vertCol);
         // COOK-TIME VERIFY: check the just-cooked skinned RENDMESH against the Meta-shipped reference schema (the
         // device runs the stock flatbuffers verifier; this catches structural divergence — e.g. a field emitted as
@@ -2709,10 +2842,36 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 if (sebd.size() > 64 && sebd[0]=='S'&&sebd[1]=='E'&&sebd[2]=='B'&&sebd[3]=='D') {
                     std::string pCol = std::string(base) + ".collider.phys/phys"; AssetKey3 colK = keyForPath(pCol);
                     assets.push_back({ pCol, colK.tgt, sebd, colK, TYPE_PHSX, TYPE_3MSH });
-                    if (!extraComp.empty()) extraComp += ",";
-                    extraComp += comp("ColliderMeshPlatformComponent", 2, std::string("{\"meshAsset\":") + refJson(colK) + "}")
-                               + "," + comp("PhysicsBodyPlatformComponent", 7, "{\"type\":\"StaticCollision\"}");
-                    if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' ANIMATED collider -> %zuB SEBD (%zu tris) on the mesh entity (kinematic)\n", i, m.name.c_str(), sebd.size(), m.indices.size()/3);
+                    std::string colComp = comp("ColliderMeshPlatformComponent", 2, std::string("{\"meshAsset\":") + refJson(colK) + "}")
+                                        + "," + comp("PhysicsBodyPlatformComponent", 7, "{\"type\":\"StaticCollision\"}");
+                    // ── KINEMATIC-PROMOTION TRAP (the bluehills windmill_tails "stuck at spawn" bug) ──────────────────────
+                    // libshell promotes a PhysicsBody that sits on an ANIMATED entity to a KINEMATIC body and drives its
+                    // KinematicPose from the entity's pose source. SKINNED meshes (useHz → AnimatorPlatformComponent) and
+                    // entity-pose meshes (usePose → top-level "poseAnimation") DO carry such a driver, so their collider
+                    // follows the animation correctly — keep it on the SAME entity (proven). But a SHADER-ONLY animation
+                    // (useRot/useTrans/useScale/usePulse/useUvScroll/useVat: the motion lives in the material getTime()
+                    // shader while the ENTITY transform is static) has NO pose driver — libshell still promotes the body to
+                    // kinematic and, finding nothing to pose it, COLLAPSES the body AND the entity transform the visual mesh
+                    // rides on to the kinematic origin == spawn (m161 windmill_tails). FIX: emit the collider on a SEPARATE
+                    // STATIC sibling entity (no animation → never promoted) carrying the SAME transform as the mesh (the
+                    // collider SEBD is in the mesh's local/centered space, so it needs hzPos to land at the world rest; the
+                    // ±few-degree shader sway is negligible for collision). project_hsr_v205_kinematic_collider.
+                    bool shaderAnim = useRot || useTrans || useScale || usePulse || useUvScroll || useVat;
+                    bool poseDriven = useHz || usePose;
+                    if (shaderAnim && !poseDriven) {
+                        std::string cid = makeUuid(rng);
+                        char ctf[256]; snprintf(ctf,sizeof ctf,
+                            "{\"localPosition\":{\"x\":%g,\"y\":%g,\"z\":%g},\"localRotation\":{\"x\":0,\"y\":0,\"z\":0},\"localScale\":{\"x\":%g,\"y\":%g,\"z\":%g}}",
+                            hzPos[0],hzPos[1],hzPos[2], hzScl[0],hzScl[1],hzScl[2]);
+                        entities += "," + std::string("{\"id\":\"") + cid + "\",\"name\":\"" + nm + "_col\",\"components\":["
+                                  + comp("TransformPlatformComponent", 1, ctf) + "," + colComp + "],\"attributes\":[]}";
+                        rels += (rels.empty() ? std::string() : std::string(",")) + relChildOf(cid, rootId);
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' shader-anim collider -> %zuB SEBD (%zu tris) on a STATIC SIBLING entity @(%.1f,%.1f,%.1f) (no kinematic collapse)\n", i, m.name.c_str(), sebd.size(), m.indices.size()/3, hzPos[0],hzPos[1],hzPos[2]);
+                    } else {
+                        if (!extraComp.empty()) extraComp += ",";
+                        extraComp += colComp;
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' collider -> %zuB SEBD (%zu tris) on the mesh entity (%s)\n", i, m.name.c_str(), sebd.size(), m.indices.size()/3, poseDriven ? "kinematic, pose-driven" : "static");
+                    }
                 } else fprintf(stderr, "[COOK] m%03zu '%s' animated-collider PhysX cook FAILED\n", i, m.name.c_str());
             }
         }

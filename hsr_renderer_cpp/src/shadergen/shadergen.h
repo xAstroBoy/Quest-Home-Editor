@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -267,7 +268,17 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
         body.push_back({133,{0,tFloat,tn,t,c_invloop}});                 // time / loopSec
         body.push_back({12,{0,tFloat,t01,glsl,GLSL_FRACT,tn}});          // fract -> [0,1)
         uint32_t acc=off[0]; float invN=1.0f/(float)N;
-        for (int i=0;i<N;i++){ int j=(i+1)%N; uint32_t c_lo=fconst((float)i*invN);
+        // LOOP-vs-ONE-WAY auto-detect (the "jumpy on device everywhere" fix): the last segment either
+        //   WRAPS off[N-1]->off[0]  (j=(i+1)%N)   — for a CYCLIC path (fog/smoke/ambient drift that returns
+        //     near its start): interpolates smoothly across the seam, NO teleport = no jump. OR
+        //   HOLDS off[N-1]          (j=clamp N-1) — for a ONE-WAY path (train/cars: end far from start): the
+        //     time fract-wrap teleports back, avoiding a fast BACKWARD SWEEP across the whole path.
+        // Decide from the DATA: if off[N-1] returns near off[0] (seam << path span) it's cyclic -> wrap.
+        float _sx=tframes[(N-1)*3]-tframes[0], _sy=tframes[(N-1)*3+1]-tframes[1], _sz=tframes[(N-1)*3+2]-tframes[2];
+        float _seam=std::sqrt(_sx*_sx+_sy*_sy+_sz*_sz), _span=0.f;
+        for (int i=0;i<N;i++){ float a=std::fabs(tframes[i*3]),b=std::fabs(tframes[i*3+1]),c=std::fabs(tframes[i*3+2]); float m=std::max(a,std::max(b,c)); if(m>_span)_span=m; }
+        bool _looping = _seam < 0.20f*_span + 0.5f;   // last frame returns near first => seamless cyclic loop
+        for (int i=0;i<N;i++){ int j = _looping ? ((i+1)%N) : ((i+1<N)?(i+1):(N-1)); uint32_t c_lo=fconst((float)i*invN);
             uint32_t w =nid(); body.push_back({12,{0,tFloat,w,glsl,GLSL_STEP,c_lo,t01}});   // step(lo,t01): 1 if t01>=lo
             uint32_t sb=nid(); body.push_back({131,{0,tFloat,sb,t01,c_lo}});                // t01 - lo
             uint32_t ml=nid(); body.push_back({133,{0,tFloat,ml,sb,c_N}});                  // *(N)
@@ -452,6 +463,339 @@ inline std::vector<uint8_t> editFragCutout(const uint8_t* sd, uint32_t spvLen, f
     return mod;
 }
 
+// FLIPBOOK in the FORWARD FRAGMENT: step the base-color texture-sample UV through spritesheet cells from
+// globalUniforms.time, right before the OpImageSampleImplicitLod. THE device fix: the vertex-stage UV edit
+// (editVertModule FLIPBOOK) did NOT animate on device (the transparent pass's UV varying never advanced → smoke/fog/
+// dust frozen at cell 0 = static/"invisible faint cell"), while the SAME getTime() math IN THE FRAGMENT animates
+// (the forward frag reads globalUniforms.time + offsets the exact sample coord in the exact rendered pass — the place
+// CUTOUT's editFragCutout already proves reaches device). offsetOnly: base UV maps to ONE cell (uv+=cell); else the UV
+// is the full quad (uv*cell+off). cols/rows/frames/fps as FLIPBOOK.
+inline std::vector<uint8_t> editFragFlipbook(const uint8_t* sd, uint32_t spvLen, int ncols, int nrows, int nframes, float fps, bool offsetOnly){
+    using namespace detail;
+    size_t nw=spvLen/4; auto W=[&](size_t k){ return u32(sd,spvLen,(int64_t)k*4); };
+    uint32_t version=W(1), generator=W(2), bound=W(3);
+    std::vector<Inst> insts;
+    for (size_t i=5;i<nw;){ uint32_t ins=W(i),wc=ins>>16,op=ins&0xffff; if(!wc)break; Inst t; t.op=(int)op; for(uint32_t k=0;k<wc;++k)t.w.push_back(W(i+k)); insts.push_back(std::move(t)); i+=wc; }
+    uint32_t tFloat=0,tInt=0,tV2=0,glsl=0,gu=0; int timeIdx=-1;
+    std::map<int64_t,uint32_t> fltc; std::map<int32_t,uint32_t> intc; std::map<uint64_t,uint32_t> ptr;
+    std::map<uint32_t,std::string> names;
+    auto fround=[](float v){ return (int64_t)llround((double)v*1e6); };
+    for (auto& t:insts){ auto&w=t.w;
+        if (t.op==5) names[w[1]]=wstr(w,2);
+        else if (t.op==6){ if (wstr(w,3)=="time") timeIdx=(int)w[2]; }
+        else if (t.op==11 && wstr(w,2).find("GLSL")!=std::string::npos) glsl=w[1];
+        else if (t.op==22 && w[2]==32) tFloat=w[1];
+        else if (t.op==21 && w[2]==32) tInt=w[1]; }
+    for (auto& t:insts){ auto&w=t.w; if (t.op==23 && w[2]==tFloat && w[3]==2) tV2=w[1]; else if (t.op==32) ptr[((uint64_t)w[2]<<32)|w[3]]=w[1]; }
+    for (auto& t:insts){ auto&w=t.w; if (t.op==43 && w[1]==tInt){ int32_t iv; memcpy(&iv,&w[3],4); intc[iv]=w[2]; } else if (t.op==43 && w[1]==tFloat){ float fv; memcpy(&fv,&w[3],4); fltc[fround(fv)]=w[2]; } }
+    for (auto& kv:names) if (kv.second=="globalUniforms") gu=kv.first;
+    if (!tFloat||!tInt||!tV2||!glsl||!gu||timeIdx<0) return {};
+    int sampIdx=-1; uint32_t coord=0;                                  // first base-color texture sample (op 87)
+    for (size_t k=0;k<insts.size();++k){ if (insts[k].op==87 && insts[k].w.size()>=5){ sampIdx=(int)k; coord=insts[k].w[4]; break; } }
+    if (sampIdx<0) return {};
+    std::vector<Inst> newConsts,newTypes;
+    auto nid=[&](){ return bound++; };
+    auto fbits=[](float f){ uint32_t u; memcpy(&u,&f,4); return u; };
+    auto fconst=[&](float val)->uint32_t{ int64_t k=fround(val); auto it=fltc.find(k); if(it!=fltc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tFloat,id,fbits(val)}}); fltc[k]=id; return id; };
+    auto iconst=[&](int32_t val)->uint32_t{ auto it=intc.find(val); if(it!=intc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tInt,id,(uint32_t)val}}); intc[val]=id; return id; };
+    auto ptrOf=[&](uint32_t sc,uint32_t ty)->uint32_t{ uint64_t k=((uint64_t)sc<<32)|ty; auto it=ptr.find(k); if(it!=ptr.end())return it->second; uint32_t id=nid(); newTypes.push_back({32,{0,id,sc,ty}}); ptr[k]=id; return id; };
+    const uint32_t GLSL_FLOOR=8;
+    if (ncols<1)ncols=1; if(nrows<1)nrows=1; if(nframes<1)nframes=ncols*nrows; if(fps<=0.f)fps=5.f;
+    uint32_t c_fps=fconst(fps), c_nf=fconst((float)nframes), c_nc=fconst((float)ncols), c_invc=fconst(1.0f/(float)ncols), c_invr=fconst(1.0f/(float)nrows);
+    uint32_t c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);             // storageClass 2 = Uniform
+    uint32_t pt=nid(),t=nid(),tf=nid(),fr=nid(),fm=nid(),col=nid(),rdiv=nid(),row=nid(),uo=nid(),vo=nid(),off=nid(),newUv=nid();
+    std::vector<Inst> body = {
+        {65,{0,pUf,pt,gu,c_time}}, {61,{0,tFloat,t,pt}},             // time = globalUniforms.time
+        {133,{0,tFloat,tf,t,c_fps}},                                  // time*fps
+        {12,{0,tFloat,fr,glsl,GLSL_FLOOR,tf}},                        // floor
+        {141,{0,tFloat,fm,fr,c_nf}},                                  // frame = mod(.,NFRAMES)
+        {141,{0,tFloat,col,fm,c_nc}},                                 // col   = mod(frame,NCOLS)
+        {133,{0,tFloat,rdiv,fm,c_invc}},                              // frame/NCOLS
+        {12,{0,tFloat,row,glsl,GLSL_FLOOR,rdiv}},                     // row   = floor(frame/NCOLS)
+        {133,{0,tFloat,uo,col,c_invc}},                               // uOff = col/NCOLS
+        {133,{0,tFloat,vo,row,c_invr}},                               // vOff = row/NROWS
+        {80,{0,tV2,off,uo,vo}},                                       // vec2(uOff,vOff)
+    };
+    if (offsetOnly) body.push_back({129,{0,tV2,newUv,coord,off}});    // newUv = coord + off
+    else { uint32_t cell=nid(),scaled=nid(); body.push_back({80,{0,tV2,cell,c_invc,c_invr}}); body.push_back({133,{0,tV2,scaled,coord,cell}}); body.push_back({129,{0,tV2,newUv,scaled,off}}); }
+    std::vector<Inst> out; bool addedG=false;
+    for (size_t k=0;k<insts.size();++k){
+        if (!addedG && insts[k].op==54){ for(auto&t2:newTypes)out.push_back(t2); for(auto&c:newConsts)out.push_back(c); addedG=true; }
+        if ((int)k==sampIdx){ for(auto&b:body) out.push_back(b); Inst s=insts[k]; s.w[4]=newUv; out.push_back(s); continue; }   // sample at the stepped cell
+        out.push_back(insts[k]);
+    }
+    if (!addedG) return {};
+    std::vector<uint32_t> words={0x07230203u,version,generator,bound,0u};
+    for(auto&t2:out){ uint32_t hdr=((uint32_t)t2.w.size()<<16)|(uint32_t)t2.op; words.push_back(hdr); for(size_t j=1;j<t2.w.size();++j)words.push_back(t2.w[j]); }
+    std::vector<uint8_t> mod(words.size()*4); memcpy(mod.data(),words.data(),mod.size());
+    return mod;
+}
+
+// UV-SCROLL in the FORWARD FRAGMENT: offset the base-color sample UV by fract(rate*globalUniforms.time) right before
+// the OpImageSampleImplicitLod. The continuous-scroll analogue of editFragFlipbook (the bluehills drifting FOG fix) —
+// the vertex-stage UV scroll did NOT animate on device, the fragment one does (CUTOUT proves the forward frag reaches
+// device). fract bounds the offset to one tile so the texture REPEAT wrap stays seamless (no float32 precision drift).
+inline std::vector<uint8_t> editFragUvScroll(const uint8_t* sd, uint32_t spvLen, float ru, float rv){
+    using namespace detail;
+    size_t nw=spvLen/4; auto W=[&](size_t k){ return u32(sd,spvLen,(int64_t)k*4); };
+    uint32_t version=W(1), generator=W(2), bound=W(3);
+    std::vector<Inst> insts;
+    for (size_t i=5;i<nw;){ uint32_t ins=W(i),wc=ins>>16,op=ins&0xffff; if(!wc)break; Inst t; t.op=(int)op; for(uint32_t k=0;k<wc;++k)t.w.push_back(W(i+k)); insts.push_back(std::move(t)); i+=wc; }
+    uint32_t tFloat=0,tInt=0,tV2=0,glsl=0,gu=0; int timeIdx=-1;
+    std::map<int64_t,uint32_t> fltc; std::map<int32_t,uint32_t> intc; std::map<uint64_t,uint32_t> ptr;
+    std::map<uint32_t,std::string> names;
+    auto fround=[](float v){ return (int64_t)llround((double)v*1e6); };
+    for (auto& t:insts){ auto&w=t.w;
+        if (t.op==5) names[w[1]]=wstr(w,2);
+        else if (t.op==6){ if (wstr(w,3)=="time") timeIdx=(int)w[2]; }
+        else if (t.op==11 && wstr(w,2).find("GLSL")!=std::string::npos) glsl=w[1];
+        else if (t.op==22 && w[2]==32) tFloat=w[1];
+        else if (t.op==21 && w[2]==32) tInt=w[1]; }
+    for (auto& t:insts){ auto&w=t.w; if (t.op==23 && w[2]==tFloat && w[3]==2) tV2=w[1]; else if (t.op==32) ptr[((uint64_t)w[2]<<32)|w[3]]=w[1]; }
+    for (auto& t:insts){ auto&w=t.w; if (t.op==43 && w[1]==tInt){ int32_t iv; memcpy(&iv,&w[3],4); intc[iv]=w[2]; } else if (t.op==43 && w[1]==tFloat){ float fv; memcpy(&fv,&w[3],4); fltc[fround(fv)]=w[2]; } }
+    for (auto& kv:names) if (kv.second=="globalUniforms") gu=kv.first;
+    if (!tFloat||!tInt||!tV2||!glsl||!gu||timeIdx<0) return {};
+    int sampIdx=-1; uint32_t coord=0;
+    for (size_t k=0;k<insts.size();++k){ if (insts[k].op==87 && insts[k].w.size()>=5){ sampIdx=(int)k; coord=insts[k].w[4]; break; } }
+    if (sampIdx<0) return {};
+    std::vector<Inst> newConsts,newTypes;
+    auto nid=[&](){ return bound++; };
+    auto fbits=[](float f){ uint32_t u; memcpy(&u,&f,4); return u; };
+    auto fconst=[&](float val)->uint32_t{ int64_t k=fround(val); auto it=fltc.find(k); if(it!=fltc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tFloat,id,fbits(val)}}); fltc[k]=id; return id; };
+    auto iconst=[&](int32_t val)->uint32_t{ auto it=intc.find(val); if(it!=intc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tInt,id,(uint32_t)val}}); intc[val]=id; return id; };
+    auto ptrOf=[&](uint32_t sc,uint32_t ty)->uint32_t{ uint64_t k=((uint64_t)sc<<32)|ty; auto it=ptr.find(k); if(it!=ptr.end())return it->second; uint32_t id=nid(); newTypes.push_back({32,{0,id,sc,ty}}); ptr[k]=id; return id; };
+    const uint32_t GLSL_FRACT=10;
+    uint32_t c_ru=fconst(ru), c_rv=fconst(rv), c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
+    uint32_t ratevec=nid(); newConsts.push_back({0x2c,{0,tV2,ratevec,c_ru,c_rv}});
+    uint32_t pt=nid(),t=nid(),off=nid(),offf=nid(),newUv=nid();
+    std::vector<Inst> body = {
+        {65,{0,pUf,pt,gu,c_time}}, {61,{0,tFloat,t,pt}},   // time = globalUniforms.time
+        {142,{0,tV2,off,ratevec,t}},                       // off  = vec2(ru,rv)*time
+        {12,{0,tV2,offf,glsl,GLSL_FRACT,off}},             // offf = fract(off)  (one tile)
+        {129,{0,tV2,newUv,coord,offf}},                    // newUv= coord + offf
+    };
+    std::vector<Inst> out; bool addedG=false;
+    for (size_t k=0;k<insts.size();++k){
+        if (!addedG && insts[k].op==54){ for(auto&t2:newTypes)out.push_back(t2); for(auto&c:newConsts)out.push_back(c); addedG=true; }
+        if ((int)k==sampIdx){ for(auto&b:body) out.push_back(b); Inst s=insts[k]; s.w[4]=newUv; out.push_back(s); continue; }
+        out.push_back(insts[k]);
+    }
+    if (!addedG) return {};
+    std::vector<uint32_t> words={0x07230203u,version,generator,bound,0u};
+    for(auto&t2:out){ uint32_t hdr=((uint32_t)t2.w.size()<<16)|(uint32_t)t2.op; words.push_back(hdr); for(size_t j=1;j<t2.w.size();++j)words.push_back(t2.w[j]); }
+    std::vector<uint8_t> mod(words.size()*4); memcpy(mod.data(),words.data(),mod.size());
+    return mod;
+}
+
+// FLIPBOOK by EXACT per-frame FULL 2x3 MATRIX REPLAY in the forward FRAGMENT — the "stop guessing, use the desktop's
+// own data" fix. mats = N frames × 6 = [a,b,c,d,e,f] copied VERBATIM from the mat.sanim track (the SAME values the
+// desktop's animate() plays). frame = floor(fract(time/loopSec)*N) (frame-SNAP, like the desktop); the base-color
+// sample UV becomes (a·u+b·v+c, d·u+e·v+f). Uses ALL frames (no cell-skipping subsample = no flashing) and the FULL
+// matrix (so a scroll, a sprite-cell atlas AND a 2x2 SCALE/dust all replay exactly as the source authored them).
+inline std::vector<uint8_t> editFragUvMatrixReplay(const uint8_t* sd, uint32_t spvLen, const std::vector<float>& mats, int N, float loopSec){
+    using namespace detail;
+    if (N < 2 || (int)mats.size() < N*6) return {};
+    size_t nw=spvLen/4; auto W=[&](size_t k){ return u32(sd,spvLen,(int64_t)k*4); };
+    uint32_t version=W(1), generator=W(2), bound=W(3);
+    std::vector<Inst> insts;
+    for (size_t i=5;i<nw;){ uint32_t ins=W(i),wc=ins>>16,op=ins&0xffff; if(!wc)break; Inst t; t.op=(int)op; for(uint32_t k=0;k<wc;++k)t.w.push_back(W(i+k)); insts.push_back(std::move(t)); i+=wc; }
+    uint32_t tFloat=0,tInt=0,tV2=0,tV3=0,glsl=0,gu=0; int timeIdx=-1;
+    std::map<int64_t,uint32_t> fltc; std::map<int32_t,uint32_t> intc; std::map<uint64_t,uint32_t> ptr;
+    std::map<uint32_t,std::string> names;
+    auto fround=[](float v){ return (int64_t)llround((double)v*1e6); };
+    for (auto& t:insts){ auto&w=t.w;
+        if (t.op==5) names[w[1]]=wstr(w,2);
+        else if (t.op==6){ if (wstr(w,3)=="time") timeIdx=(int)w[2]; }
+        else if (t.op==11 && wstr(w,2).find("GLSL")!=std::string::npos) glsl=w[1];
+        else if (t.op==22 && w[2]==32) tFloat=w[1];
+        else if (t.op==21 && w[2]==32) tInt=w[1]; }
+    for (auto& t:insts){ auto&w=t.w; if (t.op==23 && w[2]==tFloat && w[3]==2) tV2=w[1]; else if (t.op==23 && w[2]==tFloat && w[3]==3) tV3=w[1]; else if (t.op==32) ptr[((uint64_t)w[2]<<32)|w[3]]=w[1]; }
+    for (auto& t:insts){ auto&w=t.w; if (t.op==43 && w[1]==tInt){ int32_t iv; memcpy(&iv,&w[3],4); intc[iv]=w[2]; } else if (t.op==43 && w[1]==tFloat){ float fv; memcpy(&fv,&w[3],4); fltc[fround(fv)]=w[2]; } }
+    for (auto& kv:names) if (kv.second=="globalUniforms") gu=kv.first;
+    if (!tFloat||!tInt||!tV2||!glsl||!gu||timeIdx<0) return {};
+    int sampIdx=-1; uint32_t coord=0;
+    for (size_t k=0;k<insts.size();++k){ if (insts[k].op==87 && insts[k].w.size()>=5){ sampIdx=(int)k; coord=insts[k].w[4]; break; } }
+    if (sampIdx<0) return {};
+    std::vector<Inst> newConsts,newTypes;
+    auto nid=[&](){ return bound++; };
+    auto fbits=[](float f){ uint32_t u; memcpy(&u,&f,4); return u; };
+    auto fconst=[&](float val)->uint32_t{ int64_t k=fround(val); auto it=fltc.find(k); if(it!=fltc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tFloat,id,fbits(val)}}); fltc[k]=id; return id; };
+    auto iconst=[&](int32_t val)->uint32_t{ auto it=intc.find(val); if(it!=intc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tInt,id,(uint32_t)val}}); intc[val]=id; return id; };
+    auto ptrOf=[&](uint32_t sc,uint32_t ty)->uint32_t{ uint64_t k=((uint64_t)sc<<32)|ty; auto it=ptr.find(k); if(it!=ptr.end())return it->second; uint32_t id=nid(); newTypes.push_back({32,{0,id,sc,ty}}); ptr[k]=id; return id; };
+    if (!tV3){ tV3=nid(); newTypes.push_back({23,{0,tV3,tFloat,3}}); }   // OpTypeVector float 3 (if absent)
+    const uint32_t GLSL_FRACT=10, GLSL_STEP=48;
+    if (loopSec<=1e-4f) loopSec=1.f;
+    uint32_t c_invloop=fconst(1.0f/loopSec), c_N=fconst((float)N), c_one=fconst(1.0f), c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
+    std::vector<uint32_t> row0(N), row1(N);   // per frame: row0=(a,b,c), row1=(d,e,f)
+    for (int i=0;i<N;i++){
+        uint32_t a=fconst(mats[(size_t)i*6+0]),b=fconst(mats[(size_t)i*6+1]),c=fconst(mats[(size_t)i*6+2]);
+        uint32_t d=fconst(mats[(size_t)i*6+3]),e=fconst(mats[(size_t)i*6+4]),f=fconst(mats[(size_t)i*6+5]);
+        uint32_t r0=nid(); newConsts.push_back({0x2c,{0,tV3,r0,a,b,c}}); row0[i]=r0;
+        uint32_t r1=nid(); newConsts.push_back({0x2c,{0,tV3,r1,d,e,f}}); row1[i]=r1; }
+    uint32_t pt=nid(),t=nid(),tn=nid(),t01=nid(),fphase=nid();
+    std::vector<Inst> body = {
+        {65,{0,pUf,pt,gu,c_time}}, {61,{0,tFloat,t,pt}},        // time
+        {133,{0,tFloat,tn,t,c_invloop}},                        // time/loopSec
+        {12,{0,tFloat,t01,glsl,GLSL_FRACT,tn}},                 // fract -> [0,1)
+        {133,{0,tFloat,fphase,t01,c_N}},                        // *N -> [0,N)
+    };
+    uint32_t acc0=row0[0], acc1=row1[0];                        // frame-SNAP select: acc = M[ floor(fphase) ]
+    for (int i=1;i<N;i++){ uint32_t c_i=fconst((float)i);
+        uint32_t w=nid(); body.push_back({12,{0,tFloat,w,glsl,GLSL_STEP,c_i,fphase}});   // step(i,fphase)
+        uint32_t d0=nid(); body.push_back({131,{0,tV3,d0,row0[i],acc0}});                // row0[i]-acc0
+        uint32_t s0=nid(); body.push_back({142,{0,tV3,s0,d0,w}});                         // *w
+        uint32_t n0=nid(); body.push_back({129,{0,tV3,n0,acc0,s0}}); acc0=n0;             // acc0 += (row0[i]-acc0)*w
+        uint32_t d1=nid(); body.push_back({131,{0,tV3,d1,row1[i],acc1}});
+        uint32_t s1=nid(); body.push_back({142,{0,tV3,s1,d1,w}});
+        uint32_t n1=nid(); body.push_back({129,{0,tV3,n1,acc1,s1}}); acc1=n1;
+    }
+    uint32_t uvw=nid(); body.push_back({80,{0,tV3,uvw,coord,c_one}});   // vec3(coord.x, coord.y, 1.0)  (OpCompositeConstruct vec2+scalar)
+    uint32_t ux=nid(); body.push_back({148,{0,tFloat,ux,acc0,uvw}});    // dot(row0, uvw) = a·u+b·v+c
+    uint32_t uy=nid(); body.push_back({148,{0,tFloat,uy,acc1,uvw}});    // dot(row1, uvw) = d·u+e·v+f
+    // WRAP the scrolled UV with fract() to match the desktop's REPEAT sampler. A SCROLL (dust c=0.729,
+    // fog c=5.8) pushes U past [0,1]; if the device sampler is CLAMP it lands OFF the (faint) sprite ->
+    // invisible + looks static. fract() = seamless wrap regardless of sampler mode. No-op for sprite-cell
+    // atlases (their UVs already lie in [0,1]) and for REPEAT samplers, so no regression to fog/steam.
+    uint32_t uxf=nid(); body.push_back({12,{0,tFloat,uxf,glsl,GLSL_FRACT,ux}});
+    uint32_t uyf=nid(); body.push_back({12,{0,tFloat,uyf,glsl,GLSL_FRACT,uy}});
+    uint32_t newUv=nid(); body.push_back({80,{0,tV2,newUv,uxf,uyf}});   // vec2(fract(ux),fract(uy))
+    std::vector<Inst> out; bool addedG=false;
+    for (size_t k=0;k<insts.size();++k){
+        if (!addedG && insts[k].op==54){ for(auto&t2:newTypes)out.push_back(t2); for(auto&c:newConsts)out.push_back(c); addedG=true; }
+        if ((int)k==sampIdx){ for(auto&b:body) out.push_back(b); Inst s=insts[k]; s.w[4]=newUv; out.push_back(s); continue; }
+        out.push_back(insts[k]);
+    }
+    if (!addedG) return {};
+    std::vector<uint32_t> words={0x07230203u,version,generator,bound,0u};
+    for(auto&t2:out){ uint32_t hdr=((uint32_t)t2.w.size()<<16)|(uint32_t)t2.op; words.push_back(hdr); for(size_t j=1;j<t2.w.size();++j)words.push_back(t2.w[j]); }
+    std::vector<uint8_t> mod(words.size()*4); memcpy(mod.data(),words.data(),mod.size());
+    return mod;
+}
+
+// FRAGMENT ALPHA FADE by EXACT per-frame replay — multiplies the base-color sample's ALPHA by the mat.sanim
+// MaterialTint alpha curve (fade[N], e.g. fog 0..0.22), frame-SNAP selected at fract(time/loopSec)*N (same phase
+// math as the flipbook). Ports V79's fog/dust OPACITY fade so the card fades IN then fully OUT (alpha→0) over the
+// loop — which HIDES the one-way node-translate's teleport reset AND its low/underground tail (both occur while
+// alpha≈0). Applied ON TOP of the FLIPBOOK UV replay module (re-parses & edits the SAME forward-frag SPIR-V).
+inline std::vector<uint8_t> editFragAlphaFade(const uint8_t* sd, uint32_t spvLen, const std::vector<float>& fade, int N, float loopSec){
+    using namespace detail;
+    if (N < 2 || (int)fade.size() < N) return {};
+    size_t nw=spvLen/4; auto W=[&](size_t k){ return u32(sd,spvLen,(int64_t)k*4); };
+    uint32_t version=W(1), generator=W(2), bound=W(3);
+    std::vector<Inst> insts;
+    for (size_t i=5;i<nw;){ uint32_t ins=W(i),wc=ins>>16,op=ins&0xffff; if(!wc)break; Inst t; t.op=(int)op; for(uint32_t k=0;k<wc;++k)t.w.push_back(W(i+k)); insts.push_back(std::move(t)); i+=wc; }
+    uint32_t tFloat=0,tInt=0,tV4=0,glsl=0,gu=0; int timeIdx=-1;
+    std::map<int64_t,uint32_t> fltc; std::map<int32_t,uint32_t> intc; std::map<uint64_t,uint32_t> ptr;
+    std::map<uint32_t,std::string> names;
+    auto fround=[](float v){ return (int64_t)llround((double)v*1e6); };
+    for (auto& t:insts){ auto&w=t.w;
+        if (t.op==5) names[w[1]]=wstr(w,2);
+        else if (t.op==6){ if (wstr(w,3)=="time") timeIdx=(int)w[2]; }
+        else if (t.op==11 && wstr(w,2).find("GLSL")!=std::string::npos) glsl=w[1];
+        else if (t.op==22 && w[2]==32) tFloat=w[1];
+        else if (t.op==21 && w[2]==32) tInt=w[1]; }
+    for (auto& t:insts){ auto&w=t.w; if (t.op==23 && w[2]==tFloat && w[3]==4) tV4=w[1]; else if (t.op==32) ptr[((uint64_t)w[2]<<32)|w[3]]=w[1]; }
+    for (auto& t:insts){ auto&w=t.w; if (t.op==43 && w[1]==tInt){ int32_t iv; memcpy(&iv,&w[3],4); intc[iv]=w[2]; } else if (t.op==43 && w[1]==tFloat){ float fv; memcpy(&fv,&w[3],4); fltc[fround(fv)]=w[2]; } }
+    for (auto& kv:names) if (kv.second=="globalUniforms") gu=kv.first;
+    if (!tFloat||!tInt||!glsl||!gu||timeIdx<0) return {};
+    // base-color sample = FIRST OpImageSampleImplicitLod (op 87); its vec4 result carries the alpha we fade.
+    int sampIdx=-1; uint32_t sampRes=0;
+    for (size_t k=0;k<insts.size();++k){ if (insts[k].op==87 && insts[k].w.size()>=5){ sampIdx=(int)k; sampRes=insts[k].w[2]; break; } }
+    if (sampIdx<0 || !sampRes) return {};
+    std::vector<Inst> newConsts,newTypes;
+    auto nid=[&](){ return bound++; };
+    auto fbits=[](float f){ uint32_t u; memcpy(&u,&f,4); return u; };
+    auto fconst=[&](float val)->uint32_t{ int64_t k=fround(val); auto it=fltc.find(k); if(it!=fltc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tFloat,id,fbits(val)}}); fltc[k]=id; return id; };
+    auto iconst=[&](int32_t val)->uint32_t{ auto it=intc.find(val); if(it!=intc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tInt,id,(uint32_t)val}}); intc[val]=id; return id; };
+    auto ptrOf=[&](uint32_t sc,uint32_t ty)->uint32_t{ uint64_t k=((uint64_t)sc<<32)|ty; auto it=ptr.find(k); if(it!=ptr.end())return it->second; uint32_t id=nid(); newTypes.push_back({32,{0,id,sc,ty}}); ptr[k]=id; return id; };
+    if (!tV4){ tV4=nid(); newTypes.push_back({23,{0,tV4,tFloat,4}}); }
+    const uint32_t GLSL_FRACT=10, GLSL_STEP=48;
+    if (loopSec<=1e-4f) loopSec=1.f;
+    uint32_t c_invloop=fconst(1.0f/loopSec), c_N=fconst((float)N), c_one=fconst(1.0f), c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
+    std::vector<uint32_t> fc(N); for(int i=0;i<N;i++) fc[i]=fconst(fade[i]);
+    uint32_t pt=nid(),tt=nid(),tn=nid(),t01=nid(),fphase=nid();
+    std::vector<Inst> pre = {
+        {65,{0,pUf,pt,gu,c_time}}, {61,{0,tFloat,tt,pt}},       // time
+        {133,{0,tFloat,tn,tt,c_invloop}},                       // time/loopSec
+        {12,{0,tFloat,t01,glsl,GLSL_FRACT,tn}},                 // fract -> [0,1)
+        {133,{0,tFloat,fphase,t01,c_N}},                        // *N -> [0,N)
+    };
+    uint32_t acc=fc[0];                                          // frame-SNAP select: acc = fade[ floor(fphase) ]
+    for (int i=1;i<N;i++){ uint32_t c_i=fconst((float)i);
+        uint32_t w=nid(); pre.push_back({12,{0,tFloat,w,glsl,GLSL_STEP,c_i,fphase}});   // step(i,fphase)
+        uint32_t d=nid(); pre.push_back({131,{0,tFloat,d,fc[i],acc}});                  // fade[i]-acc
+        uint32_t s=nid(); pre.push_back({133,{0,tFloat,s,d,w}});                        // *w
+        uint32_t n=nid(); pre.push_back({129,{0,tFloat,n,acc,s}}); acc=n;               // acc += (fade[i]-acc)*w
+    }
+    uint32_t v4=nid(), faded=nid();
+    std::vector<Inst> out; bool addedG=false;
+    for (size_t k=0;k<insts.size();++k){
+        if (!addedG && insts[k].op==54){ for(auto&t2:newTypes)out.push_back(t2); for(auto&c:newConsts)out.push_back(c); addedG=true; }
+        if ((int)k==sampIdx){
+            for(auto&b:pre) out.push_back(b);
+            out.push_back(insts[k]);                                       // the base-color sample (result = sampRes)
+            out.push_back({0x50,{0,tV4,v4,c_one,c_one,c_one,acc}});        // OpCompositeConstruct vec4(1,1,1,fadeA)
+            out.push_back({133,{0,tV4,faded,sampRes,v4}});                 // OpFMul: sampled·vec4 -> alpha *= fadeA
+            continue;
+        }
+        if ((int)k>sampIdx){ Inst t2=insts[k]; for(size_t j=1;j<t2.w.size();++j) if(t2.w[j]==sampRes) t2.w[j]=faded; out.push_back(t2); continue; }
+        out.push_back(insts[k]);
+    }
+    if (!addedG) return {};
+    std::vector<uint32_t> words={0x07230203u,version,generator,bound,0u};
+    for(auto&t2:out){ uint32_t hdr=((uint32_t)t2.w.size()<<16)|(uint32_t)t2.op; words.push_back(hdr); for(size_t j=1;j<t2.w.size();++j)words.push_back(t2.w[j]); }
+    std::vector<uint8_t> mod(words.size()*4); memcpy(mod.data(),words.data(),mod.size());
+    return mod;
+}
+
+// ── GENERAL round-trip: compile arbitrary GLSL → SPIR-V (bundled tools/glslangValidator.exe) and swap it into a
+//    RENDSHAD .surface's forward-FRAGMENT stage. This is the "transform ANY shader" path — instead of hand-patching
+//    a fixed base with a getTime enum, the cook can emit a WHOLE target program (any fade/scroll/noise/cell/timing,
+//    even ones needing extra samplers) as GLSL and compile it 1:1. Returns {} on any failure so the caller can fall
+//    back to the SPIR-V-edit path. glslangValidator located via $HSR_GLSLANG or tools/glslangValidator.exe (CWD). ──
+inline std::vector<uint8_t> compileGlslToSpv(const std::string& glsl, char stage /*'f'|'v'*/){
+    std::string gv = "tools/glslangValidator.exe";
+    if (const char* e = std::getenv("HSR_GLSLANG")) gv = e;
+    const char* tmp = std::getenv("TEMP"); if (!tmp) tmp = std::getenv("TMP"); if (!tmp) tmp = ".";
+    static int seq = 0; char base[600];
+    snprintf(base, sizeof base, "%s/_sg_%d_%d", tmp, (int)(size_t)&glsl & 0xffff, seq++);
+    std::string src = std::string(base) + (stage=='v' ? ".vert" : ".frag");
+    std::string out = std::string(base) + ".spv";
+    { FILE* f = fopen(src.c_str(), "wb"); if (!f) return {}; fwrite(glsl.data(), 1, glsl.size(), f); fclose(f); }
+    char cmd[1800];
+    snprintf(cmd, sizeof cmd, "\"%s\" -V --target-env vulkan1.0 -S %s \"%s\" -o \"%s\" >nul 2>&1",
+             gv.c_str(), stage=='v' ? "vert" : "frag", src.c_str(), out.c_str());
+    int rc = system(cmd);
+    std::vector<uint8_t> spv;
+    if (rc == 0) { FILE* f = fopen(out.c_str(), "rb");
+        if (f) { fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+                 if (n>0){ spv.resize((size_t)n); size_t rd=fread(spv.data(),1,(size_t)n,f); if(rd!=(size_t)n) spv.clear(); } fclose(f); } }
+    remove(src.c_str()); remove(out.c_str());
+    if (spv.size()>=20 && *(const uint32_t*)spv.data()!=0x07230203u) spv.clear();   // must be valid SPIR-V
+    return spv;
+}
+// Swap a compiled SPIR-V module into the base .surface's forward-FRAG slot (append at EOF + repoint the FlatBuffer
+// uoffset) — identical mechanism to generate()/editFragCutout. Returns {} if the slot can't be found.
+inline std::vector<uint8_t> swapFragSpv(const std::vector<uint8_t>& src, const std::vector<uint8_t>& fragSpv){
+    using namespace detail;
+    const uint8_t* d = src.data(); size_t N = src.size();
+    int64_t slot, spvOff; uint32_t spvLen;
+    if (fragSpv.size() < 20 || !findFwdFragSpv(d, N, slot, spvOff, spvLen)) return {};
+    std::vector<uint8_t> o = src;
+    while (o.size() % 4) o.push_back(0);
+    uint32_t nv = (uint32_t)o.size(), modLen = (uint32_t)fragSpv.size();
+    o.insert(o.end(), (uint8_t*)&modLen, (uint8_t*)&modLen + 4);
+    o.insert(o.end(), fragSpv.begin(), fragSpv.end());
+    uint32_t rel = nv - (uint32_t)slot; memcpy(o.data() + slot, &rel, 4);   // repoint stage uoffset -> new module
+    return o;
+}
+// Convenience: compile a whole FRAGMENT GLSL program and swap it into src. {} on failure (caller falls back).
+inline std::vector<uint8_t> transformFragGlsl(const std::vector<uint8_t>& src, const std::string& fragGlsl){
+    auto spv = compileGlslToSpv(fragGlsl, 'f');
+    if (spv.empty()) return {};
+    return swapFragSpv(src, spv);
+}
+
 // Generate an animated shader from a stock RENDSHAD `src`. Returns the new .surface.bin bytes (empty on failure).
 //   ROTATE: p0=omega(rad/s), axis | OSCILLATE: p0=amp(rad), p1=period(s), axis | UVSCROLL: p0=rateU, p1=rateV
 // Animates EVERY vertex stage (all passes) so geometry/UV is consistent across the V205 multi-pass RenderGraph
@@ -459,13 +803,40 @@ inline std::vector<uint8_t> editFragCutout(const uint8_t* sd, uint32_t spvLen, f
 // vertex on device -> depth-test/cull/motion mismatch = "animated meshes/textures don't render on device". (UV-scroll's
 // depth-only stages lack inUv -> editVertModule returns {} -> harmlessly skipped, so only real position stages grow.)
 inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode, float p0, float p1=0, float ax=0, float ay=1, float az=0,
-                                     const std::vector<float>& tframes = {}, int tN = 0){
+                                     const std::vector<float>& tframes = {}, int tN = 0,
+                                     const std::vector<float>& fade = {}, float fadeLoop = 0.f){   // FLIPBOOK: opacity-fade curve (mat.sanim tint alpha) + its loop
     using namespace detail;
     const uint8_t* d = src.data(); size_t N = src.size();
     if (mode==CUTOUT){   // edit the FORWARD FRAGMENT (alpha-test discard); the depth/shadow/motion frags don't need it
         int64_t slot,spvOff; uint32_t spvLen;
         if (!detail::findFwdFragSpv(d,N,slot,spvOff,spvLen)) return {};
         std::vector<uint8_t> mod = editFragCutout(d+spvOff, spvLen, p0>0.f ? p0 : 0.5f);   // p0 = alpha threshold
+        if (mod.empty()) return {};
+        std::vector<uint8_t> o = src;
+        while (o.size()%4) o.push_back(0);
+        uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
+        o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
+        o.insert(o.end(),mod.begin(),mod.end());
+        uint32_t rel=nv-(uint32_t)slot; memcpy(o.data()+slot,&rel,4);   // repoint the forward-frag SPIR-V uoffset
+        return o;
+    }
+    if ((mode==FLIPBOOK || mode==UVSCROLL) && !std::getenv("HSR_VERTFLIP")){   // DEFAULT: FRAGMENT-stage UV anim (animates on device; vertex-UV did not)
+        int64_t slot,spvOff; uint32_t spvLen;
+        if (!detail::findFwdFragSpv(d,N,slot,spvOff,spvLen)) return {};
+        std::vector<uint8_t> mod;
+        if (mode==FLIPBOOK) {
+            if (!tframes.empty() && tN>=2)   // EXACT per-frame MATRIX replay (p0=loopSec, tframes=N*6 verbatim source matrices) — matches the desktop
+                mod = editFragUvMatrixReplay(d+spvOff, spvLen, tframes, tN, p0);
+            else                              // legacy derived cols/rows grid (p0=cols p1=rows ax=frames ay=fps az=offsetFlag)
+                mod = editFragFlipbook(d+spvOff, spvLen, (int)(p0+0.5f),(int)(p1+0.5f),(int)(ax+0.5f), ay, az>0.5f);
+            // OPACITY FADE (fog/dust MaterialTint alpha) layered on the SAME forward-frag module — fades the card to 0
+            // at the loop ends so the node-translate's teleport reset + underground tail are invisible. fadeLoop synced
+            // to the translate period by the cooker so alpha≈0 exactly when the card resets/dips low.
+            if (!mod.empty() && !fade.empty() && (int)fade.size()>=2 && fadeLoop>1e-4f) {
+                auto m2 = editFragAlphaFade(mod.data(), (uint32_t)mod.size(), fade, (int)fade.size(), fadeLoop);
+                if (!m2.empty()) mod = m2;
+            }
+        } else mod = editFragUvScroll(d+spvOff, spvLen, p0, p1);   // UVSCROLL: p0=rateU, p1=rateV
         if (mod.empty()) return {};
         std::vector<uint8_t> o = src;
         while (o.size()%4) o.push_back(0);

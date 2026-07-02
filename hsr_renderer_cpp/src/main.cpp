@@ -295,6 +295,10 @@ static void errorCb(int err, const char* desc) {
 int main(int argc, char** argv) {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(hsrCrashHandler);   // segfault → symbolized stack in stderr + _crash.txt
+    // Init WinSock ONCE at startup so the editor's Quest-sync (editor.h sendQuestCmd -> 127.0.0.1:27042) works
+    // in a normal session. Previously WSAStartup only ran inside hsrHttpServer() (HSR_LIVE mode), so in the plain
+    // editor every socket() returned INVALID_SOCKET -> "Quest: ON" pause/scrub silently sent NOTHING to the bridge.
+    { WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa); }
 #endif
     // Record the exe's own directory so APK signing can find/auto-create the Android build-tools + debug keystore
     // right beside the exe (a machine with no Android SDK just needs the tools dropped next to the exe).
@@ -1213,13 +1217,81 @@ int main(int argc, char** argv) {
     std::unordered_map<size_t, noderot::Result> g_opaRot;
     std::unordered_map<size_t, std::pair<float,float>> g_opaUv;
     std::unordered_map<size_t, OpaLoader::FlipRec> g_opaFlip;   // mat.sanim ATLAS flipbooks (waterfall/stream/fog)
+    std::set<int> g_syncNodes;   // declared HERE (outlives the lambda stored in editor.hzAnimExtractor); populated below
     if (isOpa && !std::getenv("HSR_NOROT")) {
         opa.cookExtractRotations(g_opaRot);
         opa.cookExtractUVScroll(g_opaUv);   // mat.sanim water/foam UV scrolls (continuous)
         opa.cookExtractFlipbook(g_opaFlip); // mat.sanim ATLAS flipbooks (cell-stepping waterfall/stream/fog)
         fprintf(stderr, "[OPA] cook anim: %zu spin/sway + %zu uv-scroll + %zu flipbook (of %zu meshes)\n", g_opaRot.size(), g_opaUv.size(), g_opaFlip.size(), opa.meshes.size());
-        editor.hzAnimExtractor = [&g_opaRot,&g_opaUv,&g_opaFlip,&opa](int meshIdx, int frames, hslcook::ExportMesh& em){
+        // SYNC NODES (the "train + steam detached" fix): the train STEAM is a flipbook -> it rides the getTime() TRANSLATE
+        // clock. Its sibling the train BODY is a plain node mesh -> default useHz (animator clock) -> the two drift apart.
+        // Collect the node (+ its direct parent = the vehicle group) of every flipbook that translates a LOT (a vehicle);
+        // any node-rigid mesh on one of THOSE nodes is routed to the SAME getTime() TRANSLATE so body+steam stay attached.
+        // Complex one-offs (comets/birds, on unrelated nodes) keep their faithful useHz baked path.
+        for (size_t mi=0; mi<opa.meshes.size(); ++mi) { std::vector<float> mats; int mN=0; float mL=0.f;
+            if (!opa.cookExtractUVMatrices((int)mi, 8, mats, mN, mL)) continue;   // only UV-animated cards (the train STEAM)
+            std::vector<float> tof; float tl=0.f;
+            if (opa.cookExtractNodeTranslateFrames((int)mi, 24, tof, tl)) {
+                float md=0.f; for (float v : tof){ float a=std::fabs(v); if(a>md)md=a; }
+                if (md > 60.f) { int n=opa.animNodeOf((int)mi); if (n>=0){ g_syncNodes.insert(n); int p=opa.animNodeParentOf(n); if(p>=0) g_syncNodes.insert(p); } } } }
+        editor.hzAnimExtractor = [&g_opaRot,&g_opaUv,&g_opaFlip,&opa,&g_syncNodes](int meshIdx, int frames, hslcook::ExportMesh& em){
             (void)frames;
+            // MATERIAL UV ANIMATION — REPLAY THE DESKTOP'S EXACT DATA (the "stop guessing" fix). Any mesh whose mat.sanim
+            // track animates (fog/dust/smoke/fire/steam) → copy its ACTUAL per-frame 2x3 UV matrices (the SAME values the
+            // desktop's animate() plays) and replay them VERBATIM in a FRAGMENT getTime() shader — no derived cols/rows
+            // grid to mis-guess, all frames (no flashing), full matrix (scroll + sprite-cell + 2x2 SCALE/dust all exact).
+            // Takes priority over useHz (whose skinned shader froze the texture). If it also rides a BIG vehicle move
+            // (train STEAM ~162u), layer a TRANSLATE under it; small ambient drift stays static (looked wrong as getTime).
+            { std::vector<float> mats; int mN=0; float mLoop=0.f;
+              if (opa.cookExtractUVMatrices((int)meshIdx, 256, mats, mN, mLoop)) {
+                  em.blend=true; em.flipbook=true; em.flipOffset=true; em.uvScroll=false;
+                  em.flipUVMats=std::move(mats); em.flipN=mN; em.flipLoop=mLoop;
+                  em.flipCols=1; em.flipRows=1; em.flipFrames=mN; em.flipFps=30.f;
+                  em.rotAnim=false; em.vatOffsets.clear(); em.vatFrames=0;
+                  // OPACITY FADE (mat.sanim MaterialTint alpha) — replayed in the flipbook frag, SYNCED to the mat.sanim
+                  // period (mLoop) as the UV so fade-in/out lines up exactly like V79. Shared by BOTH motion paths below.
+                  em.fadeAnim=false;
+                  if (!std::getenv("HSR_FLIPNOFADE")) { std::vector<float> fa; float floop=0.f;
+                      if (opa.cookExtractTintAlpha((int)meshIdx, fa, floop) && fa.size()>=2) {
+                          em.fadeAnim=true; em.fadeN=(int)fa.size(); em.fadeFrames=std::move(fa); em.fadeLoop = mLoop; } }
+                  // ── MOTION (NO EXCLUSION) ────────────────────────────────────────────────────────────────────────
+                  // An effect card whose node ROTATES or SCALES (fog_01 = full T+R+S) can't be faithfully ported by the
+                  // getTime TRANSLATE shader alone (a hierarchical / far-pivot / rotating transform would FLING the card —
+                  // verified: raw node scale 1.7x vs the render's ~1.2x net world size). Route it to RIGID-HZANIM (the
+                  // EXACT per-frame WORLD matrix via a 2-joint skeleton = faithful T+R+S) AND keep the UV-flipbook + fade:
+                  // the cook bakes those into the SKINNED material shader (fragment), skinning stays in the vertex. So
+                  // T+R+S + UV + fade ALL cook together, synced (device: skeleton on the animator clock, UV/fade on the
+                  // shader clock — both real-time). HSR_FLIPNOHZ forces the old translate-only path.
+                  if (!std::getenv("HSR_FLIPNOHZ") && std::getenv("HSR_HZANIM") && opa.nodeAnimatesRotOrScale((int)meshIdx)) {   // gate on HSR_HZANIM (matches the cook's useHz); else keep the getTime path (no regression)
+                      auto rg = opa.extractNodeRigidHzAnim((int)meshIdx);
+                      if (rg.ok()) {
+                          em.hzJointPos=std::move(rg.jointPos); em.hzJointQuat=std::move(rg.jointQuat); em.hzJointScale=std::move(rg.jointScale);
+                          em.hzParents=std::move(rg.parents); em.hzBoneIdx=std::move(rg.boneIdx); em.hzBoneWgt=std::move(rg.boneWgt);
+                          em.hzTrsLocal=std::move(rg.trsLocal); em.hzRestPos=std::move(rg.restPos);
+                          em.hzJointCount=rg.jointCount; em.hzFrames=rg.frameCount; em.hzFps=rg.fps;
+                          em.transAnim=false;   // motion is in the skeleton; flipbook+fade ride the skinned material shader
+                          return;   // em keeps flipbook + fade -> cook applies them to the SKINNED shader (useHz + m.flipbook)
+                      }
+                  }
+                  // Pure-translate card (or rigid extraction failed): the lighter getTime TRANSLATE + flipbook + fade path.
+                  em.hzJointCount=0; em.hzFrames=0;
+                  std::vector<float> tof; float tloop=0.f; em.transAnim=false;
+                  if (!std::getenv("HSR_FLIPNOTRANS") && opa.cookExtractNodeTranslateFrames((int)meshIdx, 24, tof, tloop)) {   // NATURAL node period first (measure drift)
+                      float md=0.f; for (size_t k=0;k<tof.size();++k){ float a=std::fabs(tof[k]); if(a>md)md=a; }
+                      if (md > 60.f) {
+                          // VEHICLE (train/mine-cart steam): keep the NATURAL node period so steam + body stay LOCKED
+                          // (the body extracts the same node period at the g_syncNodes path). Forcing it to the steam's
+                          // UV/puff mLoop made the steam race along the track and detach from the cart = the regression.
+                          em.transAnim=true; em.transN=24; em.transFrames=std::move(tof); em.transLoop=tloop;
+                      } else if (md > 1.f) {
+                          // AMBIENT drift (fog/dust): lock the MOVEMENT to the mat.sanim period (mLoop) so translate + UV +
+                          // fade stay synced (matches the render — one mat.sanim clock).
+                          std::vector<float> tof2; float tl2=0.f;
+                          if (opa.cookExtractNodeTranslateFrames((int)meshIdx, 24, tof2, tl2, mLoop)) {
+                              em.transAnim=true; em.transN=24; em.transFrames=std::move(tof2); em.transLoop=tl2; }
+                      } }
+                  return;
+              } }
             // OPA skeletal/rigid HZANIM port — DEFAULT ON (faithful animation). Was gated after an early cooked APK
             // crashed, but the incredibles skinned fix ([[project_hsr_skinned_rendmesh_skinblock]]) made HZANIM stable
             // on device (cyberhome: loads, no crash, ErrorNotReady only transient). Opt-out via HSR_NOOPAHZ.
@@ -1234,25 +1306,43 @@ int main(int argc, char** argv) {
                 em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
                 return;
             }
-            // ⚠ DEFAULT OFF — the 1-joint RIGID HZANIM is a DEGENERATE maxBoneIdx=0 "skin": its bind is the identity
-            // origin (jointPos={0,0,0}), the verts are node-LOCAL, and ALL world placement lives only in the absolute
-            // ACL clip. The device's MeshDefinition::fix rejects / never drives this degenerate skin, so the mesh sits
-            // at the origin-bind = SPAWN (root cause of bluehills "VE_WESTERN animatedGroup MOVED TO SPAWN AFTER COOK":
-            // decoded the cooked HSTF — animatedGroup #2 = AnimatorPlatformComponent + empty {} transform + armature0
-            // = a single joint at (0,0,0); the static sub-meshes #1/#3 are world-baked and render correctly). This path
-            // runs BEFORE the device-proven ShellPoseAnimationComponent below and SHADOWED it for every translating node.
-            // Now node TRANSLATION falls through to that pose path (entity placed at the world centroid + pose lerp,
-            // "NO skin so MeshDefinition::fix can't reject it"). Opt back in (arbitrary curved paths) via HSR_OPARIGIDHZ.
-            if (std::getenv("HSR_OPARIGIDHZ")) {
-            auto rg = opa.extractNodeRigidHzAnim(meshIdx);
-            if (rg.ok()) {
-                em.hzJointPos=std::move(rg.jointPos); em.hzJointQuat=std::move(rg.jointQuat); em.hzJointScale=std::move(rg.jointScale);
-                em.hzParents=std::move(rg.parents); em.hzBoneIdx=std::move(rg.boneIdx); em.hzBoneWgt=std::move(rg.boneWgt);
-                em.hzTrsLocal=std::move(rg.trsLocal); em.hzRestPos=std::move(rg.restPos);
-                em.hzJointCount=rg.jointCount; em.hzFrames=rg.frameCount; em.hzFps=rg.fps;
-                em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
-                return;
-            }
+            // TRAIN BODY (a node on a vehicle group that also carries a getTime flipbook STEAM): route to the SAME getTime
+            // TRANSLATE clock as the steam so they stay attached (NOT useHz, whose animator clock drifts vs getTime).
+            { int myNode = opa.animNodeOf(meshIdx);
+              if (myNode>=0 && g_syncNodes.count(myNode)) { std::vector<float> tof; float tloop=0.f;
+                  if (opa.cookExtractNodeTranslateFrames(meshIdx, 24, tof, tloop)) {
+                      em.transAnim=true; em.transN=24; em.transFrames=std::move(tof); em.transLoop=tloop;
+                      em.hzJointCount=0; em.hzFrames=0; em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
+                      return; } } }
+            // NON-skinned node TRANSLATION (cars, comet STREAK) -> 1-joint RIGID HZANIM (DEFAULT, device-proven:
+            // faithful arbitrary path replay of the ACTUAL per-frame positions incl. the comet's streak). This is
+            // a real skinned mesh in the cooked env's skinned SET.
+            // ⛔⛔ DO NOT reroute this to getTime TRANSLATE (removing it from the skinned set): the on-device bridge
+            // + user PROVED that pulling these RIGID skeletons OUT of the cooked skinned set CORRUPTS the device
+            // animator so EVERY skinned mesh (owl/chicken/horses) moves RANDOMLY. Keep node-translations as
+            // RIGID-HZANIM. (Earlier "HzAnim skinning is dead/frozen" reading was WRONG HOOKS — env skinning is the
+            // HSR MeshShellEnv/JointMatrices path, not the MHE sbSkinningMatrices my hooks watched.)
+            // HSR_NODETRANSLATE = opt-in experiment to reroute to getTime TRANSLATE (BREAKS the animator — debug only).
+            if (!std::getenv("HSR_NODETRANSLATE")) {
+                auto rg = opa.extractNodeRigidHzAnim(meshIdx);
+                if (rg.ok()) {
+                    em.hzJointPos=std::move(rg.jointPos); em.hzJointQuat=std::move(rg.jointQuat); em.hzJointScale=std::move(rg.jointScale);
+                    em.hzParents=std::move(rg.parents); em.hzBoneIdx=std::move(rg.boneIdx); em.hzBoneWgt=std::move(rg.boneWgt);
+                    em.hzTrsLocal=std::move(rg.trsLocal); em.hzRestPos=std::move(rg.restPos);
+                    em.hzJointCount=rg.jointCount; em.hzFrames=rg.frameCount; em.hzFps=rg.fps;
+                    em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
+                    return;
+                }
+            } else {
+                std::vector<float> tof; float tloop=0.f;
+                if (opa.cookExtractNodeTranslateFrames(meshIdx, 64, tof, tloop)) {
+                    float md=0.f; for (float v : tof){ float a=std::fabs(v); if(a>md)md=a; }
+                    if (md > 1.f) {
+                        em.transAnim=true; em.transN=64; em.transFrames=std::move(tof); em.transLoop=tloop;
+                        em.hzJointCount=0; em.hzFrames=0; em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
+                        return;
+                    }
+                }
             }
             }   // end HSR_OPAHZ gate
             // NODE-SCALE "breathe" (NON-UNIFORM per-axis) -> shadergen::SCALE getTime() shader (faithful per-axis amplitudes).
@@ -1354,7 +1444,9 @@ int main(int argc, char** argv) {
         //   bg=r,g,b (clear colour; bg=1,1,1 = WHITE sky to expose ground HOLES) | wire=0/1
         //   hidemesh=i | solomesh=i | hidemat=sub | solomat=sub | clear | shot=path.png
         //   listmesh=sub | farscan[=thr] (meshes with a vertex |world coord|>thr — finds mis-decoded
-        //   geometry flung far away that tears holes) | quit
+        //   geometry flung far away that tears holes) | matinfo=i (shader/VAT/bones/blend flags)
+        //   dump=i (FULL data-extract for ONE mesh: coordinates/shader/material/matParams/textures/
+        //          animation/skeleton/components — the cooker ground-truth reference) | quit
 #ifdef _WIN32
         if (liveMode) {
             std::vector<LiveCmd*> batch;
@@ -1372,15 +1464,46 @@ int main(int argc, char** argv) {
                         C.yaw = yd * 3.14159265f / 180.0f; C.pitch = pd * 3.14159265f / 180.0f;
                     } else if (sscanf(ln, "move=%f,%f,%f", &x, &y, &z) == 3) { C.pos[0]+=x; C.pos[1]+=y; C.pos[2]+=z; }
                     else if (sscanf(ln, "bg=%f,%f,%f", &r, &g, &b) == 3) { vkRenderer.clearRGB[0]=r; vkRenderer.clearRGB[1]=g; vkRenderer.clearRGB[2]=b; }
+                    else if (strncmp(ln, "at=", 3) == 0)          { g_animOverride = true; g_animScrub = (float)atof(ln + 3); }  // SCRUB anim time (seconds); at=-1 -> resume real-time
                     else if (strncmp(ln, "fov=", 4) == 0)         C.fovDeg = (float)atof(ln + 4);
                     else if (strncmp(ln, "far=", 4) == 0)         C.farZ = (float)atof(ln + 4);
                     else if (strncmp(ln, "shot=", 5) == 0)        shotThis = ln + 5;
                     else if (strncmp(ln, "hidemesh=", 9) == 0)    vkRenderer.hideMesh = atoi(ln + 9);
                     else if (strncmp(ln, "solomesh=", 9) == 0)    vkRenderer.soloMesh = atoi(ln + 9);
+                    else if (strncmp(ln, "delmesh=", 8) == 0) {   // editor mesh DELETE toggle (drop from render + cook)
+                        int mi=atoi(ln+8); if (mi>=0 && mi<(int)vkRenderer.gpuMeshes.size()) { vkRenderer.setDeleted(mi, !vkRenderer.isDeleted(mi));
+                            snprintf(tmp,sizeof tmp,"mesh %d deleted=%d (deletedCount=%d)\n", mi, (int)vkRenderer.isDeleted(mi), vkRenderer.deletedCount()); out += tmp; } }
+                    else if (strncmp(ln, "dupmesh=", 8) == 0) {   // editor mesh DUPLICATE (clone + offset)
+                        int mi=atoi(ln+8); size_t before=vkRenderer.gpuMeshes.size();
+                        editor.selectOne(mi); editor.duplicateSelected();
+                        snprintf(tmp,sizeof tmp,"duplicated mesh %d -> now %zu meshes (was %zu)\n", mi, vkRenderer.gpuMeshes.size(), before); out += tmp; }
+                    else if (strncmp(ln, "settex=", 7) == 0) {   // editor SET texture from a PNG/JPG (skybox/any mesh): settex=<mi>,<path>
+                        const char* a=ln+7; const char* c=strchr(a,',');
+                        if (c) { int mi=atoi(std::string(a,c-a).c_str()); bool ok=editor.setMeshTexture(mi, c+1);
+                            snprintf(tmp,sizeof tmp,"settex %d -> %s\n", mi, ok?"ok":"FAILED"); out += tmp; } }
+                    else if (strncmp(ln, "exporttex=", 10) == 0) {   // editor EXPORT a mesh's texture to PNG: exporttex=<mi>,<path>
+                        const char* a=ln+10; const char* c=strchr(a,',');
+                        if (c) { int mi=atoi(std::string(a,c-a).c_str()); bool ok=editor.exportMeshTexture(mi, c+1);
+                            snprintf(tmp,sizeof tmp,"exporttex %d -> %s\n", mi, ok?"ok":"FAILED"); out += tmp; } }
+                    else if (strncmp(ln, "skycolor=", 9) == 0) {   // editor GENERAL skybox color (any env): skycolor=<r>,<g>,<b> (0..1)
+                        float rr,gg,bb; if (sscanf(ln+9,"%f,%f,%f",&rr,&gg,&bb)==3) { editor.setSkyColor(rr,gg,bb);
+                            snprintf(tmp,sizeof tmp,"skycolor=(%.3f,%.3f,%.3f)\n",rr,gg,bb); out += tmp; } }
+                    else if (strncmp(ln, "skyimage=", 9) == 0) {   // skybox from an IMAGE file (equirect): skyimage=<path>
+                        bool ok=editor.setSkyImage(ln+9); snprintf(tmp,sizeof tmp,"skyimage -> %s\n", ok?"ok":"FAILED"); out += tmp; }
+                    else if (strncmp(ln, "skytexmesh=", 11) == 0) {   // skybox from an EXISTING mesh TEXTURE: skytexmesh=<mi>
+                        bool ok=editor.setSkyImageFromMesh(atoi(ln+11)); snprintf(tmp,sizeof tmp,"skytexmesh -> %s\n", ok?"ok":"FAILED"); out += tmp; }
+                    else if (strncmp(ln, "exportsky=", 10) == 0) {   // export the current skybox texture: exportsky=<path>
+                        bool ok=editor.exportSkyImage(ln+10); snprintf(tmp,sizeof tmp,"exportsky -> %s\n", ok?"ok":"FAILED"); out += tmp; }
                     else if (strncmp(ln, "movemesh=", 9) == 0) {   // live-edit: world-translate ONE mesh (test placement fixes without recompiling)
                         int mi; float dx, dy, dz;
                         if (sscanf(ln + 9, "%d,%f,%f,%f", &mi, &dx, &dy, &dz) == 4 && mi >= 0 && mi < (int)vkRenderer.gpuMeshes.size()) {
-                            vkRenderer.gpuMeshes[mi].model[12] += dx; vkRenderer.gpuMeshes[mi].model[13] += dy; vkRenderer.gpuMeshes[mi].model[14] += dz;
+                            // Route through the EDITOR transform (editT + recomputeModel), NOT the raw model matrix:
+                            // the raw-matrix poke left the Object panel stale, the next editor edit clobbered the move,
+                            // and it never saved/cooked. Through editT the UI, .hsledit session and cook all see it.
+                            auto& gm = vkRenderer.gpuMeshes[mi];
+                            gm.editT[0] += dx; gm.editT[1] += dy; gm.editT[2] += dz;
+                            if (g_editor) g_editor->recomputeModel(gm);
+                            else { gm.model[12] += dx; gm.model[13] += dy; gm.model[14] += dz; }   // HSR_NOUI: no editor -> old direct poke
                             snprintf(tmp, sizeof tmp, "moved mesh %d by (%.2f,%.2f,%.2f)\n", mi, dx, dy, dz); out += tmp;
                         }
                     }
@@ -1410,6 +1533,113 @@ int main(int argc, char** argv) {
                             snprintf(tmp,sizeof tmp,"[MATINFO %d] '%s' shader=%s\n", mi, md.name.c_str(), md.shaderPath.c_str()); out += tmp;
                             snprintf(tmp,sizeof tmp,"  hasVat=%d hasBones=%d isSkinned=%d tiled=%d tex=%dx%d mdBlend=%d gmBlend=%d add=%d progIdx=%d stride=%u uvOff=%u\n",
                                 (int)md.hasVat,(int)md.hasBones,(int)gm.isSkinned,(int)md.tiled,md.texW,md.texH,(int)md.useBlend,(int)gm.useBlend,(int)gm.additive,gm.progIdx,gm.vboStride,gm.uvOffset); out += tmp;
+                        }
+                    }
+                    else if (strncmp(ln, "dump=", 5) == 0) {   // FULL data-extract for ONE mesh: material/shader/animation/skeleton/coordinates.
+                        // Ground-truth reference to fix the cooker: dumps the RENDERER's processed data for any render mode (OPA/V203/glTF/V79).
+                        int mi = atoi(ln + 5);
+                        if (mi < 0 || mi >= (int)sceneMeshes->size() || mi >= (int)vkRenderer.gpuMeshes.size()) { out += "dump: bad mesh index\n"; }
+                        else {
+                        const auto& md = (*sceneMeshes)[mi]; const auto& gm = vkRenderer.gpuMeshes[mi]; const float* M = gm.model;
+                        snprintf(tmp,sizeof tmp,"===== DUMP mesh [%d] '%s' =====\n", mi, md.name.c_str()); out += tmp;
+                        snprintf(tmp,sizeof tmp,"  meshPath=%s\n", md.meshPath.c_str()); out += tmp;
+                        // -- COORDINATES: processed world matrix (column-major), transform, world AABB --
+                        snprintf(tmp,sizeof tmp,"[COORD] worldMatrix(col-major)=\n  [%.4f %.4f %.4f %.4f]\n  [%.4f %.4f %.4f %.4f]\n  [%.4f %.4f %.4f %.4f]\n  [%.4f %.4f %.4f %.4f]\n",
+                            M[0],M[4],M[8],M[12], M[1],M[5],M[9],M[13], M[2],M[6],M[10],M[14], M[3],M[7],M[11],M[15]); out += tmp;
+                        snprintf(tmp,sizeof tmp,"  worldPos=(%.3f,%.3f,%.3f) transform.pos=(%.3f,%.3f,%.3f) rot=(%.4f,%.4f,%.4f,%.4f) scale=(%.3f,%.3f,%.3f)\n",
+                            M[12],M[13],M[14], md.transform.pos[0],md.transform.pos[1],md.transform.pos[2],
+                            md.transform.rot[0],md.transform.rot[1],md.transform.rot[2],md.transform.rot[3], md.transform.scale[0],md.transform.scale[1],md.transform.scale[2]); out += tmp;
+                        { float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f}; size_t nv=md.positions.size()/3;
+                          for(size_t i=0;i<nv;i++){ float lx=md.positions[i*3],ly=md.positions[i*3+1],lz=md.positions[i*3+2];
+                            float wx=M[0]*lx+M[4]*ly+M[8]*lz+M[12],wy=M[1]*lx+M[5]*ly+M[9]*lz+M[13],wz=M[2]*lx+M[6]*ly+M[10]*lz+M[14];
+                            for(int k=0;k<3;k++){ float w=(k==0?wx:k==1?wy:wz); if(w<mn[k])mn[k]=w; if(w>mx[k])mx[k]=w; } }
+                          if(nv) { snprintf(tmp,sizeof tmp,"  worldAABB min=(%.3f,%.3f,%.3f) max=(%.3f,%.3f,%.3f)\n", mn[0],mn[1],mn[2],mx[0],mx[1],mx[2]); out+=tmp; } }
+                        // PER-VERTEX world positions (quad orientation/curve): the ACTUAL posed geometry the renderer draws.
+                        { size_t nv=md.positions.size()/3;
+                          for(size_t vv=0; vv<nv && vv<8; vv++){ float lx=md.positions[vv*3],ly=md.positions[vv*3+1],lz=md.positions[vv*3+2];
+                            float wx=M[0]*lx+M[4]*ly+M[8]*lz+M[12],wy=M[1]*lx+M[5]*ly+M[9]*lz+M[13],wz=M[2]*lx+M[6]*ly+M[10]*lz+M[14];
+                            snprintf(tmp,sizeof tmp,"    v%zu world=(%.2f,%.2f,%.2f)\n",vv,wx,wy,wz); out+=tmp; } }
+                        snprintf(tmp,sizeof tmp,"  nVerts=%u nIdx=%u vboStride=%u posOff=%u uvOff=%u\n", md.nVerts, md.nIdx, gm.vboStride, gm.posOffset, gm.uvOffset); out += tmp;
+                        // -- SHADER --
+                        snprintf(tmp,sizeof tmp,"[SHADER] path=%s\n  shaderIng=%llu progIdx=%d\n", md.shaderPath.c_str(), (unsigned long long)md.shaderIng, gm.progIdx); out += tmp;
+                        // -- MATERIAL flags + tint --
+                        snprintf(tmp,sizeof tmp,"[MATERIAL] blend=%d additive=%d alphaTest=%d doubleSided=%d tiled=%d iblLit=%d skybox=%d\n",
+                            (int)md.useBlend,(int)md.additive,(int)md.alphaTest,(int)md.doubleSided,(int)md.tiled,(int)md.iblLit,(int)md.isSkybox); out += tmp;
+                        snprintf(tmp,sizeof tmp,"  tint=(%.3f,%.3f,%.3f,%.3f) atlasCell=%.0f\n", md.tint[0],md.tint[1],md.tint[2],md.tint[3], md.atlasCellIndex); out += tmp;
+                        // -- MATPARAMS: decode the cooked constant block by name-hash + float values --
+                        if (!md.constParams.empty()) { out += "  matParams (nameHash : values):\n";
+                          for (const auto& cp : md.constParams) { int nfl = (int)(cp.byteSize/4);
+                            snprintf(tmp,sizeof tmp,"    %08x [%uB]:", cp.nameHash, cp.byteSize); out += tmp;
+                            for (int f=0; f<nfl && f<8; f++) { float v=0; if ((size_t)cp.blobOffset+f*4+4<=md.matParamsBlob.size()) memcpy(&v,&md.matParamsBlob[cp.blobOffset+f*4],4);
+                              snprintf(tmp,sizeof tmp," %.4f", v); out += tmp; } out += "\n"; } }
+                        if (!md.matOverrides.empty()) { out += "  matOverrides (per-instance):\n";
+                          for (const auto& mo : md.matOverrides) { snprintf(tmp,sizeof tmp,"    %s = (%.4f,%.4f,%.4f,%.4f)\n", mo.name.c_str(), mo.v[0],mo.v[1],mo.v[2],mo.v[3]); out += tmp; } }
+                        // -- TEXTURES --
+                        snprintf(tmp,sizeof tmp,"[TEX] base=%dx%d(%d) normal=%dx%d(%d) orm=%dx%d(%d) emissive=%dx%d(%d) lightmap=%dx%d(%d)\n",
+                            md.texW,md.texH,(int)md.hasTexture, md.normalW,md.normalH,(int)md.hasNormal, md.ormW,md.ormH,(int)md.hasOrm,
+                            md.emissiveW,md.emissiveH,(int)md.hasEmissive, md.lmW,md.lmH,(int)md.hasLightmap); out += tmp;
+                        if (!md.ormTexName.empty()) { snprintf(tmp,sizeof tmp,"  ormTexName=%s (lightmap merge-group)\n", md.ormTexName.c_str()); out += tmp; }
+                        // -- ANIMATION --
+                        snprintf(tmp,sizeof tmp,"[ANIM] hasVat=%d vat=%ux%u(verts x frames) vatTrack=%.1f rate=%.3f timeOff=%.3f dynamicVerts=%d gltfMeshIdx=%d\n",
+                            (int)md.hasVat, md.vatW, md.vatH, md.vatTrackIndex, md.vatRateFactor, md.vatTimeOffset, (int)md.dynamicVerts, md.gltfMeshIndex); out += tmp;
+                        // -- SKELETON --
+                        snprintf(tmp,sizeof tmp,"[SKEL] hasBones=%d isSkinned=%d bonePalette=%zu slots boneIdx=%zu boneWt=%zu\n",
+                            (int)md.hasBones, (int)gm.isSkinned, md.bonePalette.size(), md.boneIndices.size()/4, md.boneWeights.size()/4); out += tmp;
+                        if (!md.bonePalette.empty()) { out += "  palette jointHashes:";
+                          for (size_t i=0;i<md.bonePalette.size() && i<24;i++){ snprintf(tmp,sizeof tmp," %08x", md.bonePalette[i]); out += tmp; } out += "\n"; }
+                        // -- COOK-ANIM CLASSIFICATION (OPA): EXACTLY what device shader/anim this mesh cooks to.
+                        //    Diagnoses "jumping / not showing": the first TRUE branch (in cook priority order) wins. --
+                        if (isOpa) {
+                            std::vector<float> cmats; int cmN=0; float cmL=0.f;
+                            bool uvm = opa.cookExtractUVMatrices(mi, 256, cmats, cmN, cmL);
+                            std::vector<float> ctof; float ctl=0.f;
+                            bool tr = opa.cookExtractNodeTranslateFrames(mi, 24, ctof, ctl);
+                            float tmd=0.f; for(float v:ctof){ float a=fabsf(v); if(a>tmd)tmd=a; }
+                            bool hz = opa.extractHzAnim(mi).ok();
+                            bool rg = opa.extractNodeRigidHzAnim(mi).ok();
+                            std::vector<float> csf; float csl=0.f; float csp[3]={0,0,0};
+                            bool sc = opa.cookExtractNodeScaleFrames(mi, 16, csf, csl, csp);
+                            float ctd[3]={0,0,0}; bool nt = opa.extractNodeTranslate(mi, ctd);
+                            int myNode = opa.animNodeOf(mi);
+                            bool nodeTrans = std::getenv("HSR_NODETRANSLATE") != nullptr;   // opt-in reroute (breaks animator)
+                            bool tt = tr && tmd > 1.f && nodeTrans;
+                            const char* winner = uvm ? "FLIPBOOK-UVMATRIX(frag getTime)" : hz ? "HZANIM-SKINNED" :
+                                                  tt ? "TRANSLATE-getTime(node path; HSR_NODETRANSLATE)" :
+                                                  rg ? "RIGID-HZANIM(node path)" : sc ? "SCALE-getTime" :
+                                                  nt ? "POSE-TRANSLATE(node move)" : "STATIC(no anim)";
+                            snprintf(tmp,sizeof tmp,"[COOK-ANIM] => %s   (node=%d)\n", winner, myNode); out += tmp;
+                            snprintf(tmp,sizeof tmp,"  uvMatrix=%d(N=%d loop=%.2fs) nodeTranslate=%d(maxDelta=%.2fu) hzSkinned=%d rigid=%d scale=%d poseTrans=%d(d=%.2f,%.2f,%.2f)\n",
+                                (int)uvm,cmN,cmL, (int)tr,tmd, (int)hz,(int)rg,(int)sc,(int)nt, ctd[0],ctd[1],ctd[2]); out += tmp;
+                            if (uvm && cmN>0) { out += "  UV matrices [a b c | d e f] (device replays these in FRAGMENT):\n";
+                              for (int f=0; f<cmN && f<5 && (int)cmats.size()>=(f+1)*6; f++){
+                                snprintf(tmp,sizeof tmp,"    f%d: %.4f %.4f %.4f | %.4f %.4f %.4f\n", f,
+                                  cmats[f*6],cmats[f*6+1],cmats[f*6+2],cmats[f*6+3],cmats[f*6+4],cmats[f*6+5]); out += tmp; } }
+                            if (tr && ctof.size()>=6) { int tn = (int)(ctof.size()/3);
+                              float sx=ctof[(tn-1)*3]-ctof[0], sy=ctof[(tn-1)*3+1]-ctof[1], sz=ctof[(tn-1)*3+2]-ctof[2];
+                              float seam=sqrtf(sx*sx+sy*sy+sz*sz), span=0.f;
+                              for(int f=0;f<tn;f++){ float m=std::max({fabsf(ctof[f*3]),fabsf(ctof[f*3+1]),fabsf(ctof[f*3+2])}); if(m>span)span=m; }
+                              bool looping = seam < 0.20f*span + 0.5f;
+                              snprintf(tmp,sizeof tmp,"  node-translate: %s (seam=%.2f span=%.2f) => device %s\n",
+                                looping?"CYCLIC-LOOP":"ONE-WAY", seam, span, looping?"WRAPS (smooth, no jump)":"HOLDS+teleport"); out += tmp;
+                              for (int f=0; f<tn && f<12; f++){ snprintf(tmp,sizeof tmp,"    t%d: %.3f %.3f %.3f\n", f, ctof[f*3],ctof[f*3+1],ctof[f*3+2]); out += tmp; } }
+                            // FADE (mat.sanim MaterialTint alpha) — the fog/dust fade-in/out baked into the frag getTime.
+                            { std::vector<float> cfa; float cfl=0.f;
+                              bool fade = opa.cookExtractTintAlpha(mi, cfa, cfl) && cfa.size()>=2;
+                              if (fade) { float amn=1e9f,amx=-1e9f; for(float a:cfa){ if(a<amn)amn=a; if(a>amx)amx=a; }
+                                snprintf(tmp,sizeof tmp,"  FADE(MaterialTint.a): N=%zu naturalLoop=%.2fs alpha[min=%.3f max=%.3f]  (cooked loop=UV %.2fs, synced) => baked into frag getTime\n",
+                                  cfa.size(), cfl, amn, amx, cmL); out += tmp; }
+                              else out += "  FADE: none\n"; }
+                            // SCALE breathe (chained into the effect-card shader when present) — amplitude + loop.
+                            { std::vector<float> csf2; float csl2=0.f; float csp2[3]={0,0,0};
+                              bool scb = opa.cookExtractNodeScaleFrames(mi, 16, csf2, csl2, csp2);
+                              if (scb) { float dev=0.f; for(float f:csf2){ float d=f>1.f?f-1.f:1.f-f; if(d>dev)dev=d; }
+                                snprintf(tmp,sizeof tmp,"  SCALE(breathe): loop=%.2fs maxDev=%.3f pivot=(%.2f,%.2f,%.2f) => CHAINED into effect-card shader\n", csl2, dev, csp2[0],csp2[1],csp2[2]); out += tmp; }
+                              else out += "  SCALE: none\n"; }
+                        }
+                        // -- COMPONENTS (all hstf components on the entity) --
+                        if (!md.components.empty()) { snprintf(tmp,sizeof tmp,"[COMPONENTS] %zu:\n", md.components.size()); out += tmp;
+                          for (const auto& c : md.components) { snprintf(tmp,sizeof tmp,"    %s v%d (%zu fields)\n", c.shortCls.c_str(), c.version, c.fields.size()); out += tmp; } }
+                        out += "===== END DUMP =====\n";
                         }
                     }
                     else if (strncmp(ln, "hidemat=", 8) == 0)     vkRenderer.hideMat = ln + 8;   // std::string; empty = none (checked via .empty())
@@ -1498,6 +1728,9 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < opa.meshes.size() && i < vkRenderer.gpuMeshes.size(); ++i) {
                 auto& md = opa.meshes[i];
                 auto& gm = vkRenderer.gpuMeshes[i];
+                if (std::getenv("HSR_FADEDBG") && md.name.find("dust")!=std::string::npos)
+                    fprintf(stderr,"[FADEDBG] m%zu '%s' dyn=%d vbomap=%d md.curTint.a=%.3f gm.curTint.a=%.3f\n",
+                        i, md.name.c_str(), (int)gm.dynamicVerts, (int)(gm.vboMapped!=nullptr), md.curTint[3], gm.curTint[3]);
                 if (!gm.dynamicVerts || !gm.vboMapped) continue;
                 // per-frame MaterialTint (UniformColor) — fog/dust/flicker opacity fade
                 gm.curTint[0]=md.curTint[0]; gm.curTint[1]=md.curTint[1];

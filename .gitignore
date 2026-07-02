@@ -32,7 +32,7 @@ apk_compare/
 bindump/
 hsr_apk_tool/
 hsr_renderer_cpp/build/
-Scripts/
+/Scripts/
 astcenc_bin/
 _astcenc_bin/
 _astcenc_src/

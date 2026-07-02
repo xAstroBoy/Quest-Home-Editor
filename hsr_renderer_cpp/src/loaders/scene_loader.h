@@ -1106,6 +1106,9 @@ public:
             MeshData md;
             md.name      = obj.name;
             md.components = obj.components;   // all hstf components -> editor inspector
+            if (std::getenv("HSR_ANIMPAIRDBG")) for (auto& c : md.components) if (c.shortCls=="AnimatorPlatformComponent") {
+                fprintf(stderr,"[ANIMPAIR] mesh '%s' AnimatorPlatformComponent:\n", md.name.c_str());
+                for (auto& kv : c.fields) fprintf(stderr,"    %s = %s\n", kv.first.c_str(), kv.second.c_str()); }
             // V203 skybox-IBL (gated HSR_SKYIBL): mark meshes to receive the equirect diffuse-IBL ambient bake
             // (vk_renderer per-vertex). Opt-in so default rendering (lightmaps) is untouched.
             if (std::getenv("HSR_SKYIBL")) md.iblLit = true;
@@ -1363,6 +1366,23 @@ public:
             auto extractIdx=[&](int fi, std::vector<u8>& out)->bool{
                 size_t sz=0; void* p=mz_zip_reader_extract_to_heap(&sceneZip, fi, &sz, 0);
                 if (p){ out.assign((u8*)p,(u8*)p+sz); mz_free(p); return true; } return false; };
+            // DEVICE PAIRING (cook): every RIGID-HZANIM rig gets GENERIC joint names (joint_0/joint_1/bounds_anchor_*),
+            // so palette/name-hash matching binds EVERY mesh to EVERY rig -> all play the first clip = "everything moves
+            // randomly" in the HSL preview (device is fine: it pairs by the AnimatorPlatformComponent's asset refs).
+            // These helpers read each mesh's component skeleton/animation ingestionId and resolve to the asset path,
+            // so we pair EXACTLY like the device. HSR_HZNOIDPAIR reverts to the old palette matching.
+            auto compU64=[](const MeshData& md,const char* fld)->uint64_t{
+                for (auto& c: md.components) if (c.shortCls=="AnimatorPlatformComponent")
+                    for (auto& kv: c.fields) if (kv.first==fld) return strtoull(kv.second.c_str(),nullptr,10);
+                return 0; };
+            auto refPath=[&](const MeshData& md,const char* ingF,const char* pkgF,const char* tgtF)->std::string{
+                uint64_t ing=compU64(md,ingF); if(!ing) return "";
+                AssetKey k{}; k.pkg=compU64(md,pkgF); k.ing=ing; k.tgt=(uint32_t)compU64(md,tgtF);
+                const std::string* p=resolve(k); if(!p) return "";
+                return (p->rfind("content/",0)==0)?p->substr(8):*p; };
+            auto meshSkelPath=[&](const MeshData& md){ return refPath(md,"skeleton.ingestionId","skeleton.packageOrRemoteId","skeleton.targetId"); };
+            auto meshAnimPath=[&](const MeshData& md){ return refPath(md,"animations[0].data.animation.ingestionId","animations[0].data.animation.packageOrRemoteId","animations[0].data.animation.targetId"); };
+            bool idPair = !std::getenv("HSR_HZNOIDPAIR");
             // MULTI-RIG: enumerate EVERY skeleton (one per animated fbx: bat/owl/windmill/lantern...). For each,
             // parse its skel + the matching anim under the SAME asset key (path up to ".../<name>.fbx" or
             // "....skel/"), then bind every skinned mesh whose meshPath shares that key. The device
@@ -1388,6 +1408,21 @@ public:
                 // count is the file-level proxy). [[project_hsr_skinned_rendmesh_skinblock]]
                 std::string homeDir = zipKey; { size_t hs = zipKey.rfind('/'); if (hs != std::string::npos) homeDir = zipKey.substr(0, hs + 1); }
                 std::vector<u8> ab; bool gotAnim=false;
+                // DEVICE-faithful clip: load the anim the BELONGING mesh's AnimatorPlatformComponent names (the
+                // joint-count guess below binds every generic-named rig to the FIRST clip = "moves randomly").
+                if (idPair && cookedNaming) {
+                    for (auto& md : meshes) {
+                        if (!md.hasBones) continue;
+                        std::string msp=meshSkelPath(md); if (msp.empty() || msp.rfind(key+".skel",0)!=0) continue;   // mesh belongs to THIS skel (".skel" boundary so armature1 != armature1X)
+                        std::string ap_=meshAnimPath(md); if (ap_.empty()) continue;
+                        for (int ai=0; ai<nf && !gotAnim; ++ai){ mz_zip_archive_file_stat at; if(!mz_zip_reader_file_stat(&sceneZip,ai,&at)) continue;
+                            std::string zp=at.m_filename, zs=(zp.rfind("content/",0)==0)?zp.substr(8):zp;
+                            if (zs.rfind(ap_,0)!=0) continue;
+                            if (zp.find("__hzanim_anim_sub_targets__")==std::string::npos && zp.find(".anim/anim")==std::string::npos) continue;
+                            if (extractIdx(ai,ab) && parseRendClip(ab,(int)g.skel.joints.size(),g.clip)) gotAnim=true; }
+                        if (gotAnim) break;
+                    }
+                }
                 // PASS 0 = exact base prefix (every env where the clip shares the skeleton's .fbx/<name> base —
                 // V79/glTF AND official V203). PASS 1 (cook only) = the cook's armatureN.skel + animclipM.anim live
                 // under one home dir with different bases, so fall back to home-dir + matching JOINT COUNT. Exact-first
@@ -1430,9 +1465,15 @@ public:
                     // skeleton (the faithful map the device uses) — disambiguates the spacestation's 1-joint vs 25-joint vehicle rigs.
                     bool pathMatch = (md.meshPath.size()>=key.size() && md.meshPath.compare(0,key.size(),key)==0);
                     if (!pathMatch) {
-                        if (!cookedNaming || md.bonePalette.empty()) continue;
-                        bool all=true; for (u32 ph : md.bonePalette){ bool f=false; for(int j=0;j<nJ;++j) if((u32)jointHash[j]==ph){f=true;break;} if(!f){all=false;break;} }
-                        if (!all) continue;
+                        // DEVICE pairing: bind iff THIS mesh's component skeleton-ref resolves to THIS group's skel.
+                        // (The cook's generic joint names make the palette match EVERY rig -> wrong clip -> random motion.)
+                        std::string msp = (idPair && cookedNaming) ? meshSkelPath(md) : "";
+                        if (!msp.empty()) { if (msp.rfind(key+".skel",0)!=0) continue; }   // has a ref: must match this skel (".skel" boundary)
+                        else {   // no component ref (older cook): fall back to palette name-hash
+                            if (!cookedNaming || md.bonePalette.empty()) continue;
+                            bool all=true; for (u32 ph : md.bonePalette){ bool f=false; for(int j=0;j<nJ;++j) if((u32)jointHash[j]==ph){f=true;break;} if(!f){all=false;break;} }
+                            if (!all) continue;
+                        }
                     }
                     if (!md.bonePalette.empty() && !std::getenv("HSR_HZNOREMAP")) {
                         // slot -> joint by the palette's name-hash (THE faithful map). Fixes the bird flock
