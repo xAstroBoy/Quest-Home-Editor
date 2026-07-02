@@ -1238,6 +1238,31 @@ int main(int argc, char** argv) {
                 if (md > 60.f) { int n=opa.animNodeOf((int)mi); if (n>=0){ g_syncNodes.insert(n); int p=opa.animNodeParentOf(n); if(p>=0) g_syncNodes.insert(p); } } } }
         editor.hzAnimExtractor = [&g_opaRot,&g_opaUv,&g_opaFlip,&opa,&g_syncNodes](int meshIdx, int frames, hslcook::ExportMesh& em){
             (void)frames;
+            // PURE CONTINUOUS SCROLL (waterfall / water / foam / stream: identity 2x2 + a small CONSTANT per-frame
+            // translate) -> the SMOOTH getTime `uv += rate*time` scroll shader, NOT the per-frame matrix REPLAY below.
+            // Replaying N discrete matrices SNAPS the UV each frame = CHOPPY, and the hard per-frame offset jump shows
+            // a visible cell BORDER/seam on a scroll (rockquarry waterfalls: "choppy + I see borders"). rate*time is
+            // continuous and seamless (texture REPEAT wrap hides the tile boundary). ONLY take this when NOTHING else
+            // is layered — no tint-fade, no node translate, no rot/scale — so fog/dust/steam (which carry fade+motion)
+            // keep the matrix-replay path unchanged. g_opaUv was filled by cookExtractUVScroll (uvScrollRate: identity
+            // 2x2 + |avgDelta|<=0.04/frame). HSR_NOUVSCROLLFAST forces the old replay path.
+            {
+                auto uit = g_opaUv.find((size_t)meshIdx);
+                if (uit != g_opaUv.end() && !std::getenv("HSR_NOUVSCROLLFAST") && !opa.nodeAnimatesRotOrScale((int)meshIdx)) {
+                    std::vector<float> fa; float floop=0.f;
+                    bool hasFade = opa.cookExtractTintAlpha((int)meshIdx, fa, floop) && fa.size()>=2;
+                    std::vector<float> tof; float tl=0.f; bool hasTrans=false;
+                    if (opa.cookExtractNodeTranslateFrames((int)meshIdx, 24, tof, tl)) {
+                        float md=0.f; for (float v : tof) { float a=std::fabs(v); if(a>md)md=a; } hasTrans = md > 1.f; }
+                    if (!hasFade && !hasTrans) {
+                        em.uvScroll=true; em.uvRate[0]=uit->second.first; em.uvRate[1]=uit->second.second;
+                        em.flipbook=false; em.rotAnim=false; em.transAnim=false; em.fadeAnim=false;
+                        em.vatOffsets.clear(); em.vatFrames=0; em.hzJointCount=0; em.hzFrames=0;
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] m%d UV-SCROLL(smooth) rate=(%.4f,%.4f)/s -> no snap/borders\n", meshIdx, em.uvRate[0], em.uvRate[1]);
+                        return;
+                    }
+                }
+            }
             // MATERIAL UV ANIMATION — REPLAY THE DESKTOP'S EXACT DATA (the "stop guessing" fix). Any mesh whose mat.sanim
             // track animates (fog/dust/smoke/fire/steam) → copy its ACTUAL per-frame 2x3 UV matrices (the SAME values the
             // desktop's animate() plays) and replay them VERBATIM in a FRAGMENT getTime() shader — no derived cols/rows
@@ -1611,11 +1636,27 @@ int main(int argc, char** argv) {
                             int myNode = opa.animNodeOf(mi);
                             bool nodeTrans = std::getenv("HSR_NODETRANSLATE") != nullptr;   // opt-in reroute (breaks animator)
                             bool tt = tr && tmd > 1.f && nodeTrans;
-                            const char* winner = uvm ? "FLIPBOOK-UVMATRIX(frag getTime)" : hz ? "HZANIM-SKINNED" :
+                            // PURE CONTINUOUS SCROLL shortcut — MUST mirror hzAnimExtractor: a clean scroll (identity 2x2 +
+                            // small const translate, no fade/motion) cooks to the SMOOTH uv+=rate*time shader, NOT the matrix
+                            // replay (which snaps = choppy + border seams). Without this the dump mislabeled waterfalls as
+                            // FLIPBOOK-UVMATRIX even though the cook now emits a smooth scroll.
+                            bool pureScroll=false; float srU=0.f, srV=0.f;
+                            if (!std::getenv("HSR_NOUVSCROLLFAST")) {
+                                std::unordered_map<size_t,std::pair<float,float>> uvsMap; opa.cookExtractUVScroll(uvsMap);
+                                if (uvsMap.count(mi) && !opa.nodeAnimatesRotOrScale(mi)) {
+                                    std::vector<float> fa2; float fl2=0.f; bool hasFade2 = opa.cookExtractTintAlpha(mi,fa2,fl2)&&fa2.size()>=2;
+                                    std::vector<float> tf2; float tl2=0.f; bool hasTr2=false;
+                                    if (opa.cookExtractNodeTranslateFrames(mi,24,tf2,tl2)){ float md=0.f; for(float v:tf2){float a=fabsf(v);if(a>md)md=a;} hasTr2=md>1.f; }
+                                    if (!hasFade2 && !hasTr2) { pureScroll=true; srU=uvsMap[mi].first; srV=uvsMap[mi].second; }
+                                }
+                            }
+                            const char* winner = pureScroll ? "UV-SCROLL(smooth uv+=rate*time)" :
+                                                  uvm ? "FLIPBOOK-UVMATRIX(frag getTime)" : hz ? "HZANIM-SKINNED" :
                                                   tt ? "TRANSLATE-getTime(node path; HSR_NODETRANSLATE)" :
                                                   rg ? "RIGID-HZANIM(node path)" : sc ? "SCALE-getTime" :
                                                   nt ? "POSE-TRANSLATE(node move)" : "STATIC(no anim)";
                             snprintf(tmp,sizeof tmp,"[COOK-ANIM] => %s   (node=%d)\n", winner, myNode); out += tmp;
+                            if (pureScroll) { snprintf(tmp,sizeof tmp,"  uvScroll rate=(%.4f,%.4f) UV/s (continuous, REPEAT-wrap; no frame snap => smooth, no borders)\n", srU, srV); out += tmp; }
                             snprintf(tmp,sizeof tmp,"  uvMatrix=%d(N=%d loop=%.2fs) nodeTranslate=%d(maxDelta=%.2fu) hzSkinned=%d rigid=%d scale=%d poseTrans=%d(d=%.2f,%.2f,%.2f)\n",
                                 (int)uvm,cmN,cmL, (int)tr,tmd, (int)hz,(int)rg,(int)sc,(int)nt, ctd[0],ctd[1],ctd[2]); out += tmp;
                             if (uvm && cmN>0) { out += "  UV matrices [a b c | d e f] (device replays these in FRAGMENT):\n";
