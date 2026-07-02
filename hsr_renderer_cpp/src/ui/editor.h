@@ -668,6 +668,7 @@ struct Editor {
     double lastAutoSaveT = 0.0;
     std::string lastSessionSnap;                 // last text persisted (save OR auto-save) — the dirty check
     bool recoverOffer = false; std::string recoverPath;
+    std::chrono::steady_clock::time_point recoverOfferAt{};   // when the recovery banner appeared (auto-hides after 5s)
     void autoSaveTick(double now){
         if (!autoSaveOn || cooking || !r || r->gpuMeshes.empty()) return;
         if (lastAutoSaveT == 0.0) { lastAutoSaveT = now;               // first tick arms the timer + captures the dirty
@@ -691,7 +692,7 @@ struct Editor {
             std::error_code ec2; auto st = fs::last_write_time(sessionPath, ec2);
             if (!ec && !ec2 && at <= st) { fs::remove(ap, ec); return; }
         }
-        recoverPath = ap; recoverOffer = true;
+        recoverPath = ap; recoverOffer = true; recoverOfferAt = std::chrono::steady_clock::now();
         fprintf(stderr,"[EDIT] auto-save recovery available: %s\n", ap.c_str());
     }
     void restoreAutosave(){
@@ -1217,6 +1218,8 @@ struct Editor {
     // Crash-recovery strip: an .autosave newer than the saved session was found on load — offer Restore / Dismiss.
     void drawRecoverBanner() {
         if (!recoverOffer) return;
+        // Auto-hide the nag after 5s (non-destructive: leaves the .autosave on disk, just stops nagging).
+        if (std::chrono::duration<float>(std::chrono::steady_clock::now() - recoverOfferAt).count() > 5.0f) { recoverOffer = false; return; }
         auto& th = cx.th; float y = (float)rcHeader.extent.height, h = 26*uiScale;
         float W = (float)rcViewport.extent.width;   // span the viewport pane; the right column stays usable
         dl.rect(0, y, W, h, ui::rgba(115,85,20,240)); dl.rect(0, y+h-1, W, 1, th.splitLine);
