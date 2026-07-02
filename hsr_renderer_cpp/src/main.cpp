@@ -1145,7 +1145,9 @@ int main(int argc, char** argv) {
     g_editor = &editor;            // expose to the GLFW input callbacks
     editor.r = &vkRenderer;             // bind the renderer up-front so Export works even when the UI is skipped (HSR_NOUI)
     editor.sceneMeshes = sceneMeshes;   // CPU geometry/textures for the "Export APK" cooker (parallel to gpuMeshes)
-    editor.bgOgg = ogg;                 // the env's background loop -> cooked as an auto-start FMOD SoundAsset
+    editor.setEnvAudio(ogg);            // the env's background loop -> cooked as an auto-start FMOD SoundAsset (editor can REPLACE/ADD/export it)
+    // (editor.audio binds in editor.init — BEFORE loadProject, so a session AUDIOOVR restarts the preview;
+    //  in headless (HSR_NOUI) it stays null, so a session AUDIOOVR swaps the cook bytes WITHOUT starting playback)
     // Auto-import the V79 env's assets/markup.json (portal->Spawn, seat-hotspots->Chair, others->Hotspot) as editable items
     if (!apkPath.empty()) {
         mz_zip_archive mkz; memset(&mkz, 0, sizeof(mkz));
@@ -1492,6 +1494,12 @@ int main(int argc, char** argv) {
                         bool ok=editor.setSkyImage(ln+9); snprintf(tmp,sizeof tmp,"skyimage -> %s\n", ok?"ok":"FAILED"); out += tmp; }
                     else if (strncmp(ln, "skytexmesh=", 11) == 0) {   // skybox from an EXISTING mesh TEXTURE: skytexmesh=<mi>
                         bool ok=editor.setSkyImageFromMesh(atoi(ln+11)); snprintf(tmp,sizeof tmp,"skytexmesh -> %s\n", ok?"ok":"FAILED"); out += tmp; }
+                    else if (strncmp(ln, "audiofile=", 10) == 0) {   // REPLACE/ADD the background loop from a file (previews + cooks)
+                        bool ok=editor.setAudioFromFile(ln+10); snprintf(tmp,sizeof tmp,"audiofile -> %s\n", ok?"ok":"FAILED"); out += tmp; }
+                    else if (strncmp(ln, "audioexport", 11) == 0) {   // export the current loop next to the session in saved/
+                        bool ok=editor.exportAudio(); snprintf(tmp,sizeof tmp,"audioexport -> %s\n", ok?"ok":"FAILED"); out += tmp; }
+                    else if (strncmp(ln, "audiorevert", 11) == 0) {   // drop the override -> env's own theme
+                        editor.clearAudioOverride(); out += "audiorevert -> ok\n"; }
                     else if (strncmp(ln, "exportsky=", 10) == 0) {   // export the current skybox texture: exportsky=<path>
                         bool ok=editor.exportSkyImage(ln+10); snprintf(tmp,sizeof tmp,"exportsky -> %s\n", ok?"ok":"FAILED"); out += tmp; }
                     else if (strncmp(ln, "movemesh=", 9) == 0) {   // live-edit: world-translate ONE mesh (test placement fixes without recompiling)

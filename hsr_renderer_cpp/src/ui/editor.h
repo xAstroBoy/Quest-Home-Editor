@@ -7,6 +7,7 @@
 // Decoupled from the renderer via its overlayBegin/overlayDraw hooks + uiViewportRect (the 3D scissor pane).
 #include "render/vk_renderer.h"
 #include "core/audio.h"
+#include "core/audio_convert.h"      // decode ANY ogg/wav/mp3/flac for the audio REPLACE/ADD/export UI
 #include "core/camera.h"
 #include "core/scene_items.h"
 #include "cook/hsl_cooker.h"
@@ -93,6 +94,59 @@ struct Editor {
     std::function<std::vector<float>(int,int,int&)> vatBaker;                      // V79 VAT bake hook
     std::function<void(int,int,hslcook::ExportMesh&)> hzAnimExtractor;             // V79 HZANIM skeletal hook
     std::vector<uint8_t> bgOgg;                                                    // env background loop -> FMOD asset
+    // ── BACKGROUND AUDIO cooker (view / REPLACE / ADD / export / revert) ─────────────────────────────────────
+    // bgOgg = what the cook SHIPS (FMOD SND asset, auto-start loop entity at spawn). envOgg keeps the env's
+    // ORIGINAL theme so a replacement is revertible. Any ogg/wav/mp3/flac works: FMOD-native containers ship
+    // raw, others transcode to WAV (audioconv — the loader's exact rules). Replacing restarts the desktop
+    // preview loop too (WYSIWYG). The override file path persists in the session (AUDIOOVR).
+    std::vector<uint8_t> envOgg;   // the env's own theme as loaded (empty = env ships no audio)
+    std::string audioOvrPath;      // user override source file ("" = env's own audio)
+    std::string audioInfo;         // cached UI line: "ogg 44100 Hz 2 ch 63.2s (1.2 MB)"
+    void setEnvAudio(const std::vector<uint8_t>& raw){ envOgg=raw; if(audioOvrPath.empty()){ bgOgg=raw; refreshAudioInfo(); } }
+    void refreshAudioInfo(){
+        audioInfo.clear(); if(bgOgg.empty()) return;
+        const char* fmt=audioconv::sniff(bgOgg.data(),bgOgg.size());
+        audioconv::Pcm pcm; char b[128];
+        if(audioconv::decode(bgOgg.data(),bgOgg.size(),pcm)){
+            float secs = pcm.sampleRate>0 ? pcm.frames()/(float)pcm.sampleRate : 0.f;
+            snprintf(b,sizeof b,"%s  %d Hz  %d ch  %.1fs  (%.2f MB)",fmt,pcm.sampleRate,pcm.channels,secs,bgOgg.size()/1048576.0);
+        } else snprintf(b,sizeof b,"%s (%.2f MB) — decode failed",fmt,bgOgg.size()/1048576.0);
+        audioInfo=b;
+    }
+    void restartAudioPreview(){
+        if(!audio) return; if(audio->ok) audio->stop();
+        if(bgOgg.empty()) return;
+        audioconv::Pcm pcm;
+        if(audioconv::decode(bgOgg.data(),bgOgg.size(),pcm)) audio->startPCM(pcm.samples.data(),pcm.frames(),pcm.channels,pcm.sampleRate);
+    }
+    bool setAudioFromFile(const std::string& path){
+        FILE* f=fopen(path.c_str(),"rb"); if(!f){ setStatus("audio FAILED (open): "+path); return false; }
+        fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+        std::vector<uint8_t> raw((size_t)(n>0?n:0)); if(n>0){ size_t rd=fread(raw.data(),1,(size_t)n,f); (void)rd; } fclose(f);
+        const char* fmt=audioconv::sniff(raw.data(),raw.size());
+        audioconv::Pcm pcm; std::string err;
+        if(!audioconv::decode(raw.data(),raw.size(),pcm,&err)){ setStatus("audio decode FAILED ("+std::string(fmt)+"): "+err+" — use OGG / WAV / MP3 / FLAC"); return false; }
+        bgOgg = audioconv::fmodNative(fmt) ? std::move(raw) : audioconv::toWav(pcm);   // raw when FMOD reads it natively (compact), else WAV
+        audioOvrPath=path; refreshAudioInfo();
+        if(audio){ if(audio->ok) audio->stop(); audio->startPCM(pcm.samples.data(),pcm.frames(),pcm.channels,pcm.sampleRate); }
+        setStatus("Audio set from "+path+" — previews now, ships in the cook as the background loop");
+        return true;
+    }
+    void clearAudioOverride(){
+        if(audioOvrPath.empty()) return;
+        audioOvrPath.clear(); bgOgg=envOgg; refreshAudioInfo(); restartAudioPreview();
+        setStatus(envOgg.empty()?"Audio override cleared — this env ships no own audio (silent)":"Audio override cleared — env's own theme restored");
+    }
+    bool exportAudio(){
+        if(bgOgg.empty()){ setStatus("no audio to export"); return false; }
+        const char* fmt=audioconv::sniff(bgOgg.data(),bgOgg.size()); if(!strcmp(fmt,"?")) fmt="bin";
+        namespace fs=std::filesystem; std::error_code ec;
+        fs::path dir=fs::path(saveTargetFile()).parent_path(); fs::create_directories(dir,ec);
+        std::string out=(dir/(projectBase()+"_audio."+fmt)).string();
+        FILE* f=fopen(out.c_str(),"wb"); if(!f){ setStatus("audio export FAILED: "+out); return false; }
+        fwrite(bgOgg.data(),1,bgOgg.size(),f); fclose(f);
+        setStatus("Exported audio -> "+out); return true;
+    }
 
     // ── UI toolkit ──
     ui::Font font, mono; ui::UIDraw uiDraw; ui::Context cx; ui::DrawList dl;
@@ -523,6 +577,7 @@ struct Editor {
         for(auto& kv:texOverride){ s += "TEXOVR "+std::to_string(kv.first)+" "+kv.second+"\n"; }   // swapped mesh/skybox textures (re-loaded from the image path on open)
         if(skyColorSet()){ snprintf(b,sizeof b,"SKYCOL %.4f %.4f %.4f\n", skyColor[0],skyColor[1],skyColor[2]); s+=b; }   // general skybox background color
         if(!skyImagePath.empty()){ s += "SKYIMG "+skyImagePath+"\n"; }   // skybox image file path OR "mesh:N" (reused texture)
+        if(!audioOvrPath.empty()){ s += "AUDIOOVR "+audioOvrPath+"\n"; }   // replaced/added background audio (re-loaded from the file on open)
         { int n=0; for(auto& it:items) if(it.hidden) n++; if(n){ s+="IHIDE "+std::to_string(n); for(int i=0;i<(int)items.size();++i) if(items[i].hidden){ snprintf(b,sizeof b," %d",i); s+=b; } s+="\n"; } }
         return s;
     }
@@ -570,6 +625,7 @@ struct Editor {
     // Parse + apply a .hsledit session text (shared by loadProject and the auto-save recovery banner).
     void applySessionText(const std::string& all, int& meshN, int& itemN){
         items.clear(); selItem=-1; deselectAll(); animColliders.clear(); skyboxMeshes.clear();
+        clearAudioOverride();   // reset to the env's own theme; an AUDIOOVR line below re-applies the replacement (no-op when none was active)
         const bool cooked = envIsCookedApk();   // a cook OUTPUT: take the session's scene ITEMS but NOT its index-based MESH transforms (already baked into the cook) — re-derive the navmesh from THIS env's ground by name
         size_t p=0; meshN=0; itemN=0;
         while(p<all.size()){
@@ -600,6 +656,7 @@ struct Editor {
             else if(t[0]=="TEXOVR" && (int)t.size()>=3){ int mi=atoi(t[1].c_str()); std::string p=t[2]; for(size_t k=3;k<t.size();++k) p+=" "+t[k]; if(mi>=0) texOverride[mi]=p; }   // remember swapped textures; applyTexOverrides() re-loads them below
             else if(t[0]=="SKYCOL" && (int)t.size()>=4){ setSkyColor((float)atof(t[1].c_str()),(float)atof(t[2].c_str()),(float)atof(t[3].c_str())); }   // general skybox color -> drives clearRGB
             else if(t[0]=="SKYIMG" && (int)t.size()>=2){ std::string p=t[1]; for(size_t k=2;k<t.size();++k) p+=" "+t[k]; if(p.rfind("mesh:",0)==0) setSkyImageFromMesh(atoi(p.c_str()+5)); else setSkyImage(p); }   // restore skybox image/texture
+            else if(t[0]=="AUDIOOVR" && (int)t.size()>=2){ std::string p=t[1]; for(size_t k=2;k<t.size();++k) p+=" "+t[k]; setAudioFromFile(p); }   // restore the replaced/added background audio
         }
     }
     // ── AUTO-SAVE (Phase-1 crash resistance): every autoSaveIntervalS seconds, if the session text changed since the
@@ -1664,6 +1721,21 @@ struct Editor {
         cx.tip(x,y0,w,th.rowH,"Emit scene-spanning bounds so the V205 shell NEVER culls/clips\nyour meshes (frustum + Hi-Z occlusion + distance + CLOD budget).\nThe old V79 shell had NO environment culler, so this matches how\nold homes looked. Geometry still sits at its real position; only\nculling is defeated. Trades the Quest's culling perf for full\nvisibility. Keep ON if cooked homes clip / disappear at distance."); y+=th.rowH+6*uiScale;
         y0=y; cx.checkbox(ui::hashId("cookaudio"), x, y, "Ship background audio loop", cookAudio);
         cx.tip(x,y0,w,th.rowH,"Bake the environment's background audio loop into the cooked APK\n(FMOD asset placed at the spawn). Turn OFF for a silent home."); y+=th.rowH+2*uiScale;
+        // ── the AUDIO COOKER UI: shows what will ship + Replace/Add/Export/Revert (backend above: setAudioFromFile etc.) ──
+        { if(audioInfo.empty() && !bgOgg.empty()) refreshAudioInfo();
+          std::string al = bgOgg.empty() ? "  audio: none — Add one below"
+                                         : ("  audio: "+audioInfo+(audioOvrPath.empty()?"  (env's own)":"  (REPLACED)"));
+          cx.label(x+14*uiScale, y, w-14*uiScale, th.rowH*0.9f, al.c_str(), th.textDim); y+=th.rowH*0.95f;
+          float bw3=(w-14*uiScale-8*uiScale)/3.f, bx3=x+14*uiScale;
+          y0=y;
+          if (cx.button(ui::hashId("audrepl"), bx3, y, bw3, th.rowH, bgOgg.empty()?"Add audio...":"Replace...", true)) {
+              std::string p=pickFileWin32(L"Choose background audio (OGG / WAV / MP3 / FLAC)");
+              if(!p.empty() && setAudioFromFile(p)) cookAudio=true;   // adding/replacing audio implies you want it shipped
+          }
+          if (cx.button(ui::hashId("audexp"), bx3+bw3+4*uiScale, y, bw3, th.rowH, "Export")) exportAudio();
+          if (cx.button(ui::hashId("audrev"), bx3+2*(bw3+4*uiScale), y, bw3, th.rowH, "Revert to env")) clearAudioOverride();
+          cx.tip(x,y0,w,th.rowH,"Replace (or ADD, for a silent env) the background loop from ANY\nogg/wav/mp3/flac file — previews immediately on the PC and ships\nin the cook (FMOD-native formats raw; flac transcodes to WAV).\nExport writes the current loop next to the session in saved/.\nRevert restores the env's own theme. Persists in the session."); y+=th.rowH+6*uiScale;
+        }
         // (PC preview-audio toggle moved to the viewport header strip — always visible, not buried here.)
         y0=y; cx.checkbox(ui::hashId("solidcol"), x, y, "Solid wall collision (trimesh)", solidCollision);
         cx.tip(x,y0,w,th.rowH,"Cook a REAL double-sided triangle-mesh collider for the whole env —\nwalk on floors AND get blocked by walls/columns, enter rooms through\ndoorways (haven2025's cooked-PhysX SEBD format, device-verified).\nOFF = a floor-only ColliderBox grid (walkable but you phase walls)."); y+=th.rowH+6*uiScale;
