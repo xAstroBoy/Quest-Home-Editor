@@ -427,6 +427,50 @@ struct Editor {
     //    the broken triangulation at all. Undoable (Ctrl+Z removes), persists via the .geom sidecar.
     bool patchMode = false;
     std::vector<std::array<float,3>> patchPts;
+    std::vector<std::array<u8,4>>    patchCols;   // color sampled from the CLICKED surface at each pin (auto-matching texture)
+    // Raycast a screen point against ONE mesh and return hit point + the SURFACE COLOR there
+    // (barycentric-interpolated UV -> bilinear sample of that mesh's texture).
+    bool screenRayHitColor(double mx, double my, int meshIdx, float outP[3], u8 outCol[4]){
+        outCol[0]=outCol[1]=outCol[2]=180; outCol[3]=255;
+        if(!r||!sceneMeshes||meshIdx<0||meshIdx>=(int)r->gpuMeshes.size()) return false;
+        float W=(float)rcViewport.extent.width,H=(float)rcViewport.extent.height; if(W<=0||H<=0)return false;
+        float vp[16]; mat4mul(r->cam.proj,r->cam.view,vp); float inv[16]; if(!invertMat4(vp,inv))return false;
+        float ndcx=2.f*((float)mx-rcViewport.offset.x)/W-1.f, ndcy=2.f*((float)my-rcViewport.offset.y)/H-1.f;
+        float O[3],Fp[3]; unproject(inv,ndcx,ndcy,1.f,O); unproject(inv,ndcx,ndcy,0.f,Fp);
+        float D[3]={Fp[0]-O[0],Fp[1]-O[1],Fp[2]-O[2]}; float dl_=std::sqrt(D[0]*D[0]+D[1]*D[1]+D[2]*D[2]); if(dl_<1e-6f)return false; D[0]/=dl_;D[1]/=dl_;D[2]/=dl_;
+        auto& gm=r->gpuMeshes[meshIdx]; const auto& P=gm.pickPos; const auto& I=gm.pickIdx; if(P.size()<9||I.size()<3)return false;
+        const MeshData& md=(*sceneMeshes)[(size_t)meshIdx];
+        float bestT=1e30f; bool hit=false; uint32_t hA=0,hB=0,hC=0; float hP[3]={0,0,0};
+        for(size_t k=0;k+2<I.size();k+=3){ uint32_t a=I[k],b=I[k+1],c=I[k+2];
+            if((size_t)a*3+2>=P.size()||(size_t)b*3+2>=P.size()||(size_t)c*3+2>=P.size())continue;
+            float w0[3],w1[3],w2[3]; xformPoint(gm.model,&P[a*3],w0); xformPoint(gm.model,&P[b*3],w1); xformPoint(gm.model,&P[c*3],w2);
+            float t; if(rayTri(O,D,w0,w1,w2,t)&&t<bestT){ bestT=t; hit=true; hA=a; hB=b; hC=c;
+                hP[0]=O[0]+D[0]*t; hP[1]=O[1]+D[1]*t; hP[2]=O[2]+D[2]*t; } }
+        if(!hit) return false;
+        outP[0]=hP[0]; outP[1]=hP[1]; outP[2]=hP[2];
+        // barycentric of the hit inside its triangle (world space) -> interpolated UV -> texture sample
+        size_t nvm = md.positions.size()/3;
+        if (!md.texRGBA.empty() && md.uvs.size()>=nvm*2 && hA<nvm && hB<nvm && hC<nvm) {
+            float w0[3],w1[3],w2[3];
+            xformPoint(gm.model,&P[hA*3],w0); xformPoint(gm.model,&P[hB*3],w1); xformPoint(gm.model,&P[hC*3],w2);
+            float v0[3]={w1[0]-w0[0],w1[1]-w0[1],w1[2]-w0[2]}, v1[3]={w2[0]-w0[0],w2[1]-w0[1],w2[2]-w0[2]}, v2[3]={hP[0]-w0[0],hP[1]-w0[1],hP[2]-w0[2]};
+            float d00=v0[0]*v0[0]+v0[1]*v0[1]+v0[2]*v0[2], d01=v0[0]*v1[0]+v0[1]*v1[1]+v0[2]*v1[2];
+            float d11=v1[0]*v1[0]+v1[1]*v1[1]+v1[2]*v1[2], d20=v2[0]*v0[0]+v2[1]*v0[1]+v2[2]*v0[2], d21=v2[0]*v1[0]+v2[1]*v1[1]+v2[2]*v1[2];
+            float den=d00*d11-d01*d01;
+            if (std::fabs(den)>1e-12f){
+                float bv=(d11*d20-d01*d21)/den, bw=(d00*d21-d01*d20)/den, bu=1.f-bv-bw;
+                float uu=bu*md.uvs[hA*2]+bv*md.uvs[hB*2]+bw*md.uvs[hC*2];
+                float vv=bu*md.uvs[hA*2+1]+bv*md.uvs[hB*2+1]+bw*md.uvs[hC*2+1];
+                uu-=std::floor(uu); vv-=std::floor(vv);
+                int W2=(int)md.texW,H2=(int)md.texH;
+                float fx=uu*W2-0.5f, fy=vv*H2-0.5f; int x0=(int)std::floor(fx), y0=(int)std::floor(fy); float tx=fx-x0, ty=fy-y0;
+                auto S=[&](int px,int py,int ch)->float{ px=std::clamp(px,0,W2-1); py=std::clamp(py,0,H2-1); return (float)md.texRGBA[((size_t)py*W2+px)*4+ch]; };
+                for (int ch=0;ch<4;++ch){ float a2=S(x0,y0,ch)*(1-tx)+S(x0+1,y0,ch)*tx, b2=S(x0,y0+1,ch)*(1-tx)+S(x0+1,y0+1,ch)*tx;
+                    outCol[ch]=(u8)std::clamp(a2*(1-ty)+b2*ty,0.f,255.f); }
+            }
+        }
+        return true;
+    }
     void drawPatchOverlay(){
         if (!patchMode) return;
         dl.pushClip((float)rcViewport.offset.x,(float)rcViewport.offset.y,(float)rcViewport.extent.width,(float)rcViewport.extent.height);
@@ -447,44 +491,65 @@ struct Editor {
             if (prevOk && worldToScreen(w0,sx,sy)) dl.line(prev[0],prev[1],sx,sy, ui::rgba(120,230,140,140), 1.5f); }
         dl.popClip();
     }
-    // A patch click: raycast the cursor against ALL meshes, drop a pin at the hit.
+    // A patch click: raycast the cursor against ALL meshes, drop a pin at the hit AND remember the
+    // SURFACE COLOR under the click (the patch texture is auto-generated from these samples).
     bool patchClick(double mx, double my){
         int hit = pickIndex(mx,my); if (hit<0) return false;
-        float p[3], n[3];
-        if (!screenRayHitMesh(mx,my,hit,p,n)) return false;
+        float p[3]; u8 col[4];
+        if (!screenRayHitColor(mx,my,hit,p,col)) return false;
         patchPts.push_back({p[0],p[1],p[2]});
+        patchCols.push_back({col[0],col[1],col[2],col[3]});
         setStatus("patch: point "+std::to_string(patchPts.size())+" set (Enter builds with 3+, Esc cancels)");
         return true;
     }
     void buildPatch(){
-        if (patchPts.size()<3){ setStatus("patch: click at least 3 corner points first"); patchMode=false; patchPts.clear(); return; }
-        if (!r || !sceneMeshes || selected<0 || selected>=(int)sceneMeshes->size()){ setStatus("patch: select the mesh whose texture the patch should use"); return; }
-        const MeshData& srcMd=(*sceneMeshes)[(size_t)selected];
-        MeshData md = srcMd;                              // texture + material flags from the SELECTED mesh
-        md.positions.clear(); md.uvs.clear(); md.uvs2.clear(); md.indices.clear();
-        md.colors.clear(); md.uvs3.clear(); md.uvs4.clear();
-        md.boneIndices.clear(); md.boneWeights.clear(); md.hasBones=false;
-        md.hasLightmap=false; md.lmRGBA.clear(); md.astcRaw.clear();
+        if (patchPts.size()<3){ setStatus("patch: click at least 3 corner points first"); patchMode=false; patchPts.clear(); patchCols.clear(); return; }
+        if (!r || !sceneMeshes) return;
+        MeshData md;                                      // FRESH mesh - nothing inherited, nothing stale
+        md.name = "patch";
+        md.doubleSided = true;                            // show from both sides regardless of click order
+        md.useBlend = false; md.additive = false; md.alphaTest = false;
         md.transform = Transform{}; md.hasWorldMatrix = true;
         static const float I16[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
         memcpy(md.worldMatrix, I16, sizeof I16);
         size_t n = patchPts.size();
-        // Newell normal -> dominant axis for FLAT projected UVs (no radial smear; texture tiles ~1 rep / 4m)
+        // dominant plane (Newell normal) -> 2D coords for UVs + the generated texture
         float nx=0,ny=0,nz=0;
         for (size_t i2=0;i2<n;++i2){ auto& a=patchPts[i2]; auto& b=patchPts[(i2+1)%n];
             nx+=(a[1]-b[1])*(a[2]+b[2]); ny+=(a[2]-b[2])*(a[0]+b[0]); nz+=(a[0]-b[0])*(a[1]+b[1]); }
         int dom = std::fabs(nx)>std::fabs(ny) ? (std::fabs(nx)>std::fabs(nz)?0:2) : (std::fabs(ny)>std::fabs(nz)?1:2);
         int ua=(dom+1)%3, va=(dom+2)%3;
+        float mnu=1e30f,mxu=-1e30f,mnv=1e30f,mxv=-1e30f;
+        for (auto& p : patchPts){ mnu=std::min(mnu,p[ua]); mxu=std::max(mxu,p[ua]); mnv=std::min(mnv,p[va]); mxv=std::max(mxv,p[va]); }
+        float su=(mxu-mnu)>1e-4f?(mxu-mnu):1.f, sv=(mxv-mnv)>1e-4f?(mxv-mnv):1.f;
+        // ── AUTO-GENERATED TEXTURE: blend the pin-sampled surface colors across the sheet (inverse-
+        //    distance weighting) -> the patch CONTINUES the surrounding tones instead of tiling the
+        //    source's baked atlas (which produced checker garbage). UVs are a FLAT 0..1 sheet, so an
+        //    AI-generated/inpainted image drops straight on via Export PNG -> AI -> Set texture.
+        const int TS = 256;
+        md.texRGBA.assign((size_t)TS*TS*4, 255); md.texW=TS; md.texH=TS; md.hasTexture=true;
+        std::vector<std::array<float,2>> pinUV(n);
+        for (size_t i2=0;i2<n;++i2) pinUV[i2] = { (patchPts[i2][ua]-mnu)/su, (patchPts[i2][va]-mnv)/sv };
+        for (int ty2=0; ty2<TS; ++ty2) for (int tx2=0; tx2<TS; ++tx2){
+            float u0=(tx2+0.5f)/TS, v0=(ty2+0.5f)/TS;
+            float wsum=0, acc[4]={0,0,0,0};
+            for (size_t i2=0;i2<n;++i2){
+                float du=u0-pinUV[i2][0], dv=v0-pinUV[i2][1];
+                float w2 = 1.f/(du*du+dv*dv+1e-4f);       // IDW^2 with epsilon
+                wsum+=w2; for (int ch=0;ch<4;++ch) acc[ch]+=w2*(float)patchCols[i2][ch];
+            }
+            u8* px=&md.texRGBA[((size_t)ty2*TS+tx2)*4];
+            for (int ch=0;ch<4;++ch) px[ch]=(u8)std::clamp(acc[ch]/wsum, 0.f, 255.f);
+            px[3]=255;
+        }
         float cen[3]={0,0,0}; for (auto& p : patchPts){ cen[0]+=p[0]; cen[1]+=p[1]; cen[2]+=p[2]; }
         cen[0]/=n; cen[1]/=n; cen[2]/=n;
-        const float UVSCALE = 0.25f;                      // 1 texture repeat per 4m (matches typical floor tiling)
         auto pushV=[&](const float p[3]){ md.positions.push_back(p[0]); md.positions.push_back(p[1]); md.positions.push_back(p[2]);
-            md.uvs.push_back(p[ua]*UVSCALE); md.uvs.push_back(p[va]*UVSCALE); };
+            md.uvs.push_back((p[ua]-mnu)/su); md.uvs.push_back((p[va]-mnv)/sv); };
         for (auto& p : patchPts){ float q[3]={p[0],p[1],p[2]}; pushV(q); }
         pushV(cen);
         uint32_t ci=(uint32_t)n;
         for (size_t i2=0;i2<n;++i2){ md.indices.push_back((u32)i2); md.indices.push_back((u32)((i2+1)%n)); md.indices.push_back(ci); }
-        md.doubleSided = true;                            // a patch must show from both sides regardless of click order
         md.nVerts=(u32)(md.positions.size()/3); md.nIdx=(u32)md.indices.size();
         sceneMeshes->push_back(std::move(md));
         size_t ni=r->gpuMeshes.size();
@@ -495,8 +560,8 @@ struct Editor {
         meshEditLog[(int)ni]="patch("+std::to_string(n)+"pts)";
         geomDirty=true; holesMesh=-1;
         selectOne((int)ni); scrollToSel=true;
-        patchPts.clear(); patchMode=false;
-        setStatus("Patch built through "+std::to_string(n)+" points (selected mesh's texture, flat UVs) - Ctrl+Z removes");
+        patchPts.clear(); patchCols.clear(); patchMode=false;
+        setStatus("Patch built - texture auto-blended from the clicked surfaces (flat 0..1 UVs: Export PNG -> AI -> Set texture for a fancy fill)");
     }
 
     // ── SLICE the mesh in half along an axis plane through its center: every triangle goes to the LEFT
@@ -1838,7 +1903,7 @@ struct Editor {
         if (key==GLFW_KEY_F1) showKeybinds = !showKeybinds;   // all-shortcuts overlay
         if (patchMode) {   // PATCH TOOL keys: Enter = build through the pins, Esc = cancel
             if (key==GLFW_KEY_ENTER) buildPatch();
-            if (key==GLFW_KEY_ESCAPE) { patchMode=false; patchPts.clear(); setStatus("patch cancelled"); }
+            if (key==GLFW_KEY_ESCAPE) { patchMode=false; patchPts.clear(); patchCols.clear(); setStatus("patch cancelled"); }
         }
         if (key==GLFW_KEY_SPACE && !playSim) {   // SPACE = toggle visibility of the selection (meshes or scene items)
             if (!selItems.empty()) { bool anyVis=false; for (int i:selItems) if (i>=0&&i<(int)items.size()&&!items[i].hidden) anyVis=true;
@@ -2223,7 +2288,7 @@ struct Editor {
                 else if (a==35) forEachSelMesh([&](int m){ sliceMesh(m, 0); });
                 else if (a==36) forEachSelMesh([&](int m){ sliceMesh(m, 1); });
                 else if (a==37) forEachSelMesh([&](int m){ sliceMesh(m, 2); });
-                else if (a==38) { patchMode=!patchMode; patchPts.clear();
+                else if (a==38) { patchMode=!patchMode; patchPts.clear(); patchCols.clear();
                                   if (patchMode) setStatus("PATCH: click the gap's corner points in the viewport (3+), Enter builds, Esc cancels"); }
                 else if (a==27) { bool exc = !noColMeshes.count(ctxMesh);      // collision walk-through toggle (whole selection)
                                   for (int t2:tg) { if (exc) noColMeshes.insert(t2); else noColMeshes.erase(t2); }
@@ -2769,7 +2834,7 @@ struct Editor {
           y += th.rowH+3*uiScale; }
         { float bw2=(w-6*uiScale)/2;    // PATCH TOOL: paint EXACTLY where geometry goes (gap corners -> Enter)
           char pb2[48]; snprintf(pb2,sizeof pb2, patchMode?"Patching: %d pts (Enter)":"Patch tool (click corners)",(int)patchPts.size());
-          if (cx.button(ui::hashId("patchtg"), x, y, bw2, th.rowH, pb2, patchMode)) { patchMode=!patchMode; patchPts.clear();
+          if (cx.button(ui::hashId("patchtg"), x, y, bw2, th.rowH, pb2, patchMode)) { patchMode=!patchMode; patchPts.clear(); patchCols.clear();
               if (patchMode) setStatus("PATCH: click the gap's corner points in the viewport (3+), Enter builds, Esc cancels"); }
           if (cx.button(ui::hashId("patchgo"), x+bw2+6*uiScale, y, bw2, th.rowH, "Build patch (Enter)", false) && patchMode) buildPatch();
           y += th.rowH+3*uiScale; }
