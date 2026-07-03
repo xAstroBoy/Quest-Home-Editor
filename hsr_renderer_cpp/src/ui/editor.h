@@ -733,6 +733,148 @@ struct Editor {
                           : "bend: no vertices inside the radius on the selection - click closer or raise the radius");
     }
 
+    // ── FUSE + REBUILD SURFACE: the PROPER merge for stacked/overlapping sheets (floors). Instead of
+    //    concatenating triangles, the selection is RE-BUILT from scratch:
+    //      1. project everything onto the dominant plane and rasterize the union FOOTPRINT (256 grid),
+    //      2. per cell keep the TOP surface height (under-layers are gone - no overlaps, no z-fight),
+    //      3. retriangulate as a clean uniform grid (two tris/cell, single layer, watertight interior),
+    //      4. BAKE the appearance into ONE 1024 texture by sampling each covering triangle through its
+    //         own UVs (atlas-safe) -> texture preserved, UVs = flat 0..1 sheet.
+    //    Sources go to history (one Ctrl+Z restores them and removes the rebuild).
+    void rebuildSurface(){
+        if (!r || !sceneMeshes || sel.empty()) { setStatus("rebuild: select the meshes to merge first"); return; }
+        std::vector<int> src; int skipped=0;
+        for (int s : sel) { if (s<0||s>=(int)sceneMeshes->size()||s>=(int)r->gpuMeshes.size()||r->isDeleted((size_t)s)) continue;
+            if (r->gpuMeshes[s].isSkinned || r->gpuMeshes[s].dynamicVerts) { ++skipped; continue; }
+            src.push_back(s); }
+        if (src.empty()) { setStatus("rebuild: no static meshes in the selection"); return; }
+        // world triangles of every source + area-weighted normal
+        struct RTri { int mesh; uint32_t a,b,c; float wa[3],wb[3],wc[3]; };
+        std::vector<RTri> tris;
+        float nx=0,ny=0,nz=0;
+        for (int s : src){ const MeshData& md=(*sceneMeshes)[(size_t)s]; const float* M=r->gpuMeshes[(size_t)s].model;
+            size_t nvm=md.positions.size()/3;
+            for (size_t k=0;k+2<md.indices.size();k+=3){ uint32_t a=md.indices[k],b=md.indices[k+1],c=md.indices[k+2];
+                if (a>=nvm||b>=nvm||c>=nvm) continue;
+                RTri t; t.mesh=s; t.a=a; t.b=b; t.c=c;
+                auto X=[&](uint32_t v2, float o[3]){ const float* p=&md.positions[v2*3];
+                    o[0]=M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12]; o[1]=M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13]; o[2]=M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14]; };
+                X(a,t.wa); X(b,t.wb); X(c,t.wc);
+                float e1[3]={t.wb[0]-t.wa[0],t.wb[1]-t.wa[1],t.wb[2]-t.wa[2]}, e2[3]={t.wc[0]-t.wa[0],t.wc[1]-t.wa[1],t.wc[2]-t.wa[2]};
+                nx+=e1[1]*e2[2]-e1[2]*e2[1]; ny+=e1[2]*e2[0]-e1[0]*e2[2]; nz+=e1[0]*e2[1]-e1[1]*e2[0];
+                tris.push_back(t);
+            } }
+        if (tris.empty()) { setStatus("rebuild: no triangles found"); return; }
+        int dom = std::fabs(nx)>std::fabs(ny) ? (std::fabs(nx)>std::fabs(nz)?0:2) : (std::fabs(ny)>std::fabs(nz)?1:2);
+        int ua=(dom+1)%3, va=(dom+2)%3;
+        float mnu=1e30f,mxu=-1e30f,mnv=1e30f,mxv=-1e30f;
+        for (auto& t : tris) for (const float* w : {t.wa,t.wb,t.wc}){ mnu=std::min(mnu,w[ua]); mxu=std::max(mxu,w[ua]); mnv=std::min(mnv,w[va]); mxv=std::max(mxv,w[va]); }
+        float su=(mxu-mnu)>1e-3f?(mxu-mnu):1.f, sv=(mxv-mnv)>1e-3f?(mxv-mnv):1.f;
+        const int G=256, T=1024;
+        float cellU=su/G, cellV=sv/G;
+        // bucket triangles over the G-grid (by 2D bbox)
+        std::vector<std::vector<int>> bucket((size_t)G*G);
+        for (int ti2=0; ti2<(int)tris.size(); ++ti2){ auto& t=tris[ti2];
+            float tmnu=std::min({t.wa[ua],t.wb[ua],t.wc[ua]}), tmxu=std::max({t.wa[ua],t.wb[ua],t.wc[ua]});
+            float tmnv=std::min({t.wa[va],t.wb[va],t.wc[va]}), tmxv=std::max({t.wa[va],t.wb[va],t.wc[va]});
+            int cu0=std::clamp((int)((tmnu-mnu)/cellU),0,G-1), cu1=std::clamp((int)((tmxu-mnu)/cellU),0,G-1);
+            int cv0=std::clamp((int)((tmnv-mnv)/cellV),0,G-1), cv1=std::clamp((int)((tmxv-mnv)/cellV),0,G-1);
+            for (int cv=cv0;cv<=cv1;++cv) for (int cu=cu0;cu<=cu1;++cu) bucket[(size_t)cv*G+cu].push_back(ti2);
+        }
+        // covering triangle at a plane point: TOP surface wins (max dom coordinate)
+        auto coverAt=[&](float u0,float v0, int& outTri, float& outDom)->bool{
+            int cu=std::clamp((int)((u0-mnu)/cellU),0,G-1), cv=std::clamp((int)((v0-mnv)/cellV),0,G-1);
+            outTri=-1; outDom=-1e30f;
+            for (int ti2 : bucket[(size_t)cv*G+cu]){ const RTri& t=tris[ti2];
+                float au=t.wa[ua],av=t.wa[va], bu=t.wb[ua],bv=t.wb[va], cu2=t.wc[ua],cv2=t.wc[va];
+                float den=(bv-cv2)*(au-cu2)+(cu2-bu)*(av-cv2);
+                if (std::fabs(den)<1e-12f) continue;
+                float l0=((bv-cv2)*(u0-cu2)+(cu2-bu)*(v0-cv2))/den;
+                float l1=((cv2-av)*(u0-cu2)+(au-cu2)*(v0-cv2))/den;
+                float l2=1.f-l0-l1;
+                if (l0<-1e-4f||l1<-1e-4f||l2<-1e-4f) continue;
+                float dcoord=l0*t.wa[dom]+l1*t.wb[dom]+l2*t.wc[dom];
+                if (dcoord>outDom){ outDom=dcoord; outTri=ti2; }
+            }
+            return outTri>=0;
+        };
+        // occupancy + top height per cell
+        std::vector<char>  occ((size_t)G*G, 0);
+        std::vector<float> hgt((size_t)G*G, 0.f);
+        int occCount=0;
+        for (int cv=0;cv<G;++cv) for (int cu=0;cu<G;++cu){
+            float u0=mnu+(cu+0.5f)*cellU, v0=mnv+(cv+0.5f)*cellV;
+            int t2; float d2;
+            if (coverAt(u0,v0,t2,d2)){ occ[(size_t)cv*G+cu]=1; hgt[(size_t)cv*G+cu]=d2; ++occCount; }
+        }
+        if (!occCount){ setStatus("rebuild: footprint rasterization found nothing"); return; }
+        // BAKE the texture: every texel samples the TOP covering triangle through ITS OWN UVs
+        MeshData out;
+        out.name="rebuilt"; out.doubleSided=true;
+        out.transform=Transform{}; out.hasWorldMatrix=true;
+        static const float I16[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        memcpy(out.worldMatrix, I16, sizeof I16);
+        out.texRGBA.assign((size_t)T*T*4, 255); out.texW=T; out.texH=T; out.hasTexture=true;
+        for (int ty2=0;ty2<T;++ty2) for (int tx2=0;tx2<T;++tx2){
+            float u0=mnu+((tx2+0.5f)/T)*su, v0=mnv+((ty2+0.5f)/T)*sv;
+            int t2; float d2;
+            u8* px=&out.texRGBA[((size_t)ty2*T+tx2)*4];
+            if (!coverAt(u0,v0,t2,d2)) { px[3]=255; continue; }
+            const RTri& t=tris[t2]; const MeshData& m2=(*sceneMeshes)[(size_t)t.mesh];
+            size_t nvm=m2.positions.size()/3;
+            if (m2.uvs.size()<nvm*2 || m2.texRGBA.empty()) { px[0]=px[1]=px[2]=170; continue; }
+            float au=t.wa[ua],av=t.wa[va], bu=t.wb[ua],bv=t.wb[va], cu2=t.wc[ua],cv2=t.wc[va];
+            float den=(bv-cv2)*(au-cu2)+(cu2-bu)*(av-cv2); if (std::fabs(den)<1e-12f) continue;
+            float l0=((bv-cv2)*(u0-cu2)+(cu2-bu)*(v0-cv2))/den;
+            float l1=((cv2-av)*(u0-cu2)+(au-cu2)*(v0-cv2))/den;
+            float l2=1.f-l0-l1;
+            float uu=l0*m2.uvs[t.a*2]+l1*m2.uvs[t.b*2]+l2*m2.uvs[t.c*2];
+            float vv=l0*m2.uvs[t.a*2+1]+l1*m2.uvs[t.b*2+1]+l2*m2.uvs[t.c*2+1];
+            uu-=std::floor(uu); vv-=std::floor(vv);
+            int W2=(int)m2.texW,H2=(int)m2.texH;
+            float fx=uu*W2-0.5f, fy=vv*H2-0.5f; int x0=(int)std::floor(fx), y0=(int)std::floor(fy); float tfx=fx-x0, tfy=fy-y0;
+            auto S=[&](int sx2,int sy2,int ch)->float{ sx2=std::clamp(sx2,0,W2-1); sy2=std::clamp(sy2,0,H2-1); return (float)m2.texRGBA[((size_t)sy2*W2+sx2)*4+ch]; };
+            for (int ch=0;ch<3;++ch){ float a2=S(x0,y0,ch)*(1-tfx)+S(x0+1,y0,ch)*tfx, b2=S(x0,y0+1,ch)*(1-tfx)+S(x0+1,y0+1,ch)*tfx;
+                px[ch]=(u8)std::clamp(a2*(1-tfy)+b2*tfy,0.f,255.f); }
+            px[3]=255;
+        }
+        // RETRIANGULATE: corner vertices of occupied cells; height = average of adjacent occupied cells
+        std::map<std::pair<int,int>,uint32_t> cornerId;
+        auto corner=[&](int cu,int cv)->uint32_t{
+            auto it=cornerId.find({cu,cv}); if (it!=cornerId.end()) return it->second;
+            float a=0; int c2=0;
+            for (int oy=-1;oy<=0;++oy) for (int ox=-1;ox<=0;++ox){ int xx=cu+ox, yy=cv+oy;
+                if (xx<0||yy<0||xx>=G||yy>=G||!occ[(size_t)yy*G+xx]) continue; a+=hgt[(size_t)yy*G+xx]; ++c2; }
+            float h2=c2? a/c2 : 0.f;
+            uint32_t id=(uint32_t)(out.positions.size()/3);
+            float p[3]; p[ua]=mnu+cu*cellU; p[va]=mnv+cv*cellV; p[dom]=h2;
+            out.positions.push_back(p[0]); out.positions.push_back(p[1]); out.positions.push_back(p[2]);
+            out.uvs.push_back((float)cu/G); out.uvs.push_back((float)cv/G);
+            cornerId[{cu,cv}]=id; return id;
+        };
+        for (int cv=0;cv<G;++cv) for (int cu=0;cu<G;++cu){
+            if (!occ[(size_t)cv*G+cu]) continue;
+            uint32_t i00=corner(cu,cv), i10=corner(cu+1,cv), i11=corner(cu+1,cv+1), i01=corner(cu,cv+1);
+            out.indices.push_back(i00); out.indices.push_back(i10); out.indices.push_back(i11);
+            out.indices.push_back(i00); out.indices.push_back(i11); out.indices.push_back(i01);
+        }
+        out.nVerts=(u32)(out.positions.size()/3); out.nIdx=(u32)out.indices.size();
+        sceneMeshes->push_back(std::move(out));
+        size_t ni=r->gpuMeshes.size();
+        r->uploadMesh(sceneMeshes->back());
+        if (r->gpuMeshes.size()!=ni+1){ setStatus("rebuild: GPU upload failed"); sceneMeshes->pop_back(); return; }
+        r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
+        std::vector<int> hist=src; std::vector<uint8_t> histA(src.size(),1);
+        for (int s : src) r->setDeleted((size_t)s, true);
+        hist.push_back((int)ni); histA.push_back(0);
+        pushDeleteUndo(hist, histA);
+        meshEditLog[(int)ni] = "rebuild(" + std::to_string(src.size()) + ")";
+        geomDirty=true; holesMesh=-1;
+        selectOne((int)ni); scrollToSel=true;
+        setStatus("REBUILT "+std::to_string(src.size())+" mesh(es) as ONE clean single-layer surface ("+std::to_string(occCount)
+                  +" cells, texture baked 1024)"+(skipped?" - skipped "+std::to_string(skipped)+" animated":"")+" - Ctrl+Z restores the originals");
+    }
+
     // ── RE-UV FLAT: give the mesh ONE continuous planar UV sheet (0..1 across its bounds, dominant
     //    plane by area-weighted normal). After fusing floor+patch their UVs disagree (atlas cells vs
     //    0..1 sheet) so a Set texture shows at different scales - Re-UV first and the texture spans
@@ -1306,6 +1448,7 @@ struct Editor {
         std::vector<uint8_t> bytes((size_t)(sz>0?sz:0)); if(sz>0){ size_t rd=fread(bytes.data(),1,(size_t)sz,f); (void)rd; } fclose(f);
         int w=0,h=0,n=0; unsigned char* px=stbi_load_from_memory(bytes.data(),(int)bytes.size(),&w,&h,&n,4);
         if(!px){ setStatus("texture decode FAILED (PNG/JPG only): "+path); return false; }
+        backupTexture(mi);   // "Undo texture" can take this back
         MeshData& md=(*sceneMeshes)[mi];
         md.texRGBA.assign(px, px+(size_t)w*h*4); md.texW=w; md.texH=h; md.hasTexture=true;
         stbi_image_free(px);
@@ -2431,6 +2574,7 @@ struct Editor {
             {"Rotate Y +90 (repeat to stack)",28},{"Rotate Y 180",29},                        // true rotations, no reflection
             {"Rotate X +90",30},{"Rotate Z +90",31},
             {std::string("Fuse selection into ONE mesh")+suf,32},                             // bake world transforms, concat geometry (active mesh's texture)
+            {std::string("Fuse + REBUILD surface")+suf+" (clean retriangulate)",42},           // single-layer grid remesh + baked 1024 texture (NO overlaps)
             {std::string(noColMeshes.count(ctxMesh)?"Collision: INCLUDE again":"Collision: EXCLUDE (walk-through)")+suf,27},
             {std::string("Reset transform")+suf,3}, {"Copy name",4},
             {colLbl,5},
@@ -2493,6 +2637,7 @@ struct Editor {
                 else if (a==30) forEachSelMesh([&](int m){ rotateMeshGeom(m, 0, 90); });
                 else if (a==31) forEachSelMesh([&](int m){ rotateMeshGeom(m, 2, 90); });
                 else if (a==32) fuseSelectedMeshes();
+                else if (a==42) rebuildSurface();
                 else if (a==33) { showHoles=!showHoles; if (showHoles){ refreshHoles(); setStatus(std::to_string(holeLoops.size())+" boundary loop(s) outlined - CLICK an orange marker to seal that hole"); } }
                 else if (a==34) { if (ctxHitValid) sealMeshHoles(ctxMesh, ctxHitP);
                                   else setStatus("seal: right-click ON the mesh near the hole"); }
@@ -3101,6 +3246,9 @@ struct Editor {
           char fb2[40]; snprintf(fb2,sizeof fb2,"Fuse selection (%d)",(int)sel.size());
           if (cx.button(ui::hashId("fusesel"), x+bw2+6*uiScale, y, bw2, th.rowH, fb2, sel.size()>1)) fuseSelectedMeshes();
           y+=th.rowH+3*uiScale;
+          char rb2[52]; snprintf(rb2,sizeof rb2,"Fuse + REBUILD surface (%d) - clean retriangulate",(int)sel.size());
+          if (cx.button(ui::hashId("rebuilds"), x, y, w, th.rowH, rb2, !sel.empty())) rebuildSurface();
+          y+=th.rowH+3*uiScale;
           bool exc = noColMeshes.count(selected)!=0;
           if (cx.button(ui::hashId("nocol"), x, y, w, th.rowH, exc?"Collision: OFF (walk-through)":"Collision: ON", exc)) {
               bool nowExc = !exc;   // apply to the WHOLE selection
@@ -3236,6 +3384,8 @@ struct Editor {
         { cx.label(x,y,64*uiScale,rh,"Shadow",th.textDim);
           cx.dragFloat(ui::hashId("dshstr"), x+66*uiScale, y, 70*uiScale, rh, deshadowStr, 0.005f, "%.2f");
           if (cx.button(ui::hashId("dshgo"), x+142*uiScale, y, w-142*uiScale, rh, "Remove baked shadows")) forEachSelMesh([&](int m){ removeBakedShadows(m); });
+          y+=rh+3*uiScale;
+          if (cx.button(ui::hashId("txundo"), x, y, w, rh, "Undo texture (restore before last texture op)")) undoTexture(selected);
           y+=rh+4*uiScale; }
         // ── TEXTURE GENERATOR (procedural replacements; previews live + ships in the cook) ──
         cx.label(x,y,w,rh,"Generate texture",th.text); y+=rh+2*uiScale;
@@ -3326,6 +3476,26 @@ struct Editor {
     float texBright = 1.f, texSat = 1.f, texHueDeg = 0.f;   // Material tab texture-adjust fields (baked on Apply)
     float deshadowStr = 0.8f;                               // "Remove baked shadows" strength (0..1)
 
+    // ── ONE-STEP TEXTURE UNDO: every texture-modifying op (adjust / de-shadow / generate / set) backs
+    //    the previous pixels up first; "Undo texture" restores them. A ruined texture is never final.
+    struct TexBackup { u32 w=0,h=0; std::vector<u8> rgba; };
+    std::map<int,TexBackup> texBackup;
+    void backupTexture(int mi){
+        if (!sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size()) return;
+        const MeshData& md=(*sceneMeshes)[(size_t)mi];
+        if (md.texRGBA.empty()) return;
+        texBackup[mi] = TexBackup{ md.texW, md.texH, md.texRGBA };
+    }
+    void undoTexture(int mi){
+        auto it=texBackup.find(mi);
+        if (it==texBackup.end() || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size()){ setStatus("undo texture: no backup for this mesh"); return; }
+        MeshData& md=(*sceneMeshes)[(size_t)mi];
+        std::swap(md.texW, it->second.w); std::swap(md.texH, it->second.h); std::swap(md.texRGBA, it->second.rgba);   // swap = redo-able
+        md.astcRaw.clear();
+        r->replaceMeshTexture((size_t)mi, *sceneMeshes);
+        setStatus("Texture restored from backup (press again to swap back)");
+    }
+
     // ── REMOVE BAKED SHADOWS: envs bake lightmap shading INTO the texture; this flattens the LARGE-
     //    SCALE luminance (divide by a heavily blurred luminance map, normalized to the image mean) so
     //    shadows/gradients lift while the fine texture detail stays. strength = lerp toward the result.
@@ -3334,16 +3504,31 @@ struct Editor {
         MeshData& md = (*sceneMeshes)[(size_t)mi];
         int W=(int)md.texW, H=(int)md.texH;
         if (md.texRGBA.empty() || W<4 || H<4) { setStatus("de-shadow: mesh has no texture"); return; }
-        // coarse luminance field: downsample to <=64 wide, two box-blur passes, bilinear upsample on read
+        backupTexture(mi);   // "Undo texture" can always take this back
+        // coarse luminance field: downsample to <=64 wide, two box-blur passes, bilinear upsample on read.
+        // NEAR-WHITE texels (atlas PADDING) and near-black voids are EXCLUDED from the statistics —
+        // a fused atlas's white padding used to drag the mean up and blow the whole floor to white.
         int dw = std::min(64, W), dh = std::min(64, H);
         std::vector<float> lum((size_t)dw*dh, 0.f);
         for (int y2=0;y2<dh;++y2) for (int x2=0;x2<dw;++x2){
             int sx0=x2*W/dw, sx1=std::max(sx0+1,(x2+1)*W/dw), sy0=y2*H/dh, sy1=std::max(sy0+1,(y2+1)*H/dh);
             double acc=0; int cnt=0;
             for (int sy=sy0; sy<sy1; sy+=std::max(1,(sy1-sy0)/4)) for (int sx=sx0; sx<sx1; sx+=std::max(1,(sx1-sx0)/4)){
-                const u8* p=&md.texRGBA[((size_t)sy*W+sx)*4]; acc += 0.299*p[0]+0.587*p[1]+0.114*p[2]; ++cnt; }
-            lum[(size_t)y2*dw+x2] = cnt? (float)(acc/cnt/255.0) : 0.5f;
+                const u8* p=&md.texRGBA[((size_t)sy*W+sx)*4];
+                double l = 0.299*p[0]+0.587*p[1]+0.114*p[2];
+                if (l > 245.0 || l < 6.0) continue;                 // padding / void - not real surface
+                acc += l; ++cnt; }
+            lum[(size_t)y2*dw+x2] = cnt? (float)(acc/cnt/255.0) : -1.f;   // -1 = no data (filled below)
         }
+        // fill no-data cells from neighbors so padding regions don't distort the field
+        for (int pass=0; pass<3; ++pass){ std::vector<float> tmp=lum; bool any=false;
+            for (int y2=0;y2<dh;++y2) for (int x2=0;x2<dw;++x2){ if (tmp[(size_t)y2*dw+x2]>=0) continue;
+                float a=0; int c2=0;
+                for (int oy=-1;oy<=1;++oy) for (int ox=-1;ox<=1;++ox){ int xx=x2+ox, yy=y2+oy;
+                    if (xx<0||yy<0||xx>=dw||yy>=dh) continue; float v=tmp[(size_t)yy*dw+xx]; if (v>=0){ a+=v; ++c2; } }
+                if (c2){ lum[(size_t)y2*dw+x2]=a/c2; any=true; } }
+            if (!any) break; }
+        for (auto& v : lum) if (v<0) v=0.5f;
         for (int pass=0; pass<2; ++pass){ std::vector<float> tmp=lum;
             for (int y2=0;y2<dh;++y2) for (int x2=0;x2<dw;++x2){ float a=0; int c2=0;
                 for (int oy=-2;oy<=2;++oy) for (int ox=-2;ox<=2;++ox){ int xx=x2+ox, yy=y2+oy;
@@ -3352,13 +3537,16 @@ struct Editor {
         double mean=0; for (float v : lum) mean+=v; mean/= (double)lum.size(); if (mean<0.05) mean=0.05;
         float st = std::clamp(deshadowStr, 0.f, 1.f);
         for (int y2=0;y2<H;++y2) for (int x2=0;x2<W;++x2){
+            u8* px=&md.texRGBA[((size_t)y2*W+x2)*4];
+            double lpix = 0.299*px[0]+0.587*px[1]+0.114*px[2];
+            if (lpix > 245.0 || lpix < 6.0) continue;             // don't touch padding/void texels
             float fu=(x2+0.5f)/W*dw-0.5f, fv=(y2+0.5f)/H*dh-0.5f;
             int u0=(int)std::floor(fu), v0=(int)std::floor(fv); float tu=fu-u0, tv=fv-v0;
             auto L=[&](int a,int b2)->float{ a=std::clamp(a,0,dw-1); b2=std::clamp(b2,0,dh-1); return lum[(size_t)b2*dw+a]; };
             float bl = (L(u0,v0)*(1-tu)+L(u0+1,v0)*tu)*(1-tv) + (L(u0,v0+1)*(1-tu)+L(u0+1,v0+1)*tu)*tv;
             float f = (float)mean / std::max(bl, 0.04f);
-            f = 1.f + (f-1.f)*st;                        // strength lerp
-            u8* px=&md.texRGBA[((size_t)y2*W+x2)*4];
+            f = std::clamp(f, 0.6f, 1.8f);                        // NEVER blow out to white / crush to black
+            f = 1.f + (f-1.f)*st;                                 // strength lerp
             for (int ch=0;ch<3;++ch) px[ch]=(u8)std::clamp(px[ch]*f, 0.f, 255.f);
         }
         md.astcRaw.clear();
@@ -3372,6 +3560,7 @@ struct Editor {
         if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size()) return;
         MeshData& md = (*sceneMeshes)[(size_t)mi];
         if (md.texRGBA.empty()) { setStatus("adjust: mesh has no texture"); return; }
+        backupTexture(mi);   // "Undo texture" can take this back
         float rad = texHueDeg*3.14159265f/180.f, cH=std::cos(rad), sH=std::sin(rad);
         // hue rotation about the grey axis (standard YIQ-ish matrix), then saturation lerp, then brightness
         float m[9] = { 0.213f+cH*0.787f-sH*0.213f, 0.715f-cH*0.715f-sH*0.715f, 0.072f-cH*0.072f+sH*0.928f,
@@ -3395,6 +3584,7 @@ struct Editor {
     void generateTexture(int mi, int kind){
         if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
         MeshData& md = (*sceneMeshes)[(size_t)mi];
+        backupTexture(mi);   // "Undo texture" can take this back
         const int S = 512;
         md.texRGBA.assign((size_t)S*S*4, 255); md.texW=S; md.texH=S; md.hasTexture=true; md.astcRaw.clear();
         const float* t = r->gpuMeshes[(size_t)mi].editTint;
