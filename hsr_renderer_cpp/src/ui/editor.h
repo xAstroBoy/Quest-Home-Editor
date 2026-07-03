@@ -5254,15 +5254,7 @@ struct Editor {
         std::vector<int> ms = navSourceMeshes(si);
         // per-mesh COLLISION EXCLUSION ("walk-through") + editor-deleted meshes never contribute collision
         ms.erase(std::remove_if(ms.begin(), ms.end(), [&](int m){
-            if (noColMeshes.count(m)!=0 || (r && r->isDeleted((size_t)m))) return true;
-            // TRANSPARENT meshes never contribute collision: japan's "hidden colliders" were its BLEND
-            // fog planes / water pSpheres / firefly glow cards silently feeding the walkable bake +
-            // auto floor ("collision on two sides that isn't supposed to be there"). Explicit user
-            // selection (navMode 2) is respected - only the automatic modes skip them.
-            if (si.navMode!=2 && r && m>=0 && m<(int)r->gpuMeshes.size()) {
-                const auto& g=r->gpuMeshes[(size_t)m]; if (g.useBlend || g.additive) return true;
-            }
-            return false; }), ms.end());
+            return noColMeshes.count(m)!=0 || (r && r->isDeleted((size_t)m)); }), ms.end());
         bool forceFlat = si.navMode==0 || std::getenv("HSR_NAVFLAT");   // diag: force a 2-tri flat quad (isolate cook vs geometry)
         if (forceFlat){                                       // FLAT — a single ground plane
             float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f};
@@ -5367,7 +5359,7 @@ struct Editor {
     void buildSimGeometry(){
         simV.clear(); simI.clear();
         for (auto& it:items) if (it.type==sitem::NAVMESH && it.navVerts.size()>=9){ uint32_t b=(uint32_t)(simV.size()/3); for(float f:it.navVerts) simV.push_back(f); for(uint32_t k:it.navIdx) simI.push_back(b+k); }
-        if (simI.empty()) for (int m=0;m<(int)r->gpuMeshes.size();++m){ if(r->isHidden(m)||isBackdrop(r->gpuMeshes[m].name))continue; auto&gm=r->gpuMeshes[m]; if(gm.useBlend||gm.additive||r->isDeleted((size_t)m)||noColMeshes.count(m))continue; /* transparent fog/water/glow never block the walk sim */ const auto&P=gm.pickPos; const auto&I=gm.pickIdx; if(P.size()<9||I.size()<3)continue; uint32_t b=(uint32_t)(simV.size()/3);
+        if (simI.empty()) for (int m=0;m<(int)r->gpuMeshes.size();++m){ if(r->isHidden(m)||isBackdrop(r->gpuMeshes[m].name))continue; auto&gm=r->gpuMeshes[m]; const auto&P=gm.pickPos; const auto&I=gm.pickIdx; if(P.size()<9||I.size()<3)continue; uint32_t b=(uint32_t)(simV.size()/3);
             for(size_t v=0;v+2<P.size();v+=3){ float p[3]={P[v],P[v+1],P[v+2]},o[3]; xformPoint(gm.model,p,o); simV.push_back(o[0]);simV.push_back(o[1]);simV.push_back(o[2]); }
             for(size_t k=0;k+2<I.size();k+=3){ simI.push_back(b+I[k]);simI.push_back(b+I[k+1]);simI.push_back(b+I[k+2]); } }
     }
