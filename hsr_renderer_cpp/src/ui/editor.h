@@ -426,8 +426,51 @@ struct Editor {
     //    its OWN mesh - selected mesh's texture, flat planar UVs (no radial smearing), no dependence on
     //    the broken triangulation at all. Undoable (Ctrl+Z removes), persists via the .geom sidecar.
     bool patchMode = false;
+    bool pinIsCut  = false;                       // pins define a CUT REGION instead of a patch (same click-the-corners UX)
     std::vector<std::array<float,3>> patchPts;
     std::vector<std::array<u8,4>>    patchCols;   // color sampled from the CLICKED surface at each pin (auto-matching texture)
+    // ── CUT REGION by pins: drop every triangle of the SELECTION whose centroid falls inside the
+    //    clicked polygon (projected on the pins' plane, +-3m). Texture/UVs untouched - "cut with the
+    //    same texture and all". Non-destructive per mesh (Ctrl+Z reverts each).
+    void cutRegionByPins(){
+        if (patchPts.size()<3){ setStatus("cut region: click at least 3 corner points first"); return; }
+        size_t n=patchPts.size();
+        float nx=0,ny=0,nz=0;
+        for (size_t i2=0;i2<n;++i2){ auto& a=patchPts[i2]; auto& b=patchPts[(i2+1)%n];
+            nx+=(a[1]-b[1])*(a[2]+b[2]); ny+=(a[2]-b[2])*(a[0]+b[0]); nz+=(a[0]-b[0])*(a[1]+b[1]); }
+        int dom = std::fabs(nx)>std::fabs(ny) ? (std::fabs(nx)>std::fabs(nz)?0:2) : (std::fabs(ny)>std::fabs(nz)?1:2);
+        int ua=(dom+1)%3, va=(dom+2)%3;
+        float planeDom=0; for (auto& p : patchPts) planeDom+=p[dom]; planeDom/=(float)n;
+        std::vector<std::array<float,2>> poly(n);
+        for (size_t i2=0;i2<n;++i2) poly[i2]={patchPts[i2][ua], patchPts[i2][va]};
+        auto inPoly=[&](float u0,float v0)->bool{ bool in=false;
+            for (size_t i2=0,j=n-1;i2<n;j=i2++){
+                if (((poly[i2][1]>v0)!=(poly[j][1]>v0)) &&
+                    (u0 < (poly[j][0]-poly[i2][0])*(v0-poly[i2][1])/(poly[j][1]-poly[i2][1])+poly[i2][0])) in=!in; }
+            return in; };
+        int totalCut=0;
+        forEachSelMesh([&](int mi){
+            if (mi<0||mi>=(int)sceneMeshes->size()||mi>=(int)r->gpuMeshes.size()) return;
+            MeshData md=(*sceneMeshes)[(size_t)mi];
+            const float* M=r->gpuMeshes[(size_t)mi].model;
+            std::vector<u32> keep; keep.reserve(md.indices.size());
+            int cut=0;
+            for (size_t k=0;k+2<md.indices.size();k+=3){
+                float c[3]={0,0,0};
+                for (int e=0;e<3;e++){ const float* p=&md.positions[md.indices[k+e]*3];
+                    c[0]+=M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12]; c[1]+=M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13]; c[2]+=M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14]; }
+                c[0]/=3; c[1]/=3; c[2]/=3;
+                if (std::fabs(c[dom]-planeDom)<3.f && inPoly(c[ua],c[va])) { ++cut; continue; }
+                keep.push_back(md.indices[k]); keep.push_back(md.indices[k+1]); keep.push_back(md.indices[k+2]);
+            }
+            if (!cut) return;
+            md.indices=std::move(keep); totalCut+=cut;
+            commitGeomEdit(mi, std::move(md), "cutRegion");
+        });
+        patchPts.clear(); patchCols.clear(); patchMode=false; pinIsCut=false;
+        setStatus(totalCut ? ("Cut "+std::to_string(totalCut)+" tris inside the clicked region (texture untouched) - Ctrl+Z reverts")
+                           : "cut region: nothing inside the polygon on the selected mesh(es)");
+    }
     // Raycast a screen point against ONE mesh and return hit point + the SURFACE COLOR there
     // (barycentric-interpolated UV -> bilinear sample of that mesh's texture).
     bool screenRayHitColor(double mx, double my, int meshIdx, float outP[3], u8 outCol[4]){
@@ -475,7 +518,8 @@ struct Editor {
         if (!patchMode) return;
         dl.pushClip((float)rcViewport.offset.x,(float)rcViewport.offset.y,(float)rcViewport.extent.width,(float)rcViewport.extent.height);
         cx.textAligned((float)rcViewport.offset.x, (float)rcViewport.offset.y+26*uiScale, (float)rcViewport.extent.width, 18*uiScale,
-                       "PATCH TOOL - click the gap's corners in order (3+), ENTER builds, ESC cancels", ui::rgba(120,230,140), 1);
+                       pinIsCut ? "CUT REGION - click the region's corners (3+), ENTER cuts it out of the selection, ESC cancels"
+                                : "PATCH TOOL - click the gap's corners in order (3+), ENTER builds, ESC cancels", ui::rgba(120,230,140), 1);
         float prev[2]; bool prevOk=false;
         for (size_t i2=0;i2<patchPts.size();++i2){
             float w[3]={patchPts[i2][0],patchPts[i2][1],patchPts[i2][2]}; float sx,sy;
@@ -630,6 +674,36 @@ struct Editor {
         selectOne((int)ni); scrollToSel=true;
         patchPts.clear(); patchCols.clear(); patchMode=false;
         setStatus("Patch built - texture auto-blended from the clicked surfaces (flat 0..1 UVs: Export PNG -> AI -> Set texture for a fancy fill)");
+    }
+
+    // ── RE-UV FLAT: give the mesh ONE continuous planar UV sheet (0..1 across its bounds, dominant
+    //    plane by area-weighted normal). After fusing floor+patch their UVs disagree (atlas cells vs
+    //    0..1 sheet) so a Set texture shows at different scales - Re-UV first and the texture spans
+    //    ONCE, seamlessly, across everything. Pairs with: Fuse -> Re-UV flat -> Set texture (AI image).
+    void reUVFlat(int mi){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
+        MeshData md = (*sceneMeshes)[(size_t)mi];
+        size_t nv = md.positions.size()/3;
+        if (nv<3) return;
+        // area-weighted normal over all triangles -> dominant projection plane
+        float nx=0,ny=0,nz=0;
+        for (size_t k=0;k+2<md.indices.size();k+=3){
+            const float* A=&md.positions[md.indices[k]*3]; const float* B=&md.positions[md.indices[k+1]*3]; const float* C=&md.positions[md.indices[k+2]*3];
+            float e1[3]={B[0]-A[0],B[1]-A[1],B[2]-A[2]}, e2[3]={C[0]-A[0],C[1]-A[1],C[2]-A[2]};
+            nx+=e1[1]*e2[2]-e1[2]*e2[1]; ny+=e1[2]*e2[0]-e1[0]*e2[2]; nz+=e1[0]*e2[1]-e1[1]*e2[0];
+        }
+        int dom = std::fabs(nx)>std::fabs(ny) ? (std::fabs(nx)>std::fabs(nz)?0:2) : (std::fabs(ny)>std::fabs(nz)?1:2);
+        int ua=(dom+1)%3, va=(dom+2)%3;
+        float mnu=1e30f,mxu=-1e30f,mnv=1e30f,mxv=-1e30f;
+        for (size_t v2=0;v2<nv;++v2){ float a=md.positions[v2*3+ua], b=md.positions[v2*3+va];
+            mnu=std::min(mnu,a); mxu=std::max(mxu,a); mnv=std::min(mnv,b); mxv=std::max(mxv,b); }
+        float su=(mxu-mnu)>1e-4f?(mxu-mnu):1.f, sv=(mxv-mnv)>1e-4f?(mxv-mnv):1.f;
+        md.uvs.resize(nv*2);
+        for (size_t v2=0;v2<nv;++v2){ md.uvs[v2*2]=(md.positions[v2*3+ua]-mnu)/su; md.uvs[v2*2+1]=(md.positions[v2*3+va]-mnv)/sv; }
+        md.uvs2.clear(); md.hasLightmap=false; md.lmRGBA.clear();   // old lightmap unwrap no longer applies
+        md.astcRaw.clear();
+        if (commitGeomEdit(mi, std::move(md), "reUV"))
+            setStatus("Re-UV'd to ONE flat 0..1 sheet - Set texture now spans the whole surface once (Ctrl+Z reverts)");
     }
 
     // ── SLICE the mesh in half along an axis plane through its center: every triangle goes to the LEFT
@@ -1969,9 +2043,9 @@ struct Editor {
             if (!sel.empty()) { selected=sel.back(); r->selectedMesh=selected; duplicateSelected(); }
         }
         if (key==GLFW_KEY_F1) showKeybinds = !showKeybinds;   // all-shortcuts overlay
-        if (patchMode) {   // PATCH TOOL keys: Enter = build through the pins, Esc = cancel
-            if (key==GLFW_KEY_ENTER) buildPatch();
-            if (key==GLFW_KEY_ESCAPE) { patchMode=false; patchPts.clear(); patchCols.clear(); setStatus("patch cancelled"); }
+        if (patchMode) {   // PIN TOOLS (patch/cut region): Enter = apply, Esc = cancel
+            if (key==GLFW_KEY_ENTER) { if (pinIsCut) cutRegionByPins(); else buildPatch(); }
+            if (key==GLFW_KEY_ESCAPE) { patchMode=false; pinIsCut=false; patchPts.clear(); patchCols.clear(); setStatus("pin tool cancelled"); }
         }
         if (key==GLFW_KEY_SPACE && !playSim) {   // SPACE = toggle visibility of the selection (meshes or scene items)
             if (!selItems.empty()) { bool anyVis=false; for (int i:selItems) if (i>=0&&i<(int)items.size()&&!items[i].hidden) anyVis=true;
@@ -2282,6 +2356,8 @@ struct Editor {
             {std::string("Seal ALL holes (keeps perimeter)")+suf,21},
             {"Slice in half X",35},{"Slice in half Y",36},{"Slice in half Z",37},             // separate halves (move/delete independently)
             {std::string(patchMode?"Patch tool: CANCEL":"Patch tool (click gap corners, Enter)"),38},
+            {std::string("Re-UV flat (texture spans ONCE)")+suf,39},
+            {"Cut region tool (click corners, Enter)",40},
             {std::string("Cut hole HERE (r=")+std::to_string((int)(cutRadius*100)/100.f).substr(0,4)+"m)",22},   // carve the clicked spot open (doorways)
             {"Split into connected pieces",23},                                               // separate disjoint parts into own meshes
             {"Mirror X",24},{"Mirror Y",25},{"Mirror Z",26},                                  // flip to face the other side (winding fixed)
@@ -2358,6 +2434,9 @@ struct Editor {
                 else if (a==37) forEachSelMesh([&](int m){ sliceMesh(m, 2); });
                 else if (a==38) { patchMode=!patchMode; patchPts.clear(); patchCols.clear();
                                   if (patchMode) setStatus("PATCH: click the gap's corner points in the viewport (3+), Enter builds, Esc cancels"); }
+                else if (a==39) forEachSelMesh([&](int m){ reUVFlat(m); });
+                else if (a==40) { patchMode=true; pinIsCut=true; patchPts.clear(); patchCols.clear();
+                                  setStatus("CUT REGION: click the region's corner points (3+), Enter cuts it from the SELECTED mesh(es), Esc cancels"); }
                 else if (a==27) { bool exc = !noColMeshes.count(ctxMesh);      // collision walk-through toggle (whole selection)
                                   for (int t2:tg) { if (exc) noColMeshes.insert(t2); else noColMeshes.erase(t2); }
                                   bakeNavmeshes(this->items);                  // preview + cook collision re-bake immediately ("items" here = the MENU rows)
@@ -2902,9 +2981,16 @@ struct Editor {
           y += th.rowH+3*uiScale; }
         { float bw2=(w-6*uiScale)/2;    // PATCH TOOL: paint EXACTLY where geometry goes (gap corners -> Enter)
           char pb2[48]; snprintf(pb2,sizeof pb2, patchMode?"Patching: %d pts (Enter)":"Patch tool (click corners)",(int)patchPts.size());
-          if (cx.button(ui::hashId("patchtg"), x, y, bw2, th.rowH, pb2, patchMode)) { patchMode=!patchMode; patchPts.clear(); patchCols.clear();
+          if (cx.button(ui::hashId("patchtg"), x, y, bw2, th.rowH, pb2, patchMode&&!pinIsCut)) { patchMode=!(patchMode&&!pinIsCut); pinIsCut=false; patchPts.clear(); patchCols.clear();
               if (patchMode) setStatus("PATCH: click the gap's corner points in the viewport (3+), Enter builds, Esc cancels"); }
           if (cx.button(ui::hashId("patchgo"), x+bw2+6*uiScale, y, bw2, th.rowH, "Build patch (Enter)", false) && patchMode) buildPatch();
+          y += th.rowH+3*uiScale; }
+        if (cx.button(ui::hashId("reuvflat"), x, y, w, th.rowH, "Re-UV flat (Set texture spans once)")) forEachSelMesh([&](int m){ reUVFlat(m); });
+        y += th.rowH+3*uiScale;
+        { char cb2[52]; snprintf(cb2,sizeof cb2, (patchMode&&pinIsCut)?"Cutting: %d pts (Enter)":"Cut region tool (click corners)",(int)patchPts.size());
+          if (cx.button(ui::hashId("cutreg"), x, y, w, th.rowH, cb2, patchMode&&pinIsCut)) {
+              patchMode=!(patchMode&&pinIsCut); pinIsCut=patchMode; patchPts.clear(); patchCols.clear();
+              if (patchMode) setStatus("CUT REGION: click the region's corner points (3+), Enter cuts it from the SELECTED mesh(es), Esc cancels"); }
           y += th.rowH+3*uiScale; }
         { float bw3=(w-10*uiScale)/3;   // SLICE: separate the mesh into two halves along a center plane
           if (cx.button(ui::hashId("slcx"), x,                   y, bw3, th.rowH, "Slice X")) forEachSelMesh([&](int m){ sliceMesh(m, 0); });
@@ -3060,6 +3146,11 @@ struct Editor {
           y+=rh+3*uiScale;
           if (cx.button(ui::hashId("txapply"), x, y, w, rh, "Apply adjust (bakes into the texture)")) applyTextureAdjust(selected);
           y+=rh+4*uiScale; }
+        // ── DE-SHADOW: lift the lightmap shading BAKED into the texture (large-scale luminance flatten) ──
+        { cx.label(x,y,64*uiScale,rh,"Shadow",th.textDim);
+          cx.dragFloat(ui::hashId("dshstr"), x+66*uiScale, y, 70*uiScale, rh, deshadowStr, 0.005f, "%.2f");
+          if (cx.button(ui::hashId("dshgo"), x+142*uiScale, y, w-142*uiScale, rh, "Remove baked shadows")) forEachSelMesh([&](int m){ removeBakedShadows(m); });
+          y+=rh+4*uiScale; }
         // ── TEXTURE GENERATOR (procedural replacements; previews live + ships in the cook) ──
         cx.label(x,y,w,rh,"Generate texture",th.text); y+=rh+2*uiScale;
         { float bw3=(w-10*uiScale)/3;
@@ -3147,6 +3238,47 @@ struct Editor {
     }
     std::set<int> matEdited;   // meshes whose material flags/tint were edited (session MATF/TINT lines)
     float texBright = 1.f, texSat = 1.f, texHueDeg = 0.f;   // Material tab texture-adjust fields (baked on Apply)
+    float deshadowStr = 0.8f;                               // "Remove baked shadows" strength (0..1)
+
+    // ── REMOVE BAKED SHADOWS: envs bake lightmap shading INTO the texture; this flattens the LARGE-
+    //    SCALE luminance (divide by a heavily blurred luminance map, normalized to the image mean) so
+    //    shadows/gradients lift while the fine texture detail stays. strength = lerp toward the result.
+    void removeBakedShadows(int mi){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size()) return;
+        MeshData& md = (*sceneMeshes)[(size_t)mi];
+        int W=(int)md.texW, H=(int)md.texH;
+        if (md.texRGBA.empty() || W<4 || H<4) { setStatus("de-shadow: mesh has no texture"); return; }
+        // coarse luminance field: downsample to <=64 wide, two box-blur passes, bilinear upsample on read
+        int dw = std::min(64, W), dh = std::min(64, H);
+        std::vector<float> lum((size_t)dw*dh, 0.f);
+        for (int y2=0;y2<dh;++y2) for (int x2=0;x2<dw;++x2){
+            int sx0=x2*W/dw, sx1=std::max(sx0+1,(x2+1)*W/dw), sy0=y2*H/dh, sy1=std::max(sy0+1,(y2+1)*H/dh);
+            double acc=0; int cnt=0;
+            for (int sy=sy0; sy<sy1; sy+=std::max(1,(sy1-sy0)/4)) for (int sx=sx0; sx<sx1; sx+=std::max(1,(sx1-sx0)/4)){
+                const u8* p=&md.texRGBA[((size_t)sy*W+sx)*4]; acc += 0.299*p[0]+0.587*p[1]+0.114*p[2]; ++cnt; }
+            lum[(size_t)y2*dw+x2] = cnt? (float)(acc/cnt/255.0) : 0.5f;
+        }
+        for (int pass=0; pass<2; ++pass){ std::vector<float> tmp=lum;
+            for (int y2=0;y2<dh;++y2) for (int x2=0;x2<dw;++x2){ float a=0; int c2=0;
+                for (int oy=-2;oy<=2;++oy) for (int ox=-2;ox<=2;++ox){ int xx=x2+ox, yy=y2+oy;
+                    if (xx<0||yy<0||xx>=dw||yy>=dh) continue; a+=tmp[(size_t)yy*dw+xx]; ++c2; }
+                lum[(size_t)y2*dw+x2]=a/c2; } }
+        double mean=0; for (float v : lum) mean+=v; mean/= (double)lum.size(); if (mean<0.05) mean=0.05;
+        float st = std::clamp(deshadowStr, 0.f, 1.f);
+        for (int y2=0;y2<H;++y2) for (int x2=0;x2<W;++x2){
+            float fu=(x2+0.5f)/W*dw-0.5f, fv=(y2+0.5f)/H*dh-0.5f;
+            int u0=(int)std::floor(fu), v0=(int)std::floor(fv); float tu=fu-u0, tv=fv-v0;
+            auto L=[&](int a,int b2)->float{ a=std::clamp(a,0,dw-1); b2=std::clamp(b2,0,dh-1); return lum[(size_t)b2*dw+a]; };
+            float bl = (L(u0,v0)*(1-tu)+L(u0+1,v0)*tu)*(1-tv) + (L(u0,v0+1)*(1-tu)+L(u0+1,v0+1)*tu)*tv;
+            float f = (float)mean / std::max(bl, 0.04f);
+            f = 1.f + (f-1.f)*st;                        // strength lerp
+            u8* px=&md.texRGBA[((size_t)y2*W+x2)*4];
+            for (int ch=0;ch<3;++ch) px[ch]=(u8)std::clamp(px[ch]*f, 0.f, 255.f);
+        }
+        md.astcRaw.clear();
+        r->replaceMeshTexture((size_t)mi, *sceneMeshes);
+        setStatus("Baked shadows lifted (strength "+std::to_string(st).substr(0,4)+") - previews now, ships in the cook. Repeat to flatten more; Set texture restores.");
+    }
 
     // ── TEXTURE ADJUST: bake brightness / saturation / hue-rotate into md.texRGBA, live re-upload.
     //    (Baked = it SHIPS in the cook; the Tint above is the non-destructive alternative.)
