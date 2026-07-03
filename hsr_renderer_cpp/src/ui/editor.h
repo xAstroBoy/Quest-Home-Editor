@@ -1263,17 +1263,40 @@ struct Editor {
         dl.pushClip((float)rcViewport.offset.x,(float)rcViewport.offset.y,(float)rcViewport.extent.width,(float)rcViewport.extent.height);
         cx.textAligned((float)rcViewport.offset.x, (float)rcViewport.offset.y+26*uiScale, (float)rcViewport.extent.width, 18*uiScale,
                        "SLICE GIZMO - Move/Rotate the plane, the glowing line is the exact cut - ENTER cuts, ESC cancels", ui::rgba(255,120,120), 1);
-        // translucent plane quad sized to the selection
+        // ── THE CUT FENCE: a big, IMPOSSIBLE-TO-MISS square frame with a grid, chunky handles and a
+        //    direction arrow. Every line is drawn in SEGMENTS so it stays visible even when parts sit
+        //    off-screen or the plane is viewed edge-on (the old quad vanished if ANY corner failed
+        //    to project = "invisible line").
         { float mn[3],mx[3]; worldAabb(r->gpuMeshes[(size_t)selected],mn,mx);
           float s = 0.75f*std::sqrt((mx[0]-mn[0])*(mx[0]-mn[0])+(mx[1]-mn[1])*(mx[1]-mn[1])+(mx[2]-mn[2])*(mx[2]-mn[2])) + 0.5f;
-          float t1[3], t2[3]; { float a[3]={0,1,0}, b[3]={0,0,1}; quatRotVec(sliceQuat,a,t1); quatRotVec(sliceQuat,b,t2); }
-          float c4[4][3]; float sc[4][2]; bool ok=true;
-          for (int i2=0;i2<4;++i2){ float s1=(i2==0||i2==3)?-s:s, s2=(i2<2)?-s:s;
-              for (int k=0;k<3;++k) c4[i2][k]=slicePos[k]+t1[k]*s1+t2[k]*s2;
-              if (!worldToScreen(c4[i2], sc[i2][0], sc[i2][1])) ok=false; }
-          if (ok){ dl.triangle(sc[0][0],sc[0][1], sc[1][0],sc[1][1], sc[2][0],sc[2][1], ui::rgba(255,90,90,42));
-                   dl.triangle(sc[0][0],sc[0][1], sc[2][0],sc[2][1], sc[3][0],sc[3][1], ui::rgba(255,90,90,42));
-                   for (int i2=0;i2<4;++i2) dl.line(sc[i2][0],sc[i2][1], sc[(i2+1)%4][0],sc[(i2+1)%4][1], ui::rgba(255,110,110,200), 2.f); } }
+          float t1[3], t2[3], n2[3]; { float a[3]={0,1,0}, b[3]={0,0,1}; quatRotVec(sliceQuat,a,t1); quatRotVec(sliceQuat,b,t2); }
+          sliceNormal(n2);
+          auto W3=[&](float a1, float a2v, float o[3]){ for (int k=0;k<3;++k) o[k]=slicePos[k]+t1[k]*a1+t2[k]*a2v; };
+          auto segLine=[&](const float A3[3], const float B3[3], uint32_t col, float thick){
+              const int SEG=12; float pa[2]; bool paOk=false;
+              for (int i2=0;i2<=SEG;++i2){ float t=(float)i2/SEG;
+                  float wp[3]={A3[0]+(B3[0]-A3[0])*t, A3[1]+(B3[1]-A3[1])*t, A3[2]+(B3[2]-A3[2])*t};
+                  float pb[2]; bool ok=worldToScreen(wp,pb[0],pb[1]);
+                  if (ok && paOk) dl.line(pa[0],pa[1],pb[0],pb[1],col,thick);
+                  pa[0]=pb[0]; pa[1]=pb[1]; paOk=ok; } };
+          const uint32_t FRAME=ui::rgba(255,80,80), GRID=ui::rgba(255,110,110,120);
+          // grid (a FENCE - reads clearly even edge-on)
+          const int GN=6;
+          for (int i2=0;i2<=GN;++i2){ float f=-s+2.f*s*i2/GN;
+              float A3[3],B3[3];
+              W3(f,-s,A3); W3(f,s,B3); segLine(A3,B3, i2==0||i2==GN?FRAME:GRID, i2==0||i2==GN?4.f:1.5f);
+              W3(-s,f,A3); W3(s,f,B3); segLine(A3,B3, i2==0||i2==GN?FRAME:GRID, i2==0||i2==GN?4.f:1.5f); }
+          // chunky corner + edge-midpoint handles
+          for (int i2=0;i2<8;++i2){ static const float HS[8][2]={{-1,-1},{1,-1},{1,1},{-1,1},{0,-1},{1,0},{0,1},{-1,0}};
+              float hp[3]; W3(HS[i2][0]*s, HS[i2][1]*s, hp); float sc2[2];
+              if (worldToScreen(hp, sc2[0], sc2[1])){ float hs2=7*uiScale;
+                  dl.rect(sc2[0]-hs2, sc2[1]-hs2, hs2*2, hs2*2, FRAME);
+                  dl.border(sc2[0]-hs2, sc2[1]-hs2, hs2*2, hs2*2, ui::rgba(30,10,10), 1.5f); } }
+          // DIRECTION ARROW along the normal (which side is which)
+          { float tip[3]={slicePos[0]+n2[0]*s*0.45f, slicePos[1]+n2[1]*s*0.45f, slicePos[2]+n2[2]*s*0.45f};
+            segLine(slicePos, tip, ui::rgba(255,200,80), 4.f);
+            float ts2[2]; if (worldToScreen(tip, ts2[0], ts2[1])){ float hs2=8*uiScale;
+                dl.triangle(ts2[0]-hs2,ts2[1]+hs2, ts2[0]+hs2,ts2[1]+hs2, ts2[0],ts2[1]-hs2, ui::rgba(255,200,80)); } } }
         // LIVE CUT LINE: every selected mesh's triangle edges crossing the plane, highlighted
         int segs=0;
         std::vector<int> targets = sel.empty()? std::vector<int>{selected} : sel;
@@ -1296,7 +1319,7 @@ struct Editor {
                         ip[ipn][2]=M[2]*lp[0]+M[6]*lp[1]+M[10]*lp[2]+M[14]; ++ipn; } }
                 if (ipn==2){ float s0[2],s1[2];
                     if (worldToScreen(ip[0],s0[0],s0[1]) && worldToScreen(ip[1],s1[0],s1[1]))
-                        { dl.line(s0[0],s0[1],s1[0],s1[1], ui::rgba(255,240,90), 3.f); ++segs; } }
+                        { dl.line(s0[0],s0[1],s1[0],s1[1], ui::rgba(255,240,90), 5.f); ++segs; } }
             }
         }
         dl.popClip();
