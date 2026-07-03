@@ -456,10 +456,12 @@ int main(int argc, char** argv) {
     // Interactive sessions create the REAL main window IMMEDIATELY — before any scene parsing —
     // and paint into it with GDI: a drop-zone when launched bare (the drag&drop is integrated, no
     // separate popup), then the live loading progress while the env parses on a worker thread.
-    // Vulkan later takes over presentation of this same window. Headless/scripted modes
-    // (HSR_EXPORT / HSR_SHOT / HSR_LIVE / HSR_BLENDER_EXPORT) keep the old synchronous flow.
+    // Vulkan later takes over presentation of this same window. HSR_LIVE (MCP-driven) is ALSO
+    // interactive: its window is visible, so it gets the same splash + streaming upload (live
+    // commands are simply deferred until the last mesh lands). Only truly headless/scripted modes
+    // (HSR_EXPORT / HSR_SHOT / HSR_BLENDER_EXPORT) keep the old synchronous flow.
     const bool interactive = !std::getenv("HSR_EXPORT") && !std::getenv("HSR_SHOT")
-                          && !std::getenv("HSR_LIVE")   && !std::getenv("HSR_BLENDER_EXPORT");
+                          && !std::getenv("HSR_BLENDER_EXPORT");
     glfwSetErrorCallback(errorCb);
     if (interactive) {
         if (!glfwInit()) { fprintf(stderr, "GLFW init failed\n"); return 1; }
@@ -1653,7 +1655,7 @@ int main(int argc, char** argv) {
         //   dump=i (FULL data-extract for ONE mesh: coordinates/shader/material/matParams/textures/
         //          animation/skeleton/components — the cooker ground-truth reference) | quit
 #ifdef _WIN32
-        if (liveMode) {
+        if (liveMode && uploadNext >= uploadEnd) {   // DEFER live commands until the scene finished streaming in (a shot/listmesh mid-upload would see a partial scene)
             std::vector<LiveCmd*> batch;
             { std::lock_guard<std::mutex> g(g_liveMx); while (!g_liveQ.empty()) { batch.push_back(g_liveQ.front()); g_liveQ.pop_front(); } }
             for (LiveCmd* lc : batch) {

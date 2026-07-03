@@ -172,9 +172,11 @@ struct Editor {
         if (sel.empty() || !r) return;
         bool anyLive=false; for (int m:sel) if (!r->isDeleted((size_t)m)) anyLive=true;
         for (int m:sel) r->setDeleted((size_t)m, anyLive);
-        pushDeleteUndo(sel, anyLive);   // part of the edit HISTORY: Ctrl+Z restores deleted meshes
-        setStatus(anyLive ? ("Deleted "+std::to_string(sel.size())+" mesh(es) - removed from render + cook (Ctrl+Z or Del to restore)")
-                          : ("Restored "+std::to_string(sel.size())+" mesh(es)"));
+        pushDeleteUndo(sel, anyLive);   // the edit HISTORY: Ctrl+Z is the ONLY way back
+        size_t n = sel.size();
+        if (anyLive) deselectAll();     // deleted = GONE (no list row, no pick, no gizmo)
+        setStatus(anyLive ? ("Deleted "+std::to_string(n)+" mesh(es) - gone from render + list + cook (only Ctrl+Z restores)")
+                          : ("Restored "+std::to_string(n)+" mesh(es)"));
     }
     // ── mesh DUPLICATE (Ctrl+D) — clone the selected mesh(es) into a fresh GPU mesh (its own buffers) offset in place,
     //    so the copy can be moved/edited/cooked independently WITHOUT re-authoring geometry. Appends to sceneMeshes +
@@ -193,7 +195,7 @@ struct Editor {
             VkGpuMesh& ng = r->gpuMeshes[ni];
             const VkGpuMesh& og = r->gpuMeshes[(size_t)s];    // (both refs taken AFTER the push -> valid)
             memcpy(ng.editT, og.editT, sizeof ng.editT); memcpy(ng.editR, og.editR, sizeof ng.editR); memcpy(ng.editS, og.editS, sizeof ng.editS);
-            ng.editT[0] += 0.5f; ng.editT[2] += 0.5f;         // offset so the copy is visible next to the original
+            // NO offset: the copy lands EXACTLY on the original (move it yourself) — the shift annoyed more than it helped
             recomputeModel(ng);
             made.push_back((int)ni);
         }
@@ -201,6 +203,7 @@ struct Editor {
         r->deletedMeshes.resize(r->gpuMeshes.size(), false);
         if (!made.empty()) pushDeleteUndo(made, false);       // duplicates are part of the HISTORY: Ctrl+Z removes them
         sel=made; selected=made.empty()?-1:made.back(); r->selectedMesh=selected; selItem=-1;
+        scrollToSel = true;                                   // outliner jumps to the new clones (they append at the END)
         setStatus("Duplicated "+std::to_string(made.size())+" mesh(es) - move/edit/cook independently (Ctrl+Z removes)");
     }
 
@@ -321,6 +324,24 @@ struct Editor {
             setStatus(std::string("Mirrored across ")+an[axis]+" (faces the other side now) - Ctrl+Z reverts");
     }
 
+    // ── mesh ROTATE 180: spin the geometry half a turn about its own vertical (Y) center axis — a TRUE
+    //    rotation (not a mirror: no reflection, winding/orientation preserved, text stays readable).
+    void rotateMesh180(int mi){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
+        MeshData md = (*sceneMeshes)[(size_t)mi];
+        size_t nv = md.positions.size()/3;
+        if (nv<3) return;
+        float lx=1e30f,hx=-1e30f,lz=1e30f,hz=-1e30f;
+        for (size_t v2=0;v2<nv;++v2){ float px=md.positions[v2*3], pz=md.positions[v2*3+2];
+            lx=std::min(lx,px); hx=std::max(hx,px); lz=std::min(lz,pz); hz=std::max(hz,pz); }
+        float cx0=(lx+hx)*0.5f, cz0=(lz+hz)*0.5f;
+        for (size_t v2=0;v2<nv;++v2){ md.positions[v2*3]   = 2.f*cx0 - md.positions[v2*3];
+                                      md.positions[v2*3+2] = 2.f*cz0 - md.positions[v2*3+2]; }   // 180 deg about Y = negate X and Z about the center
+        md.name += " rot180";
+        if (commitGeomEdit(mi, std::move(md), "rot180"))
+            setStatus("Rotated 180 deg about its vertical center - Ctrl+Z reverts");
+    }
+
     // shared tail of the geometry tools: append the edited clone, carry the transform/tint, soft-delete
     // the original into the undo history, select the new mesh.
     bool commitGeomEdit(int mi, MeshData&& md, const char* what){
@@ -335,6 +356,7 @@ struct Editor {
         r->setDeleted((size_t)mi, true);
         pushDeleteUndo({mi,(int)ni}, std::vector<uint8_t>{1,0});   // ONE history entry: Ctrl+Z restores the original AND removes the result
         selectOne((int)ni);
+        scrollToSel = true;   // the result appends at the END of the outliner — jump to it
         return true;
     }
 
@@ -1522,6 +1544,7 @@ struct Editor {
             {std::string("Cut hole HERE (r=")+std::to_string((int)(cutRadius*100)/100.f).substr(0,4)+"m)",22},   // carve the clicked spot open (doorways)
             {"Split into connected pieces",23},                                               // separate disjoint parts into own meshes
             {"Mirror X",24},{"Mirror Y",25},{"Mirror Z",26},                                  // flip to face the other side (winding fixed)
+            {"Rotate 180 (about Y center)",28},                                               // true half-turn, no reflection
             {std::string(noColMeshes.count(ctxMesh)?"Collision: INCLUDE again":"Collision: EXCLUDE (walk-through)")+suf,27},
             {std::string("Reset transform")+suf,3}, {"Copy name",4},
             {colLbl,5},
@@ -1551,7 +1574,7 @@ struct Editor {
             if (hv && cx.in.pressed[0]) {
                 int a=it.second;
                 if (a==0) focusMesh(gm);
-                else if (a==1) r->soloMesh = soloed?-1:ctxMesh;
+                else if (a==1) { r->soloMesh = soloed?-1:ctxMesh; if (!soloed) focusMesh(gm); }   // solo AUTO-FOCUSES (a solo you can't see is useless)
                 else if (a==2) { for (int t:tg) r->setHidden(t, !hidden); }                       // hide/unhide ALL selected
                 else if (a==3) { std::vector<int> mm; std::vector<Xform> bb,aa;                    // reset ALL selected (single undo)
                     for (int t:tg){ auto& g=r->gpuMeshes[t]; mm.push_back(t); bb.push_back(captureX(g));
@@ -1579,6 +1602,7 @@ struct Editor {
                 else if (a==24) mirrorMesh(ctxMesh, 0);
                 else if (a==25) mirrorMesh(ctxMesh, 1);
                 else if (a==26) mirrorMesh(ctxMesh, 2);
+                else if (a==28) rotateMesh180(ctxMesh);
                 else if (a==27) { bool exc = !noColMeshes.count(ctxMesh);      // collision walk-through toggle (whole selection)
                                   for (int t2:tg) { if (exc) noColMeshes.insert(t2); else noColMeshes.erase(t2); }
                                   bakeNavmeshes(this->items);                  // preview + cook collision re-bake immediately ("items" here = the MENU rows)
@@ -1726,7 +1750,7 @@ struct Editor {
             auto matchesFilter=[&](int i){ if(!search[0]) return true; std::string ln=r->gpuMeshes[i].name,ls=search; for(char&c:ln)c=(char)tolower((unsigned char)c); for(char&c:ls)c=(char)tolower((unsigned char)c); return ln.find(ls)!=std::string::npos; };
             if (ctrl && kA && !prevKeyA) {
                 sel.clear();
-                for (int i=0;i<(int)r->gpuMeshes.size();++i) if (matchesFilter(i) && !r->isHidden(i)) sel.push_back(i);   // VISIBLE only (hidden meshes excluded)
+                for (int i=0;i<(int)r->gpuMeshes.size();++i) if (matchesFilter(i) && !r->isHidden(i) && !r->isDeleted(i)) sel.push_back(i);   // VISIBLE only (hidden + deleted excluded)
                 selected = sel.empty()?-1:sel.back(); r->selectedMesh=selected; selItem=-1;
             }
             if (ctrl && kC && !prevKeyC && !sel.empty()) {
@@ -1750,11 +1774,20 @@ struct Editor {
         auto itemMatches=[&](int i){ if(!search[0]) return true;
             std::string ln=items[i].name; ln+=' '; ln+=sitem::typeName(items[i].type);
             for(char&c:ln)c=(char)tolower((unsigned char)c); return ln.find(lsq)!=std::string::npos; };
-        int nMeshShown = nMesh;
-        if (search[0]) { nMeshShown=0; for (int i=0;i<nMesh;i++) if (meshMatches(i)) nMeshShown++; }
+        // DELETED meshes are GONE from the list entirely (no [DEL] rows) — only Ctrl+Z resurrects them.
+        auto meshRowVisible=[&](int i){ return !r->isDeleted(i) && meshMatches(i); };
+        int nMeshShown = 0; for (int i=0;i<nMesh;i++) if (meshRowVisible(i)) nMeshShown++;
         int nItemsShown = nItems;
         if (search[0]) { nItemsShown=0; for (int i=0;i<nItems;i++) if (itemMatches(i)) nItemsShown++; }
         float total = (nItems?(1+(itemsCollapsed?0:nItemsShown))*rowH:0) + (1+(meshesCollapsed?0:nMeshShown))*rowH;
+        // SCROLL-TO-SELECTION (duplicates/geometry results land at the END of the list — jump there so
+        // the new row is visible instead of "where did my duped mesh go?!")
+        if (scrollToSel && selected>=0 && selected<nMesh && !meshesCollapsed) {
+            float ty = (nItems?(1+(itemsCollapsed?0:nItemsShown))*rowH:0) + rowH;   // rows before the mesh section
+            for (int i2=0;i2<selected;++i2) if (meshRowVisible(i2)) ty+=rowH;
+            outlinerScroll = std::clamp(ty - listH*0.5f, 0.f, std::max(0.f, total-listH));
+            scrollToSel = false;
+        }
         outlinerScroll = std::clamp(outlinerScroll, 0.f, std::max(0.f, total-listH));
         float ry = listY - outlinerScroll;
         auto onScreen=[&](float yy){ return yy+rowH>listY && yy<listY+listH; };
@@ -1803,13 +1836,12 @@ struct Editor {
         sectionHeader("MESHES", nMeshShown, meshesCollapsed);
         if (!meshesCollapsed) for (int i=0;i<nMesh;i++) {
             // FILTER FIRST: a non-matching row takes NO space (so matches pack from the top and the scroll extent above
-            // matches the visible list). Checking on-screen first (old code) advanced ry for filtered-out off-screen rows,
-            // desyncing the packed layout. Case-insensitive (CamelCase names vs lowercase query, e.g. "tree"->"gazeboTrees").
-            if (!meshMatches(i)) continue;
+            // matches the visible list). DELETED meshes take no row at all - they're gone (Ctrl+Z restores).
+            if (!meshRowVisible(i)) continue;
             if (!onScreen(ry)) { ry+=rowH; continue; }
             auto& gm = r->gpuMeshes[i];
             bool vis = !r->isHidden(i);
-            auto rr = cx.treeRow(ui::hashId(3000+i,11), x, ry, w, rowH, (gm.name+"  ["+std::to_string(i)+"]"+(isSkyboxMesh(i)?"  *SKY*":"")+(r->isDeleted(i)?"  [DEL]":"")).c_str(), 0, false, false, inSel(i), vis);
+            auto rr = cx.treeRow(ui::hashId(3000+i,11), x, ry, w, rowH, (gm.name+"  ["+std::to_string(i)+"]"+(isSkyboxMesh(i)?"  *SKY*":"")).c_str(), 0, false, false, inSel(i), vis);
             if (addMenuOpen || ctxOpen) rr = ui::Context::RowResult{};   // an open menu overlays the list -> ignore row clicks under it
             if (rr.clicked) { selItem=-1; if (cx.in.shift||cx.in.ctrl) toggleSel(i); else selectOne(i); }   // Ctrl/Shift = add to multi-selection
             if (rr.toggledVis) r->setHidden(i, vis);
@@ -2119,8 +2151,10 @@ struct Editor {
           y+=th.rowH+3*uiScale; }
         { float bw2=(w-6*uiScale)/2;
           if (cx.button(ui::hashId("splitp"), x, y, bw2, th.rowH, "Split pieces")) splitMeshParts(selected);
+          if (cx.button(ui::hashId("rot180"), x+bw2+6*uiScale, y, bw2, th.rowH, "Rotate 180")) rotateMesh180(selected);
+          y+=th.rowH+3*uiScale;
           bool exc = noColMeshes.count(selected)!=0;
-          if (cx.button(ui::hashId("nocol"), x+bw2+6*uiScale, y, bw2, th.rowH, exc?"Collision: OFF":"Collision: ON", exc)) {
+          if (cx.button(ui::hashId("nocol"), x, y, w, th.rowH, exc?"Collision: OFF (walk-through)":"Collision: ON", exc)) {
               if (exc) noColMeshes.erase(selected); else noColMeshes.insert(selected);
               bakeNavmeshes(items);
           }
@@ -2236,7 +2270,10 @@ struct Editor {
           if (cx.button(ui::hashId("shdec"), x, y+4*uiScale, bw2, rh+2*uiScale, "Decompile -> GLSL", true)) decompileShaderFor(selected);
           if (cx.button(ui::hashId("shcmp"), x+bw2+6*uiScale, y+4*uiScale, bw2, rh+2*uiScale, "Compile + APPLY", true)) compileApplyShaderFor(selected);
           y+=rh+10*uiScale;
-          if (cx.button(ui::hashId("solox"), x, y, bw2, rh, r->soloMesh==selected?"Unsolo":"Solo only")) r->soloMesh = (r->soloMesh==selected)?-1:selected;
+          if (cx.button(ui::hashId("solox"), x, y, bw2, rh, r->soloMesh==selected?"Unsolo":"Solo only")) {
+              bool was = (r->soloMesh==selected); r->soloMesh = was?-1:selected;
+              if (!was && selected>=0 && selected<(int)r->gpuMeshes.size()) focusMesh(r->gpuMeshes[selected]);   // solo auto-focuses
+          }
           y+=rh+4*uiScale;
           cx.label(x,y,w,rh*0.9f,"Decompile writes saved/shaders/<name>.{vert,frag}.glsl and",th.textDim); y+=rh*0.85f;
           cx.label(x,y,w,rh*0.9f,"opens them; edit, then Compile+APPLY hot-reloads them LIVE.",th.textDim); }
