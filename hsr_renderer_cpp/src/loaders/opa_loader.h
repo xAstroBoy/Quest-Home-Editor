@@ -34,6 +34,7 @@
 //   mesh entry[i] uses node[i]'s world transform.
 
 #include "core/types.h"
+#include "core/load_progress.h"       // live stage/counter for the loading splash
 #include "miniz.h"
 #include "loaders/rendtxtr_parser.h"   // astc::decodeASTC (KTX/ASTC -> RGBA)
 #include "render/ibl.h"               // SpecIbl diffuse irradiance cubemap (RGBA16F KTX)
@@ -486,7 +487,7 @@ public:
     //    transform); restPos = node-LOCAL basePos; bind = IDENTITY (invBind=identity → skinMatrix(f)=nodeWorldAnim(f)
     //    → vertex(f)=nodeWorldAnim(f)*basePos = the renderer's node anim). Returns !ok() if the node doesn't TRANSLATE
     //    (origin static) so pure spins keep the lighter getTime() Rodrigues path. project_hsl_opa_anim_port_plan.
-    OpaHzAnim extractNodeRigidHzAnim(int meshIdx) {
+    OpaHzAnim extractNodeRigidHzAnim(int meshIdx, bool allowPureRotation = false) {
         OpaHzAnim e;
         if (animMaxFrames < 2) return e;
         const AnimRec* ar=nullptr; for (auto& a : animRecs) if ((int)a.meshIdx==meshIdx){ ar=&a; break; }
@@ -523,7 +524,7 @@ public:
             else if(r0>r4&&r0>r8){float S=std::sqrt(1+r0-r4-r8)*2;q[3]=(r5-r7)/S;q[0]=0.25f*S;q[1]=(r3+r1)/S;q[2]=(r6+r2)/S;}
             else if(r4>r8){float S=std::sqrt(1+r4-r0-r8)*2;q[3]=(r6-r2)/S;q[0]=(r3+r1)/S;q[1]=0.25f*S;q[2]=(r7+r5)/S;}
             else{float S=std::sqrt(1+r8-r0-r4)*2;q[3]=(r1-r3)/S;q[0]=(r6+r2)/S;q[1]=(r7+r5)/S;q[2]=0.25f*S;} };
-        std::vector<Mat4> mats((size_t)NF); float o0[3]={0,0,0}, maxd=0.f; Mat4 W0 = identity();
+        std::vector<Mat4> mats((size_t)NF); float o0[3]={0,0,0}, maxd=0.f, rotMaxd=0.f; float rs0[9]={0}; Mat4 W0 = identity();
         // EXCLUSIVE endpoint: sample [0, clipDur) so the frames march MONOTONICALLY through one period (0 -> just
         // before the wrap) with NO interior wrap. Inclusive [0,clipDur] put the last frame back ON the wrap target
         // (= frame 0), hiding the wrap at frame[NF-2]->frame[NF-1] INSIDE the clip => the device interpolated that
@@ -532,10 +533,16 @@ public:
         for (int f=0; f<NF; f++) { evalAnimNodes(clipDur * (float)f / (float)NF);
             Mat4 w = (node < nodeWorldAnim.size()) ? nodeWorldAnim[node] : identity();
             mats[f]=w; float tx=w.m[12],ty=w.m[13],tz=w.m[14];
-            if (f==0){ o0[0]=tx;o0[1]=ty;o0[2]=tz; W0=w; }
-            else { float dx=tx-o0[0],dy=ty-o0[1],dz=tz-o0[2]; float d=std::sqrt(dx*dx+dy*dy+dz*dz); if(d>maxd)maxd=d; } }
+            float rs[9]={w.m[0],w.m[1],w.m[2], w.m[4],w.m[5],w.m[6], w.m[8],w.m[9],w.m[10]};   // upper 3x3 (rotation*scale)
+            if (f==0){ o0[0]=tx;o0[1]=ty;o0[2]=tz; W0=w; for(int k=0;k<9;k++) rs0[k]=rs[k]; }
+            else { float dx=tx-o0[0],dy=ty-o0[1],dz=tz-o0[2]; float d=std::sqrt(dx*dx+dy*dy+dz*dz); if(d>maxd)maxd=d;
+                   float rd=0.f; for(int k=0;k<9;k++){ float e2=rs[k]-rs0[k]; rd+=e2*e2; } rd=std::sqrt(rd); if(rd>rotMaxd)rotMaxd=rd; } }
         animate(0.f);   // restore rest pose (geometry bake reads the renderer's GPU model, this just resets the loader)
-        if (maxd < 0.01f) return e;   // node doesn't TRANSLATE → leave pure spins to the getTime() Rodrigues path
+        // Bail if the node NEITHER translates NOR (when allowed) rotates/scales. Pure single-axis SPINS normally go to the
+        // lighter getTime Rodrigues path — BUT a TUMBLE (aurora_noise: w=0 flip-quaternions about a sweeping axis) can't
+        // be represented by a single-axis getTime spin, so a UV card with such rotation asks (allowPureRotation) to
+        // capture the EXACT per-frame node matrix here = faithful "warped mesh rotates about itself + bends texture".
+        if (maxd < 0.01f && !(allowPureRotation && rotMaxd > 0.02f)) return e;
         if (std::getenv("HSR_VERBOSE")) {
             std::string chain; int nodeEff=0;
             for (int g=0,n=(int)node; n>=0 && n<(int)animNodes.size() && g<32; n=animNodes[n].parent,++g) {
@@ -616,6 +623,67 @@ public:
         e.boneIdx.assign(nv*4,0); e.boneWgt.assign(nv*4,0); for (size_t v=0;v<nv;v++){ e.boneIdx[v*4]=(uint8_t)mj; e.boneWgt[v*4]=255; }  // weight every vert to the MOVING joint
         e.trsLocal = std::move(trsv);
         return e;
+    }
+
+    // ── COOK: per-frame ROTATION ANGLE replay (the aurora's NON-UNIFORM spin) for the shadergen ROTREPLAY vertex shader.
+    //    Samples the node's WORLD rotation over its own loop, derives a fixed axis + the signed angle-about-axis relative
+    //    to frame 0 (UNWRAPPED = continuous), + the pivot (node world origin). A getTime VERTEX shader then replays this:
+    //    faithful non-uniform rotation, perfectly SMOOTH, and NOT throttled by the skeletal animator's LOD on the big
+    //    background sky dome (the device-judder fix). Returns false if the node doesn't actually rotate. ──
+    bool cookExtractRotationReplay(int meshIdx, int N, float pivotOut[3], std::vector<float>& quats, float& loopSec) {
+        quats.clear();
+        const AnimRec* ar=nullptr; for (auto& a:animRecs) if((int)a.meshIdx==meshIdx){ar=&a;break;}
+        if (!ar) return false;
+        uint32_t node = ar->nodeIdx; if (node >= animNodes.size()) return false;
+        int nodeEff=0;
+        for (int g=0,n=(int)node; n>=0 && n<(int)animNodes.size() && g<32; n=animNodes[n].parent,++g){
+            auto it=nodeAnim.find(animNodes[n].name);
+            if(it!=nodeAnim.end()){const NodeTracks&q=it->second; nodeEff=std::max(nodeEff,std::max(q.t.effFrames,std::max(q.r.effFrames,q.s.effFrames)));}
+        }
+        if (nodeEff<2) nodeEff=animMaxFrames;
+        loopSec = (animFps>0.f)?(float)nodeEff/animFps:animDuration(); if (loopSec<=1e-4f) return false;
+        if (N<2) N=2;
+        auto matQuat=[](const float* m, float* q){
+            float sx=std::sqrt(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]), sy=std::sqrt(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]), sz=std::sqrt(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]);
+            float ix=sx>1e-8f?1/sx:0, iy=sy>1e-8f?1/sy:0, iz=sz>1e-8f?1/sz:0;
+            float r0=m[0]*ix,r1=m[1]*ix,r2=m[2]*ix, r3=m[4]*iy,r4=m[5]*iy,r5=m[6]*iy, r6=m[8]*iz,r7=m[9]*iz,r8=m[10]*iz;
+            float tr=r0+r4+r8;
+            if(tr>0){float S=std::sqrt(tr+1)*2;q[3]=0.25f*S;q[0]=(r5-r7)/S;q[1]=(r6-r2)/S;q[2]=(r1-r3)/S;}
+            else if(r0>r4&&r0>r8){float S=std::sqrt(1+r0-r4-r8)*2;q[3]=(r5-r7)/S;q[0]=0.25f*S;q[1]=(r3+r1)/S;q[2]=(r6+r2)/S;}
+            else if(r4>r8){float S=std::sqrt(1+r4-r0-r8)*2;q[3]=(r6-r2)/S;q[0]=(r3+r1)/S;q[1]=0.25f*S;q[2]=(r7+r5)/S;}
+            else{float S=std::sqrt(1+r8-r0-r4)*2;q[3]=(r1-r3)/S;q[0]=(r6+r2)/S;q[1]=(r7+r5)/S;q[2]=0.25f*S;} };
+        evalAnimNodes(0.f);
+        Mat4 W0 = (node<nodeWorldAnim.size())?nodeWorldAnim[node]:identity();
+        pivotOut[0]=W0.m[12]; pivotOut[1]=W0.m[13]; pivotOut[2]=W0.m[14];
+        float q0[4]; matQuat(W0.m,q0); float c0[4]={-q0[0],-q0[1],-q0[2],q0[3]};   // conj(q0)
+        quats.resize((size_t)(N+1)*4); float bestMag=0.f;
+        for (int f=0; f<=N; f++){
+            evalAnimNodes(loopSec*(float)f/(float)N);
+            Mat4 W=(node<nodeWorldAnim.size())?nodeWorldAnim[node]:identity();
+            float q[4]; matQuat(W.m,q); float r[4];   // rel = q * conj(q0) (xyzw) = EXACT per-frame relative rotation
+            r[0]= q[3]*c0[0] + q[0]*c0[3] + q[1]*c0[2] - q[2]*c0[1];
+            r[1]= q[3]*c0[1] - q[0]*c0[2] + q[1]*c0[3] + q[2]*c0[0];
+            r[2]= q[3]*c0[2] + q[0]*c0[1] - q[1]*c0[0] + q[2]*c0[3];
+            r[3]= q[3]*c0[3] - q[0]*c0[0] - q[1]*c0[1] - q[2]*c0[2];
+            if (!std::getenv("HSR_NOROTFLIP")) { r[0]=-r[0]; r[1]=-r[1]; r[2]=-r[2]; }   // FLIP rotation handedness to match OPA's animate() vertex sweep (DATA: OPA=+174°CCW/40s, natural rel=q*conj(q0)=CW opposite). With the flip the node spin matches OPA's CCW, so the data UV scroll (+u) CANCELS it → texture world-still. HSR_NOROTFLIP disables.
+            // sign-continuity: keep each quat in the same hemisphere as the previous so the shader nlerp takes the short arc
+            if (f>0){ float* p=&quats[(size_t)(f-1)*4]; if (r[0]*p[0]+r[1]*p[1]+r[2]*p[2]+r[3]*p[3] < 0){ r[0]=-r[0];r[1]=-r[1];r[2]=-r[2];r[3]=-r[3]; } }
+            float* o=&quats[(size_t)f*4]; o[0]=r[0];o[1]=r[1];o[2]=r[2];o[3]=r[3];
+            float mag=std::sqrt(r[0]*r[0]+r[1]*r[1]+r[2]*r[2]); if (mag>bestMag) bestMag=mag;
+        }
+        evalAnimNodes(0.f);   // restore rest
+        if (bestMag < 0.02f) { quats.clear(); return false; }   // node doesn't actually rotate
+        if (std::getenv("HSR_ROTDUMP")) {   // diagnose tumble-vs-spin: print axis+angle of the sampled relative rotation
+            fprintf(stderr,"[ROTDUMP] mesh %d node '%s' loop=%.1fs pivot=(%.1f,%.1f,%.1f) N=%d\n",
+                meshIdx, (node<animNodes.size()?animNodes[node].name.c_str():"?"), loopSec, pivotOut[0],pivotOut[1],pivotOut[2], N);
+            for (int f=0; f<=N; f+=std::max(1,N/12)){
+                float* q=&quats[(size_t)f*4]; float w=q[3]; if(w>1)w=1; if(w<-1)w=-1;
+                float ang=2.f*std::acos(w)*57.2958f; float s=std::sqrt(1-w*w); float ax=0,ay=0,az=0;
+                if(s>1e-5f){ax=q[0]/s;ay=q[1]/s;az=q[2]/s;}
+                fprintf(stderr,"  f%3d  ang=%6.1f deg  axis=(%+.2f,%+.2f,%+.2f)\n", f, ang, ax,ay,az);
+            }
+        }
+        return true;
     }
 
     // ── COOK: node TRANSLATION (cars/train) → the NET world displacement over the clip, for a ShellPoseAnimationComponent
@@ -975,6 +1043,13 @@ public:
             int src = (nf==N) ? i : (int)((double)i * nf / (double)N); if (src>=nf) src=nf-1;
             for (int k=0;k<6;k++){ float v = tr.m[(size_t)src*6+k]; mats[(size_t)i*6+k]=v;
                 if (i>0 && std::fabs(v - mats[(size_t)k]) > 1e-5f) anim=true; }
+        }
+        if (std::getenv("HSR_ROTDUMP")) {   // inspect the UVTransform: rotation vs scroll vs scale/warp
+            fprintf(stderr,"[UVDUMP] mesh %d node '%s' frames=%d N=%d loop=%.1fs  (rows: m0 m1 m2 / m3 m4 m5 ; u'=m0u+m1v+m2)\n", meshIdx, ar->node.c_str(), nf, N, loopSec);
+            for (int i=0;i<N;i+=std::max(1,N/10)){ float*m=&mats[(size_t)i*6];
+                float rot=std::atan2(m[3],m[0])*57.2958f; float sc=std::sqrt(m[0]*m[0]+m[3]*m[3]);
+                fprintf(stderr,"  f%3d  [%+.3f %+.3f %+.3f / %+.3f %+.3f %+.3f]  ~rot=%.1fdeg scale=%.3f off=(%+.3f,%+.3f)\n",
+                    i,m[0],m[1],m[2],m[3],m[4],m[5], rot, sc, m[2],m[5]); }
         }
         return anim;   // the matrix actually changes across frames
     }
@@ -1503,12 +1578,16 @@ public:
             mz_zip_reader_end(&z);
             if (!d) return false; out.assign((uint8_t*)d,(uint8_t*)d+sz); mz_free(d); return true;
         };
+        g_loadProgress.set("Reading materials...");
         parseAssetMeta(sceneZip);   // .mat.txt (blend modes) + .png.asset (AssetId -> tex) FIRST
+        g_loadProgress.set("Decoding textures...");
         loadTextures(sceneZip);
         loadIBL(sceneZip);          // SpecIbl diffuse irradiance cubemap (*_diffuse.dds.opa = RGBA16F KTX)
         loadVatData(sceneZip);      // VAT vertex-animation textures (underwater coral/fish/seaweed)
+        g_loadProgress.set("Loading animations...");
         loadAnim(sceneZip);
         loadMatAnim(sceneZip);      // mat.sanim UV/flipbook effect animation (smoke/fire/dust/fog)
+        g_loadProgress.set("Building meshes...");
         // Geo base from a *.fbx.opa name (strip path, leading "sm_", trailing ".fbx.opa") -> VAT key.
         auto opaBase = [](const std::string& nm){ size_t s=nm.find_last_of('/'); std::string b=(s==std::string::npos)?nm:nm.substr(s+1);
             std::string l; for(char c:b) l+=(char)tolower((unsigned char)c);
@@ -1796,7 +1875,9 @@ private:
         mz_zip_archive z; memset(&z, 0, sizeof(z));
         if (!mz_zip_reader_init_mem(&z, sceneZip.data(), sceneZip.size(), 0)) return;
         uint32_t nf = mz_zip_reader_get_num_files(&z);
+        g_loadProgress.set("Decoding textures...", 0, (int)nf);
         for (uint32_t i = 0; i < nf; ++i) {
+            g_loadProgress.tick((int)i);
             mz_zip_archive_file_stat st;
             if (!mz_zip_reader_file_stat(&z, i, &st)) continue;
             std::string fn(st.m_filename);

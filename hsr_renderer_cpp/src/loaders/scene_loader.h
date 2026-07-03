@@ -1,5 +1,6 @@
 #pragma once
 #include "core/types.h"
+#include "core/load_progress.h"   // live stage/counter for the loading splash
 #include "loaders/asmh_parser.h"
 #include "loaders/rendmesh_parser.h"
 #include "loaders/rendtxtr_parser.h"
@@ -1039,7 +1040,9 @@ public:
             log("  Lightmap GUID chain: %zu mesh-names, %zu override lightmaps", lmGuidName.size(), lmGuidRaw.size());
         }
 
+        g_loadProgress.set("Loading meshes + textures...", 0, (int)entities.size());
         for (size_t ei = 0; ei < entities.size(); ++ei) {
+            g_loadProgress.tick((int)ei);
             auto& obj = entities[ei];
             log("========================================");
             log("Entity[%zu] '%s'", ei, obj.name.c_str());

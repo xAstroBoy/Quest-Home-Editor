@@ -30,7 +30,12 @@ namespace shadergen {
 //   SCALE    : pos' = pivot + (inPos - pivot)*replay(N sampled per-axis SCALE FACTORS, looped) — FAITHFULLY ports ANY node
 //              SCALE "breathe" track (e.g. Erebor's 12 wisps, NON-UNIFORM per-axis amplitudes) by piecewise-linear
 //              interpolation of the sampled per-axis factor frames (frame0 = (1,1,1)); not a (1-cos) shape guess.
-enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3, TRANSLATE = 4, SCALE = 5, CUTOUT = 6 };
+enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3, TRANSLATE = 4, SCALE = 5, CUTOUT = 6, ROTREPLAY = 7 };
+// ROTREPLAY: per-frame ANGLE replay about a fixed axis+pivot (the aurora's NON-UNIFORM rotation — its w=0 flip-axis
+// sweeps unevenly, so a constant-omega ROTATE is wrong). p0=loopSec, ax/ay/az=unit axis, tframes=[px,py,pz, a0..aN]
+// (pivot then N+1 CONTINUOUS unwrapped angles, radians), tN=N segments. Vertex getTime shader interpolates the angle
+// over the loop then Rodrigues-rotates (inPos-pivot) about axis by it. Runs every frame in the vertex stage = SMOOTH
+// and NEVER animation-LOD-throttled or ACL-quantized like the skeletal clip (the aurora device-judder fix).
 
 struct Inst { int op; std::vector<uint32_t> w; };   // w[0] = header word (recomputed on emit), w[1..] = operands
 struct VStage { int64_t slot, spvOff; uint32_t spvLen; };   // one vertex stage: FlatBuffer uoffset slot, SPIR-V magic, len
@@ -374,6 +379,52 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
             {142,{0,tV3,term1,loadRes,cs}}, {142,{0,tV3,term2,crossv,sn}}, {133,{0,tFloat,kk,dotav,omc}},
             {142,{0,tV3,term3,axisVec,kk}}, {129,{0,tV3,tmp,term1,term2}}, {129,{0,tV3,rot,tmp,term3}},
         };
+    } else if (mode==ROTREPLAY){
+        // EXACT per-frame QUATERNION replay about pivot(tframes[0..2]); tframes[3 .. 3+(N+1)*4] = N+1 relative quats (xyzw,
+        // sign-continuous). q(t) = nlerp over t01=fract(time/loopSec) of the N+1 quats (piecewise-linear select of the
+        // active segment, same accumulate as the angle path but on vec4), then normalize. Rotate rel=inPos-pivot by q:
+        // v' = rel + 2*w*cross(u,rel) + 2*cross(u,cross(u,rel)), u=q.xyz w=q.w. pos'=pivot+v'. This reproduces the render's
+        // EXACT non-uniform node rotation (any axis wobble) — a single-axis angle flattened it into a uniform texture-spin.
+        const uint32_t GLSL_FRACT=10, GLSL_STEP=48, GLSL_FCLAMP=43, GLSL_CROSS=68, GLSL_NORMALIZE=69;
+        int N = tN<2?2:tN; float loopSec = (p0>1e-4f)?p0:1.f;
+        if ((int)tframes.size() < 3 + (N+1)*4) return {};
+        float px=tframes[0], py=tframes[1], pz=tframes[2]; const float* Q=tframes.data()+3;
+        uint32_t tV4=0; for (auto& tt:insts){ auto&w=tt.w; if (tt.op==23 && w.size()>=4 && w[2]==tFloat && w[3]==4){ tV4=w[1]; break; } }
+        if (!tV4){ tV4=nid(); newTypes.push_back({23,{0,tV4,tFloat,4}}); }
+        uint32_t c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
+        uint32_t c_invloop=fconst(1.0f/loopSec), c_N=fconst((float)N), c0=fconst(0.f), c1=fconst(1.f), c2=fconst(2.0f);
+        uint32_t cpx=fconst(px),cpy=fconst(py),cpz=fconst(pz); uint32_t pivot=nid(); newConsts.push_back({0x2c,{0,tV3,pivot,cpx,cpy,cpz}});
+        std::vector<uint32_t> cq(N+1);
+        for(int i=0;i<=N;i++){ uint32_t a=fconst(Q[i*4]),b=fconst(Q[i*4+1]),c=fconst(Q[i*4+2]),d=fconst(Q[i*4+3]); uint32_t v=nid(); newConsts.push_back({0x2c,{0,tV4,v,a,b,c,d}}); cq[i]=v; }
+        uint32_t pt=nid(),t=nid(),tn=nid(),t01=nid();
+        body.push_back({65,{0,pUf,pt,gu,c_time}});
+        body.push_back({61,{0,tFloat,t,pt}});
+        body.push_back({133,{0,tFloat,tn,t,c_invloop}});                 // time / loopSec
+        body.push_back({12,{0,tFloat,t01,glsl,GLSL_FRACT,tn}});          // fract -> [0,1)
+        uint32_t acc=cq[0]; float invN=1.0f/(float)N;
+        for(int i=0;i<N;i++){ int j=i+1; uint32_t c_lo=fconst((float)i*invN);
+            uint32_t w =nid(); body.push_back({12,{0,tFloat,w,glsl,GLSL_STEP,c_lo,t01}});   // step(lo,t01)
+            uint32_t sb=nid(); body.push_back({131,{0,tFloat,sb,t01,c_lo}});                // t01-lo
+            uint32_t ml=nid(); body.push_back({133,{0,tFloat,ml,sb,c_N}});                  // *N
+            uint32_t fr=nid(); body.push_back({12,{0,tFloat,fr,glsl,GLSL_FCLAMP,ml,c0,c1}});// clamp 0..1 = local frac
+            uint32_t df=nid(); body.push_back({131,{0,tV4,df,cq[j],cq[i]}});                // q[j]-q[i]
+            uint32_t sc=nid(); body.push_back({142,{0,tV4,sc,df,fr}});                      // *fr
+            uint32_t sg=nid(); body.push_back({129,{0,tV4,sg,cq[i],sc}});                   // seg=q[i]+..
+            uint32_t rd=nid(); body.push_back({131,{0,tV4,rd,sg,acc}});                     // seg-acc
+            uint32_t rs=nid(); body.push_back({142,{0,tV4,rs,rd,w}});                       // *w
+            uint32_t na=nid(); body.push_back({129,{0,tV4,na,acc,rs}}); acc=na;             // acc=mix(acc,seg,w)
+        }
+        uint32_t qn=nid();  body.push_back({12,{0,tV4,qn,glsl,GLSL_NORMALIZE,acc}});        // normalize(nlerp) quaternion
+        uint32_t u=nid();   body.push_back({79,{0,tV3,u,qn,qn,0,1,2}});                     // u = q.xyz
+        uint32_t qw=nid();  body.push_back({81,{0,tFloat,qw,qn,3}});                        // w = q.w
+        uint32_t rel=nid(); body.push_back({131,{0,tV3,rel,loadRes,pivot}});               // rel = inPos - pivot
+        uint32_t cr1=nid(); body.push_back({12,{0,tV3,cr1,glsl,GLSL_CROSS,u,rel}});         // cross(u,rel)
+        uint32_t t2=nid();  body.push_back({142,{0,tV3,t2,cr1,c2}});                        // 2*cross(u,rel)
+        uint32_t wt=nid();  body.push_back({142,{0,tV3,wt,t2,qw}});                         // w*(2*cross)
+        uint32_t cr2=nid(); body.push_back({12,{0,tV3,cr2,glsl,GLSL_CROSS,u,t2}});          // cross(u, 2*cross)
+        uint32_t s1=nid();  body.push_back({129,{0,tV3,s1,rel,wt}});                        // rel + w*t2
+        uint32_t vr=nid();  body.push_back({129,{0,tV3,vr,s1,cr2}});                        // + cross(u,t2)
+        uint32_t posOut=nid(); body.push_back({129,{0,tV3,posOut,vr,pivot}}); result=posOut; // pos' = pivot + q*rel
     } else { // OSCILLATE
         float W2 = (p1!=0.f) ? (float)(2.0*M_PI/p1) : 0.f;
         uint32_t c_w=fconst(W2), c_half=fconst(p0*0.5f), c_one=fconst(1.0f), cax=fconst(ax), cay=fconst(ay), caz=fconst(az);
@@ -430,7 +481,7 @@ inline std::vector<uint8_t> editFragCutout(const uint8_t* sd, uint32_t spvLen, f
     auto fbits=[](float f){ uint32_t u; memcpy(&u,&f,4); return u; };
     uint32_t tFloat=0, tBool=0, c_thr=0, sampleRes=0; int sampleIdx=-1;
     for (auto& t:insts){ auto&w=t.w;
-        if (t.op==22 && w.size()>=4 && w[3]==32) tFloat=w[1];          // OpTypeFloat 32
+        if (t.op==22 && w.size()>=3 && w[2]==32) tFloat=w[1];          // OpTypeFloat: w=[header, result, width] -> width is w[2] (32-bit), result id is w[1]
         else if (t.op==20 && w.size()>=2) tBool=w[1];                  // OpTypeBool
     }
     for (auto& t:insts){ auto&w=t.w;                                   // reuse an existing 0.5 const if present
@@ -846,7 +897,7 @@ inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode,
         uint32_t rel=nv-(uint32_t)slot; memcpy(o.data()+slot,&rel,4);   // repoint the forward-frag SPIR-V uoffset
         return o;
     }
-    if (mode==ROTATE || mode==OSCILLATE){ float l=std::sqrt(ax*ax+ay*ay+az*az); if (l<=0.f) l=1.f; ax/=l; ay/=l; az/=l; }  // axis -> unit (UVSCROLL/FLIPBOOK/TRANSLATE use these args as params, not an axis)
+    if (mode==ROTATE || mode==OSCILLATE || mode==ROTREPLAY){ float l=std::sqrt(ax*ax+ay*ay+az*az); if (l<=0.f) l=1.f; ax/=l; ay/=l; az/=l; }  // axis -> unit (UVSCROLL/FLIPBOOK/TRANSLATE use these args as params, not an axis)
     std::vector<VStage> stages;
     if (mode==FLIPBOOK){
         // FLIPBOOK edits ONLY the forward vertex stage (exactly like make_flipbook_shader.py). The UV-cell offset doesn't
