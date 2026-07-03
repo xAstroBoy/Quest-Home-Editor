@@ -43,6 +43,7 @@
 #include <map>
 #include <array>
 #include <tuple>
+#include <climits>
 
 struct Editor {
     // ── bindings ──
@@ -838,26 +839,38 @@ struct Editor {
                 px[ch]=(u8)std::clamp(a2*(1-tfy)+b2*tfy,0.f,255.f); }
             px[3]=255;
         }
-        // RETRIANGULATE: corner vertices of occupied cells; height = average of adjacent occupied cells
-        std::map<std::pair<int,int>,uint32_t> cornerId;
-        auto corner=[&](int cu,int cv)->uint32_t{
-            auto it=cornerId.find({cu,cv}); if (it!=cornerId.end()) return it->second;
-            float a=0; int c2=0;
-            for (int oy=-1;oy<=0;++oy) for (int ox=-1;ox<=0;++ox){ int xx=cu+ox, yy=cv+oy;
-                if (xx<0||yy<0||xx>=G||yy>=G||!occ[(size_t)yy*G+xx]) continue; a+=hgt[(size_t)yy*G+xx]; ++c2; }
-            float h2=c2? a/c2 : 0.f;
-            uint32_t id=(uint32_t)(out.positions.size()/3);
-            float p[3]; p[ua]=mnu+cu*cellU; p[va]=mnv+cv*cellV; p[dom]=h2;
-            out.positions.push_back(p[0]); out.positions.push_back(p[1]); out.positions.push_back(p[2]);
-            out.uvs.push_back((float)cu/G); out.uvs.push_back((float)cv/G);
-            cornerId[{cu,cv}]=id; return id;
-        };
-        for (int cv=0;cv<G;++cv) for (int cu=0;cu<G;++cu){
-            if (!occ[(size_t)cv*G+cu]) continue;
-            uint32_t i00=corner(cu,cv), i10=corner(cu+1,cv), i11=corner(cu+1,cv+1), i01=corner(cu,cv+1);
-            out.indices.push_back(i00); out.indices.push_back(i10); out.indices.push_back(i11);
-            out.indices.push_back(i00); out.indices.push_back(i11); out.indices.push_back(i01);
+        // RETRIANGULATE — GREEDY RECTANGLE MESHING: merge runs of occupied cells with the SAME
+        // (2cm-quantized) height into maximal rectangles; each rectangle = 2 triangles. A flat floor
+        // collapses to a handful of quads instead of a per-cell grid (the 131k-triangle blunder).
+        // Sloped areas terrace at 2cm steps; boundary detail stays at footprint resolution.
+        const float HQ = 0.02f;
+        std::vector<long long> hq((size_t)G*G, LLONG_MIN);
+        for (int i2=0;i2<G*G;++i2) if (occ[(size_t)i2]) hq[(size_t)i2] = (long long)std::llround(hgt[(size_t)i2]/HQ);
+        std::vector<char> usedC((size_t)G*G, 0);
+        int rects=0;
+        for (int cv=0; cv<G; ++cv) for (int cu=0; cu<G; ++cu){
+            size_t c0=(size_t)cv*G+cu;
+            if (!occ[c0] || usedC[c0]) continue;
+            long long h0=hq[c0];
+            int rw=1;                                             // grow width along +u
+            while (cu+rw<G){ size_t ci=(size_t)cv*G+cu+rw; if (!occ[ci]||usedC[ci]||hq[ci]!=h0) break; ++rw; }
+            int rh2=1;                                            // grow height along +v while the WHOLE row matches
+            for (; cv+rh2<G; ++rh2){ bool ok=true;
+                for (int k=0;k<rw;++k){ size_t ci=(size_t)(cv+rh2)*G+cu+k; if (!occ[ci]||usedC[ci]||hq[ci]!=h0){ ok=false; break; } }
+                if (!ok) break; }
+            for (int y2=0;y2<rh2;++y2) for (int x2=0;x2<rw;++x2) usedC[(size_t)(cv+y2)*G+cu+x2]=1;
+            float hgt0=(float)h0*HQ;
+            float u0=mnu+cu*cellU, u1=mnu+(cu+rw)*cellU, v0=mnv+cv*cellV, v1=mnv+(cv+rh2)*cellV;
+            uint32_t base=(uint32_t)(out.positions.size()/3);
+            auto pv=[&](float uu2, float vv2){ float p[3]; p[ua]=uu2; p[va]=vv2; p[dom]=hgt0;
+                out.positions.push_back(p[0]); out.positions.push_back(p[1]); out.positions.push_back(p[2]);
+                out.uvs.push_back((uu2-mnu)/su); out.uvs.push_back((vv2-mnv)/sv); };
+            pv(u0,v0); pv(u1,v0); pv(u1,v1); pv(u0,v1);
+            out.indices.push_back(base); out.indices.push_back(base+1); out.indices.push_back(base+2);
+            out.indices.push_back(base); out.indices.push_back(base+2); out.indices.push_back(base+3);
+            ++rects;
         }
+        fprintf(stderr,"[EDIT] rebuild: %d occupied cells -> %d rects = %d tris (greedy meshing)\n", occCount, rects, rects*2);
         out.nVerts=(u32)(out.positions.size()/3); out.nIdx=(u32)out.indices.size();
         sceneMeshes->push_back(std::move(out));
         size_t ni=r->gpuMeshes.size();
@@ -871,8 +884,9 @@ struct Editor {
         meshEditLog[(int)ni] = "rebuild(" + std::to_string(src.size()) + ")";
         geomDirty=true; holesMesh=-1;
         selectOne((int)ni); scrollToSel=true;
-        setStatus("REBUILT "+std::to_string(src.size())+" mesh(es) as ONE clean single-layer surface ("+std::to_string(occCount)
-                  +" cells, texture baked 1024)"+(skipped?" - skipped "+std::to_string(skipped)+" animated":"")+" - Ctrl+Z restores the originals");
+        setStatus("REBUILT "+std::to_string(src.size())+" mesh(es) as ONE clean surface: "+std::to_string(rects*2)
+                  +" triangles (greedy-merged from "+std::to_string(occCount)+" cells), texture baked 1024"
+                  +(skipped?" - skipped "+std::to_string(skipped)+" animated":"")+" - Ctrl+Z restores the originals");
     }
 
     // ── RE-UV FLAT: give the mesh ONE continuous planar UV sheet (0..1 across its bounds, dominant
