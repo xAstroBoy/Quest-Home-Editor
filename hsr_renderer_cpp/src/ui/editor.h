@@ -346,8 +346,10 @@ struct Editor {
     void rotateMesh180(int mi){ rotateMeshGeom(mi, 1, 180); }
 
     // ── FUSE the multi-selection into ONE mesh: every source's CURRENT world transform is baked into
-    //    the vertices, geometry/UVs concatenated onto the ACTIVE mesh's material+texture, sources go
-    //    to history (ONE Ctrl+Z un-fuses). Skinned/animated sources are skipped (their verts stream).
+    //    the vertices, geometry concatenated, and EVERY SOURCE KEEPS ITS OWN TEXTURE — the textures are
+    //    packed into ONE ATLAS (identical textures share a cell) and each source's UVs are remapped into
+    //    its cell. Sources go to history (ONE Ctrl+Z un-fuses). Skinned/animated sources are skipped.
+    //    Caveat: TILED UVs (outside 0..1) are wrapped into the cell — heavy tiling shows seams.
     void fuseSelectedMeshes(){
         if (!r || !sceneMeshes || sel.size()<2) { setStatus("fuse: select 2+ meshes first (Ctrl+click)"); return; }
         std::vector<int> src; int skippedAnim=0;
@@ -356,24 +358,79 @@ struct Editor {
             src.push_back(s); }
         if (src.size()<2) { setStatus("fuse: need 2+ STATIC meshes (skinned/animated can't fuse)"); return; }
         int base = src[0];
-        MeshData out = (*sceneMeshes)[(size_t)base];          // material/texture/flags of the ACTIVE-first mesh
+        // ── TEXTURE ATLAS: dedup source textures by content, pack unique ones into a grid ──
+        static const u8 WHITE1[4] = {255,255,255,255};
+        struct SrcTex { const u8* d; int w, h; };
+        std::vector<SrcTex> cells; std::map<unsigned long long,int> cellByHash;
+        std::vector<int> cellOf(src.size());
+        for (size_t i2=0;i2<src.size();++i2){ const MeshData& md=(*sceneMeshes)[(size_t)src[i2]];
+            SrcTex st{WHITE1,1,1};
+            if (!md.texRGBA.empty() && md.texW>0 && md.texH>0 && md.texRGBA.size()>=(size_t)md.texW*md.texH*4)
+                st = SrcTex{ md.texRGBA.data(), (int)md.texW, (int)md.texH };
+            unsigned long long hh = VkRenderer::texHash(st.d, (size_t)st.w*st.h*4, (u32)st.w, (u32)st.h, 0);
+            auto it=cellByHash.find(hh);
+            if (it==cellByHash.end()){ cellByHash[hh]=(int)cells.size(); cellOf[i2]=(int)cells.size(); cells.push_back(st); }
+            else cellOf[i2]=it->second;
+        }
+        int nCells=(int)cells.size();
+        int grid=1; while (grid*grid<nCells) ++grid;
+        int cellW=1, cellH=1; for (auto& c : cells){ cellW=std::max(cellW,c.w); cellH=std::max(cellH,c.h); }
+        const int MAXA=4096;                                   // cap the atlas (downscale cells to fit)
+        if (grid*cellW>MAXA) cellW=MAXA/grid; if (grid*cellH>MAXA) cellH=MAXA/grid;
+        if (cellW<1) cellW=1; if (cellH<1) cellH=1;
+        int aw=grid*cellW, ah=grid*cellH;
+        std::vector<u8> atlas; bool useAtlas = nCells>1;
+        if (useAtlas) {
+            atlas.assign((size_t)aw*ah*4, 255);
+            for (int ci=0; ci<nCells; ++ci) {                  // bilinear-resample each unique texture into its cell
+                const SrcTex& st=cells[ci]; int ox=(ci%grid)*cellW, oy=(ci/grid)*cellH;
+                for (int y2=0;y2<cellH;++y2) for (int x2=0;x2<cellW;++x2) {
+                    float fx=(x2+0.5f)/cellW*st.w-0.5f, fy=(y2+0.5f)/cellH*st.h-0.5f;
+                    int x0=(int)std::floor(fx), y0=(int)std::floor(fy);
+                    float tx=fx-x0, ty=fy-y0;
+                    auto S=[&](int px,int py,int ch){ px=std::clamp(px,0,st.w-1); py=std::clamp(py,0,st.h-1); return (float)st.d[((size_t)py*st.w+px)*4+ch]; };
+                    u8* o=&atlas[((size_t)(oy+y2)*aw+(ox+x2))*4];
+                    for (int ch=0;ch<4;++ch){
+                        float v0=S(x0,y0,ch)*(1-tx)+S(x0+1,y0,ch)*tx, v1=S(x0,y0+1,ch)*(1-tx)+S(x0+1,y0+1,ch)*tx;
+                        o[ch]=(u8)std::clamp(v0*(1-ty)+v1*ty, 0.f, 255.f); }
+                }
+            }
+        }
+        MeshData out = (*sceneMeshes)[(size_t)base];          // material FLAGS from the active-first mesh
         out.positions.clear(); out.uvs.clear(); out.uvs2.clear(); out.indices.clear();
         out.transform = Transform{};                          // world already baked into the verts below
         out.hasWorldMatrix = true;
         static const float I16[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
         memcpy(out.worldMatrix, I16, sizeof I16);
-        bool wantUV = !(*sceneMeshes)[(size_t)base].uvs.empty(), wantUV2 = !(*sceneMeshes)[(size_t)base].uvs2.empty();
-        for (int s : src) {
+        if (useAtlas) {
+            out.texRGBA = std::move(atlas); out.texW=(u32)aw; out.texH=(u32)ah; out.hasTexture=true;
+            out.astcRaw.clear();                              // the compressed source no longer matches — force the RGBA path
+            out.hasLightmap=false; out.lmRGBA.clear();        // per-source role maps can't ride the atlas UVs
+            out.hasNormal=false; out.normalRGBA.clear();
+            out.hasOrm=false; out.ormRGBA.clear();
+            out.hasEmissive=false; out.emissiveRGBA.clear();
+        }
+        float insetU = useAtlas ? 2.0f/(float)cellW : 0.f;    // guard band so mips don't bleed neighbor cells
+        float insetV = useAtlas ? 2.0f/(float)cellH : 0.f;
+        for (size_t i2=0;i2<src.size();++i2) {
+            int s = src[i2];
             const MeshData& md=(*sceneMeshes)[(size_t)s]; const VkGpuMesh& gm=r->gpuMeshes[(size_t)s];
             const float* M=gm.model;
+            int cell=cellOf[i2]; float cgx=(float)(cell%grid), cgy=(float)(cell/grid);
             u32 vb=(u32)(out.positions.size()/3);
             size_t nv=md.positions.size()/3;
+            bool srcUV = md.uvs.size()>=nv*2;
             for (size_t k2=0;k2<nv;++k2){ const float* p=&md.positions[k2*3];
                 out.positions.push_back(M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12]);
                 out.positions.push_back(M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13]);
                 out.positions.push_back(M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14]);
-                if (wantUV)  { if (md.uvs.size()>=nv*2)  { out.uvs.push_back(md.uvs[k2*2]);  out.uvs.push_back(md.uvs[k2*2+1]); }   else { out.uvs.push_back(0);  out.uvs.push_back(0); } }
-                if (wantUV2) { if (md.uvs2.size()>=nv*2) { out.uvs2.push_back(md.uvs2[k2*2]); out.uvs2.push_back(md.uvs2[k2*2+1]); } else { out.uvs2.push_back(0); out.uvs2.push_back(0); } }
+                float u0 = srcUV ? md.uvs[k2*2] : 0.f, v0 = srcUV ? md.uvs[k2*2+1] : 0.f;
+                if (useAtlas) {
+                    u0 -= std::floor(u0); v0 -= std::floor(v0);                     // wrap tiling into the cell
+                    u0 = (cgx + insetU + u0*(1.f-2.f*insetU)) / (float)grid;        // remap into THIS source's cell
+                    v0 = (cgy + insetV + v0*(1.f-2.f*insetV)) / (float)grid;
+                }
+                out.uvs.push_back(u0); out.uvs.push_back(v0);
             }
             for (u32 ix : md.indices) out.indices.push_back(vb+ix);
         }
@@ -388,7 +445,9 @@ struct Editor {
         pushDeleteUndo(hist, histA);                          // ONE Ctrl+Z un-fuses (sources back, fused gone)
         meshEditLog[(int)ni] = "fuse(" + std::to_string(src.size()) + ")";
         selectOne((int)ni); scrollToSel=true;
-        setStatus("Fused "+std::to_string(src.size())+" meshes into one (active mesh's texture)"
+        setStatus("Fused "+std::to_string(src.size())+" meshes into one - "
+                  +(nCells>1 ? (std::to_string(nCells)+" textures packed into a "+std::to_string(aw)+"x"+std::to_string(ah)+" atlas (UVs remapped)")
+                             : std::string("shared texture kept as-is"))
                   +(skippedAnim? " - skipped "+std::to_string(skippedAnim)+" animated" : "")+" - Ctrl+Z un-fuses");
     }
 
