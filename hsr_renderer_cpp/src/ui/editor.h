@@ -41,6 +41,8 @@
 #include <mutex>
 #include <set>
 #include <map>
+#include <array>
+#include <tuple>
 
 struct Editor {
     // ── bindings ──
@@ -257,12 +259,28 @@ struct Editor {
     //    flow as extendMeshBoundary. Run on every selected mesh via the context menu.
     // Collect every CLOSED boundary loop (edges used by exactly one triangle, chained into rings).
     // Shared by the seal tools AND the visual HOLE INSPECTOR overlay.
+    // WELDS VERTICES BY POSITION first: baked env meshes (and fuse results) duplicate vertices along
+    // UV/normal seams, so without welding nearly EVERY seam edge looked like a boundary — 58 phantom
+    // "holes" on a floor while the REAL rim (crossing seam-split verts) never chained into one loop.
     static void collectBoundaryLoops(const MeshData& md, std::vector<std::vector<uint32_t>>& loops){
         loops.clear();
         if (md.indices.size() < 3) return;
+        size_t nv = md.positions.size()/3;
+        std::vector<uint32_t> weld(nv);
+        { std::map<std::tuple<long long,long long,long long>, uint32_t> grid;   // 0.5mm quantized position -> first vert there
+          for (size_t v2=0; v2<nv; ++v2) {
+              auto k = std::make_tuple((long long)std::llround(md.positions[v2*3]  *2000.0),
+                                       (long long)std::llround(md.positions[v2*3+1]*2000.0),
+                                       (long long)std::llround(md.positions[v2*3+2]*2000.0));
+              auto it = grid.find(k);
+              if (it == grid.end()) { grid.emplace(k, (uint32_t)v2); weld[v2] = (uint32_t)v2; }
+              else weld[v2] = it->second;
+          } }
         std::map<std::pair<uint32_t,uint32_t>,int> ec;
         auto key=[&](uint32_t a,uint32_t b){ return a<b?std::make_pair(a,b):std::make_pair(b,a); };
-        for (size_t k=0;k+2<md.indices.size();k+=3){ uint32_t a=md.indices[k],b=md.indices[k+1],c=md.indices[k+2];
+        for (size_t k=0;k+2<md.indices.size();k+=3){
+            uint32_t a=weld[md.indices[k]], b=weld[md.indices[k+1]], c=weld[md.indices[k+2]];
+            if (a==b || b==c || c==a) continue;              // degenerate after weld
             ec[key(a,b)]++; ec[key(b,c)]++; ec[key(c,a)]++; }
         std::multimap<uint32_t,uint32_t> adj;   // undirected boundary adjacency
         for (auto& kv : ec) if (kv.second==1) { adj.insert({kv.first.first,kv.first.second}); adj.insert({kv.first.second,kv.first.first}); }
@@ -353,10 +371,16 @@ struct Editor {
     bool showHoles = false;
     int  holesMesh = -1;                              // which mesh the cache belongs to (-1 = stale)
     std::vector<std::vector<uint32_t>> holeLoops;     // boundary loops of holesMesh
+    std::vector<std::array<float,3>> holeCenterL;     // cached MODEL-space loop centroids (world = M * this, cheap per frame)
     void refreshHoles(){
-        holesMesh = -1; holeLoops.clear();
+        holesMesh = -1; holeLoops.clear(); holeCenterL.clear();
         if (!r || !sceneMeshes || selected<0 || selected>=(int)sceneMeshes->size()) return;
-        collectBoundaryLoops((*sceneMeshes)[(size_t)selected], holeLoops);
+        const MeshData& md=(*sceneMeshes)[(size_t)selected];
+        collectBoundaryLoops(md, holeLoops);
+        holeCenterL.resize(holeLoops.size());
+        for (size_t li=0; li<holeLoops.size(); ++li){ float cx0=0,cy0=0,cz0=0;
+            for (uint32_t v2 : holeLoops[li]){ cx0+=md.positions[v2*3]; cy0+=md.positions[v2*3+1]; cz0+=md.positions[v2*3+2]; }
+            float n2=(float)holeLoops[li].size(); holeCenterL[li]={cx0/n2, cy0/n2, cz0/n2}; }
         holesMesh = selected;
     }
     void drawHoleOverlay(){
@@ -366,21 +390,21 @@ struct Editor {
         auto& th=cx.th;
         const MeshData& md=(*sceneMeshes)[(size_t)selected]; const float* M=r->gpuMeshes[(size_t)selected].model;
         dl.pushClip((float)rcViewport.offset.x,(float)rcViewport.offset.y,(float)rcViewport.extent.width,(float)rcViewport.extent.height);
-        for (size_t li=0; li<holeLoops.size(); ++li) {
+        size_t maxLoops = std::min(holeLoops.size(), (size_t)128);   // sanity cap (post-weld counts are small anyway)
+        for (size_t li=0; li<maxLoops; ++li) {
             const auto& L = holeLoops[li];
-            float cx0=0,cy0=0,cz0=0;
-            float prevS[2]; bool prevOk=false; float firstS[2]; bool firstOk=false;
-            for (size_t i2=0;i2<=L.size();++i2){
+            size_t step = L.size()>160 ? L.size()/160 : 1;           // DECIMATED rim (projecting 20k rim verts per frame was the lag)
+            float prevS[2]; bool prevOk=false;
+            for (size_t i2=0;i2<=L.size();i2+=step){
                 uint32_t v2 = L[i2 % L.size()]; const float* p=&md.positions[v2*3];
                 float wp[3]={ M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12], M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13], M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14] };
-                if (i2<L.size()){ cx0+=wp[0]; cy0+=wp[1]; cz0+=wp[2]; }
                 float sx,sy; bool ok=worldToScreen(wp,sx,sy);
                 if (ok && prevOk) dl.line(prevS[0],prevS[1],sx,sy, ui::rgba(255,160,40), 2.5f);   // orange rim
-                if (ok && !firstOk){ firstS[0]=sx; firstS[1]=sy; firstOk=true; }
                 prevS[0]=sx; prevS[1]=sy; prevOk=ok;
             }
-            cx0/=L.size(); cy0/=L.size(); cz0/=L.size();
-            float cw[3]={cx0,cy0,cz0}; float ms[2];
+            const auto& cl = holeCenterL[li];
+            float cw[3]={ M[0]*cl[0]+M[4]*cl[1]+M[8]*cl[2]+M[12], M[1]*cl[0]+M[5]*cl[1]+M[9]*cl[2]+M[13], M[2]*cl[0]+M[6]*cl[1]+M[10]*cl[2]+M[14] };
+            float ms[2];
             if (worldToScreen(cw, ms[0], ms[1])) {
                 bool hv = std::fabs(cx.in.mx-ms[0])<14*uiScale && std::fabs(cx.in.my-ms[1])<14*uiScale;
                 float hs=9*uiScale;
@@ -585,6 +609,33 @@ struct Editor {
                 out.uvs.push_back(u0); out.uvs.push_back(v0);
             }
             for (u32 ix : md.indices) out.indices.push_back(vb+ix);
+        }
+        // DROP EXACT-DUPLICATE triangles (welded-position identical): overlapping source sheets / copies
+        // landing on their original z-fought inside the fused draw = "texture flashes". Exact overlaps
+        // vanish; NEAR-coplanar different sheets still fight (that needs real CSG - out of scope).
+        {
+            size_t fnv = out.positions.size()/3;
+            std::vector<uint32_t> weld(fnv);
+            std::map<std::tuple<long long,long long,long long>, uint32_t> grid;
+            for (size_t v2=0; v2<fnv; ++v2) {
+                auto k = std::make_tuple((long long)std::llround(out.positions[v2*3]  *2000.0),
+                                         (long long)std::llround(out.positions[v2*3+1]*2000.0),
+                                         (long long)std::llround(out.positions[v2*3+2]*2000.0));
+                auto it=grid.find(k);
+                if (it==grid.end()) { grid.emplace(k,(uint32_t)v2); weld[v2]=(uint32_t)v2; } else weld[v2]=it->second;
+            }
+            std::set<std::tuple<uint32_t,uint32_t,uint32_t>> seen;
+            std::vector<u32> keep; keep.reserve(out.indices.size());
+            size_t dropped=0;
+            for (size_t k=0;k+2<out.indices.size();k+=3){
+                uint32_t a=weld[out.indices[k]], b=weld[out.indices[k+1]], c=weld[out.indices[k+2]];
+                if (a==b||b==c||c==a) { ++dropped; continue; }                     // degenerate
+                uint32_t s0=a,s1=b,s2=c; if(s0>s1)std::swap(s0,s1); if(s1>s2)std::swap(s1,s2); if(s0>s1)std::swap(s0,s1);
+                if (!seen.insert(std::make_tuple(s0,s1,s2)).second) { ++dropped; continue; }   // exact duplicate
+                keep.push_back(out.indices[k]); keep.push_back(out.indices[k+1]); keep.push_back(out.indices[k+2]);
+            }
+            if (dropped) fprintf(stderr,"[EDIT] fuse: dropped %zu duplicate/degenerate tris (z-fight killers)\n", dropped);
+            out.indices = std::move(keep);
         }
         out.nVerts=(u32)(out.positions.size()/3); out.nIdx=(u32)out.indices.size();   // uploadMesh trusts the EXPLICIT counts
         sceneMeshes->push_back(std::move(out));
