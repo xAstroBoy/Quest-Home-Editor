@@ -522,26 +522,94 @@ struct Editor {
         float mnu=1e30f,mxu=-1e30f,mnv=1e30f,mxv=-1e30f;
         for (auto& p : patchPts){ mnu=std::min(mnu,p[ua]); mxu=std::max(mxu,p[ua]); mnv=std::min(mnv,p[va]); mxv=std::max(mxv,p[va]); }
         float su=(mxu-mnu)>1e-4f?(mxu-mnu):1.f, sv=(mxv-mnv)>1e-4f?(mxv-mnv):1.f;
-        // ── AUTO-GENERATED TEXTURE: blend the pin-sampled surface colors across the sheet (inverse-
-        //    distance weighting) -> the patch CONTINUES the surrounding tones instead of tiling the
-        //    source's baked atlas (which produced checker garbage). UVs are a FLAT 0..1 sheet, so an
-        //    AI-generated/inpainted image drops straight on via Export PNG -> AI -> Set texture.
-        const int TS = 256;
+        // ── AUTO-GENERATED TEXTURE (v2 - a REAL MAP): every texel PROJECTS onto the surrounding
+        //    geometry along the patch plane (fused meshes included) and samples that triangle's texture
+        //    through its OWN UVs (atlas-safe). Texels over the actual gap (nothing to sample) get the
+        //    pin-color IDW blend. Result: the sheet shows the true surrounding imagery with a smooth
+        //    fill in the hole = ready-made AI inpainting template (Export PNG -> AI -> Set texture).
+        const int TS = 512;
         md.texRGBA.assign((size_t)TS*TS*4, 255); md.texW=TS; md.texH=TS; md.hasTexture=true;
+        float patchDom=0; for (auto& p : patchPts) patchDom += p[dom]; patchDom/=(float)n;
+        // gather candidate triangles: any visible mesh whose bounds overlap the patch region (in the
+        // plane) and sit within +-3m of the patch along the dominant axis; bucket them on a 2D grid.
+        struct CTri { int mesh; uint32_t a,b,c; float au,av,bu,bv,cu,cv; float domAvg; };
+        std::vector<CTri> ctris;
+        std::map<std::pair<int,int>, std::vector<int>> cgrid;   // 1/32-of-patch cells
+        float cellU = su/32.f, cellV = sv/32.f;
+        for (int mi2=0; mi2<(int)r->gpuMeshes.size(); ++mi2){
+            if (r->isHidden(mi2) || r->isDeleted(mi2)) continue;
+            const auto& gm2=r->gpuMeshes[mi2]; const MeshData& m2=(*sceneMeshes)[(size_t)mi2];
+            if (gm2.isSkinned || gm2.dynamicVerts) continue;
+            float mn3[3],mx3[3]; worldAabb(const_cast<VkGpuMesh&>(gm2),mn3,mx3);
+            if (mx3[ua]<mnu||mn3[ua]>mxu||mx3[va]<mnv||mn3[va]>mxv) continue;
+            if (mx3[dom]<patchDom-3.f||mn3[dom]>patchDom+3.f) continue;
+            size_t nvm=m2.positions.size()/3; if (m2.uvs.size()<nvm*2 || m2.texRGBA.empty()) continue;
+            const auto& P2=gm2.pickPos; const auto& I2=gm2.pickIdx; if (P2.size()<9||I2.size()<3) continue;
+            for (size_t k=0;k+2<I2.size();k+=3){ uint32_t a=I2[k],b=I2[k+1],c=I2[k+2];
+                if ((size_t)a*3+2>=P2.size()||(size_t)b*3+2>=P2.size()||(size_t)c*3+2>=P2.size()) continue;
+                if (a>=nvm||b>=nvm||c>=nvm) continue;
+                float wa[3],wb[3],wc[3]; xformPoint(gm2.model,&P2[a*3],wa); xformPoint(gm2.model,&P2[b*3],wb); xformPoint(gm2.model,&P2[c*3],wc);
+                float dAvg=(wa[dom]+wb[dom]+wc[dom])/3.f;
+                if (std::fabs(dAvg-patchDom)>3.f) continue;
+                CTri ct{mi2,a,b,c, wa[ua],wa[va], wb[ua],wb[va], wc[ua],wc[va], dAvg};
+                float tmnu=std::min({ct.au,ct.bu,ct.cu}), tmxu=std::max({ct.au,ct.bu,ct.cu});
+                float tmnv=std::min({ct.av,ct.bv,ct.cv}), tmxv=std::max({ct.av,ct.bv,ct.cv});
+                if (tmxu<mnu||tmnu>mxu||tmxv<mnv||tmnv>mxv) continue;
+                int id=(int)ctris.size(); ctris.push_back(ct);
+                for (int gu=(int)std::floor((tmnu-mnu)/cellU); gu<=(int)std::floor((tmxu-mnu)/cellU); ++gu)
+                    for (int gv=(int)std::floor((tmnv-mnv)/cellV); gv<=(int)std::floor((tmxv-mnv)/cellV); ++gv)
+                        cgrid[{gu,gv}].push_back(id);
+            }
+        }
         std::vector<std::array<float,2>> pinUV(n);
         for (size_t i2=0;i2<n;++i2) pinUV[i2] = { (patchPts[i2][ua]-mnu)/su, (patchPts[i2][va]-mnv)/sv };
+        size_t baked=0;
         for (int ty2=0; ty2<TS; ++ty2) for (int tx2=0; tx2<TS; ++tx2){
-            float u0=(tx2+0.5f)/TS, v0=(ty2+0.5f)/TS;
-            float wsum=0, acc[4]={0,0,0,0};
-            for (size_t i2=0;i2<n;++i2){
-                float du=u0-pinUV[i2][0], dv=v0-pinUV[i2][1];
-                float w2 = 1.f/(du*du+dv*dv+1e-4f);       // IDW^2 with epsilon
-                wsum+=w2; for (int ch=0;ch<4;++ch) acc[ch]+=w2*(float)patchCols[i2][ch];
-            }
+            float u01=(tx2+0.5f)/TS, v01=(ty2+0.5f)/TS;
+            float wu=mnu+u01*su, wv=mnv+v01*sv;               // texel's position in the patch plane
             u8* px=&md.texRGBA[((size_t)ty2*TS+tx2)*4];
-            for (int ch=0;ch<4;++ch) px[ch]=(u8)std::clamp(acc[ch]/wsum, 0.f, 255.f);
+            // find the surrounding triangle covering this texel (nearest to the patch plane wins)
+            int bestT=-1; float bestDd=1e30f;
+            auto itc=cgrid.find({(int)std::floor((wu-mnu)/cellU),(int)std::floor((wv-mnv)/cellV)});
+            if (itc!=cgrid.end()) for (int ti2 : itc->second){ const CTri& T=ctris[ti2];
+                float d0=(T.bu-T.au)*(wv-T.av)-(T.bv-T.av)*(wu-T.au);
+                float d1=(T.cu-T.bu)*(wv-T.bv)-(T.cv-T.bv)*(wu-T.bu);
+                float d2=(T.au-T.cu)*(wv-T.cv)-(T.av-T.cv)*(wu-T.cu);
+                bool neg=(d0<1e-7f)&&(d1<1e-7f)&&(d2<1e-7f), pos=(d0>-1e-7f)&&(d1>-1e-7f)&&(d2>-1e-7f);
+                if (!(neg||pos)) continue;
+                float dd=std::fabs(T.domAvg-patchDom);
+                if (dd<bestDd){ bestDd=dd; bestT=ti2; }
+            }
+            if (bestT>=0){
+                const CTri& T=ctris[bestT]; const MeshData& m2=(*sceneMeshes)[(size_t)T.mesh];
+                // 2D barycentric in the plane -> interpolated UV -> bilinear texture sample
+                float den=(T.bv-T.cv)*(T.au-T.cu)+(T.cu-T.bu)*(T.av-T.cv);
+                if (std::fabs(den)>1e-12f){
+                    float l0=((T.bv-T.cv)*(wu-T.cu)+(T.cu-T.bu)*(wv-T.cv))/den;
+                    float l1=((T.cv-T.av)*(wu-T.cu)+(T.au-T.cu)*(wv-T.cv))/den;
+                    float l2=1.f-l0-l1;
+                    float uu=l0*m2.uvs[T.a*2]+l1*m2.uvs[T.b*2]+l2*m2.uvs[T.c*2];
+                    float vv=l0*m2.uvs[T.a*2+1]+l1*m2.uvs[T.b*2+1]+l2*m2.uvs[T.c*2+1];
+                    uu-=std::floor(uu); vv-=std::floor(vv);
+                    int W2=(int)m2.texW,H2=(int)m2.texH;
+                    float fx=uu*W2-0.5f, fy=vv*H2-0.5f; int x0=(int)std::floor(fx), y0=(int)std::floor(fy); float tfx=fx-x0, tfy=fy-y0;
+                    auto S=[&](int sx2,int sy2,int ch)->float{ sx2=std::clamp(sx2,0,W2-1); sy2=std::clamp(sy2,0,H2-1); return (float)m2.texRGBA[((size_t)sy2*W2+sx2)*4+ch]; };
+                    for (int ch=0;ch<3;++ch){ float a2=S(x0,y0,ch)*(1-tfx)+S(x0+1,y0,ch)*tfx, b2=S(x0,y0+1,ch)*(1-tfx)+S(x0+1,y0+1,ch)*tfx;
+                        px[ch]=(u8)std::clamp(a2*(1-tfy)+b2*tfy,0.f,255.f); }
+                    px[3]=255; ++baked; continue;
+                }
+            }
+            // over the actual GAP: smooth pin-color blend (AI inpaints this region beautifully)
+            float wsum=0, acc[3]={0,0,0};
+            for (size_t i2=0;i2<n;++i2){
+                float du=u01-pinUV[i2][0], dv=v01-pinUV[i2][1];
+                float w2 = 1.f/(du*du+dv*dv+1e-4f);
+                wsum+=w2; for (int ch=0;ch<3;++ch) acc[ch]+=w2*(float)patchCols[i2][ch];
+            }
+            for (int ch=0;ch<3;++ch) px[ch]=(u8)std::clamp(acc[ch]/wsum, 0.f, 255.f);
             px[3]=255;
         }
+        fprintf(stderr,"[EDIT] patch bake: %zu/%d texels sampled from surrounding geometry, rest = gap blend\n", baked, TS*TS);
         float cen[3]={0,0,0}; for (auto& p : patchPts){ cen[0]+=p[0]; cen[1]+=p[1]; cen[2]+=p[2]; }
         cen[0]/=n; cen[1]/=n; cen[2]/=n;
         auto pushV=[&](const float p[3]){ md.positions.push_back(p[0]); md.positions.push_back(p[1]); md.positions.push_back(p[2]);
