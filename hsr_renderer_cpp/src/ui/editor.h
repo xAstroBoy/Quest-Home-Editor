@@ -433,7 +433,24 @@ struct Editor {
     //    clicked polygon (projected on the pins' plane, +-3m). Texture/UVs untouched - "cut with the
     //    same texture and all". Non-destructive per mesh (Ctrl+Z reverts each).
     void cutRegionByPins(){
-        if (patchPts.size()<3){ setStatus("cut region: click at least 3 corner points first"); return; }
+        // 2 PINS = SPLIT LINE: draw a line across the mesh -> split the selection in two along the
+        // vertical plane through it (texture untouched). 3+ pins = polygon cut-out.
+        if (patchPts.size()==2){
+            float d[3]={patchPts[1][0]-patchPts[0][0], patchPts[1][1]-patchPts[0][1], patchPts[1][2]-patchPts[0][2]};
+            float dl2=std::sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]);
+            if (dl2<1e-4f){ setStatus("split line: the two points are on top of each other"); return; }
+            d[0]/=dl2; d[1]/=dl2; d[2]/=dl2;
+            int up = std::fabs(d[0])<std::fabs(d[1]) ? (std::fabs(d[0])<std::fabs(d[2])?0:2) : (std::fabs(d[1])<std::fabs(d[2])?1:2);
+            float u[3]={0,0,0}; u[up]=1.f;                                     // world axis most perpendicular to the line
+            float pn[3]={ d[1]*u[2]-d[2]*u[1], d[2]*u[0]-d[0]*u[2], d[0]*u[1]-d[1]*u[0] };
+            float nl=std::sqrt(pn[0]*pn[0]+pn[1]*pn[1]+pn[2]*pn[2]); if (nl<1e-6f){ setStatus("split line: degenerate plane"); return; }
+            pn[0]/=nl; pn[1]/=nl; pn[2]/=nl;
+            float pd = pn[0]*patchPts[0][0]+pn[1]*patchPts[0][1]+pn[2]*patchPts[0][2];
+            forEachSelMesh([&](int m){ sliceMeshByPlane(m, pn, pd); });
+            patchPts.clear(); patchCols.clear(); patchMode=false; pinIsCut=false;
+            return;
+        }
+        if (patchPts.size()<3){ setStatus("cut: 2 pins = SPLIT along the line, 3+ pins = cut the polygon out"); return; }
         size_t n=patchPts.size();
         float nx=0,ny=0,nz=0;
         for (size_t i2=0;i2<n;++i2){ auto& a=patchPts[i2]; auto& b=patchPts[(i2+1)%n];
@@ -518,7 +535,8 @@ struct Editor {
         if (!patchMode) return;
         dl.pushClip((float)rcViewport.offset.x,(float)rcViewport.offset.y,(float)rcViewport.extent.width,(float)rcViewport.extent.height);
         cx.textAligned((float)rcViewport.offset.x, (float)rcViewport.offset.y+26*uiScale, (float)rcViewport.extent.width, 18*uiScale,
-                       pinIsCut ? "CUT REGION - click the region's corners (3+), ENTER cuts it out of the selection, ESC cancels"
+                       pinIsBend ? "BEND/STRETCH - click the grab point, set radius+offset in Geometry, ENTER applies"
+                                 : pinIsCut ? "CUT REGION - 2 pins = SPLIT along the line, 3+ = cut the polygon out; ENTER applies"
                                 : "PATCH TOOL - click the gap's corners in order (3+), ENTER builds, ESC cancels", ui::rgba(120,230,140), 1);
         float prev[2]; bool prevOk=false;
         for (size_t i2=0;i2<patchPts.size();++i2){
@@ -676,6 +694,45 @@ struct Editor {
         setStatus("Patch built - texture auto-blended from the clicked surfaces (flat 0..1 UVs: Export PNG -> AI -> Set texture for a fancy fill)");
     }
 
+    // ── BEND / STRETCH ("grab" deform): click a point on the mesh (1 pin in bend mode), set radius +
+    //    offset, Apply -> vertices within the radius move by offset * smooth cosine falloff (full at
+    //    the pin, zero at the rim). Pulls dents/hills/bends into the geometry - texture follows the
+    //    verts (UVs unchanged). Repeatable; Ctrl+Z reverts each apply.
+    bool  pinIsBend = false;
+    float bendRadius = 2.f, bendOff[3] = {0.f, 0.5f, 0.f};
+    void bendAtPin(){
+        if (patchPts.empty()){ setStatus("bend: click a point on the mesh first"); return; }
+        const auto& pin = patchPts.back();
+        int applied=0;
+        forEachSelMesh([&](int mi){
+            if (mi<0||mi>=(int)sceneMeshes->size()||mi>=(int)r->gpuMeshes.size()) return;
+            MeshData md=(*sceneMeshes)[(size_t)mi];
+            const float* M=r->gpuMeshes[(size_t)mi].model;
+            float inv[16]; if (!invertMat4(const_cast<float*>(M), inv)) return;   // pull the world offset into MODEL space
+            size_t nv=md.positions.size()/3; int moved=0;
+            // pin + offset in model space (positions are model-space; gm.model re-applies on draw)
+            float pinL[3]={ inv[0]*pin[0]+inv[4]*pin[1]+inv[8]*pin[2]+inv[12],
+                            inv[1]*pin[0]+inv[5]*pin[1]+inv[9]*pin[2]+inv[13],
+                            inv[2]*pin[0]+inv[6]*pin[1]+inv[10]*pin[2]+inv[14] };
+            float offL[3]={ inv[0]*bendOff[0]+inv[4]*bendOff[1]+inv[8]*bendOff[2],
+                            inv[1]*bendOff[0]+inv[5]*bendOff[1]+inv[9]*bendOff[2],
+                            inv[2]*bendOff[0]+inv[6]*bendOff[1]+inv[10]*bendOff[2] };
+            float R = bendRadius>0.01f?bendRadius:0.01f;
+            for (size_t v2=0;v2<nv;++v2){
+                float dx=md.positions[v2*3]-pinL[0], dy=md.positions[v2*3+1]-pinL[1], dz=md.positions[v2*3+2]-pinL[2];
+                float dist=std::sqrt(dx*dx+dy*dy+dz*dz);
+                if (dist>=R) continue;
+                float w2 = 0.5f+0.5f*std::cos(3.14159265f*dist/R);   // smooth falloff (1 at pin -> 0 at rim)
+                md.positions[v2*3]+=offL[0]*w2; md.positions[v2*3+1]+=offL[1]*w2; md.positions[v2*3+2]+=offL[2]*w2;
+                ++moved;
+            }
+            if (!moved) return;
+            if (commitGeomEdit(mi, std::move(md), "bend")) ++applied;
+        });
+        setStatus(applied ? ("Bent/stretched "+std::to_string(applied)+" mesh(es) around the pin (repeat to sculpt more; Ctrl+Z reverts)")
+                          : "bend: no vertices inside the radius on the selection - click closer or raise the radius");
+    }
+
     // ── RE-UV FLAT: give the mesh ONE continuous planar UV sheet (0..1 across its bounds, dominant
     //    plane by area-weighted normal). After fusing floor+patch their UVs disagree (atlas cells vs
     //    0..1 sheet) so a Set texture shows at different scales - Re-UV first and the texture spans
@@ -706,16 +763,16 @@ struct Editor {
             setStatus("Re-UV'd to ONE flat 0..1 sheet - Set texture now spans the whole surface once (Ctrl+Z reverts)");
     }
 
-    // ── SLICE the mesh in half along an axis plane through its center: every triangle goes to the LEFT
-    //    or RIGHT part by centroid (v1: triangles are not split at the plane - fine for prop separation).
-    //    Both halves keep the texture/UVs; original goes to history (one Ctrl+Z un-slices).
-    void sliceMesh(int mi, int axis){
+    // ── SLICE by an ARBITRARY world plane (n . p = pd): every triangle goes LEFT or RIGHT by world
+    //    centroid (triangles are not split at the plane - fine for prop separation). Both halves keep
+    //    the texture/UVs; original goes to history (one Ctrl+Z un-slices). Used by the axis buttons
+    //    AND the 2-pin cut line ("draw a line -> split in two").
+    void sliceMeshByPlane(int mi, const float pn[3], float pd){
         if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
         const MeshData& src=(*sceneMeshes)[(size_t)mi];
+        const float* M=r->gpuMeshes[(size_t)mi].model;
         size_t nv=src.positions.size()/3;
         if (nv<3 || src.indices.size()<6) return;
-        float lo=1e30f,hi=-1e30f; for (size_t v2=0;v2<nv;++v2){ float p=src.positions[v2*3+axis]; lo=std::min(lo,p); hi=std::max(hi,p); }
-        float plane=(lo+hi)*0.5f;
         MeshData half[2]; std::map<uint32_t,uint32_t> rm[2];
         bool hasUV=src.uvs.size()>=nv*2, hasUV2=src.uvs2.size()>=nv*2, hasCol=src.colors.size()>=nv*4;
         for (int h2=0;h2<2;++h2){ half[h2]=src;
@@ -724,8 +781,11 @@ struct Editor {
             half[h2].boneIndices.clear(); half[h2].boneWeights.clear(); half[h2].hasBones=false; }
         for (size_t k=0;k+2<src.indices.size();k+=3){
             uint32_t tri[3]={src.indices[k],src.indices[k+1],src.indices[k+2]};
-            float cc=(src.positions[tri[0]*3+axis]+src.positions[tri[1]*3+axis]+src.positions[tri[2]*3+axis])/3.f;
-            int h2 = cc<plane ? 0 : 1;
+            float cw[3]={0,0,0};
+            for (int e=0;e<3;e++){ const float* p=&src.positions[tri[e]*3];
+                cw[0]+=M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12]; cw[1]+=M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13]; cw[2]+=M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14]; }
+            float cc=(pn[0]*cw[0]+pn[1]*cw[1]+pn[2]*cw[2])/3.f;
+            int h2 = cc<pd ? 0 : 1;
             auto& pt=half[h2]; auto& rmm=rm[h2];
             for (int e=0;e<3;e++){ uint32_t v2=tri[e];
                 auto it=rmm.find(v2); uint32_t nvi;
@@ -757,8 +817,14 @@ struct Editor {
         r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
         r->setDeleted((size_t)mi, true); pushDeleteUndo(hist, histA);
         deselectAll(); holesMesh=-1; geomDirty = true;
-        const char* an[3]={"X","Y","Z"};
-        setStatus(std::string("Sliced in half across ")+an[axis]+" ("+std::to_string(made)+" parts) - move/delete each; Ctrl+Z un-slices");
+        setStatus("Sliced in two ("+std::to_string(made)+" parts, texture kept) - move/delete each; Ctrl+Z un-slices");
+    }
+    // axis slice = plane through the mesh's world center, normal along the axis
+    void sliceMesh(int mi, int axis){
+        if (!r || mi<0 || mi>=(int)r->gpuMeshes.size()) return;
+        float mn[3],mx[3]; worldAabb(r->gpuMeshes[(size_t)mi],mn,mx);
+        float pn[3]={0,0,0}; pn[axis]=1.f;
+        sliceMeshByPlane(mi, pn, (mn[axis]+mx[axis])*0.5f);
     }
 
     // ── mesh MIRROR: flip the geometry across an axis (about its own local center) so it FACES THE
@@ -2043,9 +2109,9 @@ struct Editor {
             if (!sel.empty()) { selected=sel.back(); r->selectedMesh=selected; duplicateSelected(); }
         }
         if (key==GLFW_KEY_F1) showKeybinds = !showKeybinds;   // all-shortcuts overlay
-        if (patchMode) {   // PIN TOOLS (patch/cut region): Enter = apply, Esc = cancel
-            if (key==GLFW_KEY_ENTER) { if (pinIsCut) cutRegionByPins(); else buildPatch(); }
-            if (key==GLFW_KEY_ESCAPE) { patchMode=false; pinIsCut=false; patchPts.clear(); patchCols.clear(); setStatus("pin tool cancelled"); }
+        if (patchMode) {   // PIN TOOLS (patch / cut region / bend): Enter = apply, Esc = cancel
+            if (key==GLFW_KEY_ENTER) { if (pinIsBend) bendAtPin(); else if (pinIsCut) cutRegionByPins(); else buildPatch(); }
+            if (key==GLFW_KEY_ESCAPE) { patchMode=false; pinIsCut=false; pinIsBend=false; patchPts.clear(); patchCols.clear(); setStatus("pin tool cancelled"); }
         }
         if (key==GLFW_KEY_SPACE && !playSim) {   // SPACE = toggle visibility of the selection (meshes or scene items)
             if (!selItems.empty()) { bool anyVis=false; for (int i:selItems) if (i>=0&&i<(int)items.size()&&!items[i].hidden) anyVis=true;
@@ -2357,7 +2423,8 @@ struct Editor {
             {"Slice in half X",35},{"Slice in half Y",36},{"Slice in half Z",37},             // separate halves (move/delete independently)
             {std::string(patchMode?"Patch tool: CANCEL":"Patch tool (click gap corners, Enter)"),38},
             {std::string("Re-UV flat (texture spans ONCE)")+suf,39},
-            {"Cut region tool (click corners, Enter)",40},
+            {"Cut region tool (2=split line, 3+=cut out)",40},
+            {"Bend/stretch tool (click grab point)",41},
             {std::string("Cut hole HERE (r=")+std::to_string((int)(cutRadius*100)/100.f).substr(0,4)+"m)",22},   // carve the clicked spot open (doorways)
             {"Split into connected pieces",23},                                               // separate disjoint parts into own meshes
             {"Mirror X",24},{"Mirror Y",25},{"Mirror Z",26},                                  // flip to face the other side (winding fixed)
@@ -2435,8 +2502,10 @@ struct Editor {
                 else if (a==38) { patchMode=!patchMode; patchPts.clear(); patchCols.clear();
                                   if (patchMode) setStatus("PATCH: click the gap's corner points in the viewport (3+), Enter builds, Esc cancels"); }
                 else if (a==39) forEachSelMesh([&](int m){ reUVFlat(m); });
-                else if (a==40) { patchMode=true; pinIsCut=true; patchPts.clear(); patchCols.clear();
-                                  setStatus("CUT REGION: click the region's corner points (3+), Enter cuts it from the SELECTED mesh(es), Esc cancels"); }
+                else if (a==40) { patchMode=true; pinIsCut=true; pinIsBend=false; patchPts.clear(); patchCols.clear();
+                                  setStatus("CUT: 2 pins = SPLIT along the line, 3+ pins = cut the polygon out; Enter applies"); }
+                else if (a==41) { patchMode=true; pinIsBend=true; pinIsCut=false; patchPts.clear(); patchCols.clear();
+                                  setStatus("BEND: click the grab point, set Radius + Offset (Object > Geometry), Enter deforms"); }
                 else if (a==27) { bool exc = !noColMeshes.count(ctxMesh);      // collision walk-through toggle (whole selection)
                                   for (int t2:tg) { if (exc) noColMeshes.insert(t2); else noColMeshes.erase(t2); }
                                   bakeNavmeshes(this->items);                  // preview + cook collision re-bake immediately ("items" here = the MENU rows)
@@ -2981,7 +3050,7 @@ struct Editor {
           y += th.rowH+3*uiScale; }
         { float bw2=(w-6*uiScale)/2;    // PATCH TOOL: paint EXACTLY where geometry goes (gap corners -> Enter)
           char pb2[48]; snprintf(pb2,sizeof pb2, patchMode?"Patching: %d pts (Enter)":"Patch tool (click corners)",(int)patchPts.size());
-          if (cx.button(ui::hashId("patchtg"), x, y, bw2, th.rowH, pb2, patchMode&&!pinIsCut)) { patchMode=!(patchMode&&!pinIsCut); pinIsCut=false; patchPts.clear(); patchCols.clear();
+          if (cx.button(ui::hashId("patchtg"), x, y, bw2, th.rowH, pb2, patchMode&&!pinIsCut)) { patchMode=!(patchMode&&!pinIsCut&&!pinIsBend); pinIsCut=false; pinIsBend=false; patchPts.clear(); patchCols.clear();
               if (patchMode) setStatus("PATCH: click the gap's corner points in the viewport (3+), Enter builds, Esc cancels"); }
           if (cx.button(ui::hashId("patchgo"), x+bw2+6*uiScale, y, bw2, th.rowH, "Build patch (Enter)", false) && patchMode) buildPatch();
           y += th.rowH+3*uiScale; }
@@ -2989,9 +3058,26 @@ struct Editor {
         y += th.rowH+3*uiScale;
         { char cb2[52]; snprintf(cb2,sizeof cb2, (patchMode&&pinIsCut)?"Cutting: %d pts (Enter)":"Cut region tool (click corners)",(int)patchPts.size());
           if (cx.button(ui::hashId("cutreg"), x, y, w, th.rowH, cb2, patchMode&&pinIsCut)) {
-              patchMode=!(patchMode&&pinIsCut); pinIsCut=patchMode; patchPts.clear(); patchCols.clear();
-              if (patchMode) setStatus("CUT REGION: click the region's corner points (3+), Enter cuts it from the SELECTED mesh(es), Esc cancels"); }
+              patchMode=!(patchMode&&pinIsCut); pinIsCut=patchMode; pinIsBend=false; patchPts.clear(); patchCols.clear();
+              if (patchMode) setStatus("CUT: 2 pins = SPLIT along the line, 3+ pins = cut the polygon out of the SELECTION; Enter applies"); }
           y += th.rowH+3*uiScale; }
+        // BEND/STRETCH: grab-deform with falloff (click a point, set radius + offset, Apply)
+        { char bb2[52]; snprintf(bb2,sizeof bb2, (patchMode&&pinIsBend)?"Bending: pin set (Enter)":"Bend/stretch tool (click grab point)");
+          if (cx.button(ui::hashId("bendtg"), x, y, w, th.rowH, bb2, patchMode&&pinIsBend)) {
+              patchMode=!(patchMode&&pinIsBend); pinIsBend=patchMode; pinIsCut=false; patchPts.clear(); patchCols.clear();
+              if (patchMode) setStatus("BEND: click the grab point on the mesh, set Radius + Offset below, Enter (or Apply) deforms"); }
+          y += th.rowH+3*uiScale;
+          if (patchMode && pinIsBend) {
+              cx.label(x,y,54*uiScale,th.rowH,"Radius",th.textDim);
+              cx.dragFloat(ui::hashId("bendrad"), x+56*uiScale, y, 70*uiScale, th.rowH, bendRadius, 0.02f, "%.2f"); y+=th.rowH+2*uiScale;
+              float lw2=24*uiScale, fw2=(w-lw2*3)/3-4*uiScale; const char* bn[3]={"X","Y","Z"};
+              for (int k=0;k<3;k++){ float fx=x+k*(lw2+fw2+4*uiScale);
+                  cx.label(fx,y,lw2,th.rowH,bn[k],th.textDim);
+                  cx.dragFloat(ui::hashId(9600u+(unsigned)k,19u), fx+lw2, y, fw2, th.rowH, bendOff[k], 0.01f, "%.2f"); }
+              y+=th.rowH+2*uiScale;
+              if (cx.button(ui::hashId("bendgo"), x, y, w, th.rowH, "Apply bend (Enter)")) bendAtPin();
+              y+=th.rowH+3*uiScale;
+          } }
         { float bw3=(w-10*uiScale)/3;   // SLICE: separate the mesh into two halves along a center plane
           if (cx.button(ui::hashId("slcx"), x,                   y, bw3, th.rowH, "Slice X")) forEachSelMesh([&](int m){ sliceMesh(m, 0); });
           if (cx.button(ui::hashId("slcy"), x+bw3+5*uiScale,     y, bw3, th.rowH, "Slice Y")) forEachSelMesh([&](int m){ sliceMesh(m, 1); });
