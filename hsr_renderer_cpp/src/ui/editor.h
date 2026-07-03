@@ -1231,6 +1231,60 @@ struct Editor {
         sliceMeshByPlane(mi, pn, (mn[axis]+mx[axis])*0.5f);
     }
 
+    // ── KNIFE: draw a plain 2D LINE across the screen - on release the selection is cut along it
+    //    (the cutting plane goes through the camera and the drawn line, so the cut lands EXACTLY
+    //    under the line you see). No 3D widget, no gizmo - just drag a line over the mesh.
+    bool  knifeOn = false, knifeDrag = false;
+    float knifeA[2] = {0,0};
+    void startKnife(){
+        // no selection needed - the knife cuts whatever mesh the line is DRAWN OVER
+        patchMode=false; pinIsCut=false; pinIsBend=false; sliceGizmoOn=false; patchPts.clear(); patchCols.clear();
+        knifeOn=true; knifeDrag=false;
+        setStatus("KNIFE: drag a straight line ACROSS a mesh - release cuts that mesh exactly under the line (Esc cancels)");
+    }
+    void applyKnife(float ax, float ay, float bx, float by){
+        knifeOn=false; knifeDrag=false;
+        float dx2=bx-ax, dy2=by-ay;
+        if (dx2*dx2+dy2*dy2 < 100.f) { setStatus("knife: line too short - drag a longer stroke"); return; }
+        // plane through the CAMERA EYE and the two unprojected rays of the line endpoints
+        float W=(float)rcViewport.extent.width, H=(float)rcViewport.extent.height; if (W<=0||H<=0) return;
+        float vp[16]; mat4mul(r->cam.proj, r->cam.view, vp); float inv[16]; if (!invertMat4(vp, inv)) return;
+        auto ray=[&](float sx, float sy, float d[3]){
+            float ndcx=2.f*(sx-rcViewport.offset.x)/W-1.f, ndcy=2.f*(sy-rcViewport.offset.y)/H-1.f;
+            float O2[3],F2[3]; unproject(inv,ndcx,ndcy,1.f,O2); unproject(inv,ndcx,ndcy,0.f,F2);
+            d[0]=F2[0]-O2[0]; d[1]=F2[1]-O2[1]; d[2]=F2[2]-O2[2];
+            float l=std::sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]); if (l>1e-6f){ d[0]/=l; d[1]/=l; d[2]/=l; } };
+        float dA[3], dB[3]; ray(ax,ay,dA); ray(bx,by,dB);
+        float n[3]={ dA[1]*dB[2]-dA[2]*dB[1], dA[2]*dB[0]-dA[0]*dB[2], dA[0]*dB[1]-dA[1]*dB[0] };
+        float nl=std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+        if (nl<1e-6f) { setStatus("knife: degenerate line"); return; }
+        n[0]/=nl; n[1]/=nl; n[2]/=nl;
+        float pd = n[0]*r->cam.pos[0]+n[1]*r->cam.pos[1]+n[2]*r->cam.pos[2];
+        // cut ONLY the mesh(es) actually UNDER the drawn line - sample the stroke and pick what it crosses
+        std::set<int> targets;
+        for (int i2=0;i2<=8;++i2){ float t=(float)i2/8.f;
+            int hit = pickIndex(ax+(bx-ax)*t, ay+(by-ay)*t);
+            if (hit>=0) targets.insert(hit); }
+        if (targets.empty()) { setStatus("knife: the line didn't cross any mesh"); return; }
+        int done=0;
+        for (int m : targets) { sliceMeshByPlane(m, n, pd); ++done; }   // EXACT triangle-splitting cut
+        setStatus("Knife cut "+std::to_string(done)+" mesh(es) exactly under the line - Ctrl+Z un-cuts");
+    }
+    void drawKnifeOverlay(){
+        if (!knifeOn) return;
+        dl.pushClip((float)rcViewport.offset.x,(float)rcViewport.offset.y,(float)rcViewport.extent.width,(float)rcViewport.extent.height);
+        cx.textAligned((float)rcViewport.offset.x, (float)rcViewport.offset.y+26*uiScale, (float)rcViewport.extent.width, 18*uiScale,
+                       "KNIFE - drag a line across the mesh, release = cut (Esc cancels)", ui::rgba(255,240,90), 1);
+        if (knifeDrag){
+            dl.line(knifeA[0],knifeA[1], cx.in.mx,cx.in.my, ui::rgba(0,0,0,180), 5.f);          // outline for contrast
+            dl.line(knifeA[0],knifeA[1], cx.in.mx,cx.in.my, ui::rgba(255,240,90), 2.5f);        // THE line
+            float hs2=5*uiScale;
+            dl.rect(knifeA[0]-hs2,knifeA[1]-hs2,hs2*2,hs2*2, ui::rgba(255,240,90));
+            dl.rect(cx.in.mx-hs2,cx.in.my-hs2,hs2*2,hs2*2, ui::rgba(255,240,90));
+        }
+        dl.popClip();
+    }
+
     // ── SLICE GIZMO: a VISIBLE cutting plane you place with the normal move/rotate gizmo. The exact
     //    cut line is highlighted LIVE on the mesh as you drag; Enter cuts (true triangle-splitting).
     //    Move = slide the plane, Rotate = turn it; works on the whole selection.
@@ -2510,6 +2564,10 @@ struct Editor {
             else { cx.in.down[0]=false; cx.in.released[0]=true; }
             return;                                             // (item action is performed in drawContextMenu / drawAddMenu)
         }
+        if (knifeOn && b == 0 && action == GLFW_PRESS && inRect(rcViewport, cx.in.mx, cx.in.my)) {
+            knifeA[0]=(float)cx.in.mx; knifeA[1]=(float)cx.in.my; knifeDrag=true;   // KNIFE stroke start
+            cx.in.down[0]=true; cx.in.pressed[0]=true; return;
+        }
         if (playSim) {   // WALK MODE: the fly-cam owns the mouse-look; no pick / gizmo / exit-drag
             if (action==GLFW_PRESS){ cx.in.down[b]=true; cx.in.pressed[b]=true; } else { cx.in.down[b]=false; cx.in.released[b]=true; }
             return;
@@ -2539,6 +2597,10 @@ struct Editor {
                 else { std::vector<Xform> after; for (int m:gizmoSel) after.push_back(captureX(r->gpuMeshes[m])); pushUndo(gizmoSel, gizmoBeforeV, after); }
                 gizmoDrag=false; gizmoAxis=-1; }
             else if (b == 0 && popupAtePress) { popupAtePress = false; }   // the press went to a MENU: its release must NOT pick a mesh behind the popup
+            else if (b == 0 && knifeOn && knifeDrag) {   // KNIFE: release = cut under the drawn line
+                knifeDrag=false;
+                applyKnife(knifeA[0], knifeA[1], (float)cx.in.mx, (float)cx.in.my);
+            }
             else if (b == 0 && in3D && patchMode) {   // PATCH TOOL: clicks drop pins, never select/deselect
                 float dx=cx.in.mx-(float)cx.in.pressX[0], dy=cx.in.my-(float)cx.in.pressY[0];
                 if (dx*dx+dy*dy < 25.f*uiScale*uiScale) patchClick(cx.in.mx, cx.in.my);
@@ -2617,6 +2679,7 @@ struct Editor {
             if (key==GLFW_KEY_ENTER) applySliceGizmo();
             if (key==GLFW_KEY_ESCAPE) { sliceGizmoOn=false; setStatus("slice gizmo cancelled"); }
         }
+        if (knifeOn && key==GLFW_KEY_ESCAPE) { knifeOn=false; knifeDrag=false; setStatus("knife cancelled"); }
         if (key==GLFW_KEY_SPACE && !playSim) {   // SPACE = toggle visibility of the selection (meshes or scene items)
             if (!selItems.empty()) { bool anyVis=false; for (int i:selItems) if (i>=0&&i<(int)items.size()&&!items[i].hidden) anyVis=true;
                                      for (int i:selItems) if (i>=0&&i<(int)items.size()) items[i].hidden = anyVis; }
@@ -2667,7 +2730,7 @@ struct Editor {
     int winW() const { int w=0,h=0; glfwGetWindowSize(win,&w,&h); return w; }
     int winH() const { int w=0,h=0; glfwGetWindowSize(win,&w,&h); return h; }
     // main gates camera/WASD on these
-    bool wantsMouse() const { return ctxOpen || cx.active!=0 || cx.kbFocus!=0 || gizmoDrag || exitDrag || boxSel || dragSplit!=0 || !inRect(rcViewport, cx.in.mx, cx.in.my); }
+    bool wantsMouse() const { return ctxOpen || knifeOn || cx.active!=0 || cx.kbFocus!=0 || gizmoDrag || exitDrag || boxSel || dragSplit!=0 || !inRect(rcViewport, cx.in.mx, cx.in.my); }
     bool wantsKeyboard() const { return cx.kbFocus != 0; }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -2764,6 +2827,7 @@ struct Editor {
         drawHoleOverlay();                                      // numbered orange hole outlines - CLICK a marker to seal that hole
         drawPatchOverlay();                                     // patch tool: pins + outline while clicking corners
         drawSliceOverlay();                                     // slice gizmo: plane quad + LIVE glowing cut line
+        drawKnifeOverlay();                                     // knife: the 2D stroke line while dragging
         drawKeybindsPanel();                                    // F1 overlay: every shortcut in one place
         cx.drawTooltip();                                       // deferred hover tooltips — drawn ABOVE everything
         cx.in.newFrame();                                       // consume per-frame input edges/deltas
@@ -2925,6 +2989,7 @@ struct Editor {
             {std::string(showHoles?"Hide hole inspector":"SHOW HOLES (click a marker to seal)"),33},   // visual: numbered outlines, click = fill THAT hole
             {"Seal hole HERE (nearest to click)",34},                                         // fills the loop nearest the right-clicked spot
             {std::string("Seal ALL holes (keeps perimeter)")+suf,21},
+            {"KNIFE: cut by drawing a LINE over the mesh",45},                                // 2D stroke, release = exact cut under the line
             {"SLICE GIZMO here (place the cut visually)",44},                                 // gizmo-placed plane + live cut line, Enter cuts
             {"Slice in half X",35},{"Slice in half Y",36},{"Slice in half Z",37},             // separate halves (move/delete independently)
             {std::string(patchMode?"Patch tool: CANCEL":"Patch tool (click gap corners, Enter)"),38},
@@ -3010,6 +3075,7 @@ struct Editor {
                 else if (a==36) forEachSelMesh([&](int m){ sliceMesh(m, 1); });
                 else if (a==37) forEachSelMesh([&](int m){ sliceMesh(m, 2); });
                 else if (a==44) startSliceGizmo(ctxHitValid?ctxHitP:nullptr);
+                else if (a==45) startKnife();
                 else if (a==38) { patchMode=!patchMode; patchPts.clear(); patchCols.clear();
                                   if (patchMode) setStatus("PATCH: click the gap's corner points in the viewport (3+), Enter builds, Esc cancels"); }
                 else if (a==39) forEachSelMesh([&](int m){ reUVFlat(m); });
@@ -3612,6 +3678,9 @@ struct Editor {
               if (cx.button(ui::hashId("bendgo"), x, y, w, th.rowH, "Apply bend (Enter)")) bendAtPin();
               y+=th.rowH+3*uiScale;
           } }
+        { char kb2[52]; snprintf(kb2,sizeof kb2, knifeOn?"KNIFE active - drag a line over the mesh":"KNIFE: cut by drawing a LINE");
+          if (cx.button(ui::hashId("knife"), x, y, w, th.rowH, kb2, knifeOn)) { if (knifeOn){ knifeOn=false; knifeDrag=false; } else startKnife(); }
+          y += th.rowH+3*uiScale; }
         { char sb2[52]; snprintf(sb2,sizeof sb2, sliceGizmoOn?"SLICE GIZMO active (Enter cuts)":"Slice GIZMO (place the cut visually)");
           if (cx.button(ui::hashId("slcgiz"), x, y, w, th.rowH, sb2, sliceGizmoOn)) { if (sliceGizmoOn) sliceGizmoOn=false; else startSliceGizmo(nullptr); }
           y += th.rowH+3*uiScale; }
