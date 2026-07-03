@@ -2093,10 +2093,14 @@ int main(int argc, char** argv) {
         glfwPollEvents();
         // (pick + the gizmo are handled immediately in editor.onMouseButton, using the viewport pane rect)
 
-        // Drag-and-drop reload: swap the env IN PLACE (same window/process - no relaunch, no focus steal).
-        // Headless/scripted modes keep the old relaunch behavior.
+        // Drag-and-drop: a .hsrprefab SPAWNS into the current scene (no reload!); anything else swaps
+        // the env IN PLACE (same window/process - no relaunch, no focus steal).
         if (g_doReload) {
-            if (interactive) { nextEnv = g_dropPath; g_doReload = false; g_dropPath.clear(); break; }
+            if (g_dropPath.size() > 10 && g_dropPath.substr(g_dropPath.size()-10) == ".hsrprefab") {
+                if (!std::getenv("HSR_NOUI") && editor.ready) editor.spawnPrefab(g_dropPath);
+                g_doReload = false; g_dropPath.clear();
+            }
+            else if (interactive) { nextEnv = g_dropPath; g_doReload = false; g_dropPath.clear(); break; }
 #ifdef _WIN32
             relaunchSelf(g_dropPath);
 #endif
