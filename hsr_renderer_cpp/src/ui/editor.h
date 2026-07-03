@@ -186,10 +186,10 @@ struct Editor {
         std::vector<int> src=sel; deselectAll(); std::vector<int> made;
         for (int s : src) {
             if (s<0 || s>=(int)sceneMeshes->size() || s>=(int)r->gpuMeshes.size()) continue;
-            MeshData cp = (*sceneMeshes)[(size_t)s];          // clone CPU mesh (geometry + textures + material flags)
-            cp.name = cp.name + " copy";
+            MeshData cp = (*sceneMeshes)[(size_t)s];          // clone CPU mesh (geometry + textures + material flags) — SAME name (hidden edit log tracks it)
             sceneMeshes->push_back(cp);
             size_t ni = r->gpuMeshes.size();
+            meshEditLog[(int)ni] = "copy";
             r->uploadMesh(sceneMeshes->back());               // creates gpuMeshes[ni] with its own GPU buffers
             if (r->gpuMeshes.size() != ni+1) continue;        // upload failed -> skip
             VkGpuMesh& ng = r->gpuMeshes[ni];
@@ -246,7 +246,6 @@ struct Editor {
                 md.indices.push_back(a); md.indices.push_back(b2); md.indices.push_back(a2);
                 added+=2; } }
         if (!added) { setStatus("extend: mesh is CLOSED (no boundary edges) - nothing to grow"); return; }
-        md.name += " extended";
         if (commitGeomEdit(mi, std::move(md), "extend"))
             setStatus("Extended "+std::to_string(added)+" tris off the boundary (texture continued) - Ctrl+Z reverts");
     }
@@ -300,7 +299,6 @@ struct Editor {
                 md.indices.push_back(a); md.indices.push_back(b); md.indices.push_back(cvi); ++added; }
         }
         if (!holes) { setStatus("seal: no closed holes found on '"+md.name+"'"); return; }
-        md.name += " sealed";
         if (commitGeomEdit(mi, std::move(md), "seal"))
             setStatus("Sealed "+std::to_string(holes)+" hole(s) with "+std::to_string(added)+" tris - Ctrl+Z reverts");
     }
@@ -319,31 +317,87 @@ struct Editor {
         for (size_t v2=0;v2<nv;++v2) md.positions[v2*3+axis] = 2.f*c - md.positions[v2*3+axis];
         for (size_t k=0;k+2<md.indices.size();k+=3) std::swap(md.indices[k+1], md.indices[k+2]);   // fix winding
         const char* an[3]={"X","Y","Z"};
-        md.name += std::string(" mirror") + an[axis];
         if (commitGeomEdit(mi, std::move(md), "mirror"))
             setStatus(std::string("Mirrored across ")+an[axis]+" (faces the other side now) - Ctrl+Z reverts");
     }
 
-    // ── mesh ROTATE 180: spin the geometry half a turn about its own vertical (Y) center axis — a TRUE
-    //    rotation (not a mirror: no reflection, winding/orientation preserved, text stays readable).
-    void rotateMesh180(int mi){
+    // ── mesh ROTATE (baked): TRUE rotation of the geometry about its own center axis — no reflection,
+    //    winding/orientation preserved. axis 0=X 1=Y 2=Z; deg any multiple of 90 (90/180/270). Repeat
+    //    presses stack. (Arbitrary angles = the Rotate gizmo; this BAKES the turn into the vertices.)
+    void rotateMeshGeom(int mi, int axis, int deg){
         if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
         MeshData md = (*sceneMeshes)[(size_t)mi];
         size_t nv = md.positions.size()/3;
         if (nv<3) return;
-        float lx=1e30f,hx=-1e30f,lz=1e30f,hz=-1e30f;
-        for (size_t v2=0;v2<nv;++v2){ float px=md.positions[v2*3], pz=md.positions[v2*3+2];
-            lx=std::min(lx,px); hx=std::max(hx,px); lz=std::min(lz,pz); hz=std::max(hz,pz); }
-        float cx0=(lx+hx)*0.5f, cz0=(lz+hz)*0.5f;
-        for (size_t v2=0;v2<nv;++v2){ md.positions[v2*3]   = 2.f*cx0 - md.positions[v2*3];
-                                      md.positions[v2*3+2] = 2.f*cz0 - md.positions[v2*3+2]; }   // 180 deg about Y = negate X and Z about the center
-        md.name += " rot180";
-        if (commitGeomEdit(mi, std::move(md), "rot180"))
-            setStatus("Rotated 180 deg about its vertical center - Ctrl+Z reverts");
+        int u=(axis+1)%3, v=(axis+2)%3;                       // the plane the rotation spins in
+        float lo0=1e30f,hi0=-1e30f,lo1=1e30f,hi1=-1e30f;
+        for (size_t k=0;k<nv;++k){ float a=md.positions[k*3+u], b=md.positions[k*3+v];
+            lo0=std::min(lo0,a); hi0=std::max(hi0,a); lo1=std::min(lo1,b); hi1=std::max(hi1,b); }
+        float cu=(lo0+hi0)*0.5f, cv=(lo1+hi1)*0.5f;
+        float rad=(float)deg*3.14159265f/180.f, c=std::cos(rad), s=std::sin(rad);
+        if (deg%90==0){ int q=((deg/90)%4+4)%4; const float qc[4]={1,0,-1,0}, qs[4]={0,1,0,-1}; c=qc[q]; s=qs[q]; }   // exact quarter turns
+        for (size_t k=0;k<nv;++k){ float a=md.positions[k*3+u]-cu, b=md.positions[k*3+v]-cv;
+            md.positions[k*3+u]=cu + a*c - b*s; md.positions[k*3+v]=cv + a*s + b*c; }
+        const char* an[3]={"X","Y","Z"};
+        char what[24]; snprintf(what,sizeof what,"rot%s%d",an[axis],deg);
+        if (commitGeomEdit(mi, std::move(md), what))
+            setStatus(std::string("Rotated ")+std::to_string(deg)+" deg about "+an[axis]+" center - repeat to stack, Ctrl+Z reverts");
+    }
+    void rotateMesh180(int mi){ rotateMeshGeom(mi, 1, 180); }
+
+    // ── FUSE the multi-selection into ONE mesh: every source's CURRENT world transform is baked into
+    //    the vertices, geometry/UVs concatenated onto the ACTIVE mesh's material+texture, sources go
+    //    to history (ONE Ctrl+Z un-fuses). Skinned/animated sources are skipped (their verts stream).
+    void fuseSelectedMeshes(){
+        if (!r || !sceneMeshes || sel.size()<2) { setStatus("fuse: select 2+ meshes first (Ctrl+click)"); return; }
+        std::vector<int> src; int skippedAnim=0;
+        for (int s : sel) { if (s<0||s>=(int)sceneMeshes->size()||s>=(int)r->gpuMeshes.size()||r->isDeleted((size_t)s)) continue;
+            if (r->gpuMeshes[s].isSkinned || r->gpuMeshes[s].dynamicVerts) { ++skippedAnim; continue; }
+            src.push_back(s); }
+        if (src.size()<2) { setStatus("fuse: need 2+ STATIC meshes (skinned/animated can't fuse)"); return; }
+        int base = src[0];
+        MeshData out = (*sceneMeshes)[(size_t)base];          // material/texture/flags of the ACTIVE-first mesh
+        out.positions.clear(); out.uvs.clear(); out.uvs2.clear(); out.indices.clear();
+        out.transform = Transform{};                          // world already baked into the verts below
+        out.hasWorldMatrix = true;
+        static const float I16[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        memcpy(out.worldMatrix, I16, sizeof I16);
+        bool wantUV = !(*sceneMeshes)[(size_t)base].uvs.empty(), wantUV2 = !(*sceneMeshes)[(size_t)base].uvs2.empty();
+        for (int s : src) {
+            const MeshData& md=(*sceneMeshes)[(size_t)s]; const VkGpuMesh& gm=r->gpuMeshes[(size_t)s];
+            const float* M=gm.model;
+            u32 vb=(u32)(out.positions.size()/3);
+            size_t nv=md.positions.size()/3;
+            for (size_t k2=0;k2<nv;++k2){ const float* p=&md.positions[k2*3];
+                out.positions.push_back(M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12]);
+                out.positions.push_back(M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13]);
+                out.positions.push_back(M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14]);
+                if (wantUV)  { if (md.uvs.size()>=nv*2)  { out.uvs.push_back(md.uvs[k2*2]);  out.uvs.push_back(md.uvs[k2*2+1]); }   else { out.uvs.push_back(0);  out.uvs.push_back(0); } }
+                if (wantUV2) { if (md.uvs2.size()>=nv*2) { out.uvs2.push_back(md.uvs2[k2*2]); out.uvs2.push_back(md.uvs2[k2*2+1]); } else { out.uvs2.push_back(0); out.uvs2.push_back(0); } }
+            }
+            for (u32 ix : md.indices) out.indices.push_back(vb+ix);
+        }
+        sceneMeshes->push_back(std::move(out));
+        size_t ni=r->gpuMeshes.size();
+        r->uploadMesh(sceneMeshes->back());
+        if (r->gpuMeshes.size()!=ni+1){ setStatus("fuse: GPU upload failed"); sceneMeshes->pop_back(); return; }
+        r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
+        std::vector<int> hist=src; std::vector<uint8_t> histA(src.size(),1);
+        for (int s : src) r->setDeleted((size_t)s, true);
+        hist.push_back((int)ni); histA.push_back(0);
+        pushDeleteUndo(hist, histA);                          // ONE Ctrl+Z un-fuses (sources back, fused gone)
+        meshEditLog[(int)ni] = "fuse(" + std::to_string(src.size()) + ")";
+        selectOne((int)ni); scrollToSel=true;
+        setStatus("Fused "+std::to_string(src.size())+" meshes into one (active mesh's texture)"
+                  +(skippedAnim? " - skipped "+std::to_string(skippedAnim)+" animated" : "")+" - Ctrl+Z un-fuses");
     }
 
-    // shared tail of the geometry tools: append the edited clone, carry the transform/tint, soft-delete
-    // the original into the undo history, select the new mesh.
+    // HIDDEN per-mesh edit log: geometry ops NEVER rename the mesh (the outliner keeps the original name);
+    // what happened is tracked here and shown only as a dim "edits: ..." line in the Object tab.
+    std::map<int,std::string> meshEditLog;
+
+    // shared tail of the geometry tools: append the edited clone (SAME name), carry the transform/tint,
+    // soft-delete the original into the undo history, select the new mesh, log the edit invisibly.
     bool commitGeomEdit(int mi, MeshData&& md, const char* what){
         sceneMeshes->push_back(std::move(md));
         size_t ni=r->gpuMeshes.size();
@@ -355,9 +409,19 @@ struct Editor {
         r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
         r->setDeleted((size_t)mi, true);
         pushDeleteUndo({mi,(int)ni}, std::vector<uint8_t>{1,0});   // ONE history entry: Ctrl+Z restores the original AND removes the result
+        { auto it=meshEditLog.find(mi); std::string prev = it!=meshEditLog.end()? it->second+"+" : std::string();
+          meshEditLog[(int)ni] = prev + what; }
         selectOne((int)ni);
         scrollToSel = true;   // the result appends at the END of the outliner — jump to it
         return true;
+    }
+    // Run a single-mesh geometry op over the WHOLE selection (each op selects its result; afterwards the
+    // multi-selection is the set of results).
+    void forEachSelMesh(const std::function<void(int)>& op){
+        std::vector<int> src = sel.empty() ? (selected>=0 ? std::vector<int>{selected} : std::vector<int>{}) : sel;
+        std::vector<int> results;
+        for (int s : src) { if (s<0 || (r && r->isDeleted((size_t)s))) continue; op(s); if (selected>=0) results.push_back(selected); }
+        if (results.size()>1) { sel=results; selected=results.back(); r->selectedMesh=selected; }
     }
 
     // ── mesh CUT HOLE: delete every triangle whose centroid lies within `radius` of the WORLD point
@@ -382,7 +446,6 @@ struct Editor {
         }
         if (!cut) { setStatus("cut: no triangles within "+std::to_string(radius)+"m of the clicked point"); return; }
         md.indices = std::move(keep);
-        md.name += " cut";
         if (commitGeomEdit(mi, std::move(md), "cut"))
             setStatus("Cut "+std::to_string(cut)+" tris (r="+std::to_string(radius)+"m) - re-bake/collision follows; original in history (Ctrl+Z)");
     }
@@ -407,7 +470,7 @@ struct Editor {
         std::vector<MeshData> parts((size_t)nComp);
         std::vector<std::map<uint32_t,uint32_t>> remap((size_t)nComp);
         for (int c2=0;c2<nComp;++c2){ parts[c2]=src; parts[c2].positions.clear(); parts[c2].uvs.clear(); parts[c2].uvs2.clear(); parts[c2].indices.clear();
-            parts[c2].name = src.name + " part" + std::to_string(c2+1); }
+            /* parts KEEP the original name (the [idx] suffix in the outliner disambiguates) */ }
         for (size_t k=0;k+2<src.indices.size();k+=3){
             int c2 = compOf[find(src.indices[k])]; auto& pt=parts[c2]; auto& rm=remap[c2];
             for (int e=0;e<3;e++){ uint32_t v2=src.indices[k+e];
@@ -1210,10 +1273,10 @@ struct Editor {
         if ((mods&GLFW_MOD_CONTROL) && key=='L') loadProject();   // restore the session
         if ((mods&GLFW_MOD_CONTROL) && key=='C' && selItem>=0 && selItem<(int)items.size()) { clipboardItem=items[selItem]; hasClipboard=true; }   // copy item
         if ((mods&GLFW_MOD_CONTROL) && key=='V' && hasClipboard) {   // paste a copy (offset so it's visible), undoable, and select it
-            pushItemUndo(items); sitem::Item it=clipboardItem; it.pos[0]+=0.5f; it.pos[2]+=0.5f; it.name+=" copy";
+            pushItemUndo(items); sitem::Item it=clipboardItem; it.pos[0]+=0.5f; it.pos[2]+=0.5f; /*name kept*/
             deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; }
         if ((mods&GLFW_MOD_CONTROL) && key=='D' && selItem>=0 && selItem<(int)items.size()) {   // Ctrl+D = duplicate in place+offset
-            pushItemUndo(items); sitem::Item it=items[selItem]; it.pos[0]+=0.5f; it.pos[2]+=0.5f; it.name+=" copy";
+            pushItemUndo(items); sitem::Item it=items[selItem]; it.pos[0]+=0.5f; it.pos[2]+=0.5f; /*name kept*/
             deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; }
         if (key=='P' && !(mods&GLFW_MOD_CONTROL)) { if(playSim) stopSim(); else startSim(); }   // toggle WALK mode (player sim)
         if ((mods&GLFW_MOD_SHIFT) && !(mods&GLFW_MOD_CONTROL)) {   // Shift+X/Y/Z = toggle the per-axis gizmo lock (viewport pills)
@@ -1506,7 +1569,7 @@ struct Editor {
                 else if (a==1) { bool anyVis=false; for (int t:tgt) if (t<(int)items.size() && !items[t].hidden) anyVis=true;
                                  for (int t:tgt) if (t<(int)items.size()) items[t].hidden = anyVis; }
                 else if (a==2) { pushItemUndo(items);
-                                 for (int t:tgt) if (t<(int)items.size()) { sitem::Item cp=items[t]; cp.pos[0]+=0.5f; cp.pos[2]+=0.5f; cp.name+=" copy"; items.push_back(std::move(cp)); }
+                                 for (int t:tgt) if (t<(int)items.size()) { sitem::Item cp=items[t]; cp.pos[0]+=0.5f; cp.pos[2]+=0.5f; /*name kept*/ items.push_back(std::move(cp)); }
                                  selItem=(int)items.size()-1; selItems.clear(); deselectAll(); }
                 else if (a==3) { pushItemUndo(items); std::vector<int> del=tgt; std::sort(del.rbegin(), del.rend());
                                  for (int t:del) if (t<(int)items.size()) items.erase(items.begin()+t);
@@ -1544,7 +1607,9 @@ struct Editor {
             {std::string("Cut hole HERE (r=")+std::to_string((int)(cutRadius*100)/100.f).substr(0,4)+"m)",22},   // carve the clicked spot open (doorways)
             {"Split into connected pieces",23},                                               // separate disjoint parts into own meshes
             {"Mirror X",24},{"Mirror Y",25},{"Mirror Z",26},                                  // flip to face the other side (winding fixed)
-            {"Rotate 180 (about Y center)",28},                                               // true half-turn, no reflection
+            {"Rotate Y +90 (repeat to stack)",28},{"Rotate Y 180",29},                        // true rotations, no reflection
+            {"Rotate X +90",30},{"Rotate Z +90",31},
+            {std::string("Fuse selection into ONE mesh")+suf,32},                             // bake world transforms, concat geometry (active mesh's texture)
             {std::string(noColMeshes.count(ctxMesh)?"Collision: INCLUDE again":"Collision: EXCLUDE (walk-through)")+suf,27},
             {std::string("Reset transform")+suf,3}, {"Copy name",4},
             {colLbl,5},
@@ -1592,17 +1657,21 @@ struct Editor {
                 else if (a==9) { if (!inSel(ctxMesh)) selectOne(ctxMesh); toggleDeleteSelected(); }  // drop from render + cook (Del again restores)
                 else if (a==18) { if (!inSel(ctxMesh)) selectOne(ctxMesh); gizmoOp=2; tab=TAB_OBJECT;   // STRETCH: per-axis Scale gizmo + the Object tab's Scale fields
                                   setStatus("Scale gizmo ON - drag a box handle to stretch per-axis (or type in Object > Scale)"); }
-                else if (a==19) extendMeshBoundary(ctxMesh, extendDist, 0);   // grow triangles DOWN off open edges (floor gaps)
-                else if (a==20) extendMeshBoundary(ctxMesh, extendDist, 1);   // grow triangles OUTWARD (radial, horizon gaps)
-                else if (a==21) { std::vector<int> tg2 = tg; std::sort(tg2.rbegin(), tg2.rend());   // seal EVERY selected mesh
-                                  for (int t2 : tg2) sealMeshHoles(t2); }
-                else if (a==22) { if (ctxHitValid) cutMeshHole(ctxMesh, ctxHitP, cutRadius);   // carve a doorway at the clicked spot
+                // GEOMETRY ops apply to the WHOLE multi-selection (each source -> its own result, all re-selected)
+                else if (a==19) forEachSelMesh([&](int m){ extendMeshBoundary(m, extendDist, 0); });   // grow DOWN off open edges
+                else if (a==20) forEachSelMesh([&](int m){ extendMeshBoundary(m, extendDist, 1); });   // grow OUTWARD (radial)
+                else if (a==21) forEachSelMesh([&](int m){ sealMeshHoles(m); });
+                else if (a==22) { if (ctxHitValid) forEachSelMesh([&](int m){ cutMeshHole(m, ctxHitP, cutRadius); });   // carve at the clicked spot
                                   else setStatus("cut: no surface point under the cursor (right-click ON the mesh)"); }
-                else if (a==23) splitMeshParts(ctxMesh);                       // separate connected pieces
-                else if (a==24) mirrorMesh(ctxMesh, 0);
-                else if (a==25) mirrorMesh(ctxMesh, 1);
-                else if (a==26) mirrorMesh(ctxMesh, 2);
-                else if (a==28) rotateMesh180(ctxMesh);
+                else if (a==23) forEachSelMesh([&](int m){ splitMeshParts(m); });
+                else if (a==24) forEachSelMesh([&](int m){ mirrorMesh(m, 0); });
+                else if (a==25) forEachSelMesh([&](int m){ mirrorMesh(m, 1); });
+                else if (a==26) forEachSelMesh([&](int m){ mirrorMesh(m, 2); });
+                else if (a==28) forEachSelMesh([&](int m){ rotateMeshGeom(m, 1, 90); });
+                else if (a==29) forEachSelMesh([&](int m){ rotateMeshGeom(m, 1, 180); });
+                else if (a==30) forEachSelMesh([&](int m){ rotateMeshGeom(m, 0, 90); });
+                else if (a==31) forEachSelMesh([&](int m){ rotateMeshGeom(m, 2, 90); });
+                else if (a==32) fuseSelectedMeshes();
                 else if (a==27) { bool exc = !noColMeshes.count(ctxMesh);      // collision walk-through toggle (whole selection)
                                   for (int t2:tg) { if (exc) noColMeshes.insert(t2); else noColMeshes.erase(t2); }
                                   bakeNavmeshes(this->items);                  // preview + cook collision re-bake immediately ("items" here = the MENU rows)
@@ -2134,31 +2203,44 @@ struct Editor {
         cx.label(x,y,w,th.rowH,"Geometry (fill gaps/holes)",th.text); y+=th.rowH+2*uiScale;
         cx.label(x,y,70*uiScale,th.rowH,"Distance",th.textDim);
         cx.dragFloat(ui::hashId("extdist"), x+72*uiScale, y, 80*uiScale, th.rowH, extendDist, 0.01f, "%.2f"); y+=th.rowH+3*uiScale;
+        // every button below runs over the WHOLE multi-selection
         { float bw3=(w-10*uiScale)/3;
-          if (cx.button(ui::hashId("extdn"),  x,                 y, bw3, th.rowH, "Extend Down"))    extendMeshBoundary(selected, extendDist, 0);
-          if (cx.button(ui::hashId("extout"), x+bw3+5*uiScale,   y, bw3, th.rowH, "Extend Out"))     extendMeshBoundary(selected, extendDist, 1);
-          if (cx.button(ui::hashId("extup"),  x+2*(bw3+5*uiScale), y, bw3, th.rowH, "Extend Up"))    extendMeshBoundary(selected, extendDist, 2);
+          if (cx.button(ui::hashId("extdn"),  x,                 y, bw3, th.rowH, "Extend Down"))    forEachSelMesh([&](int m){ extendMeshBoundary(m, extendDist, 0); });
+          if (cx.button(ui::hashId("extout"), x+bw3+5*uiScale,   y, bw3, th.rowH, "Extend Out"))     forEachSelMesh([&](int m){ extendMeshBoundary(m, extendDist, 1); });
+          if (cx.button(ui::hashId("extup"),  x+2*(bw3+5*uiScale), y, bw3, th.rowH, "Extend Up"))    forEachSelMesh([&](int m){ extendMeshBoundary(m, extendDist, 2); });
           y+=th.rowH+3*uiScale; }
-        if (cx.button(ui::hashId("sealhx"), x, y, w, th.rowH, "Seal holes (auto-fill loops)")) sealMeshHoles(selected);
+        if (cx.button(ui::hashId("sealhx"), x, y, w, th.rowH, "Seal holes (auto-fill loops)")) forEachSelMesh([&](int m){ sealMeshHoles(m); });
         y += th.rowH+3*uiScale;
         cx.label(x,y,70*uiScale,th.rowH,"Cut radius",th.textDim);
         cx.dragFloat(ui::hashId("cutrad"), x+72*uiScale, y, 80*uiScale, th.rowH, cutRadius, 0.01f, "%.2f"); y+=th.rowH+3*uiScale;
         cx.label(x,y,w,th.rowH*0.9f,"(cut: RIGHT-CLICK the exact spot -> 'Cut hole HERE')",th.textDim); y+=th.rowH*0.9f+2*uiScale;
         { float bw3=(w-10*uiScale)/3;
-          if (cx.button(ui::hashId("mirx"), x,                   y, bw3, th.rowH, "Mirror X")) mirrorMesh(selected, 0);
-          if (cx.button(ui::hashId("miry"), x+bw3+5*uiScale,     y, bw3, th.rowH, "Mirror Y")) mirrorMesh(selected, 1);
-          if (cx.button(ui::hashId("mirz"), x+2*(bw3+5*uiScale), y, bw3, th.rowH, "Mirror Z")) mirrorMesh(selected, 2);
+          if (cx.button(ui::hashId("mirx"), x,                   y, bw3, th.rowH, "Mirror X")) forEachSelMesh([&](int m){ mirrorMesh(m, 0); });
+          if (cx.button(ui::hashId("miry"), x+bw3+5*uiScale,     y, bw3, th.rowH, "Mirror Y")) forEachSelMesh([&](int m){ mirrorMesh(m, 1); });
+          if (cx.button(ui::hashId("mirz"), x+2*(bw3+5*uiScale), y, bw3, th.rowH, "Mirror Z")) forEachSelMesh([&](int m){ mirrorMesh(m, 2); });
+          y+=th.rowH+3*uiScale; }
+        { float bw3=(w-10*uiScale)/3;   // TRUE rotations about the mesh's own center (repeat to stack: 90 -> 180 -> 270)
+          if (cx.button(ui::hashId("rox90"), x,                   y, bw3, th.rowH, "Rot X +90")) forEachSelMesh([&](int m){ rotateMeshGeom(m, 0, 90); });
+          if (cx.button(ui::hashId("roy90"), x+bw3+5*uiScale,     y, bw3, th.rowH, "Rot Y +90")) forEachSelMesh([&](int m){ rotateMeshGeom(m, 1, 90); });
+          if (cx.button(ui::hashId("roz90"), x+2*(bw3+5*uiScale), y, bw3, th.rowH, "Rot Z +90")) forEachSelMesh([&](int m){ rotateMeshGeom(m, 2, 90); });
           y+=th.rowH+3*uiScale; }
         { float bw2=(w-6*uiScale)/2;
-          if (cx.button(ui::hashId("splitp"), x, y, bw2, th.rowH, "Split pieces")) splitMeshParts(selected);
-          if (cx.button(ui::hashId("rot180"), x+bw2+6*uiScale, y, bw2, th.rowH, "Rotate 180")) rotateMesh180(selected);
+          if (cx.button(ui::hashId("splitp"), x, y, bw2, th.rowH, "Split pieces")) forEachSelMesh([&](int m){ splitMeshParts(m); });
+          char fb2[40]; snprintf(fb2,sizeof fb2,"Fuse selection (%d)",(int)sel.size());
+          if (cx.button(ui::hashId("fusesel"), x+bw2+6*uiScale, y, bw2, th.rowH, fb2, sel.size()>1)) fuseSelectedMeshes();
           y+=th.rowH+3*uiScale;
           bool exc = noColMeshes.count(selected)!=0;
           if (cx.button(ui::hashId("nocol"), x, y, w, th.rowH, exc?"Collision: OFF (walk-through)":"Collision: ON", exc)) {
-              if (exc) noColMeshes.erase(selected); else noColMeshes.insert(selected);
+              bool nowExc = !exc;   // apply to the WHOLE selection
+              for (int m : sel) { if (nowExc) noColMeshes.insert(m); else noColMeshes.erase(m); }
+              if (sel.empty() && selected>=0) { if (nowExc) noColMeshes.insert(selected); else noColMeshes.erase(selected); }
               bakeNavmeshes(items);
           }
           y+=th.rowH+8*uiScale; }
+        // hidden edit log (names never change; this is the only place edits show)
+        { auto it=meshEditLog.find(selected);
+          if (it!=meshEditLog.end()) { std::string el = "edits: "+it->second;
+              cx.label(x,y,w,th.rowH*0.9f, el.c_str(), th.textDim); y+=th.rowH*0.9f+2*uiScale; } }
         char b[96]; snprintf(b,sizeof b,"indices: %u    centroid %.1f %.1f %.1f", gm.nIdx, gm.centroid[0],gm.centroid[1],gm.centroid[2]);
         cx.label(x,y,w,th.rowH,b,th.textDim); y+=th.rowH;
         snprintf(b,sizeof b,"skinned: %s   dynamic: %s", gm.isSkinned?"yes":"no", gm.dynamicVerts?"yes":"no");
