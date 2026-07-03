@@ -421,6 +421,84 @@ struct Editor {
         dl.popClip();
     }
 
+    // ── PATCH TOOL ("paint where to seal"): YOU click the corner points around a gap in the viewport
+    //    (pins land on the geometry you click), Enter builds a clean fan patch through those points as
+    //    its OWN mesh - selected mesh's texture, flat planar UVs (no radial smearing), no dependence on
+    //    the broken triangulation at all. Undoable (Ctrl+Z removes), persists via the .geom sidecar.
+    bool patchMode = false;
+    std::vector<std::array<float,3>> patchPts;
+    void drawPatchOverlay(){
+        if (!patchMode) return;
+        dl.pushClip((float)rcViewport.offset.x,(float)rcViewport.offset.y,(float)rcViewport.extent.width,(float)rcViewport.extent.height);
+        cx.textAligned((float)rcViewport.offset.x, (float)rcViewport.offset.y+26*uiScale, (float)rcViewport.extent.width, 18*uiScale,
+                       "PATCH TOOL - click the gap's corners in order (3+), ENTER builds, ESC cancels", ui::rgba(120,230,140), 1);
+        float prev[2]; bool prevOk=false;
+        for (size_t i2=0;i2<patchPts.size();++i2){
+            float w[3]={patchPts[i2][0],patchPts[i2][1],patchPts[i2][2]}; float sx,sy;
+            if (worldToScreen(w,sx,sy)){
+                dl.rect(sx-5*uiScale,sy-5*uiScale,10*uiScale,10*uiScale, ui::rgba(120,230,140));
+                char nb[8]; snprintf(nb,sizeof nb,"%d",(int)i2+1);
+                cx.textAligned(sx+7*uiScale,sy-8*uiScale,20*uiScale,14*uiScale,nb,ui::rgba(160,255,180),0);
+                if (prevOk) dl.line(prev[0],prev[1],sx,sy, ui::rgba(120,230,140), 2.f);
+                prev[0]=sx; prev[1]=sy; prevOk=true;
+            }
+        }
+        if (patchPts.size()>2){ float w0[3]={patchPts[0][0],patchPts[0][1],patchPts[0][2]}; float sx,sy;
+            if (prevOk && worldToScreen(w0,sx,sy)) dl.line(prev[0],prev[1],sx,sy, ui::rgba(120,230,140,140), 1.5f); }
+        dl.popClip();
+    }
+    // A patch click: raycast the cursor against ALL meshes, drop a pin at the hit.
+    bool patchClick(double mx, double my){
+        int hit = pickIndex(mx,my); if (hit<0) return false;
+        float p[3], n[3];
+        if (!screenRayHitMesh(mx,my,hit,p,n)) return false;
+        patchPts.push_back({p[0],p[1],p[2]});
+        setStatus("patch: point "+std::to_string(patchPts.size())+" set (Enter builds with 3+, Esc cancels)");
+        return true;
+    }
+    void buildPatch(){
+        if (patchPts.size()<3){ setStatus("patch: click at least 3 corner points first"); patchMode=false; patchPts.clear(); return; }
+        if (!r || !sceneMeshes || selected<0 || selected>=(int)sceneMeshes->size()){ setStatus("patch: select the mesh whose texture the patch should use"); return; }
+        const MeshData& srcMd=(*sceneMeshes)[(size_t)selected];
+        MeshData md = srcMd;                              // texture + material flags from the SELECTED mesh
+        md.positions.clear(); md.uvs.clear(); md.uvs2.clear(); md.indices.clear();
+        md.colors.clear(); md.uvs3.clear(); md.uvs4.clear();
+        md.boneIndices.clear(); md.boneWeights.clear(); md.hasBones=false;
+        md.hasLightmap=false; md.lmRGBA.clear(); md.astcRaw.clear();
+        md.transform = Transform{}; md.hasWorldMatrix = true;
+        static const float I16[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        memcpy(md.worldMatrix, I16, sizeof I16);
+        size_t n = patchPts.size();
+        // Newell normal -> dominant axis for FLAT projected UVs (no radial smear; texture tiles ~1 rep / 4m)
+        float nx=0,ny=0,nz=0;
+        for (size_t i2=0;i2<n;++i2){ auto& a=patchPts[i2]; auto& b=patchPts[(i2+1)%n];
+            nx+=(a[1]-b[1])*(a[2]+b[2]); ny+=(a[2]-b[2])*(a[0]+b[0]); nz+=(a[0]-b[0])*(a[1]+b[1]); }
+        int dom = std::fabs(nx)>std::fabs(ny) ? (std::fabs(nx)>std::fabs(nz)?0:2) : (std::fabs(ny)>std::fabs(nz)?1:2);
+        int ua=(dom+1)%3, va=(dom+2)%3;
+        float cen[3]={0,0,0}; for (auto& p : patchPts){ cen[0]+=p[0]; cen[1]+=p[1]; cen[2]+=p[2]; }
+        cen[0]/=n; cen[1]/=n; cen[2]/=n;
+        const float UVSCALE = 0.25f;                      // 1 texture repeat per 4m (matches typical floor tiling)
+        auto pushV=[&](const float p[3]){ md.positions.push_back(p[0]); md.positions.push_back(p[1]); md.positions.push_back(p[2]);
+            md.uvs.push_back(p[ua]*UVSCALE); md.uvs.push_back(p[va]*UVSCALE); };
+        for (auto& p : patchPts){ float q[3]={p[0],p[1],p[2]}; pushV(q); }
+        pushV(cen);
+        uint32_t ci=(uint32_t)n;
+        for (size_t i2=0;i2<n;++i2){ md.indices.push_back((u32)i2); md.indices.push_back((u32)((i2+1)%n)); md.indices.push_back(ci); }
+        md.doubleSided = true;                            // a patch must show from both sides regardless of click order
+        md.nVerts=(u32)(md.positions.size()/3); md.nIdx=(u32)md.indices.size();
+        sceneMeshes->push_back(std::move(md));
+        size_t ni=r->gpuMeshes.size();
+        r->uploadMesh(sceneMeshes->back());
+        if (r->gpuMeshes.size()!=ni+1){ setStatus("patch: GPU upload failed"); sceneMeshes->pop_back(); return; }
+        r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
+        pushDeleteUndo({(int)ni}, false);                 // Ctrl+Z removes the patch
+        meshEditLog[(int)ni]="patch("+std::to_string(n)+"pts)";
+        geomDirty=true; holesMesh=-1;
+        selectOne((int)ni); scrollToSel=true;
+        patchPts.clear(); patchMode=false;
+        setStatus("Patch built through "+std::to_string(n)+" points (selected mesh's texture, flat UVs) - Ctrl+Z removes");
+    }
+
     // ── SLICE the mesh in half along an axis plane through its center: every triangle goes to the LEFT
     //    or RIGHT part by centroid (v1: triangles are not split at the plane - fine for prop separation).
     //    Both halves keep the texture/UVs; original goes to history (one Ctrl+Z un-slices).
@@ -588,6 +666,7 @@ struct Editor {
         out.boneIndices.clear(); out.boneWeights.clear(); out.hasBones=false;
         float insetU = useAtlas ? 2.0f/(float)cellW : 0.f;    // guard band so mips don't bleed neighbor cells
         float insetV = useAtlas ? 2.0f/(float)cellH : 0.f;
+        std::vector<int> triOrd;                              // per-triangle source ordinal (selection order)
         for (size_t i2=0;i2<src.size();++i2) {
             int s = src[i2];
             const MeshData& md=(*sceneMeshes)[(size_t)s]; const VkGpuMesh& gm=r->gpuMeshes[(size_t)s];
@@ -609,23 +688,29 @@ struct Editor {
                 out.uvs.push_back(u0); out.uvs.push_back(v0);
             }
             for (u32 ix : md.indices) out.indices.push_back(vb+ix);
+            triOrd.resize(out.indices.size()/3, (int)i2);   // tag every tri with its source ordinal (earlier selection wins overlaps)
         }
-        // DROP EXACT-DUPLICATE triangles (welded-position identical): overlapping source sheets / copies
-        // landing on their original z-fought inside the fused draw = "texture flashes". Exact overlaps
-        // vanish; NEAR-coplanar different sheets still fight (that needs real CSG - out of scope).
+        // ── Z-FIGHT ELIMINATION ────────────────────────────────────────────────────────────────────
+        // Pass A: weld by position, drop degenerate + EXACT duplicate triangles.
+        // Pass B: COPLANAR COVERAGE ("make it happen"): a triangle from a LATER-selected source that
+        // lies in (within ~8mm of) an EARLIER source's plane AND whose surface is fully covered by
+        // that source's triangles is REDUNDANT SHEET - dropped. First-selected sheet wins. This kills
+        // the stacked floorGroup01/02/03 shimmer without full CSG (partial overlaps keep both).
         {
             size_t fnv = out.positions.size()/3;
             std::vector<uint32_t> weld(fnv);
-            std::map<std::tuple<long long,long long,long long>, uint32_t> grid;
-            for (size_t v2=0; v2<fnv; ++v2) {
-                auto k = std::make_tuple((long long)std::llround(out.positions[v2*3]  *2000.0),
-                                         (long long)std::llround(out.positions[v2*3+1]*2000.0),
-                                         (long long)std::llround(out.positions[v2*3+2]*2000.0));
-                auto it=grid.find(k);
-                if (it==grid.end()) { grid.emplace(k,(uint32_t)v2); weld[v2]=(uint32_t)v2; } else weld[v2]=it->second;
-            }
+            { std::map<std::tuple<long long,long long,long long>, uint32_t> wgrid;
+              for (size_t v2=0; v2<fnv; ++v2) {
+                  auto k = std::make_tuple((long long)std::llround(out.positions[v2*3]  *2000.0),
+                                           (long long)std::llround(out.positions[v2*3+1]*2000.0),
+                                           (long long)std::llround(out.positions[v2*3+2]*2000.0));
+                  auto it=wgrid.find(k);
+                  if (it==wgrid.end()) { wgrid.emplace(k,(uint32_t)v2); weld[v2]=(uint32_t)v2; } else weld[v2]=it->second;
+              } }
+            // Pass A
             std::set<std::tuple<uint32_t,uint32_t,uint32_t>> seen;
             std::vector<u32> keep; keep.reserve(out.indices.size());
+            std::vector<int> keepOrd;
             size_t dropped=0;
             for (size_t k=0;k+2<out.indices.size();k+=3){
                 uint32_t a=weld[out.indices[k]], b=weld[out.indices[k+1]], c=weld[out.indices[k+2]];
@@ -633,9 +718,74 @@ struct Editor {
                 uint32_t s0=a,s1=b,s2=c; if(s0>s1)std::swap(s0,s1); if(s1>s2)std::swap(s1,s2); if(s0>s1)std::swap(s0,s1);
                 if (!seen.insert(std::make_tuple(s0,s1,s2)).second) { ++dropped; continue; }   // exact duplicate
                 keep.push_back(out.indices[k]); keep.push_back(out.indices[k+1]); keep.push_back(out.indices[k+2]);
+                keepOrd.push_back(k/3 < triOrd.size() ? triOrd[k/3] : 0);
             }
-            if (dropped) fprintf(stderr,"[EDIT] fuse: dropped %zu duplicate/degenerate tris (z-fight killers)\n", dropped);
-            out.indices = std::move(keep);
+            // Pass B: coplanar-coverage removal (later source loses where an earlier one already has surface)
+            size_t nT = keep.size()/3, coplDropped=0;
+            struct TriP { float n[3]; float d; int dom; float mn[2], mx[2]; };
+            std::vector<TriP> tp(nT);
+            std::map<std::tuple<int,int,int>, std::vector<int>> planeBuckets;      // quantized canonical normal -> tris
+            auto V=[&](size_t t,int e)->const float*{ return &out.positions[keep[t*3+e]*3]; };
+            auto uvOf=[&](const TriP& P, const float* p, float& u, float& v){     // project onto the plane's dominant 2D
+                int a2=(P.dom+1)%3, b2=(P.dom+2)%3; u=p[a2]; v=p[b2]; };
+            for (size_t t=0;t<nT;++t){
+                const float* A=V(t,0); const float* B=V(t,1); const float* C=V(t,2);
+                float e1[3]={B[0]-A[0],B[1]-A[1],B[2]-A[2]}, e2[3]={C[0]-A[0],C[1]-A[1],C[2]-A[2]};
+                float n[3]={e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]};
+                float l=std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+                if (l<1e-9f){ tp[t].dom=-1; continue; }
+                n[0]/=l; n[1]/=l; n[2]/=l;
+                int dom = std::fabs(n[0])>std::fabs(n[1]) ? (std::fabs(n[0])>std::fabs(n[2])?0:2) : (std::fabs(n[1])>std::fabs(n[2])?1:2);
+                if (n[dom]<0){ n[0]=-n[0]; n[1]=-n[1]; n[2]=-n[2]; }               // canonical facing (opposite-winding sheets fight too)
+                TriP& P=tp[t]; memcpy(P.n,n,12); P.d=n[0]*A[0]+n[1]*A[1]+n[2]*A[2]; P.dom=dom;
+                float u,v; uvOf(P,A,u,v); P.mn[0]=P.mx[0]=u; P.mn[1]=P.mx[1]=v;
+                for (int e=1;e<3;++e){ uvOf(P,V(t,e),u,v); P.mn[0]=std::min(P.mn[0],u); P.mx[0]=std::max(P.mx[0],u); P.mn[1]=std::min(P.mn[1],v); P.mx[1]=std::max(P.mx[1],v); }
+                planeBuckets[std::make_tuple((int)std::lround(n[0]*24.f),(int)std::lround(n[1]*24.f),(int)std::lround(n[2]*24.f))].push_back((int)t);
+            }
+            std::vector<char> triDead(nT, 0);
+            const float PLANE_EPS = 0.008f;                                        // 8mm sheet-offset tolerance
+            for (auto& kb : planeBuckets) {
+                auto& tris = kb.second;
+                if (tris.size()<2) continue;
+                // 2D grid inside the bucket for fast coverage lookups
+                std::map<std::pair<int,int>, std::vector<int>> cell;               // 0.5m cells over dominant-plane coords
+                auto cellOf2=[&](float u,float v){ return std::make_pair((int)std::floor(u*2.f),(int)std::floor(v*2.f)); };
+                for (int t : tris){ if (tp[t].dom<0) continue;
+                    for (int cu=(int)std::floor(tp[t].mn[0]*2.f); cu<=(int)std::floor(tp[t].mx[0]*2.f); ++cu)
+                        for (int cv=(int)std::floor(tp[t].mn[1]*2.f); cv<=(int)std::floor(tp[t].mx[1]*2.f); ++cv)
+                            cell[{cu,cv}].push_back(t); }
+                for (int t : tris) {
+                    if (tp[t].dom<0 || keepOrd[t]==0) continue;                    // the FIRST source never loses
+                    // sample points: centroid + verts shrunk 8% toward centroid
+                    const float* A=V(t,0); const float* B=V(t,1); const float* C=V(t,2);
+                    float cen[3]={(A[0]+B[0]+C[0])/3,(A[1]+B[1]+C[1])/3,(A[2]+B[2]+C[2])/3};
+                    float smp[4][3]; memcpy(smp[0],cen,12);
+                    for (int e=0;e<3;++e){ const float* P0=V(t,e);
+                        for (int ax2=0;ax2<3;++ax2) smp[e+1][ax2]=P0[ax2]+(cen[ax2]-P0[ax2])*0.08f; }
+                    bool allCovered=true;
+                    for (int si2=0; si2<4 && allCovered; ++si2) {
+                        float su,sv; uvOf(tp[t], smp[si2], su, sv);
+                        auto itc = cell.find(cellOf2(su,sv));
+                        bool cov=false;
+                        if (itc!=cell.end()) for (int c2 : itc->second) {
+                            if (triDead[c2] || keepOrd[c2] >= keepOrd[t] || tp[c2].dom<0) continue;   // only EARLIER live sources cover
+                            if (std::fabs(tp[c2].n[0]*smp[si2][0]+tp[c2].n[1]*smp[si2][1]+tp[c2].n[2]*smp[si2][2]-tp[c2].d) > PLANE_EPS) continue;
+                            float au,av,bu,bv,cu2,cv2; uvOf(tp[c2],V(c2,0),au,av); uvOf(tp[c2],V(c2,1),bu,bv); uvOf(tp[c2],V(c2,2),cu2,cv2);
+                            float d0=(bu-au)*(sv-av)-(bv-av)*(su-au);
+                            float d1=(cu2-bu)*(sv-bv)-(cv2-bv)*(su-bu);
+                            float d2=(au-cu2)*(sv-cv2)-(av-cv2)*(su-cu2);
+                            bool neg=(d0<1e-6f)&&(d1<1e-6f)&&(d2<1e-6f), pos=(d0>-1e-6f)&&(d1>-1e-6f)&&(d2>-1e-6f);
+                            if (neg||pos){ cov=true; break; }
+                        }
+                        allCovered = cov;
+                    }
+                    if (allCovered) { triDead[t]=1; ++coplDropped; }
+                }
+            }
+            std::vector<u32> fin; fin.reserve(keep.size());
+            for (size_t t=0;t<nT;++t){ if (triDead[t]) continue; fin.push_back(keep[t*3]); fin.push_back(keep[t*3+1]); fin.push_back(keep[t*3+2]); }
+            if (dropped||coplDropped) fprintf(stderr,"[EDIT] fuse: dropped %zu duplicate/degenerate + %zu COPLANAR-COVERED tris (z-fight elimination)\n", dropped, coplDropped);
+            out.indices = std::move(fin);
         }
         out.nVerts=(u32)(out.positions.size()/3); out.nIdx=(u32)out.indices.size();   // uploadMesh trusts the EXPLICIT counts
         sceneMeshes->push_back(std::move(out));
@@ -665,35 +815,54 @@ struct Editor {
     //    apply so every index matches. Textures stored as PNG (the fused atlas compresses well).
     bool geomDirty = false;
     int  baseMeshCount = -1;   // how many meshes the ENV itself loaded (anything above = editor-created)
+    std::thread geomThread; std::atomic<bool> geomSaving{false};   // sidecar writes run OFF the UI thread (PNG-encoding a fused 4K atlas froze the app for seconds)
     void saveGeomSidecar(const std::string& sessionFile){
         if (!r || !sceneMeshes || baseMeshCount < 0) return;
+        if (geomSaving.load()) return;                            // previous write still running - retry next autosave tick
         std::string gp = sessionFile + ".geom";
         int extra = (int)sceneMeshes->size() - baseMeshCount;
-        if (extra <= 0) { std::error_code ec; std::filesystem::remove(gp, ec); return; }
-        FILE* f = fopen(gp.c_str(), "wb"); if (!f) return;
-        auto w32=[&](u32 v){ fwrite(&v,4,1,f); };
-        auto wstr=[&](const std::string& s){ w32((u32)s.size()); fwrite(s.data(),1,s.size(),f); };
-        fwrite("HSRGEOM1",8,1,f); w32((u32)extra);
+        if (extra <= 0) { std::error_code ec; std::filesystem::remove(gp, ec); geomDirty=false; return; }
+        // SNAPSHOT the extra meshes fast (bulk vector copies), then encode + write on a WORKER thread.
+        struct GeoSnap { std::string name; u8 flags[4]; u32 texW,texH; std::vector<u8> texRGBA;
+                         std::vector<float> pos,uv,uv2; std::vector<u32> idx; std::string log; };
+        auto snap = std::make_shared<std::vector<GeoSnap>>();
+        snap->reserve((size_t)extra);
         for (int i=baseMeshCount; i<(int)sceneMeshes->size(); ++i){
             const MeshData& md=(*sceneMeshes)[(size_t)i];
-            wstr(md.name);
-            u8 flags[4]={ md.useBlend?(u8)1:(u8)0, md.additive?(u8)1:(u8)0, md.alphaTest?(u8)1:(u8)0, md.doubleSided?(u8)1:(u8)0 };
-            fwrite(flags,1,4,f);
-            w32(md.texW); w32(md.texH);
-            std::vector<u8> png;   // texture -> PNG in memory (atlas RGBA compresses well)
-            if (!md.texRGBA.empty() && md.texW>0)
-                stbi_write_png_to_func([](void* ctx, void* d, int n){ auto* v=(std::vector<u8>*)ctx; v->insert(v->end(),(u8*)d,(u8*)d+n); },
-                                       &png, md.texW, md.texH, 4, md.texRGBA.data(), md.texW*4);
-            w32((u32)png.size()); if(!png.empty()) fwrite(png.data(),1,png.size(),f);
-            w32((u32)md.positions.size()); if(!md.positions.empty()) fwrite(md.positions.data(),4,md.positions.size(),f);
-            w32((u32)md.uvs.size());       if(!md.uvs.empty())       fwrite(md.uvs.data(),4,md.uvs.size(),f);
-            w32((u32)md.uvs2.size());      if(!md.uvs2.empty())      fwrite(md.uvs2.data(),4,md.uvs2.size(),f);
-            w32((u32)md.indices.size());   if(!md.indices.empty())   fwrite(md.indices.data(),4,md.indices.size(),f);
-            auto it=meshEditLog.find(i); wstr(it!=meshEditLog.end()?it->second:std::string());
+            GeoSnap g; g.name=md.name;
+            g.flags[0]=md.useBlend?1:0; g.flags[1]=md.additive?1:0; g.flags[2]=md.alphaTest?1:0; g.flags[3]=md.doubleSided?1:0;
+            g.texW=md.texW; g.texH=md.texH; g.texRGBA=md.texRGBA;
+            g.pos=md.positions; g.uv=md.uvs; g.uv2=md.uvs2; g.idx=md.indices;
+            auto it=meshEditLog.find(i); if (it!=meshEditLog.end()) g.log=it->second;
+            snap->push_back(std::move(g));
         }
-        fclose(f);
-        geomDirty = false;
-        fprintf(stderr,"[EDIT] geometry sidecar saved: %d editor-created mesh(es) -> %s\n", extra, gp.c_str());
+        geomDirty = false; geomSaving.store(true);
+        if (geomThread.joinable()) geomThread.join();
+        geomThread = std::thread([this, gp, snap]{
+            FILE* f = fopen(gp.c_str(), "wb");
+            if (f) {
+                auto w32=[&](u32 v){ fwrite(&v,4,1,f); };
+                auto wstr=[&](const std::string& s){ w32((u32)s.size()); fwrite(s.data(),1,s.size(),f); };
+                fwrite("HSRGEOM1",8,1,f); w32((u32)snap->size());
+                for (auto& g : *snap){
+                    wstr(g.name); fwrite(g.flags,1,4,f);
+                    w32(g.texW); w32(g.texH);
+                    std::vector<u8> png;   // texture -> PNG in memory (the slow part - now off-thread)
+                    if (!g.texRGBA.empty() && g.texW>0)
+                        stbi_write_png_to_func([](void* ctx, void* d, int n){ auto* v=(std::vector<u8>*)ctx; v->insert(v->end(),(u8*)d,(u8*)d+n); },
+                                               &png, g.texW, g.texH, 4, g.texRGBA.data(), g.texW*4);
+                    w32((u32)png.size()); if(!png.empty()) fwrite(png.data(),1,png.size(),f);
+                    w32((u32)g.pos.size()); if(!g.pos.empty()) fwrite(g.pos.data(),4,g.pos.size(),f);
+                    w32((u32)g.uv.size());  if(!g.uv.empty())  fwrite(g.uv.data(),4,g.uv.size(),f);
+                    w32((u32)g.uv2.size()); if(!g.uv2.empty()) fwrite(g.uv2.data(),4,g.uv2.size(),f);
+                    w32((u32)g.idx.size()); if(!g.idx.empty()) fwrite(g.idx.data(),4,g.idx.size(),f);
+                    wstr(g.log);
+                }
+                fclose(f);
+                fprintf(stderr,"[EDIT] geometry sidecar saved: %zu editor-created mesh(es) -> %s\n", snap->size(), gp.c_str());
+            }
+            geomSaving.store(false);
+        });
     }
     void loadGeomSidecar(const std::string& sessionFile){
         if (!r || !sceneMeshes) return;
@@ -1295,6 +1464,7 @@ struct Editor {
                fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ all.resize(n); fread(&all[0],1,n,f);} fclose(f); }
         else { all = extractEmbeddedSession();   // ORPHAN cooked APK: no saved/<env>.hsledit on disk -> read the session the cook EMBEDDED inside the APK ("extract em")
                if(all.empty()){ fprintf(stderr,"[EDIT] no saved session (disk) and no _editor_session.hsledit embedded in the APK\n");
+                                loadGeomSidecar(saveTargetFile());   // a .geom can exist without a .hsledit (autosave-only runs) — created meshes still restore
                                 checkAutosaveRecovery(); return; }   // a crash before the FIRST save still leaves an .autosave -> offer it
                sessionPath.clear(); fprintf(stderr,"[EDIT] loaded EMBEDDED session from cooked APK (%zu bytes)\n", all.size()); }
         // Restore editor-CREATED meshes (fuse/cut/seal/split/slice/duplicate results) BEFORE the session
@@ -1397,6 +1567,9 @@ struct Editor {
     void restoreAutosave(){
         FILE* f=fopen(recoverPath.c_str(),"rb"); if(!f){ recoverOffer=false; return; }
         std::string all; fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ all.resize(n); fread(&all[0],1,n,f);} fclose(f);
+        // editor-created meshes FIRST (the autosave's MESH/DELETED indices assume they exist) — the
+        // sidecar lives at the SESSION path (autosaves share it); skip if already restored this run.
+        if (sceneMeshes && (int)sceneMeshes->size() <= baseMeshCount) loadGeomSidecar(saveTargetFile());
         int meshN=0, itemN=0; applySessionText(all, meshN, itemN);
         didAutoSel = true; applyTexOverrides();
         lastSessionSnap = std::move(all); recoverOffer = false;
@@ -1542,9 +1715,10 @@ struct Editor {
         if (cookThread.joinable()) cookThread.join();
         if (restoreThread.joinable()) restoreThread.join();
         if (javaThread.joinable()) javaThread.join();
+        if (geomThread.joinable()) geomThread.join();
         if (ready) { vkDeviceWaitIdle(r->device); uiDraw.destroy(); ready = false; }
     }
-    ~Editor() { if (cookThread.joinable()) cookThread.join(); if (restoreThread.joinable()) restoreThread.join(); if (javaThread.joinable()) javaThread.join(); }
+    ~Editor() { if (cookThread.joinable()) cookThread.join(); if (restoreThread.joinable()) restoreThread.join(); if (javaThread.joinable()) javaThread.join(); if (geomThread.joinable()) geomThread.join(); }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  INPUT  (GLFW callbacks in main route here; we accumulate into cx.in, cleared at end of buildFrame)
@@ -1592,6 +1766,10 @@ struct Editor {
                 else { std::vector<Xform> after; for (int m:gizmoSel) after.push_back(captureX(r->gpuMeshes[m])); pushUndo(gizmoSel, gizmoBeforeV, after); }
                 gizmoDrag=false; gizmoAxis=-1; }
             else if (b == 0 && popupAtePress) { popupAtePress = false; }   // the press went to a MENU: its release must NOT pick a mesh behind the popup
+            else if (b == 0 && in3D && patchMode) {   // PATCH TOOL: clicks drop pins, never select/deselect
+                float dx=cx.in.mx-(float)cx.in.pressX[0], dy=cx.in.my-(float)cx.in.pressY[0];
+                if (dx*dx+dy*dy < 25.f*uiScale*uiScale) patchClick(cx.in.mx, cx.in.my);
+            }
             else if (b == 0 && in3D && !wasExit) {   // a click (pick) OR a Ctrl/Shift box-drag (rubber-band multi-select)
                 float dx=cx.in.mx-(float)cx.in.pressX[0], dy=cx.in.my-(float)cx.in.pressY[0];
                 if (wasBox && dx*dx+dy*dy >= 25.f*uiScale*uiScale) boxSelectRect(boxX0, boxY0, (float)cx.in.mx, (float)cx.in.my, cx.in.ctrl);   // Ctrl box = toggle/unpick, Shift box = add
@@ -1658,6 +1836,10 @@ struct Editor {
             if (!sel.empty()) { selected=sel.back(); r->selectedMesh=selected; duplicateSelected(); }
         }
         if (key==GLFW_KEY_F1) showKeybinds = !showKeybinds;   // all-shortcuts overlay
+        if (patchMode) {   // PATCH TOOL keys: Enter = build through the pins, Esc = cancel
+            if (key==GLFW_KEY_ENTER) buildPatch();
+            if (key==GLFW_KEY_ESCAPE) { patchMode=false; patchPts.clear(); setStatus("patch cancelled"); }
+        }
         if (key==GLFW_KEY_SPACE && !playSim) {   // SPACE = toggle visibility of the selection (meshes or scene items)
             if (!selItems.empty()) { bool anyVis=false; for (int i:selItems) if (i>=0&&i<(int)items.size()&&!items[i].hidden) anyVis=true;
                                      for (int i:selItems) if (i>=0&&i<(int)items.size()) items[i].hidden = anyVis; }
@@ -1803,6 +1985,7 @@ struct Editor {
         drawContextMenu();                                      // floating; drawn last = on top
         drawAddMenu();
         drawHoleOverlay();                                      // numbered orange hole outlines - CLICK a marker to seal that hole
+        drawPatchOverlay();                                     // patch tool: pins + outline while clicking corners
         drawKeybindsPanel();                                    // F1 overlay: every shortcut in one place
         cx.drawTooltip();                                       // deferred hover tooltips — drawn ABOVE everything
         cx.in.newFrame();                                       // consume per-frame input edges/deltas
@@ -1965,6 +2148,7 @@ struct Editor {
             {"Seal hole HERE (nearest to click)",34},                                         // fills the loop nearest the right-clicked spot
             {std::string("Seal ALL holes (keeps perimeter)")+suf,21},
             {"Slice in half X",35},{"Slice in half Y",36},{"Slice in half Z",37},             // separate halves (move/delete independently)
+            {std::string(patchMode?"Patch tool: CANCEL":"Patch tool (click gap corners, Enter)"),38},
             {std::string("Cut hole HERE (r=")+std::to_string((int)(cutRadius*100)/100.f).substr(0,4)+"m)",22},   // carve the clicked spot open (doorways)
             {"Split into connected pieces",23},                                               // separate disjoint parts into own meshes
             {"Mirror X",24},{"Mirror Y",25},{"Mirror Z",26},                                  // flip to face the other side (winding fixed)
@@ -2039,6 +2223,8 @@ struct Editor {
                 else if (a==35) forEachSelMesh([&](int m){ sliceMesh(m, 0); });
                 else if (a==36) forEachSelMesh([&](int m){ sliceMesh(m, 1); });
                 else if (a==37) forEachSelMesh([&](int m){ sliceMesh(m, 2); });
+                else if (a==38) { patchMode=!patchMode; patchPts.clear();
+                                  if (patchMode) setStatus("PATCH: click the gap's corner points in the viewport (3+), Enter builds, Esc cancels"); }
                 else if (a==27) { bool exc = !noColMeshes.count(ctxMesh);      // collision walk-through toggle (whole selection)
                                   for (int t2:tg) { if (exc) noColMeshes.insert(t2); else noColMeshes.erase(t2); }
                                   bakeNavmeshes(this->items);                  // preview + cook collision re-bake immediately ("items" here = the MENU rows)
@@ -2580,6 +2766,12 @@ struct Editor {
           char hb2[48]; snprintf(hb2,sizeof hb2, showHoles?"Holes: %d shown (click to seal)":"Show holes (inspector)", (int)holeLoops.size());
           if (cx.button(ui::hashId("holeshow"), x, y, bw2, th.rowH, hb2, showHoles)) { showHoles=!showHoles; if (showHoles) refreshHoles(); }
           if (cx.button(ui::hashId("sealhx"), x+bw2+6*uiScale, y, bw2, th.rowH, "Seal ALL holes")) forEachSelMesh([&](int m){ sealMeshHoles(m); });
+          y += th.rowH+3*uiScale; }
+        { float bw2=(w-6*uiScale)/2;    // PATCH TOOL: paint EXACTLY where geometry goes (gap corners -> Enter)
+          char pb2[48]; snprintf(pb2,sizeof pb2, patchMode?"Patching: %d pts (Enter)":"Patch tool (click corners)",(int)patchPts.size());
+          if (cx.button(ui::hashId("patchtg"), x, y, bw2, th.rowH, pb2, patchMode)) { patchMode=!patchMode; patchPts.clear();
+              if (patchMode) setStatus("PATCH: click the gap's corner points in the viewport (3+), Enter builds, Esc cancels"); }
+          if (cx.button(ui::hashId("patchgo"), x+bw2+6*uiScale, y, bw2, th.rowH, "Build patch (Enter)", false) && patchMode) buildPatch();
           y += th.rowH+3*uiScale; }
         { float bw3=(w-10*uiScale)/3;   // SLICE: separate the mesh into two halves along a center plane
           if (cx.button(ui::hashId("slcx"), x,                   y, bw3, th.rowH, "Slice X")) forEachSelMesh([&](int m){ sliceMesh(m, 0); });

@@ -310,7 +310,8 @@ static void keyCb(GLFWwindow* w, int key, int sc, int act, int mods) {
     if (g_editor && g_editor->ready) g_editor->onKey(key, act, mods);
     if (g_editor && g_editor->ready && g_editor->wantsKeyboard()) return;  // typing in a UI text field
     if (key == GLFW_KEY_ESCAPE && act == GLFW_PRESS) {
-        if (g_renderer && g_renderer->selectedMesh >= 0) {
+        if (g_editor && g_editor->ready && g_editor->patchMode) { /* Esc cancels the PATCH tool (editor.onKey handles it) - don't deselect/quit */ }
+        else if (g_renderer && g_renderer->selectedMesh >= 0) {
             // Deselect first, exit on second Esc
             g_renderer->selectedMesh = -1;
             glfwSetWindowTitle(w, "HSR Renderer [Vulkan] - Tab=select mesh  F=wireframe  Esc=quit");
