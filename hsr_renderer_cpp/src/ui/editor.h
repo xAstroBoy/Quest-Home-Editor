@@ -1145,24 +1145,62 @@ struct Editor {
             half[h2].positions.clear(); half[h2].uvs.clear(); half[h2].uvs2.clear(); half[h2].indices.clear();
             half[h2].colors.clear(); half[h2].uvs3.clear(); half[h2].uvs4.clear();
             half[h2].boneIndices.clear(); half[h2].boneWeights.clear(); half[h2].hasBones=false; }
+        // ── TRUE PLANE CLIPPING (the ACCURATE slice): triangles crossing the plane are SPLIT at it.
+        //    New vertices land EXACTLY on the cut (positions + UVs lerped by the crossing fraction),
+        //    so the edge is a perfectly straight line and the texture is continuous across it.
+        (void)hasCol;   // per-vertex colors are dropped by the halves (can't survive re-indexing cleanly)
+        // plane in MODEL space: f(p) = A*x + B*y + C*z + E  ==  world signed distance n.p_w - d
+        float A2 = pn[0]*M[0] + pn[1]*M[1]  + pn[2]*M[2];
+        float B2 = pn[0]*M[4] + pn[1]*M[5]  + pn[2]*M[6];
+        float C2 = pn[0]*M[8] + pn[1]*M[9]  + pn[2]*M[10];
+        float E2 = pn[0]*M[12]+ pn[1]*M[13] + pn[2]*M[14] - pd;
+        auto SD=[&](uint32_t v2)->float{ const float* p=&src.positions[v2*3]; return A2*p[0]+B2*p[1]+C2*p[2]+E2; };
+        std::map<std::pair<uint32_t,uint32_t>,uint32_t> cutRm[2];   // shared cut-verts per half (edge-keyed - watertight cut line)
+        auto origV=[&](int h2, uint32_t v2)->uint32_t{
+            auto& pt=half[h2]; auto& rmm=rm[h2];
+            auto it=rmm.find(v2); if (it!=rmm.end()) return it->second;
+            uint32_t nvi=(uint32_t)(pt.positions.size()/3);
+            pt.positions.push_back(src.positions[v2*3]); pt.positions.push_back(src.positions[v2*3+1]); pt.positions.push_back(src.positions[v2*3+2]);
+            if (hasUV) { pt.uvs.push_back(src.uvs[v2*2]);  pt.uvs.push_back(src.uvs[v2*2+1]); }
+            if (hasUV2){ pt.uvs2.push_back(src.uvs2[v2*2]); pt.uvs2.push_back(src.uvs2[v2*2+1]); }
+            rmm[v2]=nvi; return nvi;
+        };
+        auto cutV=[&](int h2, uint32_t va, uint32_t vb)->uint32_t{
+            auto key = va<vb?std::make_pair(va,vb):std::make_pair(vb,va);
+            auto& crm=cutRm[h2];
+            auto it=crm.find(key); if (it!=crm.end()) return it->second;
+            float sa=SD(va), sb=SD(vb); float t=sa/(sa-sb);          // crossing fraction along the edge
+            t=std::clamp(t,0.f,1.f);
+            auto& pt=half[h2];
+            uint32_t nvi=(uint32_t)(pt.positions.size()/3);
+            for (int c2=0;c2<3;++c2) pt.positions.push_back(src.positions[va*3+c2]+(src.positions[vb*3+c2]-src.positions[va*3+c2])*t);
+            if (hasUV)  for (int c2=0;c2<2;++c2) pt.uvs.push_back(src.uvs[va*2+c2]+(src.uvs[vb*2+c2]-src.uvs[va*2+c2])*t);
+            if (hasUV2) for (int c2=0;c2<2;++c2) pt.uvs2.push_back(src.uvs2[va*2+c2]+(src.uvs2[vb*2+c2]-src.uvs2[va*2+c2])*t);
+            crm[key]=nvi; return nvi;
+        };
+        const float EPS=1e-5f;
         for (size_t k=0;k+2<src.indices.size();k+=3){
             uint32_t tri[3]={src.indices[k],src.indices[k+1],src.indices[k+2]};
-            float cw[3]={0,0,0};
-            for (int e=0;e<3;e++){ const float* p=&src.positions[tri[e]*3];
-                cw[0]+=M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12]; cw[1]+=M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13]; cw[2]+=M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14]; }
-            float cc=(pn[0]*cw[0]+pn[1]*cw[1]+pn[2]*cw[2])/3.f;
-            int h2 = cc<pd ? 0 : 1;
-            auto& pt=half[h2]; auto& rmm=rm[h2];
-            for (int e=0;e<3;e++){ uint32_t v2=tri[e];
-                auto it=rmm.find(v2); uint32_t nvi;
-                if (it!=rmm.end()) nvi=it->second;
-                else { nvi=(uint32_t)(pt.positions.size()/3);
-                       pt.positions.push_back(src.positions[v2*3]); pt.positions.push_back(src.positions[v2*3+1]); pt.positions.push_back(src.positions[v2*3+2]);
-                       if (hasUV){ pt.uvs.push_back(src.uvs[v2*2]); pt.uvs.push_back(src.uvs[v2*2+1]); }
-                       if (hasUV2){ pt.uvs2.push_back(src.uvs2[v2*2]); pt.uvs2.push_back(src.uvs2[v2*2+1]); }
-                       if (hasCol){ for (int cc2=0;cc2<4;++cc2) pt.colors.push_back(src.colors[v2*4+cc2]); }
-                       rmm[v2]=nvi; }
-                pt.indices.push_back(nvi); } }
+            float sd[3]={SD(tri[0]),SD(tri[1]),SD(tri[2])};
+            bool anyNeg=sd[0]<-EPS||sd[1]<-EPS||sd[2]<-EPS, anyPos=sd[0]>EPS||sd[1]>EPS||sd[2]>EPS;
+            if (!anyPos){ // whole tri -> half 0
+                auto& pt=half[0]; for (int e=0;e<3;++e) pt.indices.push_back(origV(0,tri[e])); continue; }
+            if (!anyNeg){ // whole tri -> half 1
+                auto& pt=half[1]; for (int e=0;e<3;++e) pt.indices.push_back(origV(1,tri[e])); continue; }
+            // CROSSING: Sutherland-Hodgman clip against the plane, once per side
+            for (int h2=0;h2<2;++h2){
+                float sign = h2==0 ? -1.f : 1.f;                     // keep sd*sign >= 0
+                uint32_t poly[4]; int pn2=0;
+                for (int e=0;e<3;++e){
+                    uint32_t va=tri[e], vb=tri[(e+1)%3];
+                    float da=sd[e]*sign, db=sd[(e+1)%3]*sign;
+                    if (da>=-EPS) poly[pn2++]=origV(h2,va);
+                    if ((da>EPS&&db<-EPS)||(da<-EPS&&db>EPS)) poly[pn2++]=cutV(h2,va,vb);
+                }
+                auto& pt=half[h2];
+                for (int e=2;e<pn2;++e){ pt.indices.push_back(poly[0]); pt.indices.push_back(poly[e-1]); pt.indices.push_back(poly[e]); }
+            }
+        }
         if (half[0].indices.empty() || half[1].indices.empty()) { setStatus("slice: everything landed on one side (already flat here?)"); return; }
         const VkGpuMesh og = r->gpuMeshes[(size_t)mi];
         std::vector<int> hist{mi}; std::vector<uint8_t> histA{1};
@@ -1191,6 +1229,77 @@ struct Editor {
         float mn[3],mx[3]; worldAabb(r->gpuMeshes[(size_t)mi],mn,mx);
         float pn[3]={0,0,0}; pn[axis]=1.f;
         sliceMeshByPlane(mi, pn, (mn[axis]+mx[axis])*0.5f);
+    }
+
+    // ── SLICE GIZMO: a VISIBLE cutting plane you place with the normal move/rotate gizmo. The exact
+    //    cut line is highlighted LIVE on the mesh as you drag; Enter cuts (true triangle-splitting).
+    //    Move = slide the plane, Rotate = turn it; works on the whole selection.
+    bool  sliceGizmoOn = false;
+    float slicePos[3] = {0,0,0};
+    float sliceQuat[4] = {0,0,0,1};                        // plane normal = quat * world X
+    void sliceNormal(float n[3]) const { float x[3]={1,0,0}; const_cast<Editor*>(this)->quatRotVec(sliceQuat, x, n); }
+    void startSliceGizmo(const float* atWorld /*nullable*/){
+        if (selected<0 || !r || selected>=(int)r->gpuMeshes.size()) { setStatus("slice gizmo: select the mesh(es) to cut first"); return; }
+        patchMode=false; pinIsCut=false; pinIsBend=false; patchPts.clear(); patchCols.clear();
+        sliceGizmoOn = true;
+        sliceQuat[0]=sliceQuat[1]=sliceQuat[2]=0; sliceQuat[3]=1;
+        if (atWorld){ memcpy(slicePos, atWorld, 12); }
+        else { float mn[3],mx[3]; worldAabb(r->gpuMeshes[(size_t)selected],mn,mx);
+               slicePos[0]=(mn[0]+mx[0])*0.5f; slicePos[1]=(mn[1]+mx[1])*0.5f; slicePos[2]=(mn[2]+mx[2])*0.5f; }
+        gizmoOp = 0;
+        setStatus("SLICE GIZMO: drag the gizmo to place the plane (Move slides, Rotate turns), watch the highlighted cut line - ENTER cuts, ESC cancels");
+    }
+    void applySliceGizmo(){
+        if (!sliceGizmoOn) return;
+        float n[3]; sliceNormal(n);
+        float pd = n[0]*slicePos[0]+n[1]*slicePos[1]+n[2]*slicePos[2];
+        forEachSelMesh([&](int m){ sliceMeshByPlane(m, n, pd); });
+        sliceGizmoOn = false;
+    }
+    void drawSliceOverlay(){
+        if (!sliceGizmoOn || !r || selected<0 || selected>=(int)r->gpuMeshes.size()) return;
+        float n[3]; sliceNormal(n);
+        float pd = n[0]*slicePos[0]+n[1]*slicePos[1]+n[2]*slicePos[2];
+        dl.pushClip((float)rcViewport.offset.x,(float)rcViewport.offset.y,(float)rcViewport.extent.width,(float)rcViewport.extent.height);
+        cx.textAligned((float)rcViewport.offset.x, (float)rcViewport.offset.y+26*uiScale, (float)rcViewport.extent.width, 18*uiScale,
+                       "SLICE GIZMO - Move/Rotate the plane, the glowing line is the exact cut - ENTER cuts, ESC cancels", ui::rgba(255,120,120), 1);
+        // translucent plane quad sized to the selection
+        { float mn[3],mx[3]; worldAabb(r->gpuMeshes[(size_t)selected],mn,mx);
+          float s = 0.75f*std::sqrt((mx[0]-mn[0])*(mx[0]-mn[0])+(mx[1]-mn[1])*(mx[1]-mn[1])+(mx[2]-mn[2])*(mx[2]-mn[2])) + 0.5f;
+          float t1[3], t2[3]; { float a[3]={0,1,0}, b[3]={0,0,1}; quatRotVec(sliceQuat,a,t1); quatRotVec(sliceQuat,b,t2); }
+          float c4[4][3]; float sc[4][2]; bool ok=true;
+          for (int i2=0;i2<4;++i2){ float s1=(i2==0||i2==3)?-s:s, s2=(i2<2)?-s:s;
+              for (int k=0;k<3;++k) c4[i2][k]=slicePos[k]+t1[k]*s1+t2[k]*s2;
+              if (!worldToScreen(c4[i2], sc[i2][0], sc[i2][1])) ok=false; }
+          if (ok){ dl.triangle(sc[0][0],sc[0][1], sc[1][0],sc[1][1], sc[2][0],sc[2][1], ui::rgba(255,90,90,42));
+                   dl.triangle(sc[0][0],sc[0][1], sc[2][0],sc[2][1], sc[3][0],sc[3][1], ui::rgba(255,90,90,42));
+                   for (int i2=0;i2<4;++i2) dl.line(sc[i2][0],sc[i2][1], sc[(i2+1)%4][0],sc[(i2+1)%4][1], ui::rgba(255,110,110,200), 2.f); } }
+        // LIVE CUT LINE: every selected mesh's triangle edges crossing the plane, highlighted
+        int segs=0;
+        std::vector<int> targets = sel.empty()? std::vector<int>{selected} : sel;
+        for (int m : targets){
+            if (m<0||m>=(int)sceneMeshes->size()||m>=(int)r->gpuMeshes.size()||r->isDeleted((size_t)m)) continue;
+            const MeshData& md=(*sceneMeshes)[(size_t)m]; const float* M=r->gpuMeshes[(size_t)m].model;
+            float A2=n[0]*M[0]+n[1]*M[1]+n[2]*M[2], B2=n[0]*M[4]+n[1]*M[5]+n[2]*M[6];
+            float C2=n[0]*M[8]+n[1]*M[9]+n[2]*M[10], E2=n[0]*M[12]+n[1]*M[13]+n[2]*M[14]-pd;
+            auto SD2=[&](uint32_t v2)->float{ const float* p=&md.positions[v2*3]; return A2*p[0]+B2*p[1]+C2*p[2]+E2; };
+            for (size_t k=0;k+2<md.indices.size() && segs<3000;k+=3){
+                uint32_t tri[3]={md.indices[k],md.indices[k+1],md.indices[k+2]};
+                float sd[3]={SD2(tri[0]),SD2(tri[1]),SD2(tri[2])};
+                float ip[2][3]; int ipn=0;
+                for (int e=0;e<3 && ipn<2;++e){ float da=sd[e], db=sd[(e+1)%3];
+                    if ((da>0&&db<0)||(da<0&&db>0)){ float t=da/(da-db);
+                        const float* pa=&md.positions[tri[e]*3]; const float* pb=&md.positions[tri[(e+1)%3]*3];
+                        float lp[3]={pa[0]+(pb[0]-pa[0])*t, pa[1]+(pb[1]-pa[1])*t, pa[2]+(pb[2]-pa[2])*t};
+                        ip[ipn][0]=M[0]*lp[0]+M[4]*lp[1]+M[8]*lp[2]+M[12];
+                        ip[ipn][1]=M[1]*lp[0]+M[5]*lp[1]+M[9]*lp[2]+M[13];
+                        ip[ipn][2]=M[2]*lp[0]+M[6]*lp[1]+M[10]*lp[2]+M[14]; ++ipn; } }
+                if (ipn==2){ float s0[2],s1[2];
+                    if (worldToScreen(ip[0],s0[0],s0[1]) && worldToScreen(ip[1],s1[0],s1[1]))
+                        { dl.line(s0[0],s0[1],s1[0],s1[1], ui::rgba(255,240,90), 3.f); ++segs; } }
+            }
+        }
+        dl.popClip();
     }
 
     // ── mesh MIRROR: flip the geometry across an axis (about its own local center) so it FACES THE
@@ -2391,7 +2500,8 @@ struct Editor {
             if (b == 0 && gzVisible && in3D && !exitDrag) {     // gizmo handle hit-test (cached screen positions)
                 int hit = gizmoHitTest(cx.in.mx, cx.in.my);
                 if (hit >= 0) {
-                    if (selItem>=0) { gizmoDrag=true; gizmoAxis=hit; gizmoSel.clear(); itemsBeforeDrag=items; }   // scene-item drag (snapshot for undo)
+                    if (sliceGizmoOn && selItem<0) { gizmoDrag=true; gizmoAxis=hit; gizmoSel.clear(); }          // dragging the SLICE PLANE (no undo capture needed)
+                    else if (selItem>=0) { gizmoDrag=true; gizmoAxis=hit; gizmoSel.clear(); itemsBeforeDrag=items; }   // scene-item drag (snapshot for undo)
                     else if (!sel.empty()) { gizmoDrag=true; gizmoAxis=hit; gizmoSel=sel; gizmoBeforeV.clear(); for (int m:sel) gizmoBeforeV.push_back(captureX(r->gpuMeshes[m])); }
                 }
             }
@@ -2479,6 +2589,10 @@ struct Editor {
         if (patchMode) {   // PIN TOOLS (patch / cut region / bend): Enter = apply, Esc = cancel
             if (key==GLFW_KEY_ENTER) { if (pinIsBend) bendAtPin(); else if (pinIsCut) cutRegionByPins(); else buildPatch(); }
             if (key==GLFW_KEY_ESCAPE) { patchMode=false; pinIsCut=false; pinIsBend=false; patchPts.clear(); patchCols.clear(); setStatus("pin tool cancelled"); }
+        }
+        if (sliceGizmoOn) {   // SLICE GIZMO: Enter = cut along the placed plane, Esc = cancel
+            if (key==GLFW_KEY_ENTER) applySliceGizmo();
+            if (key==GLFW_KEY_ESCAPE) { sliceGizmoOn=false; setStatus("slice gizmo cancelled"); }
         }
         if (key==GLFW_KEY_SPACE && !playSim) {   // SPACE = toggle visibility of the selection (meshes or scene items)
             if (!selItems.empty()) { bool anyVis=false; for (int i:selItems) if (i>=0&&i<(int)items.size()&&!items[i].hidden) anyVis=true;
@@ -2626,6 +2740,7 @@ struct Editor {
         drawAddMenu();
         drawHoleOverlay();                                      // numbered orange hole outlines - CLICK a marker to seal that hole
         drawPatchOverlay();                                     // patch tool: pins + outline while clicking corners
+        drawSliceOverlay();                                     // slice gizmo: plane quad + LIVE glowing cut line
         drawKeybindsPanel();                                    // F1 overlay: every shortcut in one place
         cx.drawTooltip();                                       // deferred hover tooltips — drawn ABOVE everything
         cx.in.newFrame();                                       // consume per-frame input edges/deltas
@@ -2787,6 +2902,7 @@ struct Editor {
             {std::string(showHoles?"Hide hole inspector":"SHOW HOLES (click a marker to seal)"),33},   // visual: numbered outlines, click = fill THAT hole
             {"Seal hole HERE (nearest to click)",34},                                         // fills the loop nearest the right-clicked spot
             {std::string("Seal ALL holes (keeps perimeter)")+suf,21},
+            {"SLICE GIZMO here (place the cut visually)",44},                                 // gizmo-placed plane + live cut line, Enter cuts
             {"Slice in half X",35},{"Slice in half Y",36},{"Slice in half Z",37},             // separate halves (move/delete independently)
             {std::string(patchMode?"Patch tool: CANCEL":"Patch tool (click gap corners, Enter)"),38},
             {std::string("Re-UV flat (texture spans ONCE)")+suf,39},
@@ -2870,6 +2986,7 @@ struct Editor {
                 else if (a==35) forEachSelMesh([&](int m){ sliceMesh(m, 0); });
                 else if (a==36) forEachSelMesh([&](int m){ sliceMesh(m, 1); });
                 else if (a==37) forEachSelMesh([&](int m){ sliceMesh(m, 2); });
+                else if (a==44) startSliceGizmo(ctxHitValid?ctxHitP:nullptr);
                 else if (a==38) { patchMode=!patchMode; patchPts.clear(); patchCols.clear();
                                   if (patchMode) setStatus("PATCH: click the gap's corner points in the viewport (3+), Enter builds, Esc cancels"); }
                 else if (a==39) forEachSelMesh([&](int m){ reUVFlat(m); });
@@ -3472,6 +3589,9 @@ struct Editor {
               if (cx.button(ui::hashId("bendgo"), x, y, w, th.rowH, "Apply bend (Enter)")) bendAtPin();
               y+=th.rowH+3*uiScale;
           } }
+        { char sb2[52]; snprintf(sb2,sizeof sb2, sliceGizmoOn?"SLICE GIZMO active (Enter cuts)":"Slice GIZMO (place the cut visually)");
+          if (cx.button(ui::hashId("slcgiz"), x, y, w, th.rowH, sb2, sliceGizmoOn)) { if (sliceGizmoOn) sliceGizmoOn=false; else startSliceGizmo(nullptr); }
+          y += th.rowH+3*uiScale; }
         { float bw3=(w-10*uiScale)/3;   // SLICE: separate the mesh into two halves along a center plane
           if (cx.button(ui::hashId("slcx"), x,                   y, bw3, th.rowH, "Slice X")) forEachSelMesh([&](int m){ sliceMesh(m, 0); });
           if (cx.button(ui::hashId("slcy"), x+bw3+5*uiScale,     y, bw3, th.rowH, "Slice Y")) forEachSelMesh([&](int m){ sliceMesh(m, 1); });
@@ -4256,6 +4376,7 @@ struct Editor {
             if (n) { origin[0]/=n; origin[1]/=n; origin[2]/=n; }
         }
         else { VkGpuMesh& gm=r->gpuMeshes[selected]; origin[0]=gm.centroid[0]+gm.editT[0]; origin[1]=gm.centroid[1]+gm.editT[1]; origin[2]=gm.centroid[2]+gm.editT[2]; memcpy(gizQuat,gm.editR,16); }
+        if (sliceGizmoOn && !itemMode) { memcpy(origin, slicePos, 12); memcpy(gizQuat, sliceQuat, 16); }   // SLICE mode: the gizmo drives the cutting plane
         float ds[3]={ origin[0]-r->cam.pos[0], origin[1]-r->cam.pos[1], origin[2]-r->cam.pos[2] };
         float dist = std::sqrt(ds[0]*ds[0]+ds[1]*ds[1]+ds[2]*ds[2]); if (dist<0.1f) dist=0.1f;
         // FIXED on-screen size (~78px) regardless of distance: len_world = px * dist / (focalY * vpH/2)
@@ -4314,6 +4435,15 @@ struct Editor {
     void applyGizmoDrag(float len) {
         int k=gizmoAxis; float* A=gzAxisW[k];
         if (lockAxis[k]) return;   // axis locked mid-drag (Shift+X/Y/Z during a grab) -> freeze it
+        if (sliceGizmoOn && selItem<0) {   // the gizmo drives the SLICE PLANE, not the meshes
+            if (gizmoOp==1) { float ang = cx.in.dmx * 0.0075f * (gzAxisFace[k]>0?-1.f:1.f);
+                float h2=std::sin(ang*0.5f), dq[4]={A[0]*h2,A[1]*h2,A[2]*h2,std::cos(ang*0.5f)};
+                float nq[4]; quatMul(dq, sliceQuat, nq); memcpy(sliceQuat,nq,16); normalizeQuat(sliceQuat); return; }
+            float sdx=gzTip[k][0]-gzOrigin[0], sdy=gzTip[k][1]-gzOrigin[1];
+            float sl=std::sqrt(sdx*sdx+sdy*sdy); if (sl<1e-3f) return; sdx/=sl; sdy/=sl;
+            float d=(cx.in.dmx*sdx + cx.in.dmy*sdy)*(len/sl);
+            slicePos[0]+=A[0]*d; slicePos[1]+=A[1]*d; slicePos[2]+=A[2]*d; return;
+        }
         bool exitMode = editExit && selItem>=0 && selItem<(int)items.size() && items[selItem].type==sitem::CHAIR;
         if (gizmoOp==1) {   // ── ROTATE: tangential mouse drag about world axis A (item euler OR mesh quat) ──
             if (exitMode) return;   // the exit point has no rotation
