@@ -839,38 +839,145 @@ struct Editor {
                 px[ch]=(u8)std::clamp(a2*(1-tfy)+b2*tfy,0.f,255.f); }
             px[3]=255;
         }
-        // RETRIANGULATE — GREEDY RECTANGLE MESHING: merge runs of occupied cells with the SAME
-        // (2cm-quantized) height into maximal rectangles; each rectangle = 2 triangles. A flat floor
-        // collapses to a handful of quads instead of a per-cell grid (the 131k-triangle blunder).
-        // Sloped areas terrace at 2cm steps; boundary detail stays at footprint resolution.
-        const float HQ = 0.02f;
-        std::vector<long long> hq((size_t)G*G, LLONG_MIN);
-        for (int i2=0;i2<G*G;++i2) if (occ[(size_t)i2]) hq[(size_t)i2] = (long long)std::llround(hgt[(size_t)i2]/HQ);
-        std::vector<char> usedC((size_t)G*G, 0);
-        int rects=0;
-        for (int cv=0; cv<G; ++cv) for (int cu=0; cu<G; ++cu){
-            size_t c0=(size_t)cv*G+cu;
-            if (!occ[c0] || usedC[c0]) continue;
-            long long h0=hq[c0];
-            int rw=1;                                             // grow width along +u
-            while (cu+rw<G){ size_t ci=(size_t)cv*G+cu+rw; if (!occ[ci]||usedC[ci]||hq[ci]!=h0) break; ++rw; }
-            int rh2=1;                                            // grow height along +v while the WHOLE row matches
-            for (; cv+rh2<G; ++rh2){ bool ok=true;
-                for (int k=0;k<rw;++k){ size_t ci=(size_t)(cv+rh2)*G+cu+k; if (!occ[ci]||usedC[ci]||hq[ci]!=h0){ ok=false; break; } }
-                if (!ok) break; }
-            for (int y2=0;y2<rh2;++y2) for (int x2=0;x2<rw;++x2) usedC[(size_t)(cv+y2)*G+cu+x2]=1;
-            float hgt0=(float)h0*HQ;
-            float u0=mnu+cu*cellU, u1=mnu+(cu+rw)*cellU, v0=mnv+cv*cellV, v1=mnv+(cv+rh2)*cellV;
-            uint32_t base=(uint32_t)(out.positions.size()/3);
-            auto pv=[&](float uu2, float vv2){ float p[3]; p[ua]=uu2; p[va]=vv2; p[dom]=hgt0;
-                out.positions.push_back(p[0]); out.positions.push_back(p[1]); out.positions.push_back(p[2]);
-                out.uvs.push_back((uu2-mnu)/su); out.uvs.push_back((vv2-mnv)/sv); };
-            pv(u0,v0); pv(u1,v0); pv(u1,v1); pv(u0,v1);
-            out.indices.push_back(base); out.indices.push_back(base+1); out.indices.push_back(base+2);
-            out.indices.push_back(base); out.indices.push_back(base+2); out.indices.push_back(base+3);
-            ++rects;
+        // RETRIANGULATE like a real author would: TRACE the footprint's boundary CONTOURS (outer
+        // outline + hole loops) off the occupancy grid, SIMPLIFY them (Douglas-Peucker), then
+        // EAR-CLIP the polygon-with-holes. Result: big, well-shaped triangles that follow the actual
+        // silhouette - like the source mesh's own triangulation, not a grid, not slivers.
+        std::vector<float> cornerH((size_t)(G+1)*(G+1), 0.f);
+        for (int cv=0; cv<=G; ++cv) for (int cu=0; cu<=G; ++cu){
+            float a=0; int c2=0;
+            for (int oy=-1;oy<=0;++oy) for (int ox=-1;ox<=0;++ox){ int xx=cu+ox, yy=cv+oy;
+                if (xx<0||yy<0||xx>=G||yy>=G||!occ[(size_t)yy*G+xx]) continue; a+=hgt[(size_t)yy*G+xx]; ++c2; }
+            cornerH[(size_t)cv*(G+1)+cu] = c2? a/c2 : 0.f;
         }
-        fprintf(stderr,"[EDIT] rebuild: %d occupied cells -> %d rects = %d tris (greedy meshing)\n", occCount, rects, rects*2);
+        auto emitVert=[&](float gu, float gv)->uint32_t{           // grid coords -> world vert + uv
+            uint32_t id=(uint32_t)(out.positions.size()/3);
+            float uu2=mnu+gu*cellU, vv2=mnv+gv*cellV;
+            int iu=std::clamp((int)std::lround(gu),0,G), iv=std::clamp((int)std::lround(gv),0,G);
+            float p[3]; p[ua]=uu2; p[va]=vv2; p[dom]=cornerH[(size_t)iv*(G+1)+iu];
+            out.positions.push_back(p[0]); out.positions.push_back(p[1]); out.positions.push_back(p[2]);
+            out.uvs.push_back((uu2-mnu)/su); out.uvs.push_back((vv2-mnv)/sv);
+            return id;
+        };
+        int triCount=0;
+        {
+            // 1) boundary SEGMENT SOUP: for each occupied cell side facing empty space, a directed unit
+            //    segment with the interior on its LEFT; chain segments into closed loops.
+            typedef std::pair<int,int> GP;
+            std::multimap<GP,GP> segs;
+            auto empt=[&](int cu,int cv){ return cu<0||cv<0||cu>=G||cv>=G||!occ[(size_t)cv*G+cu]; };
+            for (int cv=0;cv<G;++cv) for (int cu=0;cu<G;++cu){ if (!occ[(size_t)cv*G+cu]) continue;
+                if (empt(cu,cv-1)) segs.insert({{cu,cv},{cu+1,cv}});
+                if (empt(cu+1,cv)) segs.insert({{cu+1,cv},{cu+1,cv+1}});
+                if (empt(cu,cv+1)) segs.insert({{cu+1,cv+1},{cu,cv+1}});
+                if (empt(cu-1,cv)) segs.insert({{cu,cv+1},{cu,cv}});
+            }
+            std::vector<std::vector<GP>> loops2;
+            while (!segs.empty()){
+                auto it=segs.begin(); GP start=it->first, cur=it->second; segs.erase(it);
+                std::vector<GP> lp{start};
+                for (int guard=0; guard<4*G*G; ++guard){
+                    lp.push_back(cur);
+                    if (cur==start) break;
+                    auto rng=segs.equal_range(cur);
+                    if (rng.first==rng.second){ lp.clear(); break; }
+                    GP nxt = rng.first->second; segs.erase(rng.first);   // (multi-branch corners: any exit works)
+                    cur = nxt;
+                }
+                if (lp.size()>3 && lp.front()==lp.back()){ lp.pop_back(); loops2.push_back(std::move(lp)); }
+            }
+            // 2) simplify each loop (Douglas-Peucker, closed; 1.5-cell tolerance keeps the silhouette)
+            auto dpSimp=[&](const std::vector<GP>& in)->std::vector<std::array<float,2>>{
+                std::vector<std::array<float,2>> P; P.reserve(in.size());
+                for (auto& g : in) P.push_back({(float)g.first,(float)g.second});
+                if (P.size()<8) return P;
+                std::vector<char> keep(P.size(),0); keep[0]=1;
+                std::function<void(int,int)> rec=[&](int a2,int b2){
+                    if (b2-a2<2) return;
+                    float ax=P[a2][0],ay=P[a2][1],bx=P[b2%P.size()][0],by=P[b2%P.size()][1];
+                    float dx=bx-ax,dy=by-ay,len=std::sqrt(dx*dx+dy*dy); if(len<1e-6f){len=1;}
+                    int wi=-1; float wd=0;
+                    for (int i2=a2+1;i2<b2;++i2){ float d2=std::fabs((P[i2][0]-ax)*dy-(P[i2][1]-ay)*dx)/len;
+                        if (d2>wd){ wd=d2; wi=i2; } }
+                    if (wi>=0 && wd>1.5f){ keep[wi]=1; rec(a2,wi); rec(wi,b2); }
+                };
+                int half=(int)P.size()/2; keep[half]=1;
+                rec(0,half); rec(half,(int)P.size());
+                std::vector<std::array<float,2>> outP;
+                for (size_t i2=0;i2<P.size();++i2) if (keep[i2]) outP.push_back(P[i2]);
+                return outP;
+            };
+            struct Poly { std::vector<std::array<float,2>> pts; float area; };
+            std::vector<Poly> outers, holes2;
+            for (auto& lp : loops2){
+                auto sp=dpSimp(lp); if (sp.size()<3) continue;
+                float ar=0; for (size_t i2=0;i2<sp.size();++i2){ auto& a2=sp[i2]; auto& b2=sp[(i2+1)%sp.size()];
+                    ar += a2[0]*b2[1]-b2[0]*a2[1]; }
+                ar*=0.5f;
+                if (ar>1.f) outers.push_back({sp,ar}); else if (ar<-1.f) holes2.push_back({sp,ar});
+            }
+            // 3) per OUTER: bridge its holes in (rightmost-vertex ray split), then EAR-CLIP
+            auto inPoly=[&](const std::vector<std::array<float,2>>& pp, float u0, float v0)->bool{
+                bool in=false; size_t np=pp.size();
+                for (size_t i2=0,j=np-1;i2<np;j=i2++){
+                    if (((pp[i2][1]>v0)!=(pp[j][1]>v0)) &&
+                        (u0 < (pp[j][0]-pp[i2][0])*(v0-pp[i2][1])/(pp[j][1]-pp[i2][1])+pp[i2][0])) in=!in; }
+                return in; };
+            for (auto& op : outers){
+                std::vector<std::array<float,2>> poly = op.pts;   // CCW
+                // holes inside this outer, rightmost first
+                std::vector<const Poly*> myHoles;
+                for (auto& hp : holes2) if (inPoly(op.pts, hp.pts[0][0], hp.pts[0][1])) myHoles.push_back(&hp);
+                std::sort(myHoles.begin(), myHoles.end(), [](const Poly* a2, const Poly* b2){
+                    float ma=-1e30f, mb=-1e30f; for (auto& p2 : a2->pts) ma=std::max(ma,p2[0]); for (auto& p2 : b2->pts) mb=std::max(mb,p2[0]);
+                    return ma>mb; });
+                for (const Poly* hp : myHoles){
+                    size_t hm=0; for (size_t i2=1;i2<hp->pts.size();++i2) if (hp->pts[i2][0]>hp->pts[hm][0]) hm=i2;
+                    float hu=hp->pts[hm][0], hv2=hp->pts[hm][1];
+                    // nearest polygon vertex to the RIGHT of the hole's rightmost point (simple, robust enough on grid contours)
+                    int best=-1; float bd=1e30f;
+                    for (size_t i2=0;i2<poly.size();++i2){ if (poly[i2][0] < hu-0.01f) continue;
+                        float d2=(poly[i2][0]-hu)*(poly[i2][0]-hu)+(poly[i2][1]-hv2)*(poly[i2][1]-hv2);
+                        if (d2<bd){ bd=d2; best=(int)i2; } }
+                    if (best<0) continue;
+                    std::vector<std::array<float,2>> merged; merged.reserve(poly.size()+hp->pts.size()+2);
+                    for (int i2=0;i2<=best;++i2) merged.push_back(poly[i2]);
+                    for (size_t k=0;k<=hp->pts.size();++k) merged.push_back(hp->pts[(hm+k)%hp->pts.size()]);   // hole loop (CW) + back to hm
+                    for (size_t i2=best;i2<poly.size();++i2) merged.push_back(poly[i2]);
+                    poly=std::move(merged);
+                }
+                // ear clipping (CCW polygon)
+                std::vector<int> idx(poly.size()); for (size_t i2=0;i2<poly.size();++i2) idx[i2]=(int)i2;
+                std::vector<uint32_t> vid(poly.size(), UINT32_MAX);
+                auto V2=[&](int i2)->uint32_t{ if (vid[idx[i2]]==UINT32_MAX) vid[idx[i2]]=emitVert(poly[idx[i2]][0], poly[idx[i2]][1]); return vid[idx[i2]]; };
+                int guard=(int)poly.size()*(int)poly.size()+16;
+                while (idx.size()>3 && guard-->0){
+                    bool clipped=false;
+                    for (size_t i2=0;i2<idx.size();++i2){
+                        int ia=idx[(i2+idx.size()-1)%idx.size()], ib=idx[i2], ic=idx[(i2+1)%idx.size()];
+                        auto& A=poly[ia]; auto& B=poly[ib]; auto& C=poly[ic];
+                        float cr=(B[0]-A[0])*(C[1]-A[1])-(B[1]-A[1])*(C[0]-A[0]);
+                        if (cr<=1e-7f) continue;                     // reflex/degenerate
+                        bool ear=true;
+                        for (int j : idx){ if (j==ia||j==ib||j==ic) continue;
+                            float d0=(B[0]-A[0])*(poly[j][1]-A[1])-(B[1]-A[1])*(poly[j][0]-A[0]);
+                            float d1=(C[0]-B[0])*(poly[j][1]-B[1])-(C[1]-B[1])*(poly[j][0]-B[0]);
+                            float d2=(A[0]-C[0])*(poly[j][1]-C[1])-(A[1]-C[1])*(poly[j][0]-C[0]);
+                            if (d0>=-1e-7f&&d1>=-1e-7f&&d2>=-1e-7f){ ear=false; break; } }
+                        if (!ear) continue;
+                        uint32_t va2=V2((int)((i2+idx.size()-1)%idx.size())), vb2=V2((int)i2), vc2=V2((int)((i2+1)%idx.size()));
+                        out.indices.push_back(va2); out.indices.push_back(vb2); out.indices.push_back(vc2); ++triCount;
+                        idx.erase(idx.begin()+i2); clipped=true; break;
+                    }
+                    if (!clipped) break;                             // stuck (degenerate input) - keep what we have
+                }
+                if (idx.size()==3){ uint32_t va2=V2(0), vb2=V2(1), vc2=V2(2);
+                    out.indices.push_back(va2); out.indices.push_back(vb2); out.indices.push_back(vc2); ++triCount; }
+            }
+        }
+        if (!triCount){ setStatus("rebuild: contour triangulation failed (degenerate footprint)"); return; }
+        fprintf(stderr,"[EDIT] rebuild: %d occupied cells -> contour ear-clip = %d tris, %zu verts (author-grade)\n",
+                occCount, triCount, out.positions.size()/3);
         out.nVerts=(u32)(out.positions.size()/3); out.nIdx=(u32)out.indices.size();
         sceneMeshes->push_back(std::move(out));
         size_t ni=r->gpuMeshes.size();
@@ -884,9 +991,112 @@ struct Editor {
         meshEditLog[(int)ni] = "rebuild(" + std::to_string(src.size()) + ")";
         geomDirty=true; holesMesh=-1;
         selectOne((int)ni); scrollToSel=true;
-        setStatus("REBUILT "+std::to_string(src.size())+" mesh(es) as ONE clean surface: "+std::to_string(rects*2)
-                  +" triangles (greedy-merged from "+std::to_string(occCount)+" cells), texture baked 1024"
+        setStatus("REBUILT "+std::to_string(src.size())+" mesh(es) as ONE clean surface: "+std::to_string(triCount)
+                  +" author-grade triangles (contour ear-clip), texture baked 1024"
                   +(skipped?" - skipped "+std::to_string(skipped)+" animated":"")+" - Ctrl+Z restores the originals");
+    }
+
+    // ── PREFABS: save the selection as a reusable asset (prefabs/<name>.hsrprefab - geometry world-
+    //    baked relative to the selection center + texture as PNG), then SPAWN copies anywhere: from
+    //    the Scene tab list, or by DRAG & DROPPING the .hsrprefab file into the window. Spawns land
+    //    where you're looking, are undoable, persist via the .geom sidecar, and cook like any mesh.
+    std::vector<std::string> prefabList; double prefabListAt = 0.0;
+    void refreshPrefabList(){
+        prefabList.clear();
+        std::error_code ec; std::filesystem::create_directories("prefabs", ec);
+        for (auto& de : std::filesystem::directory_iterator("prefabs", ec))
+            if (de.path().extension()==".hsrprefab") prefabList.push_back(de.path().string());
+        std::sort(prefabList.begin(), prefabList.end());
+    }
+    void savePrefabFromSelection(){
+        if (!r || !sceneMeshes || sel.empty()) { setStatus("prefab: select the mesh(es) to save first"); return; }
+        std::vector<int> src;
+        for (int s : sel) if (s>=0 && s<(int)sceneMeshes->size() && s<(int)r->gpuMeshes.size() && !r->isDeleted((size_t)s)
+                              && !r->gpuMeshes[s].isSkinned && !r->gpuMeshes[s].dynamicVerts) src.push_back(s);
+        if (src.empty()) { setStatus("prefab: no static meshes in the selection"); return; }
+        // anchor = selection center (world) so spawns place naturally where you aim
+        float cen[3]={0,0,0}; int cn=0;
+        for (int s : src){ const auto& gm=r->gpuMeshes[(size_t)s]; cen[0]+=gm.centroid[0]+gm.editT[0]; cen[1]+=gm.centroid[1]+gm.editT[1]; cen[2]+=gm.centroid[2]+gm.editT[2]; ++cn; }
+        cen[0]/=cn; cen[1]/=cn; cen[2]/=cn;
+        std::error_code ec; std::filesystem::create_directories("prefabs", ec);
+        std::string base; for (char c : r->gpuMeshes[(size_t)src[0]].name) base += (isalnum((unsigned char)c)||c=='_'||c=='-')?c:'_';
+        if (base.size()>40) base.resize(40);
+        std::string gp; for (int k=1;k<1000;++k){ gp = "prefabs/"+base+(k>1?("_"+std::to_string(k)):"")+".hsrprefab";
+            if (!std::filesystem::exists(gp, ec)) break; }
+        FILE* f=fopen(gp.c_str(),"wb"); if(!f){ setStatus("prefab: can't write "+gp); return; }
+        auto w32=[&](u32 v){ fwrite(&v,4,1,f); };
+        auto wstr=[&](const std::string& s2){ w32((u32)s2.size()); fwrite(s2.data(),1,s2.size(),f); };
+        fwrite("HSRPFAB1",8,1,f); w32((u32)src.size());
+        for (int s : src){
+            const MeshData& md=(*sceneMeshes)[(size_t)s]; const float* M=r->gpuMeshes[(size_t)s].model;
+            wstr(md.name);
+            u8 flags[4]={ md.useBlend?(u8)1:(u8)0, md.additive?(u8)1:(u8)0, md.alphaTest?(u8)1:(u8)0, md.doubleSided?(u8)1:(u8)0 };
+            fwrite(flags,1,4,f);
+            w32(md.texW); w32(md.texH);
+            std::vector<u8> png;
+            if (!md.texRGBA.empty() && md.texW>0)
+                stbi_write_png_to_func([](void* ctx, void* d, int n2){ auto* v=(std::vector<u8>*)ctx; v->insert(v->end(),(u8*)d,(u8*)d+n2); },
+                                       &png, md.texW, md.texH, 4, md.texRGBA.data(), md.texW*4);
+            w32((u32)png.size()); if(!png.empty()) fwrite(png.data(),1,png.size(),f);
+            // world-baked positions RELATIVE to the anchor
+            size_t nvm=md.positions.size()/3;
+            std::vector<float> rel; rel.reserve(nvm*3);
+            for (size_t v2=0;v2<nvm;++v2){ const float* p=&md.positions[v2*3];
+                rel.push_back(M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12]-cen[0]);
+                rel.push_back(M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13]-cen[1]);
+                rel.push_back(M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14]-cen[2]); }
+            w32((u32)rel.size());        fwrite(rel.data(),4,rel.size(),f);
+            w32((u32)md.uvs.size());     if(!md.uvs.empty())  fwrite(md.uvs.data(),4,md.uvs.size(),f);
+            w32((u32)md.indices.size()); if(!md.indices.empty()) fwrite(md.indices.data(),4,md.indices.size(),f);
+        }
+        fclose(f);
+        refreshPrefabList();
+        std::string abs = std::filesystem::absolute(gp, ec).string(); for (char& c : abs) if (c=='/') c='\\';
+        setStatus("PREFAB saved: "+abs+"  - spawn it from Scene > Prefabs, or drag the file into the window");
+    }
+    void spawnPrefab(const std::string& path){
+        if (!r || !sceneMeshes) return;
+        FILE* f=fopen(path.c_str(),"rb"); if(!f){ setStatus("prefab: can't open "+path); return; }
+        char magic[8]; if (fread(magic,1,8,f)!=8 || memcmp(magic,"HSRPFAB1",8)!=0){ fclose(f); setStatus("prefab: bad file (not a .hsrprefab)"); return; }
+        auto r32=[&]()->u32{ u32 v=0; fread(&v,4,1,f); return v; };
+        auto rstr=[&]()->std::string{ u32 n2=r32(); std::string s2(n2,'\0'); if(n2) fread(&s2[0],1,n2,f); return s2; };
+        // spawn where you're LOOKING (surface hit), else 4m in front of the camera
+        float anchor[3];
+        if (!cameraForwardHit(anchor)) { Camera& c=r->cam; float cp=std::cos(c.pitch);
+            anchor[0]=c.pos[0]+std::sin(c.yaw)*cp*4.f; anchor[1]=c.pos[1]+std::sin(c.pitch)*4.f; anchor[2]=c.pos[2]-std::cos(c.yaw)*cp*4.f; }
+        u32 count=r32(); std::vector<int> made;
+        static const float I16[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        for (u32 gi=0; gi<count && gi<256; ++gi){
+            MeshData md;
+            md.name = rstr();
+            u8 flags[4]; fread(flags,1,4,f);
+            md.useBlend=flags[0]!=0; md.additive=flags[1]!=0; md.alphaTest=flags[2]!=0; md.doubleSided=flags[3]!=0;
+            md.texW=r32(); md.texH=r32();
+            u32 pn=r32();
+            if (pn){ std::vector<u8> png(pn); fread(png.data(),1,pn,f);
+                int w2=0,h2=0,n3=0; unsigned char* px=stbi_load_from_memory(png.data(),(int)pn,&w2,&h2,&n3,4);
+                if (px){ md.texRGBA.assign(px,px+(size_t)w2*h2*4); md.texW=(u32)w2; md.texH=(u32)h2; md.hasTexture=true; stbi_image_free(px); } }
+            u32 n2; n2=r32(); md.positions.resize(n2); if(n2) fread(md.positions.data(),4,n2,f);
+            n2=r32(); md.uvs.resize(n2); if(n2) fread(md.uvs.data(),4,n2,f);
+            n2=r32(); md.indices.resize(n2); if(n2) fread(md.indices.data(),4,n2,f);
+            for (size_t v2=0;v2+2<md.positions.size();v2+=3){ md.positions[v2]+=anchor[0]; md.positions[v2+1]+=anchor[1]; md.positions[v2+2]+=anchor[2]; }
+            md.transform=Transform{}; md.hasWorldMatrix=true; memcpy(md.worldMatrix,I16,sizeof I16);
+            md.nVerts=(u32)(md.positions.size()/3); md.nIdx=(u32)md.indices.size();
+            if (md.nVerts<3 || md.nIdx<3) continue;
+            sceneMeshes->push_back(std::move(md));
+            size_t ni=r->gpuMeshes.size();
+            r->uploadMesh(sceneMeshes->back());
+            if (r->gpuMeshes.size()!=ni+1){ sceneMeshes->pop_back(); continue; }
+            meshEditLog[(int)ni]="prefab"; made.push_back((int)ni);
+        }
+        fclose(f);
+        if (made.empty()) { setStatus("prefab: nothing spawned (empty/corrupt file?)"); return; }
+        r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
+        pushDeleteUndo(made, false);                          // Ctrl+Z removes the spawn
+        geomDirty=true;
+        sel=made; selected=made.back(); r->selectedMesh=selected; selItem=-1; scrollToSel=true;
+        std::string bn=path; size_t sl=bn.find_last_of("/\\"); if (sl!=std::string::npos) bn=bn.substr(sl+1);
+        setStatus("Spawned prefab '"+bn+"' ("+std::to_string(made.size())+" mesh(es)) where you were looking - move it with the gizmo (Ctrl+Z removes)");
     }
 
     // ── RE-UV FLAT: give the mesh ONE continuous planar UV sheet (0..1 across its bounds, dominant
@@ -2588,7 +2798,8 @@ struct Editor {
             {"Rotate Y +90 (repeat to stack)",28},{"Rotate Y 180",29},                        // true rotations, no reflection
             {"Rotate X +90",30},{"Rotate Z +90",31},
             {std::string("Fuse selection into ONE mesh")+suf,32},                             // bake world transforms, concat geometry (active mesh's texture)
-            {std::string("Fuse + REBUILD surface")+suf+" (clean retriangulate)",42},           // single-layer grid remesh + baked 1024 texture (NO overlaps)
+            {std::string("Fuse + REBUILD surface")+suf+" (clean retriangulate)",42},           // single-layer remesh + baked 1024 texture (NO overlaps)
+            {std::string("Save selection as PREFAB")+suf,43},                                 // reusable asset: spawn from Scene > Prefabs or drag the file in
             {std::string(noColMeshes.count(ctxMesh)?"Collision: INCLUDE again":"Collision: EXCLUDE (walk-through)")+suf,27},
             {std::string("Reset transform")+suf,3}, {"Copy name",4},
             {colLbl,5},
@@ -2652,6 +2863,7 @@ struct Editor {
                 else if (a==31) forEachSelMesh([&](int m){ rotateMeshGeom(m, 2, 90); });
                 else if (a==32) fuseSelectedMeshes();
                 else if (a==42) rebuildSurface();
+                else if (a==43) savePrefabFromSelection();
                 else if (a==33) { showHoles=!showHoles; if (showHoles){ refreshHoles(); setStatus(std::to_string(holeLoops.size())+" boundary loop(s) outlined - CLICK an orange marker to seal that hole"); } }
                 else if (a==34) { if (ctxHitValid) sealMeshHoles(ctxMesh, ctxHitP);
                                   else setStatus("seal: right-click ON the mesh near the hole"); }
@@ -3083,6 +3295,23 @@ struct Editor {
           if (cx.button(ui::hashId("litnight"), x+bw2+6*uiScale, y, bw2, rh, "Night preview")) { r->lightMul[0]=0.35f; r->lightMul[1]=0.40f; r->lightMul[2]=0.55f; r->lightMul[3]=1.f; }
           y+=rh+8*uiScale; }
         dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
+        // ── PREFABS: reusable assets - save a selection (right-click > Save as PREFAB), spawn copies
+        //    here or by DRAGGING the .hsrprefab file into the window. Spawns land where you look. ──
+        cx.label(x,y,w,rh,"Prefabs",th.text); y+=rh+2*uiScale;
+        { double nowT = glfwGetTime();
+          if (prefabList.empty() && nowT-prefabListAt>3.0) { refreshPrefabList(); prefabListAt=nowT; }
+          if (cx.button(ui::hashId("pfrefresh"), x, y, 90*uiScale, rh, "Refresh")) refreshPrefabList();
+          char pc[40]; snprintf(pc,sizeof pc,"%d prefab(s)",(int)prefabList.size());
+          cx.label(x+96*uiScale,y,w-96*uiScale,rh,pc,th.textDim); y+=rh+2*uiScale;
+          int shown=0;
+          for (auto& pf : prefabList){ if (shown++>=8){ cx.label(x,y,w,rh*0.9f,"(more in prefabs/ - drag any in)",th.textDim); y+=rh*0.9f; break; }
+              std::string bn=pf; size_t sl2=bn.find_last_of("/\\"); if (sl2!=std::string::npos) bn=bn.substr(sl2+1);
+              if (bn.size()>28) bn=bn.substr(0,25)+"...";
+              if (cx.button(ui::hashId(9700u+(unsigned)shown,23u), x, y, w-64*uiScale, rh, bn.c_str())) spawnPrefab(pf);
+              cx.textAligned(x+w-60*uiScale,y,58*uiScale,rh,"spawn",th.textDim,0);
+              y+=rh+2*uiScale; }
+          cx.label(x,y,w,rh*0.9f,"(drop a .hsrprefab file into the window = spawn)",th.textDim); y+=rh+4*uiScale; }
+        dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
         cx.label(x,y,w,rh,"Meta Components",th.text); y+=rh;
         cx.label(x,y,w,rh*0.9f,"eye = show markers     + Add = spawn one",th.textDim); y+=rh+4*uiScale;
         int types[]={sitem::SPAWN,sitem::CHAIR,sitem::BOXCOL,sitem::NAVMESH,sitem::WALLPLACE,sitem::HOTSPOT,sitem::BOUNDARY};
@@ -3141,10 +3370,16 @@ struct Editor {
         // tab strip
         float th_h = 22*uiScale; const char* tabs[]={"Object","Scene","Material","Anim","Physics","Cook"};
         float tx=x, tw=w/6.f;
-        for (int i=0;i<6;i++){ if (cx.tab(ui::hashId(4000+i,13), tx, y, tw, th_h, tabs[i], tab==i)) tab=i; tx+=tw; }
+        for (int i=0;i<6;i++){ if (cx.tab(ui::hashId(4000+i,13), tx, y, tw, th_h, tabs[i], tab==i)) { tab=i; propScroll=0.f; } tx+=tw; }
         dl.rect(x,y+th_h,w,1,th.splitLine);
-        float cy = y+th_h+6*uiScale, cx0 = x+8*uiScale, cw = w-16*uiScale;
+        // SCROLLABLE content: the tool panels outgrew the window - mouse wheel over the panel scrolls,
+        // the offset applies to every tab's content, clamped generously (tabs report no exact height).
+        if (cx.hover(x, y+th_h, w, h-th_h) && cx.in.wheel!=0) propScroll -= cx.in.wheel * th.rowH * 3.f;
+        propScroll = std::clamp(propScroll, 0.f, 1800.f*uiScale);
+        float cy = y+th_h+6*uiScale - propScroll, cx0 = x+8*uiScale, cw = w-16*uiScale;
         dl.pushClip(x, y+th_h, w, h-th_h);
+        if (propScroll > 0.5f)   // scroll indicator
+            cx.textAligned(x+w-40*uiScale, y+th_h+2*uiScale, 36*uiScale, 14*uiScale, "^^^", th.textDim, 2);
         if (tab==TAB_SCENE) { drawScenePanel(cx0, cy, cw); dl.popClip(); return; }   // the Meta-component manager (toggles + Add)
         if (selItem>=0 && selItem<(int)items.size() && tab!=TAB_COOK) { drawItemProps(cx0, cy, cw); dl.popClip(); return; }
         if (selected<0 || selected>=(int)r->gpuMeshes.size()) {
