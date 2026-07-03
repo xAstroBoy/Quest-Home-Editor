@@ -47,6 +47,8 @@ struct Item {
     bool  isLocal    = true;        // tags:["local"] vs ["remote"]
     // CHAIR
     float exitPos[3] = {0, 0, -0.45f};   // playerExitPosition (stand-up spot), relative to the seat
+    float iconY     = 0.25f;             // ChairIcon child height above the seat (haven: 0.25; raise it out of buried geometry)
+    float iconScale = 1.0f;              // ChairIcon child scale. HAVEN-EXACT default = no scale key at all (haven icons look big because the CHAIR entity itself is scaled ~2.45 - scale the chair item for the official look)
     // BOXCOL (path blocker / invisible wall)
     float half[3]    = {0.5f, 0.5f, 0.5f};   // halfExtents
     float quat[4]    = {0,0,0,0};            // optional AUTHORITATIVE localRotationQuat (tilted nav boxes); all-zero = unused
@@ -105,26 +107,12 @@ inline std::string itemEntityJson(const Item& it, int idx, const std::string& me
             // teleport-to-a-destination = a LocomotionHotspot, not a chair.
             std::string loc = std::string("\"locator\":\"chair_location_") + std::to_string(idx) + "\"";
             std::string sph = std::string("\"collisionLayer\":\"None\",\"radius\":") + f(radius);
-            // EXIT (stand-up) TELEPORT — IDA-PROVEN at the APPLICATION (CharacterSittingStates sit-state onExit
-            // `sub_1445C9C`): it reads the AvatarSitting component and writes the exit transform straight to the player's
-            // pending-transform component (`sub_12B9270(player)`), NO navmesh clamp in the path. THE GATE: the whole
-            // exit-teleport block only runs when **allowExitThroughLocomotion(@109) == FALSE** (true SKIPS it -> you just
-            // stand in place; my earlier true-flag cook was exactly wrong). Then it branches on useRelativeExitLocation(@176):
-            //   false -> ABSOLUTE: player.pos = playerExitPosition(@112) directly (player.rot = playerExitRotation@128).
-            //   true  -> seat-local compose of relativePlayerExitPosition(@144).
-            // We use the ABSOLUTE branch = a direct world write (simplest, no seat-transform dependency). editor exitPos =
-            // world delta from the seat, so playerExitPosition = seat + exitPos.
-            float wexit[3] = { it.pos[0]+it.exitPos[0], it.pos[1]+it.exitPos[1], it.pos[2]+it.exitPos[2] };
-            // playerExitRotation MUST be a valid quaternion: sub_1445C9C's absolute branch writes v23+128 (this field) as
-            // the player's exit ROTATION alongside the position. Left unset it's (0,0,0,0) = a zero quat -> the locomotion
-            // likely rejects the whole transform -> you stand up at the seat. Emit the seat's facing (identity here; the
-            // engine forces position.w=1.0 already). seat euler->quat = intrinsic-ZYX (sub_C3B280, shared w/ hstf_parser).
-            float erx=it.rot[0]*0.01745329f, ery=it.rot[1]*0.01745329f, erz=it.rot[2]*0.01745329f;
-            float ehx=erx*0.5f,ehy=ery*0.5f,ehz=erz*0.5f,ecx=std::cos(ehx),esx=std::sin(ehx),ecy=std::cos(ehy),esy=std::sin(ehy),ecz=std::cos(ehz),esz=std::sin(ehz);
-            float eqx=esx*ecy*ecz-ecx*esy*esz, eqy=ecx*esy*ecz+esx*ecy*esz, eqz=ecx*ecy*esz-esx*esy*ecz, eqw=ecx*ecy*ecz+esx*esy*esz;
-            char erb[160]; snprintf(erb,sizeof erb,",\"playerExitRotation\":{\"x\":%.6g,\"y\":%.6g,\"z\":%.6g,\"w\":%.6g}",eqx,eqy,eqz,eqw);
-            std::string sit = vec3("playerExitPosition", wexit) + erb
-                + ",\"useRelativeExitLocation\":false,\"allowExitThroughLocomotion\":false";
+// HAVEN-EXACT payload (hpi_locators.hstf, hangoutSpaceStool_*): the working official chairs ship
+            // ONLY {"playerExitPosition": <small seat-relative delta>} - no rotation, no useRelativeExitLocation,
+            // no allowExitThroughLocomotion. The previous IDA-derived ABSOLUTE-world exit + extra flags did NOT
+            // stand the player up at the exit on device ("exit points are not being programmed") - so mirror the
+            // byte shape the device provably honors. it.exitPos is already the seat-relative delta.
+            std::string sit = vec3("playerExitPosition", it.exitPos);
             comps = transformComp(it)
                 + "," + comp("horizon::platform_api::LocatorPlatformComponent", 1, loc)
                 + "," + comp("horizon::platform_api::ColliderSpherePlatformComponent", 2, sph)

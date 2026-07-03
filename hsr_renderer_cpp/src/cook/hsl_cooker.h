@@ -3159,6 +3159,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     entities += "," + sitem::itemEntityJson(bi, fbIdx); ++fbIdx;
                     rels += "," + relChildOf(bid, rootId);
                 };
+                if (std::getenv("HSR_NOAUTOFLOOR")) goto floorFallback;   // toggle OFF: no auto grid either
                 auto gb = navmeshToBoxes(nv, cell, 1.5f, 1500);     // grid the walkable verts -> one device box per occupied cell at its surface Y
                 for (auto& b : gb){ float c[3]={b[0],b[1],b[2]}, he[3]={b[3],b[4],b[5]}; emitFloorBox(c,he); }
                 if (!gb.empty()) { nTiles=1;
@@ -3168,6 +3169,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             }
             floorFallback: ;
         }
+        if (std::getenv("HSR_NOAUTOFLOOR")) { nTiles = 1; flatFloor = false; }   // editor "Auto floor collision" OFF: ship NO generated floor at all (the invisible wall the items list never showed)
         if (flatFloor || nTiles == 0) {   // fallback: a single flat disk at the camera foot (the old behaviour)
             std::string gid = makeUuid(rng); float gp[3]={gx,gy,gz}, gsc[3]={gs,1.f,gs};
             entities += "," + colliderGroundEntityJson(gid, gp, gsc, colliderK);
@@ -3187,7 +3189,19 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         auto icTex  = readFileBytes("cooker/chair_icon_tex.bin");
         if (icMesh.size() > 376 && icTex.size() > 64) {
             std::string pIcTex = MH + "/chair_icon.tex/tex"; AssetKey3 icTexK = keyForPath(pIcTex);
-            memcpy(icMesh.data()+288, &shaderK.pkg, 8); memcpy(icMesh.data()+296, &shaderK.ing, 8); memcpy(icMesh.data()+304, &shaderK.tgt, 4);  // @288 SHADER -> our unlit
+            // OFFICIAL icon shader: haven's icon mesh references shaders/billboard.surface (billboards to the
+            // player + carries the pop/hover animation). Repointing it to our plain unlit was the "static dot
+            // with 0 animations" - ship haven's billboard shader and point the icon at OUR copy of IT.
+            AssetKey3 icShK = shaderK;   // fallback: plain unlit (icon still shows, just static)
+            {
+                auto icShad = readFileBytes("cooker/billboard.surface.bin");
+                if (icShad.size() > 64) {
+                    std::string pIcSh = MH + "/shaders/billboard.surface/shader";
+                    icShK = keyForPath(pIcSh);
+                    assets.push_back({ pIcSh, icShK.tgt, icShad, icShK });
+                } else fprintf(stderr, "[COOK] WARNING: cooker/billboard.surface.bin missing -> chair icon ships STATIC (unlit) instead of haven billboard pop shader%s", "\n");
+            }
+            memcpy(icMesh.data()+288, &icShK.pkg, 8); memcpy(icMesh.data()+296, &icShK.ing, 8); memcpy(icMesh.data()+304, &icShK.tgt, 4);  // @288 SHADER -> haven billboard (fallback unlit)
             memcpy(icMesh.data()+344, &icTexK.pkg, 8); memcpy(icMesh.data()+352, &icTexK.ing, 8); memcpy(icMesh.data()+360, &icTexK.tgt, 4);     // @344 TEXTURE -> our chair.png
             assets.push_back({ pIcMesh, icMeshK.tgt, icMesh, icMeshK });
             assets.push_back({ pIcTex,  icTexK.tgt,  icTex,  icTexK });
@@ -3224,8 +3238,15 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // the chairs INTERACTABLE (DEVICE-PROVEN). The chair-button only warps you to the ChairIcon (no real sit).
         if (si.type == sitem::CHAIR && iconOk) {
             std::string iconId = sitem::uuid(sidx); ++sidx;
-            std::string iconTf = sitem::comp("horizon::platform_api::TransformPlatformComponent", 2,
-                "\"localPosition\":{\"x\":0,\"y\":0.25,\"z\":0},\"localRotation\":{\"x\":0,\"y\":0,\"z\":0},\"localScale\":{\"x\":1,\"y\":1,\"z\":1}");
+            // HAVEN-EXACT ChairIcon transform (hpi_locators.hstf): ONLY localPosition, no rotation/scale keys
+            // ("exactly take whatever haven2025 has - that is the official way"). Height stays adjustable via
+            // the same localPosition.y (buried icons); a scale key is added ONLY when the user deviates from 1.
+            char icb[220];
+            if (si.iconScale != 1.f)
+                snprintf(icb, sizeof icb, "\"localPosition\":{\"x\":0,\"y\":%.4g,\"z\":0},\"localScale\":{\"x\":%.4g,\"y\":%.4g,\"z\":%.4g}", si.iconY, si.iconScale, si.iconScale, si.iconScale);
+            else
+                snprintf(icb, sizeof icb, "\"localPosition\":{\"x\":0,\"y\":%.4g,\"z\":0}", si.iconY);
+            std::string iconTf = sitem::comp("horizon::platform_api::TransformPlatformComponent", 2, icb);
             std::string iconMeshComp = sitem::comp("horizon::platform_api::MeshPlatformComponent", 11,
                 std::string("\"mesh\":") + refJson(icMeshK) + ",\"isVisibleSelf\":false");
             entities += ",{\"id\":\"" + iconId + "\",\"name\":\"ChairIcon\",\"components\":[" + iconTf + "," + iconMeshComp + "],\"attributes\":[]}";

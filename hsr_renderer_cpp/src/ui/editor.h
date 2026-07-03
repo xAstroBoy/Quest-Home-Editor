@@ -2306,6 +2306,7 @@ struct Editor {
                 it.exitPos[0],it.exitPos[1],it.exitPos[2], it.half[0],it.half[1],it.half[2], it.propW,it.propH,
                 it.navMode, (int)it.srcMeshes.size()); s+=b;
             for(int m:it.srcMeshes){ snprintf(b,sizeof b," %d", m); s+=b; }
+            snprintf(b,sizeof b," %.4f %.4f", it.iconY, it.iconScale); s+=b;   // trailing optional fields (old loaders ignore extras)
             s+="\n";
         }
         if(!animColliders.empty()){ s+="COLLIDERS "+std::to_string(animColliders.size()); for(int m:animColliders){ snprintf(b,sizeof b," %d",m); s+=b; } s+="\n"; }
@@ -2405,6 +2406,8 @@ struct Editor {
                 it.half[0]=(float)atof(t[17].c_str()); it.half[1]=(float)atof(t[18].c_str()); it.half[2]=(float)atof(t[19].c_str());
                 it.propW=(float)atof(t[20].c_str()); it.propH=(float)atof(t[21].c_str()); it.navMode=atoi(t[22].c_str());
                 int nsrc=atoi(t[23].c_str()); for(int k=0;k<nsrc && 24+k<(int)t.size();++k) it.srcMeshes.push_back(atoi(t[24+k].c_str()));
+                if (24+nsrc   < (int)t.size()) it.iconY     = (float)atof(t[24+nsrc].c_str());     // optional (newer sessions)
+                if (24+nsrc+1 < (int)t.size()) it.iconScale = (float)atof(t[24+nsrc+1].c_str());
                 if(it.type==sitem::NAVMESH){ if(cooked){ it.srcMeshes.clear(); fillGroundMeshes(it.srcMeshes); } bakeNavGeometry(it); }   // cooked: re-pick ground by NAME (the cook re-ordered meshes -> the saved indices point at the wrong meshes)
                 items.push_back(std::move(it)); itemN++; }
             else if(t[0]=="COLLIDERS" && !cooked){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) animColliders.push_back(atoi(t[2+k].c_str())); }
@@ -2549,6 +2552,7 @@ struct Editor {
     std::string cookPkg = "com.environment.outerwilds";
     bool autoSign = true, spoofHaven = true;
     bool cookAudio = true;             // DEFAULT ON: bake the env's background audio loop into the cooked APK. Toggle off = silent home.
+    bool cookAutoFloor = true;         // DEFAULT ON: when NO Navmesh item exists, the cook generates a walkable floor (ColliderBox grid / disk). OFF = ship ZERO generated collision (the "invisible wall I never placed").
     bool previewAudio = true;          // DEFAULT ON: play the env's background loop HERE on the PC while previewing. Toggle off = mute desktop playback (drives g_audioMuted).
     bool solidCollision = true;        // DEFAULT ON: cook a REAL double-sided trimesh collider (floor+walls+columns, haven2025 SEBD format). Off = floor-only ColliderBox grid.
     bool prevSolidCol = true;          // tracks solidCollision so the navmesh gizmo re-bakes (walls appear/vanish in the preview) when it's toggled.
@@ -3500,7 +3504,12 @@ struct Editor {
                                y+=rh+2*uiScale;
                                if (cx.button(ui::hashId("exitcam"), x, y, w, rh, "Set exit point to camera position")) {
                                    it.exitPos[0]=r->cam.pos[0]-it.pos[0]; it.exitPos[1]=(r->cam.pos[1]-1.6f)-it.pos[1]; it.exitPos[2]=r->cam.pos[2]-it.pos[2]; }
-                               y+=rh+2*uiScale; break; }
+                               y+=rh+2*uiScale;
+                               // the shell chair button rides the ChairIcon child: height digs it out of buried
+                               // geometry, scale fixes the "tiny dot" (haven chairs ride transform scale ~2.45)
+                               cx.label(x,y,92*uiScale,rh,"Icon height",th.textDim); cx.dragFloat(ui::hashId("chicy"),x+94*uiScale,y,w-94*uiScale,rh,it.iconY,0.01f); y+=rh+2*uiScale;
+                               cx.label(x,y,92*uiScale,rh,"Icon scale",th.textDim);  cx.dragFloat(ui::hashId("chics"),x+94*uiScale,y,w-94*uiScale,rh,it.iconScale,0.01f); y+=rh+2*uiScale;
+                               break; }
           case sitem::BOXCOL: { vecRowF("Half size", it.half, 3, 0.01f, x, y, w); cx.label(x,y,w,rh,"(invisible wall / path blocker)",th.textDim); y+=rh; break; }
           case sitem::WALLPLACE: { cx.label(x,y,78*uiScale,rh,"Max W",th.textDim); cx.dragFloat(ui::hashId("wpw"),x+80*uiScale,y,w-80*uiScale,rh,it.propW,0.01f); y+=rh+2*uiScale;
                                    cx.label(x,y,78*uiScale,rh,"Max H",th.textDim); cx.dragFloat(ui::hashId("wph"),x+80*uiScale,y,w-80*uiScale,rh,it.propH,0.01f); y+=rh; break; }
@@ -4234,6 +4243,7 @@ struct Editor {
         y0=y; cx.checkbox(ui::hashId("nocull"), x, y, "Draw everything - disable culling (fixes clipping, V79-style)", noCull);
         cx.tip(x,y0,w,th.rowH,"Emit scene-spanning bounds so the V205 shell NEVER culls/clips\nyour meshes (frustum + Hi-Z occlusion + distance + CLOD budget).\nThe old V79 shell had NO environment culler, so this matches how\nold homes looked. Geometry still sits at its real position; only\nculling is defeated. Trades the Quest's culling perf for full\nvisibility. Keep ON if cooked homes clip / disappear at distance."); y+=th.rowH+6*uiScale;
         y0=y; cx.checkbox(ui::hashId("cookaudio"), x, y, "Ship background audio loop", cookAudio);
+        y+=cx.th.rowH+2*uiScale; cx.checkbox(ui::hashId("cookautofloor"), x, y, "Auto floor collision (no Navmesh item)", cookAutoFloor);
         cx.tip(x,y0,w,th.rowH,"Bake the environment's background audio loop into the cooked APK\n(FMOD asset placed at the spawn). Turn OFF for a silent home."); y+=th.rowH+2*uiScale;
         // ── the AUDIO COOKER UI: shows what will ship + Replace/Add/Export/Revert (backend above: setAudioFromFile etc.) ──
         { if(audioInfo.empty() && !bgOgg.empty()) refreshAudioInfo();
@@ -4835,6 +4845,7 @@ struct Editor {
         setenv_("HSR_COOK_PKG", pkg.c_str());
         setenv_("HSR_HZANIM", animSkinned ? "1" : "");   // emit skeletal HZANIM clips so skinned meshes ANIMATE on device (clouds/koi/droids)
         setenv_("HSR_NOCULL", noCull ? "1" : "");         // scene-spanning bounds -> V205 never culls our meshes (V79-style draw-everything); fixes cooked-home clipping
+        setenv_("HSR_NOAUTOFLOOR", cookAutoFloor ? "" : "1");   // Cook-tab toggle: OFF = no generated floor/walls at all
         setenv_("HSR_NAVTRIMESH", solidCollision ? "1" : "");  // real double-sided trimesh collider (haven2025 SEBD: 16-align manifest + 128-align RTree + count-shift); off -> ColliderBox grid
         setenv_("HSR_NAVSLOPE", solidCollision ? "0" : "");    // trimesh: include EVERY face (walls+columns+floor) so the CCT capsule blocks horizontally, not just the floor
         // HSL render config -> cook's ScenePlatformComponent (the SAME values the live preview applies = WYSIWYG)
