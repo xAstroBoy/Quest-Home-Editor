@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <functional>
 #include <set>
+#include <map>
 #include <cctype>
 
 
@@ -1414,16 +1415,56 @@ public:
                 // DEVICE-faithful clip: load the anim the BELONGING mesh's AnimatorPlatformComponent names (the
                 // joint-count guess below binds every generic-named rig to the FIRST clip = "moves randomly").
                 if (idPair && cookedNaming) {
-                    for (auto& md : meshes) {
-                        if (!md.hasBones) continue;
-                        std::string msp=meshSkelPath(md); if (msp.empty() || msp.rfind(key+".skel",0)!=0) continue;   // mesh belongs to THIS skel (".skel" boundary so armature1 != armature1X)
+                    // ONE AnimGroup PER (this skeleton, DISTINCT anim). The cook DEDUPES byte-identical
+                    // skeletons (polarvillage's two windmills both reference armature7.skel) while each
+                    // mesh's AnimatorPlatformComponent names ITS OWN animclipN — the device plays per
+                    // component. The old code fished ONE clip for the whole skel file, so every sharer
+                    // played the FIRST mesh's clip: the vista windmill orbited the LODGE windmill's hub
+                    // 200 units away ("windmill moving everywhere").
+                    std::map<std::string, std::vector<size_t>> byAnim;
+                    for (size_t mi=0; mi<meshes.size(); ++mi) { auto& md=meshes[mi];
+                        if (!md.hasBones || md.boneIndices.size() < md.positions.size()/3*4) continue;
+                        std::string msp=meshSkelPath(md); if (msp.empty() || msp.rfind(key+".skel",0)!=0) continue;   // ".skel" boundary so armature1 != armature1X
                         std::string ap_=meshAnimPath(md); if (ap_.empty()) continue;
-                        for (int ai=0; ai<nf && !gotAnim; ++ai){ mz_zip_archive_file_stat at; if(!mz_zip_reader_file_stat(&sceneZip,ai,&at)) continue;
-                            std::string zp=at.m_filename, zs=(zp.rfind("content/",0)==0)?zp.substr(8):zp;
-                            if (zs.rfind(ap_,0)!=0) continue;
-                            if (zp.find("__hzanim_anim_sub_targets__")==std::string::npos && zp.find(".anim/anim")==std::string::npos) continue;
-                            if (extractIdx(ai,ab) && parseRendClip(ab,(int)g.skel.joints.size(),g.clip)) gotAnim=true; }
-                        if (gotAnim) break;
+                        byAnim[ap_].push_back(mi);
+                    }
+                    if (!byAnim.empty()) {
+                        int nJ=(int)g.skel.joints.size();
+                        std::vector<u32> jointHash(nJ);
+                        for (int j=0;j<nJ;++j) jointHash[j]=murmur3_x86_32(g.skel.joints[j].name.data(), g.skel.joints[j].name.size(), 0);
+                        for (auto& kv : byAnim) {
+                            AnimGroup g2; g2.skel=g.skel; bool got=false; std::vector<u8> ab2;
+                            for (int ai=0; ai<nf && !got; ++ai){ mz_zip_archive_file_stat at; if(!mz_zip_reader_file_stat(&sceneZip,ai,&at)) continue;
+                                std::string zp=at.m_filename, zs=(zp.rfind("content/",0)==0)?zp.substr(8):zp;
+                                if (zs.rfind(kv.first,0)!=0) continue;
+                                if (zp.find("__hzanim_anim_sub_targets__")==std::string::npos && zp.find(".anim/anim")==std::string::npos) continue;
+                                if (extractIdx(ai,ab2) && parseRendClip(ab2,(int)g2.skel.joints.size(),g2.clip)) got=true; }
+                            if (!got) continue;
+                            for (size_t mi : kv.second) { auto& md=meshes[mi];
+                                if (!md.bonePalette.empty() && !std::getenv("HSR_HZNOREMAP")) {
+                                    // slot -> joint by the palette's name-hash (THE faithful map)
+                                    std::vector<int> slotToJoint(md.bonePalette.size(), -1);
+                                    for (size_t s2=0;s2<md.bonePalette.size();++s2)
+                                        for (int j=0;j<nJ;++j) if (jointHash[j]==md.bonePalette[s2]) { slotToJoint[s2]=j; break; }
+                                    for (auto& bi : md.boneIndices) if ((size_t)bi<slotToJoint.size() && slotToJoint[bi]>=0) bi=(u8)slotToJoint[bi];
+                                }
+                                SkinRec r; r.meshIdx=mi; r.basePos=md.positions; r.bIdx=md.boneIndices; r.bWgt=md.boneWeights;
+                                g2.skinRecs.push_back(std::move(r)); md.dynamicVerts=true;
+                            }
+                            size_t slash=key.rfind('/');
+                            log("  HzAnim rig '%s' + clip '%s': %zu joints, %zu skinned meshes",
+                                key.substr(slash==std::string::npos?0:slash+1).c_str(), kv.first.c_str(),
+                                g2.skel.joints.size(), g2.skinRecs.size());
+                            if (verbose && g2.clip.acl) {
+                                float dur = hzAclDuration(g2.clip.acl);
+                                std::vector<float> s0, s1; sampleRendClip(g2.skel, g2.clip, 0.f, s0); sampleRendClip(g2.skel, g2.clip, dur*0.5f, s1);
+                                float maxd=0.f; for (size_t i2=0;i2<s0.size()&&i2<s1.size();++i2){ float dd=std::fabs(s0[i2]-s1[i2]); if(dd>maxd)maxd=dd; }
+                                log("    [ACL] dur=%.3fs aclJoints=%d fps=%.1f  skinDelta(t=0 vs %.2fs)=%.4f %s",
+                                    dur, g2.clip.aclJoints, g2.clip.fps, dur*0.5f, maxd, maxd<1e-4f?"<<STATIC!":"(animates)");
+                            }
+                            if (!g2.skinRecs.empty()) animGroups.push_back(std::move(g2));
+                        }
+                        continue;   // this skeleton is fully handled (per-pair groups); skip the one-clip path
                     }
                 }
                 // PASS 0 = exact base prefix (every env where the clip shares the skeleton's .fbx/<name> base —

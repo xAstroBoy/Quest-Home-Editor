@@ -665,7 +665,11 @@ public:
             r[1]= q[3]*c0[1] - q[0]*c0[2] + q[1]*c0[3] + q[2]*c0[0];
             r[2]= q[3]*c0[2] + q[0]*c0[1] - q[1]*c0[0] + q[2]*c0[3];
             r[3]= q[3]*c0[3] - q[0]*c0[0] - q[1]*c0[1] - q[2]*c0[2];
-            if (!std::getenv("HSR_NOROTFLIP")) { r[0]=-r[0]; r[1]=-r[1]; r[2]=-r[2]; }   // FLIP rotation handedness to match OPA's animate() vertex sweep (DATA: OPA=+174°CCW/40s, natural rel=q*conj(q0)=CW opposite). With the flip the node spin matches OPA's CCW, so the data UV scroll (+u) CANCELS it → texture world-still. HSR_NOROTFLIP disables.
+            // NO handedness flip: rel = q*conj(q0) as-is IS the renderer's rotation. The old default FLIP
+            // (conjugate) made the cooked dome spin OPPOSITE the source, so the data UV counter-scroll ADDED
+            // instead of cancelling -> the aurora texture swept ~half the sky by mid-loop (verified by
+            // pinned-time captures: no-flip t=20 == source t=20 exactly; flipped drifted 2x0.24 widths).
+            if (std::getenv("HSR_ROTFLIP")) { r[0]=-r[0]; r[1]=-r[1]; r[2]=-r[2]; }   // opt-in for A/B testing only
             // sign-continuity: keep each quat in the same hemisphere as the previous so the shader nlerp takes the short arc
             if (f>0){ float* p=&quats[(size_t)(f-1)*4]; if (r[0]*p[0]+r[1]*p[1]+r[2]*p[2]+r[3]*p[3] < 0){ r[0]=-r[0];r[1]=-r[1];r[2]=-r[2];r[3]=-r[3]; } }
             float* o=&quats[(size_t)f*4]; o[0]=r[0];o[1]=r[1];o[2]=r[2];o[3]=r[3];

@@ -1160,6 +1160,28 @@ public:
             float us=s[0];   // uniform scale; bind 0 (Shield) -> 1 to avoid singular inverse-bind; the clip still drives the 0->1 pop
             e.jointScale[j] = (us > 1e-3f || us < -1e-3f) ? us : 1.0f;
         }
+        // ── IBM RESIDUAL: real glTF skinning is Σw·W_j(t)·IBM_j — the port rebuilds the bind from the
+        // NODE hierarchy and ships inverse(bindWorld_j) instead of the file's IBM_j. Equal on well-formed
+        // rigs; Maya-exported rigs (japan's kois) bake the UNIT CONVERSION into the IBMs ONLY (joint nodes
+        // s=1, mesh verts in giant cm-ish units, IBM carries the shrink) -> the cooked fish skinned HUGE.
+        // Fold the residual R = bindWorld_j·IBM_j (a GLOBAL conversion, same for every joint) into the
+        // REST VERTS: v' = R·v, so shippedSkin(t)·v' == sourceSkin(t)·v exactly.
+        if (sk.ibm.size() >= (size_t)nj*16) {
+            float bw[16]; worldM(bindNodes, sk.joints[0], bw);
+            float R[16]; mulM(bw, &sk.ibm[0], R);
+            float dev=0.f; for (int k=0;k<16;k++){ float id=(k%5==0)?1.f:0.f; float d=std::fabs(R[k]-id); if(d>dev)dev=d; }
+            if (dev > 1e-3f) {
+                for (size_t v=0; v+2 < e.restPos.size(); v+=3) {
+                    float x=e.restPos[v],y=e.restPos[v+1],z=e.restPos[v+2];
+                    e.restPos[v]  =R[0]*x+R[4]*y+R[8]*z+R[12];
+                    e.restPos[v+1]=R[1]*x+R[5]*y+R[9]*z+R[13];
+                    e.restPos[v+2]=R[2]*x+R[6]*y+R[10]*z+R[14];
+                }
+                if (std::getenv("HSR_VERBOSE"))
+                    fprintf(stderr, "[HZIBM] mesh %d: IBM residual folded into rest verts (dev=%.4f scale~%.5f)\n",
+                            meshIdx, dev, sqrtf(R[0]*R[0]+R[1]*R[1]+R[2]*R[2]));
+            }
+        }
         e.boneIdx.resize((size_t)rec->nv*4); e.boneWgt.resize((size_t)rec->nv*4);
         for (u32 v = 0; v < rec->nv; ++v) {
             float wsum=0; for (int c=0;c<4;c++) wsum += rec->jw[v*4+c];

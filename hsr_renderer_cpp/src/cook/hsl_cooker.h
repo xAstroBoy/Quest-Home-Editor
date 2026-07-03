@@ -2287,7 +2287,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     fprintf(stderr, "    [CLIP] duration=%.3fs sampleRate=%.1ffps  => FULL DECODED PATH (device plays this):\n", vd, hzAclSampleRate(vclip));
                     for (int s=0;s<=12;s++){ float t = (vd>0?vd*(float)s/12.f:0.f); int n = hzAclSampleLocal(vclip, t, out, 256);
                         if (mj<n){ for(int c=4;c<7;c++){ float v=std::fabs(out[mj*8+c]); if(v>decMax)decMax=v; }
-                            fprintf(stderr, "    t=%.2fs (%.1f,%.1f,%.1f)\n", t, out[mj*8+4],out[mj*8+5],out[mj*8+6]); } }
+                            fprintf(stderr, "    t=%.2fs (%.1f,%.1f,%.1f) sc=%.4f\n", t, out[mj*8+4],out[mj*8+5],out[mj*8+6], out[mj*8+7]); } }
+                    { int n0 = hzAclSampleLocal(vclip, 0.f, out, 256);   // scale roundtrip: INPUT trsLocal s vs decoded (koi = 25x blowup when ACL drops it)
+                      for (int j2=0; j2<m.hzJointCount && j2<n0; ++j2){ float inS=m.hzTrsLocal[(size_t)j2*10+7], deS=out[j2*8+7];
+                          if (std::fabs(inS-deS) > 0.01f*std::fabs(inS)+1e-4f)
+                              fprintf(stderr, "    [SCALE-MISMATCH] j%d input=%.4f decoded=%.4f\n", j2, inS, deS); } }
                     fprintf(stderr, "    => INPUT maxAbs=%.1f vs DECODED maxAbs=%.1f  %s\n", inMax, decMax,
                             (inMax>10.f && decMax < inMax*0.5f) ? "⛔ ACL LOST THE MOTION (device comet FROZEN)" : "ok (motion preserved)");
                     hzAclDestroy(vclip);

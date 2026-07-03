@@ -1643,7 +1643,8 @@ struct Editor {
     //    apply so every index matches. Textures stored as PNG (the fused atlas compresses well).
     bool geomDirty = false;
     int  baseMeshCount = -1;   // how many meshes the ENV itself loaded (anything above = editor-created)
-    std::thread geomThread; std::atomic<bool> geomSaving{false};   // sidecar writes run OFF the UI thread (PNG-encoding a fused 4K atlas froze the app for seconds)
+    std::thread geomThread; std::atomic<bool> geomSaving{false};
+    bool geomAuth = false;   // a v2 .geom was loaded: it is authoritative for created meshes (idx >= baseMeshCount) - stale session lines must not override it   // sidecar writes run OFF the UI thread (PNG-encoding a fused 4K atlas froze the app for seconds)
     void saveGeomSidecar(const std::string& sessionFile){
         if (!r || !sceneMeshes || baseMeshCount < 0) return;
         // NEVER skip the write: the session .hsledit is written unconditionally and its MESH/DELETED lines
@@ -1653,20 +1654,22 @@ struct Editor {
         // in practice (it has had the whole autosave interval to finish).
         if (geomThread.joinable()) geomThread.join();
         std::string gp = sessionFile + ".geom";
-        int extra = (int)sceneMeshes->size() - baseMeshCount;
-        if (extra <= 0) { std::error_code ec; std::filesystem::remove(gp, ec); geomDirty=false; return; }
         // SNAPSHOT the extra meshes fast (bulk vector copies), then encode + write on a WORKER thread.
         struct GeoSnap { std::string name; u8 flags[4]; u8 del; float eT[3],eR[4],eS[3],eTint[4]; u32 texW,texH; std::vector<u8> texRGBA;
                          std::vector<float> pos,uv,uv2; std::vector<u32> idx; std::string log; };
         auto snap = std::make_shared<std::vector<GeoSnap>>();
-        snap->reserve((size_t)extra);
         for (int i=baseMeshCount; i<(int)sceneMeshes->size(); ++i){
+            // DELETED created meshes are NOT persisted: the undo history dies with the session, so after a
+            // restart they are unreachable garbage — yet every geometry op's superseded original was being
+            // saved forever WITH its 4K PNG (treehouse's sidecar hit 402MB / 414 records, the write took so
+            // long the process died mid-file = truncated sidecar = load crash).
+            if (r->isDeleted((size_t)i)) continue;
             const MeshData& md=(*sceneMeshes)[(size_t)i];
             GeoSnap g; g.name=md.name;
             g.flags[0]=md.useBlend?1:0; g.flags[1]=md.additive?1:0; g.flags[2]=md.alphaTest?1:0; g.flags[3]=md.doubleSided?1:0;
-            // v2: the mesh's OWN deleted flag + transform ride along — created meshes no longer depend on
-            // session-line index alignment to know they were deleted or where they were moved.
-            g.del = r->isDeleted((size_t)i) ? 1 : 0;
+            // v2 state byte: bit0 = deleted (always 0 now — deleted records aren't written; kept for
+            // compatibility with the first v2 files), bit1 = collision-excluded (walk-through)
+            g.del = noColMeshes.count(i)?2:0;
             if ((size_t)i < r->gpuMeshes.size()) { const VkGpuMesh& gm=r->gpuMeshes[(size_t)i];
                 memcpy(g.eT,gm.editT,sizeof g.eT); memcpy(g.eR,gm.editR,sizeof g.eR);
                 memcpy(g.eS,gm.editS,sizeof g.eS); memcpy(g.eTint,gm.editTint,sizeof g.eTint); }
@@ -1676,23 +1679,41 @@ struct Editor {
             auto it=meshEditLog.find(i); if (it!=meshEditLog.end()) g.log=it->second;
             snap->push_back(std::move(g));
         }
+        if (snap->empty()) { std::error_code ec; std::filesystem::remove(gp, ec); geomDirty=false; return; }
         geomDirty = false; geomSaving.store(true);
         geomThread = std::thread([this, gp, snap]{
-            FILE* f = fopen(gp.c_str(), "wb");
+            // write to a TEMP file + atomic swap: a process killed mid-write (this is a multi-second job for
+            // big scenes) must never leave a half-written .geom behind — that truncated file crashed loads.
+            std::string tp = gp + ".tmp";
+            FILE* f = fopen(tp.c_str(), "wb");
             if (f) {
                 auto w32=[&](u32 v){ fwrite(&v,4,1,f); };
                 auto wstr=[&](const std::string& s){ w32((u32)s.size()); fwrite(s.data(),1,s.size(),f); };
                 fwrite("HSRGEOM2",8,1,f); w32((u32)snap->size());
-                for (auto& g : *snap){
+                // slice/copy families all share ONE source texture — encode + store each distinct texture
+                // ONCE; later records write the 0xFFFFFFFE marker + the record index that owns the pixels.
+                std::unordered_map<unsigned long long,u32> texSeen;
+                for (u32 ri=0; ri<(u32)snap->size(); ++ri){
+                    auto& g = (*snap)[ri];
                     wstr(g.name); fwrite(g.flags,1,4,f);
                     fwrite(&g.del,1,1,f);
                     fwrite(g.eT,4,3,f); fwrite(g.eR,4,4,f); fwrite(g.eS,4,3,f); fwrite(g.eTint,4,4,f);
                     w32(g.texW); w32(g.texH);
-                    std::vector<u8> png;   // texture -> PNG in memory (the slow part - now off-thread)
-                    if (!g.texRGBA.empty() && g.texW>0)
-                        stbi_write_png_to_func([](void* ctx, void* d, int n){ auto* v=(std::vector<u8>*)ctx; v->insert(v->end(),(u8*)d,(u8*)d+n); },
-                                               &png, g.texW, g.texH, 4, g.texRGBA.data(), g.texW*4);
-                    w32((u32)png.size()); if(!png.empty()) fwrite(png.data(),1,png.size(),f);
+                    if (g.texRGBA.empty() || !g.texW) { w32(0); }
+                    else {
+                        unsigned long long hh=1469598103934665603ull;
+                        for (size_t k=0;k<g.texRGBA.size();k+=7) hh=(hh^g.texRGBA[k])*1099511628211ull;   // sampled FNV — 4K RGBA hashes fast
+                        hh ^= (unsigned long long)g.texRGBA.size()*2654435761ull ^ ((unsigned long long)g.texW<<32);
+                        auto it2=texSeen.find(hh);
+                        if (it2!=texSeen.end()) { w32(0xFFFFFFFEu); w32(it2->second); }
+                        else {
+                            std::vector<u8> png;   // texture -> PNG in memory (the slow part - off-thread)
+                            stbi_write_png_to_func([](void* ctx, void* d, int n){ auto* v=(std::vector<u8>*)ctx; v->insert(v->end(),(u8*)d,(u8*)d+n); },
+                                                   &png, g.texW, g.texH, 4, g.texRGBA.data(), g.texW*4);
+                            w32((u32)png.size()); if(!png.empty()) fwrite(png.data(),1,png.size(),f);
+                            texSeen.emplace(hh, ri);
+                        }
+                    }
                     w32((u32)g.pos.size()); if(!g.pos.empty()) fwrite(g.pos.data(),4,g.pos.size(),f);
                     w32((u32)g.uv.size());  if(!g.uv.empty())  fwrite(g.uv.data(),4,g.uv.size(),f);
                     w32((u32)g.uv2.size()); if(!g.uv2.empty()) fwrite(g.uv2.data(),4,g.uv2.size(),f);
@@ -1700,7 +1721,10 @@ struct Editor {
                     wstr(g.log);
                 }
                 fclose(f);
-                fprintf(stderr,"[EDIT] geometry sidecar saved: %zu editor-created mesh(es) -> %s\n", snap->size(), gp.c_str());
+                std::error_code ec; std::filesystem::remove(gp, ec);   // Windows rename won't overwrite
+                std::filesystem::rename(tp, gp, ec);
+                if (ec) fprintf(stderr,"[EDIT] geometry sidecar swap FAILED: %s\n", ec.message().c_str());
+                else fprintf(stderr,"[EDIT] geometry sidecar saved: %zu live editor-created mesh(es) -> %s\n", snap->size(), gp.c_str());
             }
             geomSaving.store(false);
         });
@@ -1710,27 +1734,42 @@ struct Editor {
         std::string gp = sessionFile + ".geom";
         FILE* f = fopen(gp.c_str(), "rb"); if (!f) return;
         char magic[8]; if (fread(magic,1,8,f)!=8 || memcmp(magic,"HSRGEOM",7)!=0 || (magic[7]!='1' && magic[7]!='2')){ fclose(f); return; }
-        bool v2 = magic[7]=='2';   // v2 records carry deleted flag + editT/R/S/Tint (self-contained; no session-index dependence)
-        auto r32=[&]()->u32{ u32 v=0; fread(&v,4,1,f); return v; };
-        auto rstr=[&]()->std::string{ u32 n=r32(); std::string s(n,'\0'); if(n) fread(&s[0],1,n,f); return s; };
+        bool v2 = magic[7]=='2';   // v2 records carry deleted/nocol + editT/R/S/Tint (self-contained; no session-index dependence)
+        // EVERY read is checked: a process killed mid-write used to leave a truncated file whose zero-filled
+        // tail decoded as "empty mesh" records — uploadMesh(0 verts) crashed inside the driver. Any short or
+        // insane read now stops the restore cleanly and keeps everything already loaded.
+        bool ok=true;
+        auto rd =[&](void* d, size_t n){ if (ok && fread(d,1,n,f)!=n) ok=false; };
+        auto r32=[&]()->u32{ u32 v=0; rd(&v,4); return v; };
+        auto rstr=[&]()->std::string{ u32 n=r32(); if(n>1u<<20){ ok=false; return {}; } std::string s(n,'\0'); if(n) rd(&s[0],n); return s; };
         u32 count=r32(); int restored=0;
-        for (u32 gi=0; gi<count && gi<4096; ++gi){
+        std::vector<int> recScene;   // file record -> sceneMeshes/gpu index (-1 = skipped/failed) for texture dedup refs
+        for (u32 gi=0; gi<count && gi<4096 && ok; ++gi){
             MeshData md;
             md.name = rstr();
-            u8 flags[4]; fread(flags,1,4,f);
+            u8 flags[4]={0,0,0,0}; rd(flags,4);
             md.useBlend=flags[0]!=0; md.additive=flags[1]!=0; md.alphaTest=flags[2]!=0; md.doubleSided=flags[3]!=0;
             u8 del=0; float eT[3]={0,0,0}, eR[4]={0,0,0,1}, eS[3]={1,1,1}, eTint[4]={1,1,1,1};
-            if (v2){ fread(&del,1,1,f); fread(eT,4,3,f); fread(eR,4,4,f); fread(eS,4,3,f); fread(eTint,4,4,f); }
+            if (v2){ rd(&del,1); rd(eT,12); rd(eR,16); rd(eS,12); rd(eTint,16); }
             md.texW=r32(); md.texH=r32();
             u32 pn=r32();
-            if (pn){ std::vector<u8> png(pn); fread(png.data(),1,pn,f);
-                int w2=0,h2=0,n2=0; unsigned char* px=stbi_load_from_memory(png.data(),(int)pn,&w2,&h2,&n2,4);
-                if (px){ md.texRGBA.assign(px,px+(size_t)w2*h2*4); md.texW=(u32)w2; md.texH=(u32)h2; md.hasTexture=true; stbi_image_free(px); } }
-            u32 n; n=r32(); md.positions.resize(n); if(n) fread(md.positions.data(),4,n,f);
-            n=r32(); md.uvs.resize(n);  if(n) fread(md.uvs.data(),4,n,f);
-            n=r32(); md.uvs2.resize(n); if(n) fread(md.uvs2.data(),4,n,f);
-            n=r32(); md.indices.resize(n); if(n) fread(md.indices.data(),4,n,f);
+            int texFrom=-1;
+            if (pn==0xFFFFFFFEu){   // dedup marker: pixels live in an earlier record
+                u32 ref=r32(); if (ref<recScene.size()) texFrom=recScene[ref];
+            } else if (pn>0x10000000u){ ok=false; }   // >256MB "PNG" = garbage/truncation
+            else if (pn){ std::vector<u8> png(pn); rd(png.data(),pn);
+                if (ok){ int w2=0,h2=0,n2=0; unsigned char* px=stbi_load_from_memory(png.data(),(int)pn,&w2,&h2,&n2,4);
+                         if (px){ md.texRGBA.assign(px,px+(size_t)w2*h2*4); md.texW=(u32)w2; md.texH=(u32)h2; md.hasTexture=true; stbi_image_free(px); } } }
+            auto rArrF=[&](std::vector<float>& v){ u32 n=r32(); if(n>100000000u){ ok=false; return; } v.resize(n); if(n) rd(v.data(),(size_t)n*4); };
+            rArrF(md.positions); rArrF(md.uvs); rArrF(md.uvs2);
+            { u32 n=r32(); if(n>100000000u) ok=false; else { md.indices.resize(n); if(n) rd(md.indices.data(),(size_t)n*4); } }
             std::string log = rstr();
+            if (!ok){ fprintf(stderr,"[EDIT] geometry sidecar TRUNCATED at record %u/%u - ignoring the rest (%s)\n", gi, count, gp.c_str()); break; }
+            if (texFrom>=0 && texFrom<(int)sceneMeshes->size()){ const MeshData& src=(*sceneMeshes)[(size_t)texFrom];
+                md.texRGBA=src.texRGBA; md.texW=src.texW; md.texH=src.texH; md.hasTexture=src.hasTexture; }
+            // old v2 files still contain soft-deleted records; they're unreachable (undo died with the
+            // session) — parse past them but never upload. Degenerate/empty geometry is skipped too.
+            if ((del&1) || md.positions.size()<9 || md.indices.size()<3){ recScene.push_back(-1); continue; }
             md.nVerts=(u32)(md.positions.size()/3); md.nIdx=(u32)md.indices.size();
             md.transform = Transform{}; md.hasWorldMatrix=true;
             static const float I16[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -1738,19 +1777,23 @@ struct Editor {
             sceneMeshes->push_back(std::move(md));
             size_t ni=r->gpuMeshes.size();
             r->uploadMesh(sceneMeshes->back());
-            if (r->gpuMeshes.size()!=ni+1){ sceneMeshes->pop_back(); continue; }
-            if (v2){   // self-contained restore: transform + tint + deleted state (session lines may re-apply the same)
+            if (r->gpuMeshes.size()!=ni+1){ sceneMeshes->pop_back(); recScene.push_back(-1); continue; }
+            if (v2){   // self-contained restore: transform + tint + collision-exclude (no session-line dependence)
                 VkGpuMesh& ng=r->gpuMeshes[ni];
                 memcpy(ng.editT,eT,sizeof eT); memcpy(ng.editR,eR,sizeof eR);
                 memcpy(ng.editS,eS,sizeof eS); memcpy(ng.editTint,eTint,sizeof eTint);
                 recomputeModel(ng);
-                if (del) r->setDeleted(ni, true);
+                if (del&2) noColMeshes.insert((int)ni);
             }
             if (!log.empty()) meshEditLog[(int)ni]=log;
+            recScene.push_back((int)ni);
             ++restored;
         }
         fclose(f);
         r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
+        if (v2) geomAuth = true;   // GEOM2 is AUTHORITATIVE for created meshes: session MESH/DELETED/MATF/
+                                   // TEXOVR/NOCOL lines with idx >= baseMeshCount are stale (the compacted
+                                   // sidecar re-orders live meshes) and must not be applied over it.
         if (restored) fprintf(stderr,"[EDIT] geometry sidecar restored %d editor-created mesh(es) from %s\n", restored, gp.c_str());
     }
 
@@ -2336,7 +2379,10 @@ struct Editor {
     // Parse + apply a .hsledit session text (shared by loadProject and the auto-save recovery banner).
     void applySessionText(const std::string& all, int& meshN, int& itemN){
         items.clear(); selItem=-1; deselectAll(); animColliders.clear(); skyboxMeshes.clear();
-        matEdited.clear(); noColMeshes.clear(); for(int k=0;k<4;k++) r->lightMul[k]=1.f;   // reset light/material/collision edits; LIGHT/MATF/NOCOL lines re-apply
+        matEdited.clear(); for(int k=0;k<4;k++) r->lightMul[k]=1.f;   // reset light/material/collision edits; LIGHT/MATF/NOCOL lines re-apply
+        { // created-mesh collision-excludes came from the GEOM2 sidecar (loaded BEFORE this) — keep those, reset the rest
+          std::set<int> keep; for (int m : noColMeshes) if (geomAuth && m>=baseMeshCount) keep.insert(m);
+          noColMeshes = std::move(keep); }
         clearAudioOverride();   // reset to the env's own theme; an AUDIOOVR line below re-applies the replacement (no-op when none was active)
         const bool cooked = envIsCookedApk();   // a cook OUTPUT: take the session's scene ITEMS but NOT its index-based MESH transforms (already baked into the cook) — re-derive the navmesh from THIS env's ground by name
         size_t p=0; meshN=0; itemN=0;
@@ -2345,7 +2391,7 @@ struct Editor {
             auto t=tokenize(line); if(t.empty()) continue;
             if(t[0]=="CAM" && t.size()>=6){ r->cam.pos[0]=(float)atof(t[1].c_str()); r->cam.pos[1]=(float)atof(t[2].c_str()); r->cam.pos[2]=(float)atof(t[3].c_str()); r->cam.yaw=(float)atof(t[4].c_str()); r->cam.pitch=(float)atof(t[5].c_str()); }
             else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
-            else if(t[0]=="MESH" && t.size()>=14 && !cooked){ int idx=atoi(t[1].c_str()); if(idx>=0&&idx<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[idx];
+            else if(t[0]=="MESH" && t.size()>=14 && !cooked){ int idx=atoi(t[1].c_str()); if(geomAuth && idx>=baseMeshCount) continue;   /* GEOM2 owns created meshes; compacted sidecar re-orders them = stale indices */ if(idx>=0&&idx<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[idx];
                 gm.name=t[2]; gm.editT[0]=(float)atof(t[3].c_str()); gm.editT[1]=(float)atof(t[4].c_str()); gm.editT[2]=(float)atof(t[5].c_str());
                 gm.editR[0]=(float)atof(t[6].c_str()); gm.editR[1]=(float)atof(t[7].c_str()); gm.editR[2]=(float)atof(t[8].c_str()); gm.editR[3]=(float)atof(t[9].c_str());
                 gm.editS[0]=(float)atof(t[10].c_str()); gm.editS[1]=(float)atof(t[11].c_str()); gm.editS[2]=(float)atof(t[12].c_str());
@@ -2364,15 +2410,15 @@ struct Editor {
             else if(t[0]=="COLLIDERS" && !cooked){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) animColliders.push_back(atoi(t[2+k].c_str())); }
             else if(t[0]=="SKYBOX" && !cooked){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) skyboxMeshes.push_back(atoi(t[2+k].c_str())); }   // restore far-backdrop skybox marks
             else if(t[0]=="IHIDE"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k){ int idx=atoi(t[2+k].c_str()); if(idx>=0&&idx<(int)items.size()) items[idx].hidden=true; } }   // restore per-item visibility eyes
-            else if(t[0]=="DELETED"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k){ int idx=atoi(t[2+k].c_str()); if(idx>=0) r->setDeleted(idx,true); } }   // restore editor mesh deletions (dropped from render + cook)
-            else if(t[0]=="TEXOVR" && (int)t.size()>=3){ int mi=atoi(t[1].c_str()); std::string p=t[2]; for(size_t k=3;k<t.size();++k) p+=" "+t[k]; if(mi>=0) texOverride[mi]=p; }   // remember swapped textures; applyTexOverrides() re-loads them below
+            else if(t[0]=="DELETED"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k){ int idx=atoi(t[2+k].c_str()); if(idx>=0 && !(geomAuth && idx>=baseMeshCount)) r->setDeleted(idx,true); } }   // restore editor mesh deletions (dropped from render + cook)
+            else if(t[0]=="TEXOVR" && (int)t.size()>=3){ int mi=atoi(t[1].c_str()); std::string p=t[2]; for(size_t k=3;k<t.size();++k) p+=" "+t[k]; if(mi>=0 && !(geomAuth && mi>=baseMeshCount)) texOverride[mi]=p; }   // remember swapped textures; applyTexOverrides() re-loads them below
             else if(t[0]=="SKYCOL" && (int)t.size()>=4){ setSkyColor((float)atof(t[1].c_str()),(float)atof(t[2].c_str()),(float)atof(t[3].c_str())); }   // general skybox color -> drives clearRGB
             else if(t[0]=="SKYIMG" && (int)t.size()>=2){ std::string p=t[1]; for(size_t k=2;k<t.size();++k) p+=" "+t[k]; if(p.rfind("mesh:",0)==0) setSkyImageFromMesh(atoi(p.c_str()+5)); else setSkyImage(p); }   // restore skybox image/texture
             else if(t[0]=="AUDIOOVR" && (int)t.size()>=2){ std::string p=t[1]; for(size_t k=2;k<t.size();++k) p+=" "+t[k]; setAudioFromFile(p); }   // restore the replaced/added background audio
             else if(t[0]=="LIGHT" && t.size()>=5){ for(int k=0;k<4;k++) r->lightMul[k]=(float)atof(t[1+k].c_str()); }   // global light manipulation
-            else if(t[0]=="NOCOL" && !cooked){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) noColMeshes.insert(atoi(t[2+k].c_str())); }   // collision-excluded meshes
+            else if(t[0]=="NOCOL" && !cooked){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k){ int idx=atoi(t[2+k].c_str()); if(!(geomAuth && idx>=baseMeshCount)) noColMeshes.insert(idx); } }   // collision-excluded meshes
             else if(t[0]=="MATF" && t.size()>=10 && !cooked){ int mi=atoi(t[1].c_str());   // per-mesh material flags + tint
-                if (mi>=0 && mi<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[mi];
+                if (mi>=0 && mi<(int)r->gpuMeshes.size() && !(geomAuth && mi>=baseMeshCount)){ auto& gm=r->gpuMeshes[mi];
                     gm.useBlend=atoi(t[2].c_str())!=0; gm.additive=atoi(t[3].c_str())!=0;
                     gm.alphaTest=atoi(t[4].c_str())!=0; gm.cullBack=atoi(t[5].c_str())!=0;
                     for(int k=0;k<4;k++) gm.editTint[k]=(float)atof(t[6+k].c_str());
@@ -4721,7 +4767,12 @@ struct Editor {
             // normals/uv1/per-instance-VAT/per-frame-tint). project_hsl_cooker_expose_all_audit.
             em.uvs2 = md.uvs2; em.bakeLightmapVtx = md.bakeLightmapVtx;
             for (int k=0;k<3;k++){ em.lightmapPower[k]=md.lightmapPower[k]; em.albedoFactor[k]=md.albedoFactor[k]; }
-            for (int k=0;k<4;k++) em.curTint[k]=md.curTint[k];
+            // WYSIWYG tint: the live render multiplies EVERY draw by the user's per-mesh tint edit
+            // (gm.editTint) and the global Lighting sliders (r->lightMul) via the color push-constant —
+            // neither shipped, so tint/lighting edits vanished from the cooked env. Fold them into
+            // curTint, the ONE factor the cook bakes into COLOR_0 (matTint feeds separate material
+            // params — folding into both would double-apply).
+            for (int k=0;k<4;k++) em.curTint[k]=md.curTint[k]*gm.editTint[k]*r->lightMul[k];
             if (md.hasLightmap && !md.lmRGBA.empty()){ em.lmRGBA=md.lmRGBA; em.lmW=md.lmW; em.lmH=md.lmH; em.hasLightmap=true; }
             if (md.hasNormal && !md.normalRGBA.empty()){ em.normalRGBA=md.normalRGBA; em.normalW=md.normalW; em.normalH=md.normalH; em.hasNormal=true; }
             em.vatInstTrackIndex=md.vatTrackIndex; em.vatInstRateFactor=md.vatRateFactor; em.vatInstTimeOffset=md.vatTimeOffset; em.atlasCellIndex=md.atlasCellIndex;
@@ -4896,6 +4947,7 @@ struct Editor {
     // connected SKIPS the device steps cleanly instead of HANGING on `adb wait-for-device` (which blocks forever). Generic:
     // applies to every env cook (the APK files are still written; only the optional auto-install is skipped).
     bool deviceConnected() {
+        if (std::getenv("HSR_NOINSTALL")) return false;   // headless test cooks: write the APKs, never touch the user's Quest
         auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         if (!wifiIp.empty()) { std::string ip=wifiIp; if(ip.find(':')==std::string::npos) ip+=":5555"; runAdb(ADB,"","connect "+ip); }

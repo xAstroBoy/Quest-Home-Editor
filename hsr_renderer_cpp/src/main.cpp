@@ -1672,12 +1672,20 @@ int main(int argc, char** argv) {
                         C.yaw = yd * 3.14159265f / 180.0f; C.pitch = pd * 3.14159265f / 180.0f;
                     } else if (sscanf(ln, "move=%f,%f,%f", &x, &y, &z) == 3) { C.pos[0]+=x; C.pos[1]+=y; C.pos[2]+=z; }
                     else if (sscanf(ln, "bg=%f,%f,%f", &r, &g, &b) == 3) { vkRenderer.clearRGB[0]=r; vkRenderer.clearRGB[1]=g; vkRenderer.clearRGB[2]=b; }
-                    else if (strncmp(ln, "at=", 3) == 0)          { g_animOverride = true; g_animScrub = (float)atof(ln + 3); }  // SCRUB anim time (seconds); at=-1 -> resume real-time
+                    else if (strncmp(ln, "at=", 3) == 0)          { float v = (float)atof(ln + 3);   // SCRUB anim time (seconds); at=-1 -> resume real-time
+                        // PIN, don't just set: the editor timeline advances *animScrub every frame while
+                        // animPlaying, so a bare g_animScrub write drifted away immediately (the reason
+                        // bridge captures kept relaunching with HSR_ANIMTIME instead of scrubbing live).
+                        if (v < 0.f) { g_animOverride = false; if (g_editor) g_editor->animPlaying = true; }
+                        else { g_animOverride = true; g_animScrub = v; if (g_editor) g_editor->animPlaying = false; } }
                     else if (strncmp(ln, "fov=", 4) == 0)         C.fovDeg = (float)atof(ln + 4);
                     else if (strncmp(ln, "far=", 4) == 0)         C.farZ = (float)atof(ln + 4);
                     else if (strncmp(ln, "shot=", 5) == 0)        shotThis = ln + 5;
                     else if (strncmp(ln, "hidemesh=", 9) == 0)    vkRenderer.hideMesh = atoi(ln + 9);
-                    else if (strncmp(ln, "solomesh=", 9) == 0)    vkRenderer.soloMesh = atoi(ln + 9);
+                    else if (strncmp(ln, "solomesh=", 9) == 0)  { vkRenderer.soloMesh = atoi(ln + 9);
+                        // solo AUTO-FOCUSES (same as the context menu): a soloed mesh you can't see is useless
+                        if (vkRenderer.soloMesh >= 0 && g_editor && vkRenderer.soloMesh < (int)vkRenderer.gpuMeshes.size())
+                            g_editor->focusMesh(vkRenderer.gpuMeshes[vkRenderer.soloMesh]); }
                     else if (strncmp(ln, "delmesh=", 8) == 0) {   // editor mesh DELETE toggle (drop from render + cook)
                         int mi=atoi(ln+8); if (mi>=0 && mi<(int)vkRenderer.gpuMeshes.size()) { vkRenderer.setDeleted(mi, !vkRenderer.isDeleted(mi));
                             snprintf(tmp,sizeof tmp,"mesh %d deleted=%d (deletedCount=%d)\n", mi, (int)vkRenderer.isDeleted(mi), vkRenderer.deletedCount()); out += tmp; } }
