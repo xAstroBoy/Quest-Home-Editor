@@ -173,13 +173,16 @@ struct Editor {
     //    stays in gpuMeshes so indices/undo stay valid; persisted as a DELETED line in the .hsledit). Del again restores.
     void toggleDeleteSelected(){
         if (sel.empty() || !r) return;
-        bool anyLive=false; for (int m:sel) if (!r->isDeleted((size_t)m)) anyLive=true;
-        for (int m:sel) r->setDeleted((size_t)m, anyLive);
-        pushDeleteUndo(sel, anyLive);   // the edit HISTORY: Ctrl+Z is the ONLY way back
-        size_t n = sel.size();
-        if (anyLive) deselectAll();     // deleted = GONE (no list row, no pick, no gizmo)
-        setStatus(anyLive ? ("Deleted "+std::to_string(n)+" mesh(es) - gone from render + list + cook (only Ctrl+Z restores)")
-                          : ("Restored "+std::to_string(n)+" mesh(es)"));
+        // Del only ever DELETES live meshes — already-deleted ones in the selection (stale sel, old
+        // sessions) are ignored, never flipped back alive. Restoring is Ctrl+Z's job exclusively;
+        // "Del again restores" resurrected ghosts whenever a selection tool grabbed a deleted mesh.
+        std::vector<int> live; for (int m:sel) if (!r->isDeleted((size_t)m)) live.push_back(m);
+        if (live.empty()) { deselectAll(); return; }
+        for (int m:live) r->setDeleted((size_t)m, true);
+        pushDeleteUndo(live, true);     // the edit HISTORY: Ctrl+Z is the ONLY way back
+        size_t n = live.size();
+        deselectAll();                  // deleted = GONE (no list row, no pick, no gizmo)
+        setStatus("Deleted "+std::to_string(n)+" mesh(es) - gone from render + list + cook (only Ctrl+Z restores)");
     }
     // ── mesh DUPLICATE (Ctrl+D) — clone the selected mesh(es) into a fresh GPU mesh (its own buffers) offset in place,
     //    so the copy can be moved/edited/cooked independently WITHOUT re-authoring geometry. Appends to sceneMeshes +
@@ -1643,12 +1646,17 @@ struct Editor {
     std::thread geomThread; std::atomic<bool> geomSaving{false};   // sidecar writes run OFF the UI thread (PNG-encoding a fused 4K atlas froze the app for seconds)
     void saveGeomSidecar(const std::string& sessionFile){
         if (!r || !sceneMeshes || baseMeshCount < 0) return;
-        if (geomSaving.load()) return;                            // previous write still running - retry next autosave tick
+        // NEVER skip the write: the session .hsledit is written unconditionally and its MESH/DELETED lines
+        // index INTO these meshes — a dropped sidecar write leaves a stale .geom whose mesh count no longer
+        // matches the session, so on reload every index lands on the WRONG mesh (soft-deleted cut originals
+        // come back = the "ghost meshes"). The previous write runs off-thread; joining it here is instant
+        // in practice (it has had the whole autosave interval to finish).
+        if (geomThread.joinable()) geomThread.join();
         std::string gp = sessionFile + ".geom";
         int extra = (int)sceneMeshes->size() - baseMeshCount;
         if (extra <= 0) { std::error_code ec; std::filesystem::remove(gp, ec); geomDirty=false; return; }
         // SNAPSHOT the extra meshes fast (bulk vector copies), then encode + write on a WORKER thread.
-        struct GeoSnap { std::string name; u8 flags[4]; u32 texW,texH; std::vector<u8> texRGBA;
+        struct GeoSnap { std::string name; u8 flags[4]; u8 del; float eT[3],eR[4],eS[3],eTint[4]; u32 texW,texH; std::vector<u8> texRGBA;
                          std::vector<float> pos,uv,uv2; std::vector<u32> idx; std::string log; };
         auto snap = std::make_shared<std::vector<GeoSnap>>();
         snap->reserve((size_t)extra);
@@ -1656,21 +1664,29 @@ struct Editor {
             const MeshData& md=(*sceneMeshes)[(size_t)i];
             GeoSnap g; g.name=md.name;
             g.flags[0]=md.useBlend?1:0; g.flags[1]=md.additive?1:0; g.flags[2]=md.alphaTest?1:0; g.flags[3]=md.doubleSided?1:0;
+            // v2: the mesh's OWN deleted flag + transform ride along — created meshes no longer depend on
+            // session-line index alignment to know they were deleted or where they were moved.
+            g.del = r->isDeleted((size_t)i) ? 1 : 0;
+            if ((size_t)i < r->gpuMeshes.size()) { const VkGpuMesh& gm=r->gpuMeshes[(size_t)i];
+                memcpy(g.eT,gm.editT,sizeof g.eT); memcpy(g.eR,gm.editR,sizeof g.eR);
+                memcpy(g.eS,gm.editS,sizeof g.eS); memcpy(g.eTint,gm.editTint,sizeof g.eTint); }
+            else { g.eT[0]=g.eT[1]=g.eT[2]=0; g.eR[0]=g.eR[1]=g.eR[2]=0; g.eR[3]=1; g.eS[0]=g.eS[1]=g.eS[2]=1; g.eTint[0]=g.eTint[1]=g.eTint[2]=g.eTint[3]=1; }
             g.texW=md.texW; g.texH=md.texH; g.texRGBA=md.texRGBA;
             g.pos=md.positions; g.uv=md.uvs; g.uv2=md.uvs2; g.idx=md.indices;
             auto it=meshEditLog.find(i); if (it!=meshEditLog.end()) g.log=it->second;
             snap->push_back(std::move(g));
         }
         geomDirty = false; geomSaving.store(true);
-        if (geomThread.joinable()) geomThread.join();
         geomThread = std::thread([this, gp, snap]{
             FILE* f = fopen(gp.c_str(), "wb");
             if (f) {
                 auto w32=[&](u32 v){ fwrite(&v,4,1,f); };
                 auto wstr=[&](const std::string& s){ w32((u32)s.size()); fwrite(s.data(),1,s.size(),f); };
-                fwrite("HSRGEOM1",8,1,f); w32((u32)snap->size());
+                fwrite("HSRGEOM2",8,1,f); w32((u32)snap->size());
                 for (auto& g : *snap){
                     wstr(g.name); fwrite(g.flags,1,4,f);
+                    fwrite(&g.del,1,1,f);
+                    fwrite(g.eT,4,3,f); fwrite(g.eR,4,4,f); fwrite(g.eS,4,3,f); fwrite(g.eTint,4,4,f);
                     w32(g.texW); w32(g.texH);
                     std::vector<u8> png;   // texture -> PNG in memory (the slow part - now off-thread)
                     if (!g.texRGBA.empty() && g.texW>0)
@@ -1693,7 +1709,8 @@ struct Editor {
         if (!r || !sceneMeshes) return;
         std::string gp = sessionFile + ".geom";
         FILE* f = fopen(gp.c_str(), "rb"); if (!f) return;
-        char magic[8]; if (fread(magic,1,8,f)!=8 || memcmp(magic,"HSRGEOM1",8)!=0){ fclose(f); return; }
+        char magic[8]; if (fread(magic,1,8,f)!=8 || memcmp(magic,"HSRGEOM",7)!=0 || (magic[7]!='1' && magic[7]!='2')){ fclose(f); return; }
+        bool v2 = magic[7]=='2';   // v2 records carry deleted flag + editT/R/S/Tint (self-contained; no session-index dependence)
         auto r32=[&]()->u32{ u32 v=0; fread(&v,4,1,f); return v; };
         auto rstr=[&]()->std::string{ u32 n=r32(); std::string s(n,'\0'); if(n) fread(&s[0],1,n,f); return s; };
         u32 count=r32(); int restored=0;
@@ -1702,6 +1719,8 @@ struct Editor {
             md.name = rstr();
             u8 flags[4]; fread(flags,1,4,f);
             md.useBlend=flags[0]!=0; md.additive=flags[1]!=0; md.alphaTest=flags[2]!=0; md.doubleSided=flags[3]!=0;
+            u8 del=0; float eT[3]={0,0,0}, eR[4]={0,0,0,1}, eS[3]={1,1,1}, eTint[4]={1,1,1,1};
+            if (v2){ fread(&del,1,1,f); fread(eT,4,3,f); fread(eR,4,4,f); fread(eS,4,3,f); fread(eTint,4,4,f); }
             md.texW=r32(); md.texH=r32();
             u32 pn=r32();
             if (pn){ std::vector<u8> png(pn); fread(png.data(),1,pn,f);
@@ -1720,6 +1739,13 @@ struct Editor {
             size_t ni=r->gpuMeshes.size();
             r->uploadMesh(sceneMeshes->back());
             if (r->gpuMeshes.size()!=ni+1){ sceneMeshes->pop_back(); continue; }
+            if (v2){   // self-contained restore: transform + tint + deleted state (session lines may re-apply the same)
+                VkGpuMesh& ng=r->gpuMeshes[ni];
+                memcpy(ng.editT,eT,sizeof eT); memcpy(ng.editR,eR,sizeof eR);
+                memcpy(ng.editS,eS,sizeof eS); memcpy(ng.editTint,eTint,sizeof eTint);
+                recomputeModel(ng);
+                if (del) r->setDeleted(ni, true);
+            }
             if (!log.empty()) meshEditLog[(int)ni]=log;
             ++restored;
         }
@@ -2003,7 +2029,10 @@ struct Editor {
     bool  ctxOpen = false; float ctxX = 0, ctxY = 0; int ctxMesh = -1;
     int   ctxItem = -1;   // >=0: the context menu targets THIS scene item (outliner right-click), not a mesh
     float ctxRX = 0, ctxRY = 0, ctxRW = 0, ctxRH = 0;   // its on-screen rect (so clicks route to it)
-    bool  insideCtx(float x, float y) const { return x>=ctxRX && y>=ctxRY && x<ctxRX+ctxRW && y<ctxRY+ctxRH; }
+    int   ctxSub = -1; float ctxSubY = 0;                 // open submenu index (-1 none) + its anchor row Y
+    float ctxR2X = 0, ctxR2Y = 0, ctxR2W = 0, ctxR2H = 0; // the submenu panel's rect (0-wide when closed)
+    bool  insideCtx(float x, float y) const { return (x>=ctxRX && y>=ctxRY && x<ctxRX+ctxRW && y<ctxRY+ctxRH)
+                                                  || (ctxR2W>0 && x>=ctxR2X && y>=ctxR2Y && x<ctxR2X+ctxR2W && y<ctxR2Y+ctxR2H); }
     // outliner section collapse (click the SCENE ITEMS / MESHES headers)
     bool  itemsCollapsed = false, meshesCollapsed = false;
     // progressive GPU upload progress (main sets these while streaming; the viewport draws a loading bar)
@@ -2615,12 +2644,12 @@ struct Editor {
                 if (dx*dx+dy*dy < 25.f*uiScale*uiScale) {
                     int it = pickItem(cx.in.mx, cx.in.my);
                     if (it>=0) { selItem=it; deselectAll();                          // scene-item marker -> its own context menu (focus/hide/duplicate/remove)
-                        ctxItem=it; ctxMesh=-1; ctxOpen=true; ctxX=cx.in.mx; ctxY=cx.in.my; }
+                        ctxItem=it; ctxMesh=-1; ctxOpen=true; ctxSub=-1; ctxX=cx.in.mx; ctxY=cx.in.my; }
                     else { int hit = pickIndex(cx.in.mx, cx.in.my);
                         if (hit>=0) {
                             if (!inSel(hit)) selectOne(hit);                        // right-clicked an UNSELECTED mesh -> select just it;
                             // ELSE: keep the existing multi-selection so the menu can act on ALL of them
-                            selItem=-1; ctxMesh=hit; ctxItem=-1; ctxOpen=true; ctxX=cx.in.mx; ctxY=cx.in.my;
+                            selItem=-1; ctxMesh=hit; ctxItem=-1; ctxOpen=true; ctxSub=-1; ctxX=cx.in.mx; ctxY=cx.in.my;
                             float hn[3]; ctxHitValid = screenRayHitMesh(cx.in.mx, cx.in.my, hit, ctxHitP, hn);   // exact surface point (cut-hole target)
                         }
                     }
@@ -2967,9 +2996,9 @@ struct Editor {
 
     // Floating object context menu (right-click in the viewport). Items act on ctxMesh.
     void drawContextMenu() {
-        if (!ctxOpen) return;
-        if (ctxItem >= 0) { drawItemContextMenu(); return; }   // scene-item variant (outliner/marker right-click)
-        if (ctxMesh<0 || ctxMesh>=(int)r->gpuMeshes.size()) { ctxOpen=false; return; }
+        if (!ctxOpen) { ctxR2W = 0; return; }
+        if (ctxItem >= 0) { ctxR2W = 0; drawItemContextMenu(); return; }   // scene-item variant (outliner/marker right-click)
+        if (ctxMesh<0 || ctxMesh>=(int)r->gpuMeshes.size()) { ctxOpen=false; ctxR2W=0; return; }
         auto& th=cx.th; VkGpuMesh& gm=r->gpuMeshes[ctxMesh];
         bool soloed=(r->soloMesh==ctxMesh), hidden=r->isHidden(ctxMesh);
         std::vector<int> tg = (inSel(ctxMesh) && sel.size()>1) ? sel : std::vector<int>{ctxMesh};   // context actions cover the WHOLE multi-selection
@@ -2977,61 +3006,58 @@ struct Editor {
         int nHidden=0; for (int i=0;i<(int)r->gpuMeshes.size();++i) if (r->isHidden(i)) nHidden++;
         std::string colLbl = gm.dynamicVerts ? (isAnimCollider(ctxMesh) ? "Remove Animated Collider" : "Animated Collider (follows anim)")
                                               : (std::string("Make Mesh Collider (exact)")+suf);
-        bool deleted = r->isDeleted((size_t)ctxMesh);
-        std::vector<std::pair<std::string,int>> items = {
-            {gm.name, -1}, {"Focus / teleport",0}, {soloed?"Unsolo":"Solo only",1},
-            {std::string(hidden?"Unhide":"Hide")+suf+"  (Space)",2},
-            {std::string("Duplicate")+suf+"  (Ctrl+D)",8},                                    // clone -> move/stretch/cook independently
-            {std::string(deleted?"Restore (render+cook)":"Delete (render+cook)")+suf+"  (Del)",9},
-            {"Stretch / scale (per-axis gizmo)",18},                                          // Scale gizmo + Object-tab Scale fields
-            {"Extend edges DOWN 1m (fill gaps)",19},                                          // grow REAL triangles off open boundary edges,
-            {"Extend edges OUTWARD 1m (fill gaps)",20},                                       // texture continued from the border (repeatable)
-            {std::string(showHoles?"Hide hole inspector":"SHOW HOLES (click a marker to seal)"),33},   // visual: numbered outlines, click = fill THAT hole
-            {"Seal hole HERE (nearest to click)",34},                                         // fills the loop nearest the right-clicked spot
-            {std::string("Seal ALL holes (keeps perimeter)")+suf,21},
-            {"KNIFE: cut by drawing a LINE over the mesh",45},                                // 2D stroke, release = exact cut under the line
-            {"SLICE GIZMO here (place the cut visually)",44},                                 // gizmo-placed plane + live cut line, Enter cuts
-            {"Slice in half X",35},{"Slice in half Y",36},{"Slice in half Z",37},             // separate halves (move/delete independently)
-            {std::string(patchMode?"Patch tool: CANCEL":"Patch tool (click gap corners, Enter)"),38},
-            {std::string("Re-UV flat (texture spans ONCE)")+suf,39},
-            {"Cut region tool (2=split line, 3+=cut out)",40},
-            {"Bend/stretch tool (click grab point)",41},
-            {std::string("Cut hole HERE (r=")+std::to_string((int)(cutRadius*100)/100.f).substr(0,4)+"m)",22},   // carve the clicked spot open (doorways)
-            {"Split into connected pieces",23},                                               // separate disjoint parts into own meshes
-            {"Mirror X",24},{"Mirror Y",25},{"Mirror Z",26},                                  // flip to face the other side (winding fixed)
-            {"Rotate Y +90 (repeat to stack)",28},{"Rotate Y 180",29},                        // true rotations, no reflection
-            {"Rotate X +90",30},{"Rotate Z +90",31},
-            {std::string("Fuse selection into ONE mesh")+suf,32},                             // bake world transforms, concat geometry (active mesh's texture)
-            {std::string("Fuse + REBUILD surface")+suf+" (clean retriangulate)",42},           // single-layer remesh + baked 1024 texture (NO overlaps)
-            {std::string("Save selection as PREFAB")+suf,43},                                 // reusable asset: spawn from Scene > Prefabs or drag the file in
-            {std::string(noColMeshes.count(ctxMesh)?"Collision: INCLUDE again":"Collision: EXCLUDE (walk-through)")+suf,27},
-            {std::string("Reset transform")+suf,3}, {"Copy name",4},
-            {colLbl,5},
-            {std::string(isSkyboxMesh(ctxMesh)?"Unmark skybox backdrop":"Make skybox backdrop")+suf, 6} };   // -> SkyboxPlatformComponent (far-clip-exempt)
-        // CREATE a Meta Component fitted to this mesh (the user wanted every Meta Component reachable from right-click).
-        items.push_back({"-- Make component from mesh --", -1});
-        items.push_back({"Mesh Collider (static, exact tris)", 16});   // always a STATIC ColliderMesh, even for animated meshes
-        items.push_back({"Navmesh (walkable scene)", 17});             // generate the scene's walkable navmesh from here
-        items.push_back({"Box Collider (wrap mesh)", 10});
-        items.push_back({"Wall (faces camera)", 11});
-        items.push_back({"Spawn Point (on top)", 12});
-        items.push_back({"Chair / Seat (on top)", 13});
-        items.push_back({"Locomotion Hotspot", 14});
-        items.push_back({"Kill Floor / Boundary", 15});
-        if (nHidden>0) items.push_back({std::string("Unhide ALL (")+std::to_string(nHidden)+")", 7});
-        float rh=th.rowH+2*uiScale, w=180*uiScale, h=items.size()*rh+6*uiScale;
-        float x=ctxX, y=ctxY; if (x+w>fbW) x=fbW-w; if (y+h>fbH) y=fbH-h; if (x<0)x=0; if (y<0)y=0;
-        ctxRX=x; ctxRY=y; ctxRW=w; ctxRH=h;
-        dl.rect(x,y,w,h, th.panelBg); dl.border(x,y,w,h, th.border);
-        dl.pushClip(x,y,w,h);
-        float ry=y+3*uiScale;
-        for (auto& it : items) {
-            if (it.second<0) { cx.textAligned(x+8*uiScale,ry,w-10*uiScale,rh, it.first.c_str(), th.textDim, 0); dl.rect(x+4*uiScale,ry+rh-1,w-8*uiScale,1,th.border); ry+=rh; continue; }
-            bool hv=cx.hover(x,ry,w,rh);
-            if (hv) dl.rect(x+1,ry,w-2,rh, th.accent);
-            cx.textAligned(x+12*uiScale,ry,w-14*uiScale,rh, it.first.c_str(), hv?th.textSel:th.text, 0);
-            if (hv && cx.in.pressed[0]) {
-                int a=it.second;
+        // ── GROUPED menu: short top level + hover submenus (a: action id, sub: submenu index, -1 = none) ──
+        struct MRow { std::string t; int a; int sub; };
+        std::vector<MRow> subCut = {
+            {"KNIFE: draw a line, cut under it",45,-1},                       // 2D stroke, release = exact cut under the line
+            {"Slice gizmo (place the cut plane)",44,-1},                      // gizmo-placed plane + live cut line, Enter cuts
+            {"Slice in half X",35,-1},{"Slice in half Y",36,-1},{"Slice in half Z",37,-1},
+            {"Cut region (pins: 2=split, 3+=cut out)",40,-1},
+            {std::string("Cut hole HERE (r=")+std::to_string((int)(cutRadius*100)/100.f).substr(0,4)+"m)",22,-1},
+            {"Split into connected pieces",23,-1} };
+        std::vector<MRow> subGeo = {
+            {"Stretch / scale (per-axis gizmo)",18,-1},
+            {"Extend edges DOWN 1m (fill gaps)",19,-1},
+            {"Extend edges OUTWARD 1m (fill gaps)",20,-1},
+            {std::string(showHoles?"Hide hole inspector":"SHOW HOLES (click a marker to seal)"),33,-1},
+            {"Seal hole HERE (nearest to click)",34,-1},
+            {std::string("Seal ALL holes (keeps perimeter)")+suf,21,-1},
+            {std::string(patchMode?"Patch tool: CANCEL":"Patch tool (click gap corners, Enter)"),38,-1},
+            {"Bend/stretch tool (click grab point)",41,-1},
+            {"Mirror X",24,-1},{"Mirror Y",25,-1},{"Mirror Z",26,-1},
+            {"Rotate Y +90 (repeat to stack)",28,-1},{"Rotate Y 180",29,-1},
+            {"Rotate X +90",30,-1},{"Rotate Z +90",31,-1},
+            {std::string("Fuse selection into ONE mesh")+suf,32,-1},
+            {std::string("Fuse + REBUILD surface")+suf+" (clean retri)",42,-1},
+            {std::string("Re-UV flat (texture spans ONCE)")+suf,39,-1} };
+        std::vector<MRow> subCmp = {
+            {colLbl,5,-1},
+            {"Mesh Collider (static, exact tris)",16,-1},
+            {"Navmesh (walkable scene)",17,-1},
+            {"Box Collider (wrap mesh)",10,-1},
+            {"Wall (faces camera)",11,-1},
+            {"Spawn Point (on top)",12,-1},
+            {"Chair / Seat (on top)",13,-1},
+            {"Locomotion Hotspot",14,-1},
+            {"Kill Floor / Boundary",15,-1} };
+        std::vector<MRow> main = {
+            {gm.name, -1, -1},
+            {"Focus / teleport",0,-1},
+            {soloed?"Unsolo":"Solo only",1,-1},
+            {std::string(hidden?"Unhide":"Hide")+suf+"  (Space)",2,-1},
+            {std::string("Duplicate")+suf+"  (Ctrl+D)",8,-1},
+            {std::string("Delete")+suf+"  (Del)",9,-1},
+            {std::string("Save as PREFAB")+suf,43,-1},                        // reusable asset: Scene > Prefabs spawns it, or drag the file in
+            {"Cut & slice",-2,0},
+            {"Geometry / repair",-2,1},
+            {"Make component",-2,2},
+            {std::string(noColMeshes.count(ctxMesh)?"Collision: INCLUDE again":"Collision: EXCLUDE (walk-through)")+suf,27,-1},
+            {std::string(isSkyboxMesh(ctxMesh)?"Unmark skybox backdrop":"Make skybox backdrop")+suf,6,-1},
+            {std::string("Reset transform")+suf,3,-1},
+            {"Copy name",4,-1} };
+        if (nHidden>0) main.push_back({std::string("Unhide ALL (")+std::to_string(nHidden)+")",7,-1});
+        // The FULL action set (shared by main rows and submenu rows).
+        auto runAct=[&](int a){
                 if (a==0) focusMesh(gm);
                 else if (a==1) { r->soloMesh = soloed?-1:ctxMesh; if (!soloed) focusMesh(gm); }   // solo AUTO-FOCUSES (a solo you can't see is useless)
                 else if (a==2) { for (int t:tg) r->setHidden(t, !hidden); }                       // hide/unhide ALL selected
@@ -3048,7 +3074,7 @@ struct Editor {
                 }
                 else if (a==7) { for (int i=0;i<(int)r->gpuMeshes.size();++i) r->setHidden(i,false); setStatus("Unhid ALL meshes"); }   // unhide everything
                 else if (a==8) { if (!inSel(ctxMesh)) selectOne(ctxMesh); duplicateSelected(); }   // clone selection (independent copy, cooks too)
-                else if (a==9) { if (!inSel(ctxMesh)) selectOne(ctxMesh); toggleDeleteSelected(); }  // drop from render + cook (Del again restores)
+                else if (a==9) { if (!inSel(ctxMesh)) selectOne(ctxMesh); toggleDeleteSelected(); }  // drop from render + cook (Ctrl+Z restores)
                 else if (a==18) { if (!inSel(ctxMesh)) selectOne(ctxMesh); gizmoOp=2; tab=TAB_OBJECT;   // STRETCH: per-axis Scale gizmo + the Object tab's Scale fields
                                   setStatus("Scale gizmo ON - drag a box handle to stretch per-axis (or type in Object > Scale)"); }
                 // GEOMETRY ops apply to the WHOLE multi-selection (each source -> its own result, all re-selected)
@@ -3085,7 +3111,7 @@ struct Editor {
                                   setStatus("BEND: click the grab point, set Radius + Offset (Object > Geometry), Enter deforms"); }
                 else if (a==27) { bool exc = !noColMeshes.count(ctxMesh);      // collision walk-through toggle (whole selection)
                                   for (int t2:tg) { if (exc) noColMeshes.insert(t2); else noColMeshes.erase(t2); }
-                                  bakeNavmeshes(this->items);                  // preview + cook collision re-bake immediately ("items" here = the MENU rows)
+                                  bakeNavmeshes(this->items);                  // preview + cook collision re-bake immediately ("items" here = the scene items)
                                   setStatus(exc ? "Collision EXCLUDED - you can walk through these (cook follows)"
                                                 : "Collision INCLUDED again"); }
                 // "Make component from mesh" — BULK: one component per mesh in the whole selection (tg), not just the clicked one.
@@ -3097,11 +3123,47 @@ struct Editor {
                 else if (a==15) for(int t:tg) addItemFromMesh(sitem::BOUNDARY, t);
                 else if (a==16) for(int t:tg) addMeshCollider(t, true);   // STATIC mesh collider (exact tris) on EACH selected mesh
                 else if (a==17) addNavmesh(1);                            // generate the walkable scene navmesh (smart)
-                ctxOpen=false;
+                ctxOpen=false; ctxSub=-1;
+        };
+        // AUTO-FIT width: each panel is as wide as its longest label (no more truncated rows).
+        float rh=th.rowH+2*uiScale;
+        auto fitW=[&](const std::vector<MRow>& rows){ float mw=120*uiScale;
+            for (auto& m2 : rows){ float tw=dl.textW(m2.t.c_str())+28*uiScale + (m2.sub>=0?16*uiScale:0); if (tw>mw) mw=tw; }
+            return std::min(mw, fbW*0.6f); };
+        float w=fitW(main), h=main.size()*rh+6*uiScale;
+        float x=ctxX, y=ctxY; if (x+w>fbW) x=fbW-w; if (y+h>fbH) y=fbH-h; if (x<0)x=0; if (y<0)y=0;
+        ctxRX=x; ctxRY=y; ctxRW=w; ctxRH=h; ctxR2W=0;
+        // draws one panel; returns nothing, but handles hover (submenu open/close) + clicks
+        auto drawPanel=[&](float px, float py, float pw, const std::vector<MRow>& rows, bool isSub){
+            float ph=rows.size()*rh+6*uiScale;
+            dl.rect(px,py,pw,ph, th.panelBg); dl.border(px,py,pw,ph, th.border);
+            dl.pushClip(px,py,pw,ph);
+            float ry=py+3*uiScale;
+            for (auto& it : rows) {
+                if (it.a==-1 && it.sub<0) { cx.textAligned(px+8*uiScale,ry,pw-10*uiScale,rh, it.t.c_str(), th.textDim, 0); dl.rect(px+4*uiScale,ry+rh-1,pw-8*uiScale,1,th.border); ry+=rh; continue; }
+                bool hv=cx.hover(px,ry,pw,rh);
+                bool open=(!isSub && it.sub>=0 && ctxSub==it.sub);
+                if (hv || open) dl.rect(px+1,ry,pw-2,rh, th.accent);
+                cx.textAligned(px+12*uiScale,ry,pw-14*uiScale,rh, it.t.c_str(), (hv||open)?th.textSel:th.text, 0);
+                if (it.sub>=0) cx.textAligned(px,ry,pw-8*uiScale,rh, ">", (hv||open)?th.textSel:th.textDim, 2);   // submenu arrow
+                if (hv && !isSub) {   // hovering a MAIN row: open its submenu / close a stale one
+                    if (it.sub>=0) { if (ctxSub!=it.sub){ ctxSub=it.sub; ctxSubY=ry; } }
+                    else ctxSub=-1;
+                }
+                if (hv && cx.in.pressed[0]) { if (it.sub>=0) { ctxSub=it.sub; ctxSubY=ry; } else if (it.a>=0) runAct(it.a); }
+                ry+=rh;
             }
-            ry+=rh;
+            dl.popClip();
+        };
+        drawPanel(x,y,w,main,false);
+        if (ctxOpen && ctxSub>=0) {   // submenu panel beside the parent row (flips LEFT when the screen edge is near)
+            const std::vector<MRow>& rows2 = ctxSub==0?subCut : ctxSub==1?subGeo : subCmp;
+            float w2=fitW(rows2), h2=rows2.size()*rh+6*uiScale;
+            float x2 = (x+w+w2<=fbW) ? x+w-2*uiScale : x-w2+2*uiScale;
+            float y2 = ctxSubY; if (y2+h2>fbH) y2=fbH-h2; if (y2<0) y2=0; if (x2<0) x2=0;
+            ctxR2X=x2; ctxR2Y=y2; ctxR2W=w2; ctxR2H=h2;
+            drawPanel(x2,y2,w2,rows2,true);
         }
-        dl.popClip();
     }
 
     void record(VkCommandBuffer cmd) { uiDraw.record(cmd, dl); }
@@ -3299,7 +3361,7 @@ struct Editor {
                 // RIGHT-CLICK -> the scene-item context menu (focus/hide/duplicate/REMOVE — acts on the whole multi-selection)
                 if (!addMenuOpen && !ctxOpen && cx.hover(x,ry,w,rowH) && cx.in.pressed[1]) {
                     if (!inMulti) { selItems.assign(1,i); selItem=i; deselectAll(); }
-                    ctxItem=i; ctxMesh=-1; ctxOpen=true; ctxX=cx.in.mx; ctxY=cx.in.my;
+                    ctxItem=i; ctxMesh=-1; ctxOpen=true; ctxSub=-1; ctxX=cx.in.mx; ctxY=cx.in.my;
                 }
                 if (!addMenuOpen && !ctxOpen && !eyeClicked && cx.hover(x,ry,w,rowH) && cx.in.pressed[0]) { if (dh) { pushItemUndo(items); items.erase(items.begin()+i); selItem=-1; selItems.clear(); dl.popClip(); return; }
                     bool dbl = (selItem==i) && (cx.t - lastItemClickT < 0.35f);
@@ -3330,7 +3392,7 @@ struct Editor {
             // RIGHT-CLICK on the row -> the SAME mesh context menu as the viewport (hide/duplicate/delete/colliders/...)
             if (!addMenuOpen && !ctxOpen && cx.hover(x,ry,w,rowH) && cx.in.pressed[1]) {
                 if (!inSel(i)) selectOne(i);
-                selItem=-1; ctxMesh=i; ctxItem=-1; ctxOpen=true; ctxX=cx.in.mx; ctxY=cx.in.my;
+                selItem=-1; ctxMesh=i; ctxItem=-1; ctxOpen=true; ctxSub=-1; ctxX=cx.in.mx; ctxY=cx.in.my;
             }
             // DRAG-PAINT multi-select: press a row, then drag over more rows (mouse held) to add them to the selection
             if (!ctxOpen && cx.in.pressed[0] && cx.hover(x,ry,w,rowH)) outlinerDragRow=i;
@@ -3480,6 +3542,27 @@ struct Editor {
     // The Meta-Component manager: per haven component type — colour swatch, EYE visibility toggle, count, + Add, Meta class.
     void drawScenePanel(float x, float y, float w){
         auto& th=cx.th; float rh=th.rowH;
+        // ── PREFABS: reusable assets - save a selection (right-click > Save as PREFAB), spawn copies
+        //    here or by DRAGGING the .hsrprefab file into the window. Spawns land where you look. ──
+        cx.label(x,y,w,rh,"Prefabs",th.text); y+=rh+2*uiScale;
+        { double nowT = glfwGetTime();
+          if (prefabList.empty() && nowT-prefabListAt>3.0) { refreshPrefabList(); prefabListAt=nowT; }
+          // the make-a-prefab entry point, front and center (also in right-click > Save as PREFAB)
+          if (!sel.empty()) { if (cx.button(ui::hashId("pfsave"), x, y, w, rh, ("SAVE selection as prefab ("+std::to_string(sel.size())+" mesh)").c_str())) { savePrefabFromSelection(); refreshPrefabList(); } }
+          else cx.label(x,y,w,rh,"(select mesh(es) -> save them as a prefab)",th.textDim);
+          y+=rh+4*uiScale;
+          if (cx.button(ui::hashId("pfrefresh"), x, y, 90*uiScale, rh, "Refresh")) refreshPrefabList();
+          char pc[40]; snprintf(pc,sizeof pc,"%d prefab(s)",(int)prefabList.size());
+          cx.label(x+96*uiScale,y,w-96*uiScale,rh,pc,th.textDim); y+=rh+2*uiScale;
+          int shown=0;
+          for (auto& pf : prefabList){ if (shown++>=8){ cx.label(x,y,w,rh*0.9f,"(more in prefabs/ - drag any in)",th.textDim); y+=rh*0.9f; break; }
+              std::string bn=pf; size_t sl2=bn.find_last_of("/\\"); if (sl2!=std::string::npos) bn=bn.substr(sl2+1);
+              if (bn.size()>28) bn=bn.substr(0,25)+"...";
+              if (cx.button(ui::hashId(9700u+(unsigned)shown,23u), x, y, w-64*uiScale, rh, bn.c_str())) spawnPrefab(pf);
+              cx.textAligned(x+w-60*uiScale,y,58*uiScale,rh,"spawn",th.textDim,0);
+              y+=rh+2*uiScale; }
+          cx.label(x,y,w,rh*0.9f,"(drop a .hsrprefab file into the window = spawn)",th.textDim); y+=rh+4*uiScale; }
+        dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
         // ── GIZMOS / OVERLAYS — single home for the viewport overlay toggles (they used to sit in the
         //    viewport header AND partly here = the confusing duplicate row; now this tab owns them). ──
         cx.label(x,y,w,rh,"Gizmos / overlays",th.text); y+=rh+2*uiScale;
@@ -3501,22 +3584,6 @@ struct Editor {
           if (cx.button(ui::hashId("litnight"), x+bw2+6*uiScale, y, bw2, rh, "Night preview")) { r->lightMul[0]=0.35f; r->lightMul[1]=0.40f; r->lightMul[2]=0.55f; r->lightMul[3]=1.f; }
           y+=rh+8*uiScale; }
         dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
-        // ── PREFABS: reusable assets - save a selection (right-click > Save as PREFAB), spawn copies
-        //    here or by DRAGGING the .hsrprefab file into the window. Spawns land where you look. ──
-        cx.label(x,y,w,rh,"Prefabs",th.text); y+=rh+2*uiScale;
-        { double nowT = glfwGetTime();
-          if (prefabList.empty() && nowT-prefabListAt>3.0) { refreshPrefabList(); prefabListAt=nowT; }
-          if (cx.button(ui::hashId("pfrefresh"), x, y, 90*uiScale, rh, "Refresh")) refreshPrefabList();
-          char pc[40]; snprintf(pc,sizeof pc,"%d prefab(s)",(int)prefabList.size());
-          cx.label(x+96*uiScale,y,w-96*uiScale,rh,pc,th.textDim); y+=rh+2*uiScale;
-          int shown=0;
-          for (auto& pf : prefabList){ if (shown++>=8){ cx.label(x,y,w,rh*0.9f,"(more in prefabs/ - drag any in)",th.textDim); y+=rh*0.9f; break; }
-              std::string bn=pf; size_t sl2=bn.find_last_of("/\\"); if (sl2!=std::string::npos) bn=bn.substr(sl2+1);
-              if (bn.size()>28) bn=bn.substr(0,25)+"...";
-              if (cx.button(ui::hashId(9700u+(unsigned)shown,23u), x, y, w-64*uiScale, rh, bn.c_str())) spawnPrefab(pf);
-              cx.textAligned(x+w-60*uiScale,y,58*uiScale,rh,"spawn",th.textDim,0);
-              y+=rh+2*uiScale; }
-          cx.label(x,y,w,rh*0.9f,"(drop a .hsrprefab file into the window = spawn)",th.textDim); y+=rh+4*uiScale; }
         dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
         cx.label(x,y,w,rh,"Meta Components",th.text); y+=rh;
         cx.label(x,y,w,rh*0.9f,"eye = show markers     + Add = spawn one",th.textDim); y+=rh+4*uiScale;
@@ -3630,6 +3697,11 @@ struct Editor {
             Xform b=captureX(gm); gm.editT[0]=gm.editT[1]=gm.editT[2]=0; gm.editR[0]=gm.editR[1]=gm.editR[2]=0; gm.editR[3]=1; gm.editS[0]=gm.editS[1]=gm.editS[2]=1; recomputeModel(gm); pushUndo(selected,b,captureX(gm));
         }
         if (cx.button(ui::hashId("focusx"), x+126*uiScale, y, 80*uiScale, th.rowH, "Focus")) focusMesh(gm);
+        y += th.rowH+4*uiScale;
+        // PREFAB entry point right where a selected mesh's properties live (also: right-click > Save as
+        // PREFAB, and the Scene tab's Prefabs section — the user could never find it buried in the old menu)
+        { std::string pfl = sel.size()>1 ? ("Save as PREFAB ("+std::to_string(sel.size())+" meshes)") : std::string("Save as PREFAB");
+          if (cx.button(ui::hashId("mkprefab"), x, y, 206*uiScale, th.rowH, pfl.c_str())) savePrefabFromSelection(); }
         y += th.rowH+8*uiScale;
         // ── GEOMETRY: manual extend/seal (the context menu has 1-click presets; this is the dialed version).
         //    Both AUTO-ADJUST THE TEXTURE: extend continues the border UVs, seal blends the rim UVs. ──
@@ -4254,7 +4326,9 @@ struct Editor {
         float x0=std::min(ax,bx), x1=std::max(ax,bx), y0=std::min(ay,by), y1=std::max(ay,by);
         std::vector<int> hits;
         for (int i=0;i<(int)r->gpuMeshes.size();++i) {
-            if (r->isHidden(i)) continue;
+            // deleted meshes MUST be unselectable here: box-selecting one and pressing Del made
+            // toggleDeleteSelected see "all selected are deleted" and RESTORE them (the ghost comeback)
+            if (r->isHidden(i) || r->isDeleted((size_t)i)) continue;
             VkGpuMesh& gm=r->gpuMeshes[i]; const auto& P=gm.pickPos; if (P.size()<3) continue;
             double c[3]={0,0,0}; size_t nv=P.size()/3, step=nv>512?nv/512:1, cnt=0;
             for (size_t v=0; v<nv; v+=step){ float w[3]; xformPoint(gm.model,&P[v*3],w); c[0]+=w[0];c[1]+=w[1];c[2]+=w[2]; cnt++; }

@@ -1742,8 +1742,10 @@ public:
             }
         }
 
-        // Pass 3: selected mesh highlight — wireframe overlay on top
-        if (selectedMesh >= 0 && selectedMesh < (int)gpuMeshes.size()) {
+        // Pass 3: selected mesh highlight — wireframe overlay on top (never on deleted/hidden meshes:
+        // a wireframe of a soft-deleted mesh reads as a "ghost" hanging in the scene)
+        if (selectedMesh >= 0 && selectedMesh < (int)gpuMeshes.size()
+            && !isDeleted((size_t)selectedMesh) && !isHidden(selectedMesh)) {
             auto& gm = gpuMeshes[selectedMesh];
             // Draw the highlight with the SELECTED mesh's OWN wireframe pipeline + layout + descriptor sets.
             // Binding a per-material descSet2 to the global-layout wireframe pipeline is an invalid layout
