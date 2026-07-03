@@ -202,6 +202,7 @@ struct Editor {
         r->hiddenMeshes.resize(r->gpuMeshes.size(), false);   // keep the hide/delete bitsets sized to the grown list
         r->deletedMeshes.resize(r->gpuMeshes.size(), false);
         if (!made.empty()) pushDeleteUndo(made, false);       // duplicates are part of the HISTORY: Ctrl+Z removes them
+        geomDirty = true;
         sel=made; selected=made.empty()?-1:made.back(); r->selectedMesh=selected; selItem=-1;
         scrollToSel = true;                                   // outliner jumps to the new clones (they append at the END)
         setStatus("Duplicated "+std::to_string(made.size())+" mesh(es) - move/edit/cook independently (Ctrl+Z removes)");
@@ -254,11 +255,11 @@ struct Editor {
     //    than the surface") and FAN-FILL each with real triangles around the loop's centroid. UVs/uv2 are
     //    averaged from the rim, so the texture blends across the patch. Same non-destructive append+history
     //    flow as extendMeshBoundary. Run on every selected mesh via the context menu.
-    void sealMeshHoles(int mi){
-        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
-        MeshData md = (*sceneMeshes)[(size_t)mi];
-        size_t nv = md.positions.size()/3;
-        if (nv < 3 || md.indices.size() < 3) return;
+    // Collect every CLOSED boundary loop (edges used by exactly one triangle, chained into rings).
+    // Shared by the seal tools AND the visual HOLE INSPECTOR overlay.
+    static void collectBoundaryLoops(const MeshData& md, std::vector<std::vector<uint32_t>>& loops){
+        loops.clear();
+        if (md.indices.size() < 3) return;
         std::map<std::pair<uint32_t,uint32_t>,int> ec;
         auto key=[&](uint32_t a,uint32_t b){ return a<b?std::make_pair(a,b):std::make_pair(b,a); };
         for (size_t k=0;k+2<md.indices.size();k+=3){ uint32_t a=md.indices[k],b=md.indices[k+1],c=md.indices[k+2];
@@ -266,7 +267,6 @@ struct Editor {
         std::multimap<uint32_t,uint32_t> adj;   // undirected boundary adjacency
         for (auto& kv : ec) if (kv.second==1) { adj.insert({kv.first.first,kv.first.second}); adj.insert({kv.first.second,kv.first.first}); }
         std::set<std::pair<uint32_t,uint32_t>> used;
-        int holes=0, added=0;
         std::vector<uint32_t> loop;
         for (auto& st : adj) {
             if (used.count(key(st.first,st.second))) continue;
@@ -285,22 +285,171 @@ struct Editor {
             }
             if (!closed || loop.size()<4 || loop.size()>20000) continue;   // loop includes start twice at the end
             loop.pop_back();                                               // drop the repeated start
-            ++holes;
-            // centroid vert (pos+uvs averaged over the rim)
-            float px=0,py=0,pz=0,u0=0,v0=0,u1=0,v1=0; size_t n=loop.size();
-            bool hasUV=md.uvs.size()>=nv*2, hasUV2=md.uvs2.size()>=nv*2;
-            for (uint32_t v2 : loop){ px+=md.positions[v2*3]; py+=md.positions[v2*3+1]; pz+=md.positions[v2*3+2];
+            loops.push_back(loop);
+        }
+    }
+    // Seal holes. targetLoop >= 0 = fill EXACTLY that boundary loop (the hole inspector's click-to-fill —
+    // no guessing); nearWorldPt = fill the loop nearest that world point ("Seal hole HERE" right-click);
+    // neither = fill all EXCEPT the longest loop (an open sheet's outer perimeter is a loop too).
+    void sealMeshHoles(int mi, const float* nearWorldPt=nullptr, int targetLoop=-1){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
+        MeshData md = (*sceneMeshes)[(size_t)mi];
+        size_t nv = md.positions.size()/3;
+        if (nv < 3 || md.indices.size() < 3) return;
+        std::vector<std::vector<uint32_t>> loops;
+        collectBoundaryLoops(md, loops);
+        if (loops.empty()) { setStatus("seal: no closed boundary loops on '"+md.name+"'"); return; }
+        // ── PASS 2: choose WHICH loops are actual holes ──
+        // nearWorldPt (right-click "Seal hole HERE"): ONLY the loop nearest the clicked point.
+        // Otherwise: fill everything EXCEPT the longest loop — an open sheet's OUTER PERIMETER is also
+        // a closed boundary loop, and capping it was the "falsely generates" bug. (A watertight-minus-
+        // holes mesh has no perimeter; then the longest loop is simply the biggest hole and stays open —
+        // use "Seal hole HERE" to target it explicitly.)
+        const float* M = r->gpuMeshes[(size_t)mi].model;
+        std::vector<char> fill(loops.size(), 1);
+        if (targetLoop >= 0 && targetLoop < (int)loops.size()) {   // hole-inspector click: EXACTLY this loop
+            std::fill(fill.begin(), fill.end(), 0); fill[targetLoop] = 1;
+        } else if (nearWorldPt) {
+            std::fill(fill.begin(), fill.end(), 0);
+            int bestL=-1; float bestD=1e30f;
+            for (size_t li=0; li<loops.size(); ++li) {
+                float cx0=0,cy0=0,cz0=0; for (uint32_t v2 : loops[li]) { const float* p=&md.positions[v2*3];
+                    cx0+=M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12]; cy0+=M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13]; cz0+=M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14]; }
+                float n2=(float)loops[li].size(); cx0/=n2; cy0/=n2; cz0/=n2;
+                float dx=cx0-nearWorldPt[0], dy=cy0-nearWorldPt[1], dz=cz0-nearWorldPt[2], d=dx*dx+dy*dy+dz*dz;
+                if (d<bestD){ bestD=d; bestL=(int)li; }
+            }
+            if (bestL>=0) fill[bestL]=1;
+        } else if (loops.size()>1) {
+            size_t longest=0; for (size_t li=1; li<loops.size(); ++li) if (loops[li].size()>loops[longest].size()) longest=li;
+            fill[longest]=0;   // the outer perimeter stays open
+        }
+        // ── PASS 3: fan-fill the chosen loops (rim UVs averaged into the center vert) ──
+        int holes=0, added=0;
+        bool hasUV=md.uvs.size()>=nv*2, hasUV2=md.uvs2.size()>=nv*2;
+        for (size_t li=0; li<loops.size(); ++li) {
+            if (!fill[li]) continue;
+            const auto& L = loops[li]; size_t n = L.size();
+            float px=0,py=0,pz=0,u0=0,v0=0,u1=0,v1=0;
+            for (uint32_t v2 : L){ px+=md.positions[v2*3]; py+=md.positions[v2*3+1]; pz+=md.positions[v2*3+2];
                 if (hasUV){ u0+=md.uvs[v2*2]; v0+=md.uvs[v2*2+1]; } if (hasUV2){ u1+=md.uvs2[v2*2]; v1+=md.uvs2[v2*2+1]; } }
             uint32_t cvi=(uint32_t)(md.positions.size()/3);
             md.positions.push_back(px/n); md.positions.push_back(py/n); md.positions.push_back(pz/n);
             if (hasUV) { md.uvs.push_back(u0/n);  md.uvs.push_back(v0/n); }
             if (hasUV2){ md.uvs2.push_back(u1/n); md.uvs2.push_back(v1/n); }
-            for (size_t i2=0;i2<n;++i2){ uint32_t a=loop[i2], b=loop[(i2+1)%n];
+            for (size_t i2=0;i2<n;++i2){ uint32_t a=L[i2], b=L[(i2+1)%n];
                 md.indices.push_back(a); md.indices.push_back(b); md.indices.push_back(cvi); ++added; }
+            ++holes;
         }
-        if (!holes) { setStatus("seal: no closed holes found on '"+md.name+"'"); return; }
-        if (commitGeomEdit(mi, std::move(md), "seal"))
-            setStatus("Sealed "+std::to_string(holes)+" hole(s) with "+std::to_string(added)+" tris - Ctrl+Z reverts");
+        if (!holes) { setStatus("seal: only the outer perimeter found - right-click NEXT TO the hole and use 'Seal hole HERE'"); return; }
+        if (commitGeomEdit(mi, std::move(md), nearWorldPt?"sealHere":"seal"))
+            setStatus("Sealed "+std::to_string(holes)+" hole(s) with "+std::to_string(added)+" tris"
+                      +(nearWorldPt?"" : " (outer perimeter left open)")+" - Ctrl+Z reverts");
+    }
+
+    // ── HOLE INSPECTOR: detect the selected mesh's boundary loops and show each as a NUMBERED orange
+    //    outline in the viewport; click a marker (or a panel Fill button) to seal EXACTLY that hole.
+    //    No guessing. Cache invalidated on selection change / any geometry edit.
+    bool showHoles = false;
+    int  holesMesh = -1;                              // which mesh the cache belongs to (-1 = stale)
+    std::vector<std::vector<uint32_t>> holeLoops;     // boundary loops of holesMesh
+    void refreshHoles(){
+        holesMesh = -1; holeLoops.clear();
+        if (!r || !sceneMeshes || selected<0 || selected>=(int)sceneMeshes->size()) return;
+        collectBoundaryLoops((*sceneMeshes)[(size_t)selected], holeLoops);
+        holesMesh = selected;
+    }
+    void drawHoleOverlay(){
+        if (!showHoles || selected<0 || !r || selected>=(int)r->gpuMeshes.size()) return;
+        if (holesMesh != selected) refreshHoles();
+        if (holeLoops.empty()) return;
+        auto& th=cx.th;
+        const MeshData& md=(*sceneMeshes)[(size_t)selected]; const float* M=r->gpuMeshes[(size_t)selected].model;
+        dl.pushClip((float)rcViewport.offset.x,(float)rcViewport.offset.y,(float)rcViewport.extent.width,(float)rcViewport.extent.height);
+        for (size_t li=0; li<holeLoops.size(); ++li) {
+            const auto& L = holeLoops[li];
+            float cx0=0,cy0=0,cz0=0;
+            float prevS[2]; bool prevOk=false; float firstS[2]; bool firstOk=false;
+            for (size_t i2=0;i2<=L.size();++i2){
+                uint32_t v2 = L[i2 % L.size()]; const float* p=&md.positions[v2*3];
+                float wp[3]={ M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12], M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13], M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14] };
+                if (i2<L.size()){ cx0+=wp[0]; cy0+=wp[1]; cz0+=wp[2]; }
+                float sx,sy; bool ok=worldToScreen(wp,sx,sy);
+                if (ok && prevOk) dl.line(prevS[0],prevS[1],sx,sy, ui::rgba(255,160,40), 2.5f);   // orange rim
+                if (ok && !firstOk){ firstS[0]=sx; firstS[1]=sy; firstOk=true; }
+                prevS[0]=sx; prevS[1]=sy; prevOk=ok;
+            }
+            cx0/=L.size(); cy0/=L.size(); cz0/=L.size();
+            float cw[3]={cx0,cy0,cz0}; float ms[2];
+            if (worldToScreen(cw, ms[0], ms[1])) {
+                bool hv = std::fabs(cx.in.mx-ms[0])<14*uiScale && std::fabs(cx.in.my-ms[1])<14*uiScale;
+                float hs=9*uiScale;
+                dl.rect(ms[0]-hs, ms[1]-hs, hs*2, hs*2, hv?ui::rgba(255,235,80,230):ui::rgba(255,160,40,200));
+                dl.border(ms[0]-hs, ms[1]-hs, hs*2, hs*2, ui::rgba(20,20,20), 1.5f);
+                char nb[16]; snprintf(nb,sizeof nb,"%d",(int)li+1);
+                cx.textAligned(ms[0]-hs, ms[1]-hs-16*uiScale, hs*2+20*uiScale, 14*uiScale, nb, ui::rgba(255,200,90), 0);
+                if (hv && cx.in.pressed[0] && !ctxOpen && !addMenuOpen) {   // CLICK the marker = fill THIS hole
+                    sealMeshHoles(selected, nullptr, (int)li);
+                    dl.popClip(); return;                                   // geometry changed - stop this frame
+                }
+            }
+        }
+        dl.popClip();
+    }
+
+    // ── SLICE the mesh in half along an axis plane through its center: every triangle goes to the LEFT
+    //    or RIGHT part by centroid (v1: triangles are not split at the plane - fine for prop separation).
+    //    Both halves keep the texture/UVs; original goes to history (one Ctrl+Z un-slices).
+    void sliceMesh(int mi, int axis){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
+        const MeshData& src=(*sceneMeshes)[(size_t)mi];
+        size_t nv=src.positions.size()/3;
+        if (nv<3 || src.indices.size()<6) return;
+        float lo=1e30f,hi=-1e30f; for (size_t v2=0;v2<nv;++v2){ float p=src.positions[v2*3+axis]; lo=std::min(lo,p); hi=std::max(hi,p); }
+        float plane=(lo+hi)*0.5f;
+        MeshData half[2]; std::map<uint32_t,uint32_t> rm[2];
+        bool hasUV=src.uvs.size()>=nv*2, hasUV2=src.uvs2.size()>=nv*2, hasCol=src.colors.size()>=nv*4;
+        for (int h2=0;h2<2;++h2){ half[h2]=src;
+            half[h2].positions.clear(); half[h2].uvs.clear(); half[h2].uvs2.clear(); half[h2].indices.clear();
+            half[h2].colors.clear(); half[h2].uvs3.clear(); half[h2].uvs4.clear();
+            half[h2].boneIndices.clear(); half[h2].boneWeights.clear(); half[h2].hasBones=false; }
+        for (size_t k=0;k+2<src.indices.size();k+=3){
+            uint32_t tri[3]={src.indices[k],src.indices[k+1],src.indices[k+2]};
+            float cc=(src.positions[tri[0]*3+axis]+src.positions[tri[1]*3+axis]+src.positions[tri[2]*3+axis])/3.f;
+            int h2 = cc<plane ? 0 : 1;
+            auto& pt=half[h2]; auto& rmm=rm[h2];
+            for (int e=0;e<3;e++){ uint32_t v2=tri[e];
+                auto it=rmm.find(v2); uint32_t nvi;
+                if (it!=rmm.end()) nvi=it->second;
+                else { nvi=(uint32_t)(pt.positions.size()/3);
+                       pt.positions.push_back(src.positions[v2*3]); pt.positions.push_back(src.positions[v2*3+1]); pt.positions.push_back(src.positions[v2*3+2]);
+                       if (hasUV){ pt.uvs.push_back(src.uvs[v2*2]); pt.uvs.push_back(src.uvs[v2*2+1]); }
+                       if (hasUV2){ pt.uvs2.push_back(src.uvs2[v2*2]); pt.uvs2.push_back(src.uvs2[v2*2+1]); }
+                       if (hasCol){ for (int cc2=0;cc2<4;++cc2) pt.colors.push_back(src.colors[v2*4+cc2]); }
+                       rmm[v2]=nvi; }
+                pt.indices.push_back(nvi); } }
+        if (half[0].indices.empty() || half[1].indices.empty()) { setStatus("slice: everything landed on one side (already flat here?)"); return; }
+        const VkGpuMesh og = r->gpuMeshes[(size_t)mi];
+        std::vector<int> hist{mi}; std::vector<uint8_t> histA{1};
+        int made=0;
+        for (int h2=0;h2<2;++h2){
+            half[h2].nVerts=(u32)(half[h2].positions.size()/3); half[h2].nIdx=(u32)half[h2].indices.size();
+            sceneMeshes->push_back(std::move(half[h2]));
+            size_t ni=r->gpuMeshes.size();
+            r->uploadMesh(sceneMeshes->back());
+            if (r->gpuMeshes.size()!=ni+1){ sceneMeshes->pop_back(); continue; }
+            VkGpuMesh& ng=r->gpuMeshes[ni];
+            memcpy(ng.editT,og.editT,sizeof ng.editT); memcpy(ng.editR,og.editR,sizeof ng.editR); memcpy(ng.editS,og.editS,sizeof ng.editS);
+            memcpy(ng.editTint,og.editTint,sizeof ng.editTint); recomputeModel(ng);
+            hist.push_back((int)ni); histA.push_back(0);
+            meshEditLog[(int)ni] = (meshEditLog.count(mi)?meshEditLog[mi]+"+":std::string()) + "slice";
+            ++made;
+        }
+        r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
+        r->setDeleted((size_t)mi, true); pushDeleteUndo(hist, histA);
+        deselectAll(); holesMesh=-1; geomDirty = true;
+        const char* an[3]={"X","Y","Z"};
+        setStatus(std::string("Sliced in half across ")+an[axis]+" ("+std::to_string(made)+" parts) - move/delete each; Ctrl+Z un-slices");
     }
 
     // ── mesh MIRROR: flip the geometry across an axis (about its own local center) so it FACES THE
@@ -448,6 +597,7 @@ struct Editor {
         hist.push_back((int)ni); histA.push_back(0);
         pushDeleteUndo(hist, histA);                          // ONE Ctrl+Z un-fuses (sources back, fused gone)
         meshEditLog[(int)ni] = "fuse(" + std::to_string(src.size()) + ")";
+        geomDirty = true; holesMesh = -1;
         selectOne((int)ni); scrollToSel=true;
         setStatus("Fused "+std::to_string(src.size())+" meshes into one - "
                   +(nCells>1 ? (std::to_string(nCells)+" textures packed into a "+std::to_string(aw)+"x"+std::to_string(ah)+" atlas (UVs remapped)")
@@ -458,6 +608,80 @@ struct Editor {
     // HIDDEN per-mesh edit log: geometry ops NEVER rename the mesh (the outliner keeps the original name);
     // what happened is tracked here and shown only as a dim "edits: ..." line in the Object tab.
     std::map<int,std::string> meshEditLog;
+    // ── GEOMETRY PERSISTENCE: meshes CREATED by the editor (fuse/cut/seal/extend/split/slice/duplicate
+    //    results) exist only in RAM — without this sidecar they VANISHED on reload ("modified meshes are
+    //    not saved"). Saved as <session>.geom next to the .hsledit; restored BEFORE the session lines
+    //    apply so every index matches. Textures stored as PNG (the fused atlas compresses well).
+    bool geomDirty = false;
+    int  baseMeshCount = -1;   // how many meshes the ENV itself loaded (anything above = editor-created)
+    void saveGeomSidecar(const std::string& sessionFile){
+        if (!r || !sceneMeshes || baseMeshCount < 0) return;
+        std::string gp = sessionFile + ".geom";
+        int extra = (int)sceneMeshes->size() - baseMeshCount;
+        if (extra <= 0) { std::error_code ec; std::filesystem::remove(gp, ec); return; }
+        FILE* f = fopen(gp.c_str(), "wb"); if (!f) return;
+        auto w32=[&](u32 v){ fwrite(&v,4,1,f); };
+        auto wstr=[&](const std::string& s){ w32((u32)s.size()); fwrite(s.data(),1,s.size(),f); };
+        fwrite("HSRGEOM1",8,1,f); w32((u32)extra);
+        for (int i=baseMeshCount; i<(int)sceneMeshes->size(); ++i){
+            const MeshData& md=(*sceneMeshes)[(size_t)i];
+            wstr(md.name);
+            u8 flags[4]={ md.useBlend?(u8)1:(u8)0, md.additive?(u8)1:(u8)0, md.alphaTest?(u8)1:(u8)0, md.doubleSided?(u8)1:(u8)0 };
+            fwrite(flags,1,4,f);
+            w32(md.texW); w32(md.texH);
+            std::vector<u8> png;   // texture -> PNG in memory (atlas RGBA compresses well)
+            if (!md.texRGBA.empty() && md.texW>0)
+                stbi_write_png_to_func([](void* ctx, void* d, int n){ auto* v=(std::vector<u8>*)ctx; v->insert(v->end(),(u8*)d,(u8*)d+n); },
+                                       &png, md.texW, md.texH, 4, md.texRGBA.data(), md.texW*4);
+            w32((u32)png.size()); if(!png.empty()) fwrite(png.data(),1,png.size(),f);
+            w32((u32)md.positions.size()); if(!md.positions.empty()) fwrite(md.positions.data(),4,md.positions.size(),f);
+            w32((u32)md.uvs.size());       if(!md.uvs.empty())       fwrite(md.uvs.data(),4,md.uvs.size(),f);
+            w32((u32)md.uvs2.size());      if(!md.uvs2.empty())      fwrite(md.uvs2.data(),4,md.uvs2.size(),f);
+            w32((u32)md.indices.size());   if(!md.indices.empty())   fwrite(md.indices.data(),4,md.indices.size(),f);
+            auto it=meshEditLog.find(i); wstr(it!=meshEditLog.end()?it->second:std::string());
+        }
+        fclose(f);
+        geomDirty = false;
+        fprintf(stderr,"[EDIT] geometry sidecar saved: %d editor-created mesh(es) -> %s\n", extra, gp.c_str());
+    }
+    void loadGeomSidecar(const std::string& sessionFile){
+        if (!r || !sceneMeshes) return;
+        std::string gp = sessionFile + ".geom";
+        FILE* f = fopen(gp.c_str(), "rb"); if (!f) return;
+        char magic[8]; if (fread(magic,1,8,f)!=8 || memcmp(magic,"HSRGEOM1",8)!=0){ fclose(f); return; }
+        auto r32=[&]()->u32{ u32 v=0; fread(&v,4,1,f); return v; };
+        auto rstr=[&]()->std::string{ u32 n=r32(); std::string s(n,'\0'); if(n) fread(&s[0],1,n,f); return s; };
+        u32 count=r32(); int restored=0;
+        for (u32 gi=0; gi<count && gi<4096; ++gi){
+            MeshData md;
+            md.name = rstr();
+            u8 flags[4]; fread(flags,1,4,f);
+            md.useBlend=flags[0]!=0; md.additive=flags[1]!=0; md.alphaTest=flags[2]!=0; md.doubleSided=flags[3]!=0;
+            md.texW=r32(); md.texH=r32();
+            u32 pn=r32();
+            if (pn){ std::vector<u8> png(pn); fread(png.data(),1,pn,f);
+                int w2=0,h2=0,n2=0; unsigned char* px=stbi_load_from_memory(png.data(),(int)pn,&w2,&h2,&n2,4);
+                if (px){ md.texRGBA.assign(px,px+(size_t)w2*h2*4); md.texW=(u32)w2; md.texH=(u32)h2; md.hasTexture=true; stbi_image_free(px); } }
+            u32 n; n=r32(); md.positions.resize(n); if(n) fread(md.positions.data(),4,n,f);
+            n=r32(); md.uvs.resize(n);  if(n) fread(md.uvs.data(),4,n,f);
+            n=r32(); md.uvs2.resize(n); if(n) fread(md.uvs2.data(),4,n,f);
+            n=r32(); md.indices.resize(n); if(n) fread(md.indices.data(),4,n,f);
+            std::string log = rstr();
+            md.nVerts=(u32)(md.positions.size()/3); md.nIdx=(u32)md.indices.size();
+            md.transform = Transform{}; md.hasWorldMatrix=true;
+            static const float I16[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+            memcpy(md.worldMatrix, I16, sizeof I16);
+            sceneMeshes->push_back(std::move(md));
+            size_t ni=r->gpuMeshes.size();
+            r->uploadMesh(sceneMeshes->back());
+            if (r->gpuMeshes.size()!=ni+1){ sceneMeshes->pop_back(); continue; }
+            if (!log.empty()) meshEditLog[(int)ni]=log;
+            ++restored;
+        }
+        fclose(f);
+        r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
+        if (restored) fprintf(stderr,"[EDIT] geometry sidecar restored %d editor-created mesh(es) from %s\n", restored, gp.c_str());
+    }
 
     // shared tail of the geometry tools: append the edited clone (SAME name), carry the transform/tint,
     // soft-delete the original into the undo history, select the new mesh, log the edit invisibly.
@@ -481,6 +705,8 @@ struct Editor {
           meshEditLog[(int)ni] = prev + what; }
         selectOne((int)ni);
         scrollToSel = true;   // the result appends at the END of the outliner — jump to it
+        holesMesh = -1;       // hole-inspector cache is stale after any geometry change
+        geomDirty = true;     // geometry edits persist via the .geom sidecar on save/auto-save
         return true;
     }
     // Run a single-mesh geometry op over the WHOLE selection (each op selects its result; afterwards the
@@ -572,7 +798,7 @@ struct Editor {
         }
         r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
         r->setDeleted((size_t)mi, true); pushDeleteUndo(hist, histA);
-        deselectAll();
+        deselectAll(); geomDirty = true; holesMesh = -1;
         setStatus("Split into "+std::to_string(made)+" pieces - move/delete/collision-exclude them independently (Ctrl+Z reverts)");
     }
 
@@ -991,6 +1217,7 @@ struct Editor {
         FILE* f=fopen(target.c_str(),"wb"); if(!f){ setStatus("SAVE FAILED: "+target); return; }
         sessionPath=target;   // future saves/loads round-trip to here
         fwrite(s.data(),1,s.size(),f); fclose(f);
+        saveGeomSidecar(target);          // editor-created meshes (fuse/cut/seal/... results) persist beside the session
         lastSessionSnap = std::move(s);   // auto-save dirty baseline = what was just saved
         { std::error_code ec; std::filesystem::remove(target + ".autosave", ec); }   // state is properly saved -> the crash-recovery autosave is obsolete
         recoverOffer = false;
@@ -1019,6 +1246,10 @@ struct Editor {
                if(all.empty()){ fprintf(stderr,"[EDIT] no saved session (disk) and no _editor_session.hsledit embedded in the APK\n");
                                 checkAutosaveRecovery(); return; }   // a crash before the FIRST save still leaves an .autosave -> offer it
                sessionPath.clear(); fprintf(stderr,"[EDIT] loaded EMBEDDED session from cooked APK (%zu bytes)\n", all.size()); }
+        // Restore editor-CREATED meshes (fuse/cut/seal/split/slice/duplicate results) BEFORE the session
+        // lines apply — their MESH/DELETED/MATF indices assume those meshes exist.
+        if (!sessionPath.empty()) loadGeomSidecar(sessionPath);
+        else loadGeomSidecar(saveTargetFile());   // embedded-session path: sidecar may still sit at the default spot
         int meshN=0, itemN=0; applySessionText(all, meshN, itemN);
         didAutoSel = true;   // a session was restored -> don't let frame-1 auto-focus clobber the restored camera
         applyTexOverrides();   // re-load any swapped mesh/skybox textures from their image paths (preview + cook)
@@ -1096,6 +1327,7 @@ struct Editor {
         std::string ap = saveTargetFile() + ".autosave";
         FILE* f=fopen(ap.c_str(),"wb"); if(!f) return;
         fwrite(s.data(),1,s.size(),f); fclose(f);
+        if (geomDirty) saveGeomSidecar(saveTargetFile());   // crash-safe: created meshes persist with the autosave
         lastSessionSnap = std::move(s);
         fprintf(stderr,"[EDIT] auto-saved -> %s\n", ap.c_str());
     }
@@ -1240,6 +1472,7 @@ struct Editor {
         timelineH *= uiScale;
         r->overlayBegin = [this]() { this->buildFrame(); };
         r->overlayDraw  = [this](VkCommandBuffer cmd) { uiDraw.record(cmd, dl); };
+        baseMeshCount = sceneMeshes ? (int)sceneMeshes->size() : 0;   // anything appended past this = editor-created (persisted via the .geom sidecar)
         // (auto-select of a centered, in-front object happens on frame 1 in buildFrame, when the camera matrices are valid)
         // Proactively AUTO-INSTALL Java if not present (Temurin JRE beside the exe), in the background, so the first
         // cook isn't blocked on a ~40MB download. apksigner/keytool need it; a no-op if java is already on PATH.
@@ -1518,6 +1751,7 @@ struct Editor {
         drawSplitters();
         drawContextMenu();                                      // floating; drawn last = on top
         drawAddMenu();
+        drawHoleOverlay();                                      // numbered orange hole outlines - CLICK a marker to seal that hole
         drawKeybindsPanel();                                    // F1 overlay: every shortcut in one place
         cx.drawTooltip();                                       // deferred hover tooltips — drawn ABOVE everything
         cx.in.newFrame();                                       // consume per-frame input edges/deltas
@@ -1676,7 +1910,10 @@ struct Editor {
             {"Stretch / scale (per-axis gizmo)",18},                                          // Scale gizmo + Object-tab Scale fields
             {"Extend edges DOWN 1m (fill gaps)",19},                                          // grow REAL triangles off open boundary edges,
             {"Extend edges OUTWARD 1m (fill gaps)",20},                                       // texture continued from the border (repeatable)
-            {std::string("Seal holes (auto-fill)")+suf,21},                                   // fan-fill closed boundary loops on the whole selection
+            {std::string(showHoles?"Hide hole inspector":"SHOW HOLES (click a marker to seal)"),33},   // visual: numbered outlines, click = fill THAT hole
+            {"Seal hole HERE (nearest to click)",34},                                         // fills the loop nearest the right-clicked spot
+            {std::string("Seal ALL holes (keeps perimeter)")+suf,21},
+            {"Slice in half X",35},{"Slice in half Y",36},{"Slice in half Z",37},             // separate halves (move/delete independently)
             {std::string("Cut hole HERE (r=")+std::to_string((int)(cutRadius*100)/100.f).substr(0,4)+"m)",22},   // carve the clicked spot open (doorways)
             {"Split into connected pieces",23},                                               // separate disjoint parts into own meshes
             {"Mirror X",24},{"Mirror Y",25},{"Mirror Z",26},                                  // flip to face the other side (winding fixed)
@@ -1745,6 +1982,12 @@ struct Editor {
                 else if (a==30) forEachSelMesh([&](int m){ rotateMeshGeom(m, 0, 90); });
                 else if (a==31) forEachSelMesh([&](int m){ rotateMeshGeom(m, 2, 90); });
                 else if (a==32) fuseSelectedMeshes();
+                else if (a==33) { showHoles=!showHoles; if (showHoles){ refreshHoles(); setStatus(std::to_string(holeLoops.size())+" boundary loop(s) outlined - CLICK an orange marker to seal that hole"); } }
+                else if (a==34) { if (ctxHitValid) sealMeshHoles(ctxMesh, ctxHitP);
+                                  else setStatus("seal: right-click ON the mesh near the hole"); }
+                else if (a==35) forEachSelMesh([&](int m){ sliceMesh(m, 0); });
+                else if (a==36) forEachSelMesh([&](int m){ sliceMesh(m, 1); });
+                else if (a==37) forEachSelMesh([&](int m){ sliceMesh(m, 2); });
                 else if (a==27) { bool exc = !noColMeshes.count(ctxMesh);      // collision walk-through toggle (whole selection)
                                   for (int t2:tg) { if (exc) noColMeshes.insert(t2); else noColMeshes.erase(t2); }
                                   bakeNavmeshes(this->items);                  // preview + cook collision re-bake immediately ("items" here = the MENU rows)
@@ -2194,7 +2437,7 @@ struct Editor {
         y0=y; cx.label(x,y,86*uiScale,rh,"Image",th.textDim);
         cx.textField(ui::hashId("skyimgf"), x+88*uiScale, y, w-88*uiScale-110*uiScale, rh, skyImgUI);
         if (cx.button(ui::hashId("skyimgbr"), x+w-108*uiScale, y, 52*uiScale, rh, "Browse")) {
-            std::string p = pickFileWin32(L"Choose a skybox panorama image (PNG / JPG, equirect)");
+            std::string p = pickFileWin32(L"Choose a skybox panorama image (PNG / JPG, equirect)", L"Images (*.png;*.jpg;*.jpeg)", L"*.png;*.jpg;*.jpeg");
             if (!p.empty()) { skyImgUI = p; setSkyImage(p); } }
         if (cx.button(ui::hashId("skyimgcl"), x+w-52*uiScale, y, 52*uiScale, rh, "Clear")) { clearSkyImage(); skyImgUI.clear(); }
         cx.tip(x,y0,w,rh,"Equirect panorama image (PNG/JPG). Previews + cooks onto a large\ninward-facing sky sphere behind everything. Browse picks a file;\nor type/paste a path and press Set."); y+=rh+2*uiScale;
@@ -2282,8 +2525,16 @@ struct Editor {
           if (cx.button(ui::hashId("extout"), x+bw3+5*uiScale,   y, bw3, th.rowH, "Extend Out"))     forEachSelMesh([&](int m){ extendMeshBoundary(m, extendDist, 1); });
           if (cx.button(ui::hashId("extup"),  x+2*(bw3+5*uiScale), y, bw3, th.rowH, "Extend Up"))    forEachSelMesh([&](int m){ extendMeshBoundary(m, extendDist, 2); });
           y+=th.rowH+3*uiScale; }
-        if (cx.button(ui::hashId("sealhx"), x, y, w, th.rowH, "Seal holes (auto-fill loops)")) forEachSelMesh([&](int m){ sealMeshHoles(m); });
-        y += th.rowH+3*uiScale;
+        { float bw2=(w-6*uiScale)/2;   // HOLE INSPECTOR: see every gap as a numbered outline, click a marker to seal it
+          char hb2[48]; snprintf(hb2,sizeof hb2, showHoles?"Holes: %d shown (click to seal)":"Show holes (inspector)", (int)holeLoops.size());
+          if (cx.button(ui::hashId("holeshow"), x, y, bw2, th.rowH, hb2, showHoles)) { showHoles=!showHoles; if (showHoles) refreshHoles(); }
+          if (cx.button(ui::hashId("sealhx"), x+bw2+6*uiScale, y, bw2, th.rowH, "Seal ALL holes")) forEachSelMesh([&](int m){ sealMeshHoles(m); });
+          y += th.rowH+3*uiScale; }
+        { float bw3=(w-10*uiScale)/3;   // SLICE: separate the mesh into two halves along a center plane
+          if (cx.button(ui::hashId("slcx"), x,                   y, bw3, th.rowH, "Slice X")) forEachSelMesh([&](int m){ sliceMesh(m, 0); });
+          if (cx.button(ui::hashId("slcy"), x+bw3+5*uiScale,     y, bw3, th.rowH, "Slice Y")) forEachSelMesh([&](int m){ sliceMesh(m, 1); });
+          if (cx.button(ui::hashId("slcz"), x+2*(bw3+5*uiScale), y, bw3, th.rowH, "Slice Z")) forEachSelMesh([&](int m){ sliceMesh(m, 2); });
+          y += th.rowH+3*uiScale; }
         cx.label(x,y,70*uiScale,th.rowH,"Cut radius",th.textDim);
         cx.dragFloat(ui::hashId("cutrad"), x+72*uiScale, y, 80*uiScale, th.rowH, cutRadius, 0.01f, "%.2f"); y+=th.rowH+3*uiScale;
         cx.label(x,y,w,th.rowH*0.9f,"(cut: RIGHT-CLICK the exact spot -> 'Cut hole HERE')",th.textDim); y+=th.rowH*0.9f+2*uiScale;
@@ -2408,16 +2659,39 @@ struct Editor {
         cx.label(x,y,w,rh,b,th.textDim); y+=rh+2*uiScale;
         { float bw2=(w-8*uiScale)/2;
           if (cx.button(ui::hashId("mtset"), x, y, bw2, rh+2*uiScale, "Set texture...", true)) {
-              std::string p=pickFileWin32(L"Choose texture (PNG / JPG)");
+              std::string p=pickFileWin32(L"Choose texture (PNG / JPG)", L"Images (*.png;*.jpg;*.jpeg)", L"*.png;*.jpg;*.jpeg");
               if (!p.empty()) setMeshTexture(selected, p);
           }
           if (cx.button(ui::hashId("mtexp"), x+bw2+6*uiScale, y, bw2, rh+2*uiScale, "Export PNG") && md && !md->texRGBA.empty()) {
+              std::error_code ec; std::filesystem::create_directories("saved", ec);   // export failed silently when saved/ didn't exist
               std::string safe = "saved/"; for (char c : gm.name) safe += (c=='/'||c=='\\'||c==':')?'_':c; safe += "_tex.png";
-              if (stbi_write_png(safe.c_str(), md->texW, md->texH, 4, md->texRGBA.data(), md->texW*4))
-                  setStatus("Exported texture -> "+safe);
-              else setStatus("Texture export FAILED: "+safe);
+              if (stbi_write_png(safe.c_str(), md->texW, md->texH, 4, md->texRGBA.data(), md->texW*4)) {
+                  std::string abs = std::filesystem::absolute(safe, ec).string();
+                  for (char& c : abs) if (c=='/') c='\\';
+                  setStatus("Exported texture -> "+abs+"  (opening Explorer)");
+#ifdef _WIN32
+                  system(("explorer /select,\""+abs+"\"").c_str());   // SHOW the user exactly where it landed
+#endif
+              } else setStatus("Texture export FAILED (disk full / path?): "+safe);
           }
           y+=rh+8*uiScale; }
+        // ── TEXTURE ADJUST (bake brightness/saturation/hue into the texture; previews live + ships in the cook) ──
+        cx.label(x,y,w,rh,"Adjust texture  (bakes in, live)",th.text); y+=rh+2*uiScale;
+        { float lw=32*uiScale, fw=(w-lw*3)/3 - 4*uiScale;
+          cx.label(x,y,lw,rh,"Brt",th.textDim);  cx.dragFloat(ui::hashId("txbrt"), x+lw, y, fw, rh, texBright, 0.005f, "%.2f");
+          cx.label(x+lw+fw+4*uiScale,y,lw,rh,"Sat",th.textDim); cx.dragFloat(ui::hashId("txsat"), x+2*lw+fw+4*uiScale, y, fw, rh, texSat, 0.005f, "%.2f");
+          cx.label(x+2*(lw+fw+4*uiScale),y,lw,rh,"Hue",th.textDim); cx.dragFloat(ui::hashId("txhue"), x+3*lw+2*fw+8*uiScale, y, fw, rh, texHueDeg, 0.5f, "%.0f");
+          y+=rh+3*uiScale;
+          if (cx.button(ui::hashId("txapply"), x, y, w, rh, "Apply adjust (bakes into the texture)")) applyTextureAdjust(selected);
+          y+=rh+4*uiScale; }
+        // ── TEXTURE GENERATOR (procedural replacements; previews live + ships in the cook) ──
+        cx.label(x,y,w,rh,"Generate texture",th.text); y+=rh+2*uiScale;
+        { float bw3=(w-10*uiScale)/3;
+          if (cx.button(ui::hashId("tgsolid"), x,                   y, bw3, rh, "Solid (tint)")) generateTexture(selected, 0);
+          if (cx.button(ui::hashId("tgcheck"), x+bw3+5*uiScale,     y, bw3, rh, "Checker"))      generateTexture(selected, 1);
+          if (cx.button(ui::hashId("tgnoise"), x+2*(bw3+5*uiScale), y, bw3, rh, "Noise"))        generateTexture(selected, 2);
+          y+=rh+2*uiScale;
+          cx.label(x,y,w,rh*0.9f,"(Solid uses the Tint RGB above as the color)",th.textDim); y+=rh*0.9f+4*uiScale; }
         // ── SHADER DECOMPILER + COMPILER (full in-editor round trip) ───────────────────
         // Decompile: active program SPIR-V -> GLSL (tools/spirv-cross), opened for editing.
         // Compile+Apply: edited GLSL -> SPIR-V (tools/glslangValidator) -> pipelines HOT-RELOADED live.
@@ -2496,6 +2770,51 @@ struct Editor {
         setStatus("Shader '"+sn+"' -> saved/shaders/"+safe+".{vert,frag}.glsl OPENED - edit, then 'Compile + APPLY' hot-reloads it live");
     }
     std::set<int> matEdited;   // meshes whose material flags/tint were edited (session MATF/TINT lines)
+    float texBright = 1.f, texSat = 1.f, texHueDeg = 0.f;   // Material tab texture-adjust fields (baked on Apply)
+
+    // ── TEXTURE ADJUST: bake brightness / saturation / hue-rotate into md.texRGBA, live re-upload.
+    //    (Baked = it SHIPS in the cook; the Tint above is the non-destructive alternative.)
+    void applyTextureAdjust(int mi){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size()) return;
+        MeshData& md = (*sceneMeshes)[(size_t)mi];
+        if (md.texRGBA.empty()) { setStatus("adjust: mesh has no texture"); return; }
+        float rad = texHueDeg*3.14159265f/180.f, cH=std::cos(rad), sH=std::sin(rad);
+        // hue rotation about the grey axis (standard YIQ-ish matrix), then saturation lerp, then brightness
+        float m[9] = { 0.213f+cH*0.787f-sH*0.213f, 0.715f-cH*0.715f-sH*0.715f, 0.072f-cH*0.072f+sH*0.928f,
+                       0.213f-cH*0.213f+sH*0.143f, 0.715f+cH*0.285f+sH*0.140f, 0.072f-cH*0.072f-sH*0.283f,
+                       0.213f-cH*0.213f-sH*0.787f, 0.715f-cH*0.715f+sH*0.715f, 0.072f+cH*0.928f+sH*0.072f };
+        for (size_t i2=0;i2+3<md.texRGBA.size();i2+=4){
+            float R=md.texRGBA[i2]/255.f, G=md.texRGBA[i2+1]/255.f, B=md.texRGBA[i2+2]/255.f;
+            float hr=m[0]*R+m[1]*G+m[2]*B, hg=m[3]*R+m[4]*G+m[5]*B, hb=m[6]*R+m[7]*G+m[8]*B;
+            float grey = 0.299f*hr+0.587f*hg+0.114f*hb;
+            hr = grey + (hr-grey)*texSat; hg = grey + (hg-grey)*texSat; hb = grey + (hb-grey)*texSat;
+            auto q=[&](float v){ v*=texBright; return (u8)std::clamp(v*255.f+0.5f, 0.f, 255.f); };
+            md.texRGBA[i2]=q(hr); md.texRGBA[i2+1]=q(hg); md.texRGBA[i2+2]=q(hb);
+        }
+        md.astcRaw.clear();                                   // compressed source no longer matches
+        r->replaceMeshTexture((size_t)mi, *sceneMeshes);      // live re-upload
+        setStatus("Texture adjusted (brt "+std::to_string(texBright).substr(0,4)+" sat "+std::to_string(texSat).substr(0,4)
+                  +" hue "+std::to_string((int)texHueDeg)+") - baked, previews now, ships in the cook");
+        texBright=1.f; texSat=1.f; texHueDeg=0.f;             // adjustments are relative - reset for the next round
+    }
+    // ── TEXTURE GENERATOR: replace the mesh's texture procedurally. kind 0=solid(editTint RGB) 1=checker 2=value noise.
+    void generateTexture(int mi, int kind){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
+        MeshData& md = (*sceneMeshes)[(size_t)mi];
+        const int S = 512;
+        md.texRGBA.assign((size_t)S*S*4, 255); md.texW=S; md.texH=S; md.hasTexture=true; md.astcRaw.clear();
+        const float* t = r->gpuMeshes[(size_t)mi].editTint;
+        auto q=[&](float v){ return (u8)std::clamp(v*255.f+0.5f, 0.f, 255.f); };
+        for (int y2=0;y2<S;++y2) for (int x2=0;x2<S;++x2){
+            u8* p=&md.texRGBA[((size_t)y2*S+x2)*4];
+            if (kind==0){ p[0]=q(t[0]); p[1]=q(t[1]); p[2]=q(t[2]); }
+            else if (kind==1){ bool a2=((x2/32)+(y2/32))&1; u8 v=a2?200:72; p[0]=p[1]=p[2]=v; }
+            else { u32 h=(u32)(x2*374761393u + y2*668265263u); h=(h^(h>>13))*1274126177u; h^=h>>16;
+                   u8 v=(u8)(96 + (h%128)); p[0]=p[1]=p[2]=v; }
+        }
+        r->replaceMeshTexture((size_t)mi, *sceneMeshes);
+        setStatus(std::string("Generated ")+(kind==0?"SOLID (tint color)":kind==1?"CHECKER":"NOISE")+" 512x512 texture - previews now, ships in the cook");
+    }
     void drawAnimTab(float x, float y, float w) {
         auto& th=cx.th;
         if (!animOverride || !animScrub) { cx.label(x,y,w,th.rowH,"(no animation plumbed)",th.textDim); return; }
@@ -2561,7 +2880,7 @@ struct Editor {
           float bw3=(w-14*uiScale-8*uiScale)/3.f, bx3=x+14*uiScale;
           y0=y;
           if (cx.button(ui::hashId("audrepl"), bx3, y, bw3, th.rowH, bgOgg.empty()?"Add audio...":"Replace...", true)) {
-              std::string p=pickFileWin32(L"Choose background audio (OGG / WAV / MP3 / FLAC)");
+              std::string p=pickFileWin32(L"Choose background audio (OGG / WAV / MP3 / FLAC)", L"Audio (*.ogg;*.wav;*.mp3;*.flac)", L"*.ogg;*.wav;*.mp3;*.flac");
               if(!p.empty() && setAudioFromFile(p)) cookAudio=true;   // adding/replacing audio implies you want it shipped
           }
           if (cx.button(ui::hashId("audexp"), bx3+bw3+4*uiScale, y, bw3, th.rowH, "Export")) exportAudio();
@@ -3444,12 +3763,14 @@ struct Editor {
         setStatus(ok ? ("Blender project exported -> " + outDir + "\\" + env + ".gltf  (open in Blender)") : "Blender export FAILED");
     }
     // Full-Explorer FILE picker (glTF/glb). Returns "" on cancel / non-Windows.
-    static std::string pickFileWin32(const wchar_t* title) {
+    // filtName/filtSpec = the PRIMARY file-type filter for this dialog (was hardcoded to Blender glTF —
+    // "Set texture" hilariously asked for a .glb). Every call site passes what it actually wants.
+    static std::string pickFileWin32(const wchar_t* title, const wchar_t* filtName = L"All files", const wchar_t* filtSpec = L"*.*") {
 #ifdef _WIN32
         std::string result; bool co = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
         IFileOpenDialog* dlg = nullptr;
         if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))) && dlg) {
-            COMDLG_FILTERSPEC filt[] = { { L"Blender glTF (*.gltf;*.glb)", L"*.gltf;*.glb" }, { L"All files", L"*.*" } };
+            COMDLG_FILTERSPEC filt[] = { { filtName, filtSpec }, { L"All files", L"*.*" } };
             dlg->SetFileTypes(2, filt);
             DWORD opt = 0; dlg->GetOptions(&opt); dlg->SetOptions(opt | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
             if (title) dlg->SetTitle(title);
@@ -3476,7 +3797,7 @@ struct Editor {
     // Import a Blender-edited glTF/glb back in. The env is rebuilt from the loader path (gltf_import.h), so we open it
     // in a fresh editor instance with that file as the scene; the user closes this window when ready.
     void importBlender() {
-        std::string file = pickFileWin32(L"Choose a Blender glTF / glb to import back");
+        std::string file = pickFileWin32(L"Choose a Blender glTF / glb to import back", L"Blender glTF (*.gltf;*.glb)", L"*.gltf;*.glb");
         if (file.empty()) { setStatus("Blender import cancelled"); return; }
 #ifdef _WIN32
         wchar_t exe[MAX_PATH]; if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) { setStatus("Blender import: can't locate the editor exe"); return; }
