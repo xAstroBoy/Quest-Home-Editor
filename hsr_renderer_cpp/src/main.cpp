@@ -20,6 +20,7 @@
 #include <cctype>
 #include <cstring>
 #include <iostream>
+#include <thread>   // background scene-load worker (the window/UI stay live while parsing)
 
 #ifdef _WIN32
 #include <windows.h>
@@ -129,9 +130,14 @@ static void hsrHttpServer(int port) {
 #include <volk.h>
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
+#ifdef _WIN32
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>   // HWND of the main window for the GDI loading splash
+#endif
 
 #include "core/types.h"
 #include "core/camera.h"
+#include "core/load_progress.h"
 #include "loaders/asmh_parser.h"
 #include "loaders/rendmesh_parser.h"
 #include "loaders/rendtxtr_parser.h"
@@ -153,7 +159,7 @@ static void hsrHttpServer(int port) {
 #include "miniz.h"
 #ifdef _WIN32
 #include <windows.h>
-#include <GL/gl.h>   // legacy GL for the pre-load "drop an .apk here" splash window
+// (the old GL drop-splash is gone — the drop zone + loading progress paint into the MAIN window via GDI)
 #endif
 
 // Global state
@@ -195,6 +201,85 @@ static void dropCb(GLFWwindow*, int count, const char** paths) {
 }
 
 #ifdef _WIN32
+// ── In-window loading / drop-zone painter (GDI) ────────────────────────────────────────────────────
+// Paints directly onto the main (NO_API) window's HWND while the scene loads on a worker thread, or
+// while waiting for an APK drop — the ONE window is alive and informative from the first moment
+// (no separate drop popup, no white frozen rect). Double-buffered; GDI stops the instant Vulkan
+// takes over presentation of the same window.
+static void paintLoadSplash(HWND hwnd, const char* envName, bool waitingForDrop) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
+    HDC wdc = GetDC(hwnd);
+    HDC dc = CreateCompatibleDC(wdc);
+    HBITMAP bmp = CreateCompatibleBitmap(wdc, w, h);
+    HGDIOBJ obmp = SelectObject(dc, bmp);
+    // Backdrop: vertical gradient, same palette as the editor theme.
+    { TRIVERTEX v[2] = { { 0, 0, 0x1a00, 0x1d00, 0x2800, 0 }, { w, h, 0x0c00, 0x0d00, 0x1400, 0 } };
+      GRADIENT_RECT gr = { 0, 1 }; GradientFill(dc, v, 2, &gr, 1, GRADIENT_FILL_RECT_V); }
+    SetBkMode(dc, TRANSPARENT);
+    int bigPx = h / 16 > 26 ? h / 16 : 26, smallPx = h / 32 > 15 ? h / 32 : 15;
+    HFONT fBig = CreateFontA(-bigPx, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
+    HFONT fSmall = CreateFontA(-smallPx, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                               CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
+    HGDIOBJ ofont = SelectObject(dc, fBig);
+    auto center = [&](int y, const char* s, COLORREF col) {
+        SIZE sz; GetTextExtentPoint32A(dc, s, (int)strlen(s), &sz);
+        SetTextColor(dc, col); TextOutA(dc, (w - sz.cx) / 2, y, s, (int)strlen(s));
+        return sz.cy;
+    };
+    if (waitingForDrop) {
+        // Drop-zone state: dashed border + headline, integrated into the main window.
+        int mx = w / 8, my = h / 5;
+        HPEN pen = CreatePen(PS_DASH, 1, RGB(86, 132, 168)); HGDIOBJ open = SelectObject(dc, pen);
+        HGDIOBJ obr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, mx, my, w - mx, h - my);
+        SelectObject(dc, open); SelectObject(dc, obr); DeleteObject(pen);
+        int ty = h / 2 - bigPx;
+        ty += center(ty, "Drop an environment .apk here", RGB(214, 222, 235)) + 10;
+        SelectObject(dc, fSmall);
+        center(ty, "V79 / OPA / V203 / glTF project - the editor loads it right here", RGB(128, 140, 160));
+    } else {
+        const char* stage = g_loadProgress.stage.load(std::memory_order_relaxed);
+        int cur = g_loadProgress.cur.load(std::memory_order_relaxed);
+        int total = g_loadProgress.total.load(std::memory_order_relaxed);
+        int y = h / 2 - bigPx * 2;
+        char title[512]; snprintf(title, sizeof title, "Loading  %s", envName ? envName : "");
+        y += center(y, title, RGB(214, 222, 235)) + bigPx / 2;
+        SelectObject(dc, fSmall);
+        char st[256];
+        if (total > 0) snprintf(st, sizeof st, "%s   (%d / %d)", stage ? stage : "", cur, total);
+        else           snprintf(st, sizeof st, "%s", stage ? stage : "");
+        y += center(y, st, RGB(150, 164, 186)) + smallPx + 8;
+        // Progress bar: determinate fill when total known, sweeping marquee otherwise.
+        int bw = w / 2, bh = smallPx > 12 ? smallPx : 12, bx = (w - bw) / 2;
+        RECT bar = { bx, y, bx + bw, y + bh };
+        HBRUSH trough = CreateSolidBrush(RGB(34, 38, 52)); FillRect(dc, &bar, trough); DeleteObject(trough);
+        HBRUSH fill = CreateSolidBrush(RGB(64, 156, 255));
+        if (total > 0) {
+            float f = (float)cur / (float)total; if (f < 0.f) f = 0.f; if (f > 1.f) f = 1.f;
+            RECT fr = { bx, y, bx + (int)(bw * f), y + bh }; FillRect(dc, &fr, fill);
+        } else {
+            // marquee: a 25%-wide chunk sweeping left->right
+            float t = (GetTickCount() % 1200) / 1200.f;
+            int cw = bw / 4, cx0 = bx + (int)((bw + cw) * t) - cw;
+            RECT fr = { cx0 < bx ? bx : cx0, y, (cx0 + cw > bx + bw) ? bx + bw : cx0 + cw, y + bh };
+            if (fr.right > fr.left) FillRect(dc, &fr, fill);
+        }
+        DeleteObject(fill);
+        HPEN bpen = CreatePen(PS_SOLID, 1, RGB(70, 78, 98)); HGDIOBJ open = SelectObject(dc, bpen);
+        HGDIOBJ obr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, bar.left, bar.top, bar.right, bar.bottom);
+        SelectObject(dc, open); SelectObject(dc, obr); DeleteObject(bpen);
+    }
+    SelectObject(dc, ofont); DeleteObject(fBig); DeleteObject(fSmall);
+    BitBlt(wdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, obmp); DeleteObject(bmp); DeleteDC(dc); ReleaseDC(hwnd, wdc);
+}
+#endif
+
+#ifdef _WIN32
 static void relaunchSelf(const std::string& apk) {
     char exe[MAX_PATH]; GetModuleFileNameA(NULL, exe, MAX_PATH);
     std::string cmd = std::string("\"") + exe + "\" \"" + apk + "\"";
@@ -228,7 +313,7 @@ static void keyCb(GLFWwindow* w, int key, int sc, int act, int mods) {
         if (g_renderer && g_renderer->selectedMesh >= 0) {
             // Deselect first, exit on second Esc
             g_renderer->selectedMesh = -1;
-            glfwSetWindowTitle(w, "HSR Renderer [Vulkan] — Tab=select mesh  F=wireframe  Esc=quit");
+            glfwSetWindowTitle(w, "HSR Renderer [Vulkan] - Tab=select mesh  F=wireframe  Esc=quit");
         } else {
             glfwSetWindowShouldClose(w, GLFW_TRUE);
         }
@@ -311,7 +396,7 @@ int main(int argc, char** argv) {
       size_t s = p.find_last_of('/'); if (s != std::string::npos) AppConfig::s_exeDir = p.substr(0, s); }
 #endif
     fprintf(stderr, "========================================================\n");
-    fprintf(stderr, " HSR Renderer / Editor — libshell.so Vulkan replica\n");
+    fprintf(stderr, " HSR Renderer / Editor - libshell.so Vulkan replica\n");
     fprintf(stderr, " Drag an .apk onto the window to load it\n");
     fprintf(stderr, "========================================================\n\n");
     if (!std::getenv("HSR_NO_TOOLCHECK")) hslcook::reportToolchain();   // startup readiness of the signing toolchain
@@ -365,72 +450,66 @@ int main(int argc, char** argv) {
     }
 
     std::string apkPath;
-    if (argc >= 2) {
-        apkPath = argv[1];
-    } else {
-        // No command-line arg (double-clicked / launched bare): NO console, NO stdin. Pop up a small
-        // GLFW window and wait for the user to DRAG an environment .apk onto it. Whatever they drop
-        // is loaded and rendered from scratch (parse -> meshes -> textures -> shaders -> GPU -> render).
+    if (argc >= 2) apkPath = argv[1];
+
+    // ── ONE window, alive from t=0 ─────────────────────────────────────────────────────────────
+    // Interactive sessions create the REAL main window IMMEDIATELY — before any scene parsing —
+    // and paint into it with GDI: a drop-zone when launched bare (the drag&drop is integrated, no
+    // separate popup), then the live loading progress while the env parses on a worker thread.
+    // Vulkan later takes over presentation of this same window. Headless/scripted modes
+    // (HSR_EXPORT / HSR_SHOT / HSR_LIVE / HSR_BLENDER_EXPORT) keep the old synchronous flow.
+    const bool interactive = !std::getenv("HSR_EXPORT") && !std::getenv("HSR_SHOT")
+                          && !std::getenv("HSR_LIVE")   && !std::getenv("HSR_BLENDER_EXPORT");
+    glfwSetErrorCallback(errorCb);
+    if (interactive) {
         if (!glfwInit()) { fprintf(stderr, "GLFW init failed\n"); return 1; }
-        bool got = false;
-#ifdef _WIN32
-        // A small CENTERED, NOT-always-on-top GL splash (the old window was GLFW_FLOATING = stole top focus, and a
-        // NO_API window draws undefined garbage). Renders a gradient + a dashed drop-zone with a gently bobbing arrow.
-        glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
-        glfwWindowHint(GLFW_FLOATING, GLFW_FALSE);
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-        const int dw = 720, dh = 380;
-        GLFWwindow* dropWin = glfwCreateWindow(dw, dh, "HSR Renderer   —   drag an environment .apk here", nullptr, nullptr);
-        if (!dropWin) { fprintf(stderr, "GLFW window failed\n"); glfwTerminate(); return 1; }
-        if (GLFWmonitor* mon = glfwGetPrimaryMonitor()) { if (const GLFWvidmode* vm = glfwGetVideoMode(mon)) {
-            int mxp = 0, myp = 0; glfwGetMonitorPos(mon, &mxp, &myp);
-            glfwSetWindowPos(dropWin, mxp + (vm->width - dw) / 2, myp + (vm->height - dh) / 2); } }   // center
-        glfwMakeContextCurrent(dropWin); glfwSwapInterval(1);
-        glfwSetDropCallback(dropWin, dropCb);
-        glClearColor(0.06f, 0.07f, 0.11f, 1.f);
-        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glEnable(GL_LINE_SMOOTH);
-        g_doReload = false; g_dropPath.clear();
-        while (!glfwWindowShouldClose(dropWin) && !g_doReload) {
-            int fw, fh; glfwGetFramebufferSize(dropWin, &fw, &fh); glViewport(0, 0, fw, fh);
-            float asp = fh > 0 ? (float)fw / (float)fh : 1.f;
-            glClear(GL_COLOR_BUFFER_BIT);
-            glMatrixMode(GL_PROJECTION); glLoadIdentity(); glMatrixMode(GL_MODELVIEW); glLoadIdentity();
-            glBegin(GL_QUADS);                                                   // vertical gradient backdrop
-              glColor3f(0.13f, 0.15f, 0.21f); glVertex2f(-1.f, 1.f); glVertex2f(1.f, 1.f);
-              glColor3f(0.05f, 0.06f, 0.09f); glVertex2f(1.f, -1.f); glVertex2f(-1.f, -1.f);
-            glEnd();
-            float bh = 0.60f, bx = 0.66f / asp;                                  // dashed drop-zone box (un-stretched)
-            glLineWidth(2.f); glEnable(GL_LINE_STIPPLE); glLineStipple(2, (GLushort)0x00FF);
-            glColor3f(0.30f, 0.52f, 0.68f);
-            glBegin(GL_LINE_LOOP); glVertex2f(-bx, bh); glVertex2f(bx, bh); glVertex2f(bx, -bh); glVertex2f(-bx, -bh); glEnd();
-            glDisable(GL_LINE_STIPPLE);
-            float bob = 0.05f * (float)std::sin(glfwGetTime() * 2.2);            // gentle bob
-            float ay = 0.18f + bob, ah = 0.24f, aw = 0.17f / asp;
-            glColor3f(0.46f, 0.80f, 0.96f); glLineWidth(6.f);
-            glBegin(GL_LINE_STRIP); glVertex2f(-aw, ay); glVertex2f(0.f, ay - ah); glVertex2f(aw, ay); glEnd();   // chevron
-            glBegin(GL_LINES); glVertex2f(0.f, ay - ah); glVertex2f(0.f, ay + ah); glEnd();                       // stem
-            glLineWidth(3.f); glColor3f(0.30f, 0.52f, 0.68f);                    // little tray line under the arrow
-            glBegin(GL_LINES); glVertex2f(-0.22f / asp, -0.34f); glVertex2f(0.22f / asp, -0.34f); glEnd();
-            glfwSwapBuffers(dropWin);
-            glfwWaitEventsTimeout(0.03);
-        }
-        got = g_doReload && !g_dropPath.empty();
-        apkPath = g_dropPath; g_doReload = false; g_dropPath.clear();
-        glfwDestroyWindow(dropWin);
-#else
+        glfwDefaultWindowHints();
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        GLFWwindow* dropWin = glfwCreateWindow(760, 300, "HSR Renderer — drag an environment .apk onto this window", nullptr, nullptr);
-        if (!dropWin) { fprintf(stderr, "GLFW window failed\n"); glfwTerminate(); return 1; }
-        glfwSetDropCallback(dropWin, dropCb);
-        g_doReload = false; g_dropPath.clear();
-        while (!glfwWindowShouldClose(dropWin) && !g_doReload) glfwWaitEvents();
-        got = g_doReload && !g_dropPath.empty();
-        apkPath = g_dropPath; g_doReload = false; g_dropPath.clear();
-        glfwDestroyWindow(dropWin);
+        // Don't STEAL FOCUS from whatever the user is doing - neither at creation nor when shown
+        // later (drag-drop relaunches used to yank focus every time).
+        glfwWindowHint(GLFW_FOCUSED, GLFW_FALSE);
+        glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_FALSE);
+        if (std::getenv("HSR_FLOATING")) glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
+        g_window = glfwCreateWindow(g_winW, g_winH, "HSR Renderer - Quest Home Editor", nullptr, nullptr);
+        if (!g_window) { fprintf(stderr, "Window creation failed\n"); glfwTerminate(); return 1; }
+        { GLFWimage icons[2]; std::vector<unsigned char> p48, p32; genEditorIcon(48,p48); genEditorIcon(32,p32);
+          icons[0]={48,48,p48.data()}; icons[1]={32,32,p32.data()}; glfwSetWindowIcon(g_window, 2, icons); }
+        glfwSetDropCallback(g_window, dropCb);
+        if (apkPath.empty()) {
+            // Launched bare: the main window IS the drop zone. Wait here until an .apk lands on it.
+            glfwSetWindowTitle(g_window, "HSR Renderer - drag an environment .apk here");
+            g_doReload = false; g_dropPath.clear();
+#ifdef _WIN32
+            HWND hwnd = glfwGetWin32Window(g_window);
 #endif
-        if (!got) { glfwTerminate(); return 0; }  // closed without dropping anything
+            while (!glfwWindowShouldClose(g_window) && !g_doReload) {
+#ifdef _WIN32
+                paintLoadSplash(hwnd, nullptr, /*waitingForDrop=*/true);
+#endif
+                glfwWaitEventsTimeout(0.05);
+            }
+            if (!g_doReload || g_dropPath.empty()) { glfwDestroyWindow(g_window); glfwTerminate(); return 0; }
+            apkPath = g_dropPath; g_doReload = false; g_dropPath.clear();
+        }
     }
     fprintf(stderr, "[MAIN] APK: %s\n\n", apkPath.c_str());
+    std::string envBaseName = apkPath;
+    { size_t sl = envBaseName.find_last_of("/\\"); if (sl != std::string::npos) envBaseName = envBaseName.substr(sl + 1); }
+    if (interactive) glfwSetWindowTitle(g_window, ("HSR Renderer - loading " + envBaseName + " ...").c_str());
+
+    // ── IN-PLACE ENV RELOAD LOOP ────────────────────────────────────────────────────────────────
+    // The editor can SWAP the loaded env WITHOUT restarting the process: cook -> "Preview cooked
+    // (HSL)" renders the cooked APK in this SAME window, "Back to source" returns, and drag&drop
+    // reloads in place too (no new process, no focus steal). Everything from scene load to the
+    // render loop lives inside this loop; a swap tears down renderer+editor (the window survives)
+    // and goes around again with the new path.
+    const std::string sourceEnvPath = apkPath;   // the original source env ("Back to source" target)
+    std::string nextEnv;                          // set by a swap request; empty = normal exit
+    for (;;) {
+    nextEnv.clear();
+    g_loadProgress.done.store(false); g_loadProgress.failed.store(false);
+    g_loadProgress.set("Reading APK...");
+    g_animOverride = false; g_animScrub = 0.f;
     // NOTE: a single per-env lightmap exposure is WRONG for calming — it mixes INTERIOR home meshes (floor/walls,
     // need ~2.6) with OUTDOOR vista meshes (ground/boulders, want ~1.4). Lowering it globally under-exposed the
     // home floor/walls (dark/wrong). Keep the interior-tuned default (g_lmExposure=2.6); a faithful per-MESH
@@ -446,6 +525,24 @@ int main(int argc, char** argv) {
     GltfLoader gltf;
     OpaLoader opa;
     std::vector<MeshData>* sceneMeshes = nullptr;
+    static std::vector<MeshData> blenderMeshes;   // Blender round-trip import target (stable address)
+    bool isBlender = false, isV79 = false, isOpa = false;
+    // Outputs of the shader extraction/selection (consumed by Vulkan init after the load completes).
+    static constexpr u32 SPIRV_MAGIC = 0x07230203u;
+    std::vector<u32> vertSpirv, fragSpirv, skinnedVertSpirv, skinnedFragSpirv;
+    std::string g_globalShaderPath;       // path of the chosen global shader (-> renderer matParams match)
+    std::vector<u32> alphaTestFragSpirv;  // V79/OPA cutout discard frag (set below); empty otherwise
+    struct Prog { std::vector<u32> vert, frag; std::string name; bool fragTex=false; };
+    std::vector<Prog> allVariants;   // EVERY (vert,frag) pair per surface — per-material picks the right one
+    bool envShippedRendShad = false;
+
+    // The ENTIRE CPU-side load (format detect + scene parse + texture decode + shader extraction and
+    // selection). In interactive mode this runs on a WORKER thread while the main thread keeps the
+    // window alive and paints the loading progress — the old flow blocked here for the whole parse,
+    // which is exactly the "white screen" (no window, or a frozen unpainted one). Headless modes call
+    // it synchronously, unchanged.
+    auto loadSceneCPU = [&]() -> bool {
+    g_loadProgress.set("Reading APK...");
     // Companion env to render alongside (merged at the shared origin). Explicit via HSR_BACKDROP, or AUTO:
     // a "vista_" env is a BACKGROUND scenery for the haven2025 home, so auto-load haven2025 from the same
     // folder and render the home inside the vista (one command: just open the vista APK).
@@ -471,28 +568,28 @@ int main(int argc, char** argv) {
     }
     // Blender round-trip IMPORT: a plain .gltf/.glb (NOT a V79 .ovrscene) = a re-imported, Blender-edited project.
     // Load it into MeshData[] so the editor's HSL tools can tweak it further and re-cook to an APK.
-    static std::vector<MeshData> blenderMeshes;
-    bool isBlender = gltfimport::isPlainGltf(apkPath) && gltfimport::importEnv(apkPath, blenderMeshes);
-    bool isV79 = !isBlender && gltf.load(apkPath);
-    bool isOpa = false;
+    g_loadProgress.set("Parsing scene...");
+    isBlender = gltfimport::isPlainGltf(apkPath) && gltfimport::importEnv(apkPath, blenderMeshes);
+    isV79 = !isBlender && gltf.load(apkPath);
     if (isBlender) {
-        fprintf(stderr, "[MAIN] Imported Blender glTF project — %zu meshes (editable + re-cookable)\n", blenderMeshes.size());
+        fprintf(stderr, "[MAIN] Imported Blender glTF project - %zu meshes (editable + re-cookable)\n", blenderMeshes.size());
         sceneMeshes = &blenderMeshes;
     } else if (isV79) {
-        fprintf(stderr, "[MAIN] Detected V79 .gltf.ovrscene env — %zu mesh primitives\n", gltf.meshes.size());
+        fprintf(stderr, "[MAIN] Detected V79 .gltf.ovrscene env - %zu mesh primitives\n", gltf.meshes.size());
         sceneMeshes = &gltf.meshes;
     } else if ((isOpa = opa.load(apkPath))) {
         // V79 OLD OFFICIAL home: cooked .opa (faithful libshell reflection-format loader)
-        fprintf(stderr, "[MAIN] Detected V79 .opa official home — %zu renderable submeshes\n", opa.meshes.size());
+        fprintf(stderr, "[MAIN] Detected V79 .opa official home - %zu renderable submeshes\n", opa.meshes.size());
         sceneMeshes = &opa.meshes;
     } else {
         if (!loader.load(apkPath)) {
             fprintf(stderr, "\n[MAIN] FATAL: Scene load failed\n");
-            return 1;
+            return false;
         }
         // RENDER BOTH: merge the companion env (vista backdrop + haven2025 home) at the shared origin.
         if (!companionPath.empty()) {
-            static SceneLoader companion;
+            static SceneLoader companionStore; companionStore = SceneLoader{};   // fresh per load (in-place swaps re-enter here)
+            SceneLoader& companion = companionStore;
             companion.verbose = loader.verbose;
             fprintf(stderr, "[MAIN] Loading companion env: %s\n", companionPath.c_str());
             if (companion.load(companionPath)) {
@@ -511,6 +608,7 @@ int main(int argc, char** argv) {
     }
 
     // Extract shaders from the manifest (RENDSHAD entries)
+    g_loadProgress.set("Loading shaders...");
     std::vector<SpirvBlob> shaders;
     fprintf(stderr, "\n[MAIN] Searching for shaders in ASMH...\n");
 
@@ -567,7 +665,7 @@ int main(int argc, char** argv) {
     // AUTO-DETECT V203/HSL: if the env ships its OWN RENDSHAD (the SHAD per-material shaders), it's a
     // V203 home -> use the per-material path (perMat) by DEFAULT so the STOCK render (no flags) is
     // faithful. V79 sources ship no RENDSHAD and keep the built-in shader. (HSR_NOPERMAT forces off.)
-    bool envShippedRendShad = !shaders.empty();
+    envShippedRendShad = !shaders.empty();
 
     // The v200+ shared shaders (horizon_shared_shaders / renderer_module) are a SYSTEM
     // library — identical across every new env, NOT owned by any one env. When the input
@@ -599,14 +697,14 @@ int main(int argc, char** argv) {
         // pack; we use the self-contained built-in shader below. Only probe the external pack
         // when this is NOT a V79 source.
         for (auto& c : candidates) {
-            fprintf(stderr, "[MAIN] Input has no RENDSHAD — loading shaders from: %s\n", c.c_str());
+            fprintf(stderr, "[MAIN] Input has no RENDSHAD - loading shaders from: %s\n", c.c_str());
             loadShadersFromApk(c);
             if (!shaders.empty()) break;
         }
         if (shaders.empty()) {
             // ── Built-in self-contained shader (the V79 "both sides" path) ──────────────
             // Mirrors how V79 libshell renders old homes: its own shader, not the env's.
-            fprintf(stderr, "[MAIN] Using built-in self-contained shader (V79 path — like libshell's\n"
+            fprintf(stderr, "[MAIN] Using built-in self-contained shader (V79 path - like libshell's\n"
                             "       ModelLoader DynamicShaderPBR; no env-supplied RENDSHAD needed).\n");
             SpirvBlob bv; bv.stageType = 0; bv.srcName = "builtin://v79_universal";
             bv.code.assign(kUnivVertSpirv, kUnivVertSpirv + kUnivVertSize / sizeof(uint32_t));
@@ -649,10 +747,7 @@ int main(int argc, char** argv) {
     //   fragSpirv        = smallest fragment blob  (unlit.surface shader, ~2517 words)
     //   skinnedVertSpirv = largest vertex blob    (unlitblendskinned shader, ~3224 words)
     //   skinnedFragSpirv = largest fragment blob  (unlitblendskinned shader, ~7416 words)
-    static constexpr u32 SPIRV_MAGIC = 0x07230203u;
-    std::vector<u32> vertSpirv, fragSpirv, skinnedVertSpirv, skinnedFragSpirv;
-    std::string g_globalShaderPath;       // path of the chosen global shader (-> renderer matParams match)
-    std::vector<u32> alphaTestFragSpirv;  // V79/OPA cutout discard frag (set below); empty otherwise
+    g_loadProgress.set("Selecting shaders...");
 
     // Determine each blob's stage (0=vert, 4=frag) once.
     auto stageOf = [&](const SpirvBlob& s) -> u32 {
@@ -686,9 +781,7 @@ int main(int argc, char** argv) {
     // both stages in the SAME variant (matching descriptor + push-constant interfaces).
     // We then pick the variant with the LARGEST fragment — the fullest shading path
     // (the tiny fragments are depth/shadow prepass variants that output no color).
-    struct Prog { std::vector<u32> vert, frag; std::string name; bool fragTex=false; };
     std::vector<Prog> progs;
-    std::vector<Prog> allVariants;   // EVERY (vert,frag) pair per surface — per-material picks the right one
     {
         struct FileBlobs { std::vector<std::vector<u32>> verts, frags; };
         std::unordered_map<std::string, FileBlobs> byFile;
@@ -835,7 +928,7 @@ int main(int argc, char** argv) {
 
     if (vertSpirv.empty() || fragSpirv.empty()) {
         fprintf(stderr, "[MAIN] FATAL: No usable shader program found in APK\n");
-        return 1;
+        return false;
     }
     fprintf(stderr, "[MAIN] Selected VERTEX(unlit): %zu words  FRAGMENT(unlit): %zu words\n",
             vertSpirv.size(), fragSpirv.size());
@@ -844,28 +937,58 @@ int main(int argc, char** argv) {
                 skinnedVertSpirv.size(), skinnedFragSpirv.size());
 
     fprintf(stderr, "\n[MAIN] Scene: %zu meshes ready\n\n", sceneMeshes->size());
+    g_loadProgress.set("Starting renderer...");
+    return true;
+    };   // end loadSceneCPU
+
+    // Run the load: worker thread + live progress painting (interactive), else synchronous.
+    bool loadOk = false;
+    if (interactive) {
+        std::thread loadThread([&]{ loadOk = loadSceneCPU(); g_loadProgress.done.store(true); });
+#ifdef _WIN32
+        HWND splashHwnd = glfwGetWin32Window(g_window);
+#endif
+        while (!g_loadProgress.done.load()) {
+            glfwPollEvents();   // window stays responsive (move/resize/close) during the whole parse
+#ifdef _WIN32
+            paintLoadSplash(splashHwnd, envBaseName.c_str(), /*waitingForDrop=*/false);
+#endif
+            std::this_thread::sleep_for(std::chrono::milliseconds(33));
+        }
+        loadThread.join();
+        if (glfwWindowShouldClose(g_window)) { glfwDestroyWindow(g_window); glfwTerminate(); return 0; }
+    } else {
+        loadOk = loadSceneCPU();
+    }
+    if (!loadOk) {
+        fprintf(stderr, "\n[MAIN] FATAL: scene load failed for %s\n", apkPath.c_str());
+        return 1;
+    }
 
     // ── Step B: Init GLFW + Vulkan ─────────────────────────────
-    glfwSetErrorCallback(errorCb);
-    if (!glfwInit()) { fprintf(stderr, "GLFW init failed\n"); return 1; }
-    glfwDefaultWindowHints();   // reset any sticky hints from the pre-load drop window (GL/floating/resizable) before the real Vulkan window
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    // COOKING MODE (HSR_EXPORT) = console-only: hide the window so it doesn't pop a white "frozen" window with no
-    // feedback. The cook prints [GLTF]/[COOK]/[EXPORT] progress to the console; HSR_EXPORT_QUIT exits when done.
-    bool g_cookHeadless = std::getenv("HSR_EXPORT") != nullptr;
-    if (g_cookHeadless) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
-    // Always-on-top (GLFW_FLOATING) ONLY for capture modes (reliable external screenshots). The interactive editor
-    // defaults OFF — an always-on-top editor window is annoying — and exposes a runtime "Always on top" toggle.
-    else if (std::getenv("HSR_SHOT") || std::getenv("HSR_LIVE") || std::getenv("HSR_FLOATING")) glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
+    if (!glfwInit()) { fprintf(stderr, "GLFW init failed\n"); return 1; }   // no-op if already inited (interactive)
     // Title shows WHICH loader/format is active (V79 glTF / V79 OPA / HSL) + the env file name.
     std::string g_fmtName = isV79 ? "V79 glTF" : (isOpa ? "V79 OPA" : "HSL");
-    std::string g_baseName = apkPath; { size_t sl = g_baseName.find_last_of("/\\"); if (sl != std::string::npos) g_baseName = g_baseName.substr(sl + 1); }
-    std::string g_title = "HSR Renderer [Vulkan]  —  " + g_fmtName + "  —  " + g_baseName +
+    std::string g_baseName = envBaseName;
+    std::string g_title = "HSR Renderer [Vulkan]  -  " + g_fmtName + "  -  " + g_baseName +
                           "   |   WASD=move drag=look  Tab/N=next mesh B=prev  F=wire  Esc=quit";
-    g_window = glfwCreateWindow(g_winW, g_winH, g_title.c_str(), nullptr, nullptr);
-    if (!g_window) { fprintf(stderr, "Window creation failed\n"); glfwTerminate(); return 1; }
-    { GLFWimage icons[2]; std::vector<unsigned char> p48, p32; genEditorIcon(48,p48); genEditorIcon(32,p32);  // window/taskbar icon
-      icons[0]={48,48,p48.data()}; icons[1]={32,32,p32.data()}; glfwSetWindowIcon(g_window, 2, icons); }
+    if (!g_window) {   // headless/scripted modes create the window only now (after the synchronous load)
+        glfwDefaultWindowHints();
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        // COOKING MODE (HSR_EXPORT) = console-only: hide the window so it doesn't pop a white "frozen" window with no
+        // feedback. The cook prints [GLTF]/[COOK]/[EXPORT] progress to the console; HSR_EXPORT_QUIT exits when done.
+        bool g_cookHeadless = std::getenv("HSR_EXPORT") != nullptr;
+        if (g_cookHeadless) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+        // Always-on-top (GLFW_FLOATING) ONLY for capture modes (reliable external screenshots). The interactive editor
+        // defaults OFF — an always-on-top editor window is annoying — and exposes a runtime "Always on top" toggle.
+        else if (std::getenv("HSR_SHOT") || std::getenv("HSR_LIVE") || std::getenv("HSR_FLOATING")) glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
+        g_window = glfwCreateWindow(g_winW, g_winH, g_title.c_str(), nullptr, nullptr);
+        if (!g_window) { fprintf(stderr, "Window creation failed\n"); glfwTerminate(); return 1; }
+        { GLFWimage icons[2]; std::vector<unsigned char> p48, p32; genEditorIcon(48,p48); genEditorIcon(32,p32);  // window/taskbar icon
+          icons[0]={48,48,p48.data()}; icons[1]={32,32,p32.data()}; glfwSetWindowIcon(g_window, 2, icons); }
+    } else {
+        glfwSetWindowTitle(g_window, g_title.c_str());
+    }
 
     glfwSetKeyCallback(g_window, keyCb);
     glfwSetMouseButtonCallback(g_window, mouseBtnCb);
@@ -981,12 +1104,20 @@ int main(int argc, char** argv) {
     int minMesh = 0, maxMesh = (int)sceneMeshes->size();
     if (const char* e = std::getenv("HSR_MINMESH")) minMesh = atoi(e);
     if (const char* e = std::getenv("HSR_MAXMESH")) maxMesh = atoi(e);
-    for (int mi = 0; mi < (int)sceneMeshes->size(); ++mi) {
-        if (mi < minMesh || mi >= maxMesh) continue;
-        vkRenderer.uploadMesh((*sceneMeshes)[mi]);
+    // PROGRESSIVE upload (interactive): meshes are streamed to the GPU a time-slice per frame INSIDE the
+    // render loop, so the window/UI are live immediately and the scene pops in as it uploads (with a
+    // loading bar). Headless/scripted modes keep the blocking upload (captures expect the full scene).
+    int uploadNext = 0;
+    const int uploadEnd = (int)sceneMeshes->size();
+    if (!interactive) {
+        for (int mi = 0; mi < (int)sceneMeshes->size(); ++mi) {
+            if (mi < minMesh || mi >= maxMesh) continue;
+            vkRenderer.uploadMesh((*sceneMeshes)[mi]);
+        }
+        uploadNext = uploadEnd;
+        fprintf(stderr, "[MAIN] GPU upload complete: %zu meshes\n\n",
+                vkRenderer.gpuMeshes.size());
     }
-    fprintf(stderr, "[MAIN] GPU upload complete: %zu meshes\n\n",
-            vkRenderer.gpuMeshes.size());
 
     // [DEBUG] HSR_TESTMOVE=<dx>: shift every mesh's model translation by +dx in X. If the scene
     // visibly moves, the worldFromModel push constant is live; if not, the shader ignores it.
@@ -997,7 +1128,7 @@ int main(int argc, char** argv) {
     }
 
     // ── Step D: Main loop ──────────────────────────────────────
-    fprintf(stderr, "[MAIN] Render loop started — Esc to quit\n\n");
+    fprintf(stderr, "[MAIN] Render loop started - Esc to quit\n\n");
     auto lastTime = std::chrono::high_resolution_clock::now();
     int frames = 0;
     auto fpsTime = lastTime;
@@ -1073,7 +1204,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
         int port = atoi(liveEnv); if (port <= 1) port = 8777;
         std::thread(hsrHttpServer, port).detach();
-        fprintf(stderr, "[LIVE] ready — HTTP control on :%d (curl --data 'cam=..\\nshot=path' 127.0.0.1:%d)\n", port, port);
+        fprintf(stderr, "[LIVE] ready - HTTP control on :%d (curl --data 'cam=..\\nshot=path' 127.0.0.1:%d)\n", port, port);
 #endif
     }
     auto animStart = std::chrono::high_resolution_clock::now();
@@ -1145,6 +1276,7 @@ int main(int argc, char** argv) {
     g_editor = &editor;            // expose to the GLFW input callbacks
     editor.r = &vkRenderer;             // bind the renderer up-front so Export works even when the UI is skipped (HSR_NOUI)
     editor.sceneMeshes = sceneMeshes;   // CPU geometry/textures for the "Export APK" cooker (parallel to gpuMeshes)
+    editor.sourceEnvPath = sourceEnvPath;   // "Back to source" target for the in-place cook-preview swap
     editor.setEnvAudio(ogg);            // the env's background loop -> cooked as an auto-start FMOD SoundAsset (editor can REPLACE/ADD/export it)
     // (editor.audio binds in editor.init — BEFORE loadProject, so a session AUDIOOVR restarts the preview;
     //  in headless (HSR_NOUI) it stays null, so a session AUDIOOVR swaps the cook bytes WITHOUT starting playback)
@@ -1248,6 +1380,11 @@ int main(int argc, char** argv) {
             // 2x2 + |avgDelta|<=0.04/frame). HSR_NOUVSCROLLFAST forces the old replay path.
             {
                 auto uit = g_opaUv.find((size_t)meshIdx);
+                // PURE CONTINUOUS SCROLL (waterfall/foam/stream): smooth getTime `uv += rate*time`. EXCLUDE nodes that
+                // rotate/scale their GEOMETRY — the aurora's mesh is a WARPED surface that ROTATES ABOUT ITSELF (the
+                // node rotation), and that geometry rotation BENDS the texture = the animated look (user). That is a
+                // GEOMETRY animation (faithful per-frame node rotation via RIGID-HZANIM below), NOT a UV scroll/warp; a
+                // smooth uv-scroll here would wrongly make it "slide/move" instead of the mesh rotating about itself.
                 if (uit != g_opaUv.end() && !std::getenv("HSR_NOUVSCROLLFAST") && !opa.nodeAnimatesRotOrScale((int)meshIdx)) {
                     std::vector<float> fa; float floop=0.f;
                     bool hasFade = opa.cookExtractTintAlpha((int)meshIdx, fa, floop) && fa.size()>=2;
@@ -1256,7 +1393,7 @@ int main(int argc, char** argv) {
                         float md=0.f; for (float v : tof) { float a=std::fabs(v); if(a>md)md=a; } hasTrans = md > 1.f; }
                     if (!hasFade && !hasTrans) {
                         em.uvScroll=true; em.uvRate[0]=uit->second.first; em.uvRate[1]=uit->second.second;
-                        em.flipbook=false; em.rotAnim=false; em.transAnim=false; em.fadeAnim=false;
+                        em.flipbook=false; em.transAnim=false; em.fadeAnim=false; em.rotAnim=false;
                         em.vatOffsets.clear(); em.vatFrames=0; em.hzJointCount=0; em.hzFrames=0;
                         if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] m%d UV-SCROLL(smooth) rate=(%.4f,%.4f)/s -> no snap/borders\n", meshIdx, em.uvRate[0], em.uvRate[1]);
                         return;
@@ -1271,6 +1408,40 @@ int main(int argc, char** argv) {
             // (train STEAM ~162u), layer a TRANSLATE under it; small ambient drift stays static (looked wrong as getTime).
             { std::vector<float> mats; int mN=0; float mLoop=0.f;
               if (opa.cookExtractUVMatrices((int)meshIdx, 256, mats, mN, mLoop)) {
+                  // AURORA (pure-ROTATION card: node rotates, does NOT translate) -> ROTREPLAY getTime VERTEX angle-replay,
+                  // routed HERE and UNGATED (a shader, NOT skeletal — must NOT depend on the animate-skinned/HSR_HZANIM
+                  // toggle; else animSkinned=OFF cooks fall to the choppy FLIPBOOK-UVMATRIX texture-scroll = "rotating
+                  // texture + choppy", the persistent Quest bug). Faithful non-uniform rotation, smooth, no animator LOD.
+                  if (!std::getenv("HSR_NOROTREPLAY") && opa.nodeAnimatesRotOrScale((int)meshIdx)) {
+                      std::vector<float> tck; float tl3=0.f; bool moves=false;
+                      if (opa.cookExtractNodeTranslateFrames((int)meshIdx,24,tck,tl3)){ float mm=0.f; for(float v:tck){float a=std::fabs(v);if(a>mm)mm=a;} moves=mm>1.f; }
+                      if (!moves) {
+                          // AURORA = EXACTLY what OPA's animate() does: the node ROTATES the dome geometry (verified by the vertex
+                          // test — v0 sweeps ~360°/loop about world-Y) AND the mat.sanim UVTransform COUNTER-SCROLLS the texture the
+                          // matching amount, so the TEXTURE stays WORLD-STILL while the mesh spins under it (the curved dome bends the
+                          // still texture). BOTH channels are required and CANCEL: geometry rotation alone locks the texture to the
+                          // mesh so it spins (wrong); scroll alone slides the texture (wrong). Cook BOTH (natural directions, so they
+                          // cancel like OPA): ROTREPLAY(vertex) + UVSCROLL(frag) via the cook's useRot chain.
+                          int RN=128; if(const char*e=std::getenv("HSR_ROTKEYS")){int c=atoi(e);if(c>=8)RN=c;}
+                          float pivot[3]; std::vector<float> quats; float loopSec=0.f;
+                          if (opa.cookExtractRotationReplay((int)meshIdx,RN,pivot,quats,loopSec) && (int)quats.size()==(RN+1)*4) {
+                              em.rotReplay=true; em.rotReplayN=RN; em.rotLoopSec=loopSec; em.rotQuats=std::move(quats);
+                              em.rotPivot[0]=pivot[0]; em.rotPivot[1]=pivot[1]; em.rotPivot[2]=pivot[2];
+                              em.rotAnim=true; em.flipbook=false; em.fadeAnim=false;
+                              em.hzJointCount=0; em.hzFrames=0; em.vatOffsets.clear(); em.vatFrames=0;
+                              // the UV counter-scroll (raw-matrix rate = what OPA replays) — makes the texture world-still
+                              em.uvScroll=false; em.uvRate[0]=em.uvRate[1]=0.f;
+                              if (mN>=2 && mLoop>1e-3f && (int)mats.size()>=mN*6) {
+                                  const float* a=&mats[0]; const float* b=&mats[(size_t)(mN-1)*6];
+                                  if (std::fabs(a[0]-1)<1e-3f&&std::fabs(a[4]-1)<1e-3f&&std::fabs(a[1])<1e-3f&&std::fabs(a[3])<1e-3f) {
+                                      float span=mLoop*(float)(mN-1)/(float)mN;
+                                      float ru=span>1e-4f?(b[2]-a[2])/span:0.f, rv=span>1e-4f?(b[5]-a[5])/span:0.f;
+                                      if (ru!=0.f||rv!=0.f){ em.uvScroll=true; em.uvRate[0]=ru; em.uvRate[1]=rv; } } }
+                              if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] m%d AURORA ROTREPLAY+UVSCROLL %d keys loop=%.1fs scroll=(%.4f,%.4f) (geometry spins, texture world-still)\n", meshIdx, RN, loopSec, em.uvRate[0],em.uvRate[1]);
+                              return;
+                          }
+                      }
+                  }
                   em.blend=true; em.flipbook=true; em.flipOffset=true; em.uvScroll=false;
                   em.flipUVMats=std::move(mats); em.flipN=mN; em.flipLoop=mLoop;
                   em.flipCols=1; em.flipRows=1; em.flipFrames=mN; em.flipFps=30.f;
@@ -1290,14 +1461,17 @@ int main(int argc, char** argv) {
                   // T+R+S + UV + fade ALL cook together, synced (device: skeleton on the animator clock, UV/fade on the
                   // shader clock — both real-time). HSR_FLIPNOHZ forces the old translate-only path.
                   if (!std::getenv("HSR_FLIPNOHZ") && std::getenv("HSR_HZANIM") && opa.nodeAnimatesRotOrScale((int)meshIdx)) {   // gate on HSR_HZANIM (matches the cook's useHz); else keep the getTime path (no regression)
-                      auto rg = opa.extractNodeRigidHzAnim((int)meshIdx);
+                      // (Pure-ROTATION cards e.g. the aurora already returned above via the ungated ROTREPLAY quaternion path.)
+                      // This block is now only reached by TRANSLATE/SCALE effect cards (fog/dust): RIGID-HZANIM replays the
+                      // exact per-frame T+R+S via a 2-joint skeleton AND keeps the UV flipbook + fade.
+                      auto rg = opa.extractNodeRigidHzAnim((int)meshIdx, /*allowPureRotation=*/true);   // fog/dust (translate+R+S): RIGID replays exact T+R+S + keeps UV/fade
                       if (rg.ok()) {
                           em.hzJointPos=std::move(rg.jointPos); em.hzJointQuat=std::move(rg.jointQuat); em.hzJointScale=std::move(rg.jointScale);
                           em.hzParents=std::move(rg.parents); em.hzBoneIdx=std::move(rg.boneIdx); em.hzBoneWgt=std::move(rg.boneWgt);
                           em.hzTrsLocal=std::move(rg.trsLocal); em.hzRestPos=std::move(rg.restPos);
                           em.hzJointCount=rg.jointCount; em.hzFrames=rg.frameCount; em.hzFps=rg.fps;
                           em.transAnim=false;   // motion is in the skeleton; flipbook+fade ride the skinned material shader
-                          return;   // em keeps flipbook + fade -> cook applies them to the SKINNED shader (useHz + m.flipbook)
+                          return;
                       }
                   }
                   // Pure-translate card (or rigid extraction failed): the lighter getTime TRANSLATE + flipbook + fade path.
@@ -1421,8 +1595,12 @@ int main(int argc, char** argv) {
     }
     if (!std::getenv("HSR_NOUI")) {  // HSR_NOUI = clean capture without the editor overlay
         editor.init(&vkRenderer, g_window, &g_audio, &g_animOverride, &g_animScrub, animDur);
-        editor.projectPath = apkPath;   // session saves/loads to <env>.hsledit
-        editor.loadProject();           // auto-restore a prior session (transforms/renames/items) if one exists
+        if (uploadNext >= uploadEnd) {   // blocking-upload path: session restore right away (as before)
+            editor.projectPath = apkPath;   // session saves/loads to <env>.hsledit
+            editor.loadProject();           // auto-restore a prior session (transforms/renames/items) if one exists
+        }
+        // progressive path: projectPath/loadProject happen when the LAST mesh lands (the session applies
+        // per-mesh transforms by gpuMeshes index, so every index must exist first) — see the render loop.
     }
 
     // One-shot headless re-cook: HSR_EXPORT exports the loaded (optionally edited) scene to an APK then,
@@ -1695,6 +1873,25 @@ int main(int argc, char** argv) {
                     else if (strncmp(ln, "solomat=", 8) == 0)     vkRenderer.soloMat = ln + 8;
                     else if (strncmp(ln, "wire=", 5) == 0)        vkRenderer.wireframe = atoi(ln + 5) != 0;
                     else if (strncmp(ln, "clear", 5) == 0)      { vkRenderer.hideMesh = -1; vkRenderer.soloMesh = -1; vkRenderer.hideMat.clear(); vkRenderer.soloMat.clear(); vkRenderer.wireframe = false; }
+                    // ── editor-feature parity (drive + VERIFY the same ops the UI has, via the MCP bridge) ──
+                    else if (strncmp(ln, "dup=", 4) == 0)       { if (g_editor && g_editor->ready) { g_editor->selectOne(atoi(ln+4)); g_editor->duplicateSelected(); out += "dup ok, now " + std::to_string(vkRenderer.gpuMeshes.size()) + " meshes\n"; } }
+                    else if (strncmp(ln, "del=", 4) == 0)       { if (g_editor && g_editor->ready) { g_editor->selectOne(atoi(ln+4)); g_editor->toggleDeleteSelected(); out += "del toggled\n"; } }
+                    else if (strncmp(ln, "settex=", 7) == 0)    { // settex=<idx>,<imagePath>
+                        const char* c = strchr(ln+7, ','); if (c && g_editor && g_editor->ready) { bool ok=g_editor->setMeshTexture(atoi(ln+7), std::string(c+1)); out += ok?"settex ok\n":"settex FAILED\n"; } }
+                    else if (strncmp(ln, "tint=", 5) == 0)      { // tint=<idx>,r,g,b,a  (per-mesh material tint, live)
+                        int mi; float tr,tg,tb,ta;
+                        if (sscanf(ln+5, "%d,%f,%f,%f,%f", &mi,&tr,&tg,&tb,&ta)==5 && mi>=0 && mi<(int)vkRenderer.gpuMeshes.size()) {
+                            auto& gm=vkRenderer.gpuMeshes[mi]; gm.editTint[0]=tr; gm.editTint[1]=tg; gm.editTint[2]=tb; gm.editTint[3]=ta;
+                            if (g_editor) g_editor->matEdited.insert(mi); out += "tint ok\n"; } }
+                    else if (strncmp(ln, "light=", 6) == 0)     { // light=r,g,b,a  (GLOBAL light manipulation, live)
+                        float lr,lg,lb,la; if (sscanf(ln+6, "%f,%f,%f,%f", &lr,&lg,&lb,&la)==4) {
+                            vkRenderer.lightMul[0]=lr; vkRenderer.lightMul[1]=lg; vkRenderer.lightMul[2]=lb; vkRenderer.lightMul[3]=la; out += "light ok\n"; } }
+                    else if (strncmp(ln, "matflag=", 8) == 0)   { // matflag=<idx>,<blend>,<additive>,<alphaTest>,<cullBack>
+                        int mi,fb,fa,ft,fc;
+                        if (sscanf(ln+8, "%d,%d,%d,%d,%d", &mi,&fb,&fa,&ft,&fc)==5 && mi>=0 && mi<(int)vkRenderer.gpuMeshes.size()) {
+                            auto& gm=vkRenderer.gpuMeshes[mi]; gm.useBlend=fb!=0; gm.additive=fa!=0; gm.alphaTest=ft!=0; gm.cullBack=fc!=0;
+                            if (sceneMeshes && mi<(int)sceneMeshes->size()) { auto& md=(*sceneMeshes)[mi]; md.useBlend=gm.useBlend; md.additive=gm.additive; md.alphaTest=gm.alphaTest; md.doubleSided=!gm.cullBack; }
+                            if (g_editor) g_editor->matEdited.insert(mi); out += "matflag ok\n"; } }
                     else if (strncmp(ln, "listmesh=", 9) == 0) {
                         const char* sub = ln + 9; size_t N = sceneMeshes->size();
                         snprintf(tmp,sizeof tmp,"[LISTMESH] '%s':\n",sub); out += tmp;
@@ -1742,7 +1939,10 @@ int main(int argc, char** argv) {
 
         // V79 glTF skeletal animation: sample the clip and stream skinned positions into
         // each dynamic mesh's persistently-mapped VBO (vertex position is at offset 0).
-        if (isV79 && gltf.hasAnimation()) {
+        // GATED on upload completion: animate() rewrites md.positions, and uploadMesh reads
+        // md.positions — animating mid-stream would bake NOT-YET-UPLOADED meshes at a mid-anim
+        // pose (and looks wrong: things moving while the scene is still popping in).
+        if (isV79 && gltf.hasAnimation() && uploadNext >= uploadEnd) {
             float at = g_animOverride ? g_animScrub : ((fixedAnimTime >= 0.f) ? fixedAnimTime : std::chrono::duration<float>(now - animStart).count());
             gltf.animate(at);
             for (size_t i = 0; i < gltf.meshes.size() && i < vkRenderer.gpuMeshes.size(); ++i) {
@@ -1771,7 +1971,8 @@ int main(int argc, char** argv) {
 
         // V79 .opa node animation (sanim): the looping ui_ring / wire motion. Same dynamic-
         // vertex streaming path — animate() rewrites world positions, we push them to the VBO.
-        if (isOpa && opa.hasAnimation()) {
+        // GATED on upload completion (same reason as the glTF block above).
+        if (isOpa && opa.hasAnimation() && uploadNext >= uploadEnd) {
             float at = g_animOverride ? g_animScrub : ((fixedAnimTime >= 0.f) ? fixedAnimTime : std::chrono::duration<float>(now - animStart).count());
             opa.animate(at);
             for (size_t i = 0; i < opa.meshes.size() && i < vkRenderer.gpuMeshes.size(); ++i) {
@@ -1856,22 +2057,52 @@ int main(int argc, char** argv) {
         if (glfwGetKey(g_window, GLFW_KEY_Q) == GLFW_PRESS) cam.moveDown(dt);
         }
 
+        // PROGRESSIVE GPU UPLOAD: stream a ~20ms time-slice of meshes to the GPU each frame. The window +
+        // editor UI render normally in between, so the scene visibly pops in mesh-by-mesh with a loading
+        // bar instead of a white frozen window (the old flow blocked here for the entire upload).
+        if (uploadNext < uploadEnd) {
+            auto ut0 = std::chrono::high_resolution_clock::now();
+            do {
+                if (uploadNext >= minMesh && uploadNext < maxMesh)
+                    vkRenderer.uploadMesh((*sceneMeshes)[uploadNext]);
+                ++uploadNext;
+            } while (uploadNext < uploadEnd &&
+                     std::chrono::duration<float, std::milli>(std::chrono::high_resolution_clock::now() - ut0).count() < 20.f);
+            editor.uploadCur = uploadNext; editor.uploadTotal = uploadEnd;   // editor draws the loading bar
+            vkRenderer.farFitDone = false;   // re-fit the far plane to what has arrived so far
+            if (uploadNext >= uploadEnd) {
+                editor.uploadCur = editor.uploadTotal = 0;   // done -> hide the loading bar
+                fprintf(stderr, "[MAIN] GPU upload complete: %zu meshes\n\n", vkRenderer.gpuMeshes.size());
+                animStart = std::chrono::high_resolution_clock::now();   // animations START now (frozen during load)
+                // Session restore now that every gpuMeshes index exists (it applies per-mesh transforms by index).
+                if (!std::getenv("HSR_NOUI")) { editor.projectPath = apkPath; editor.loadProject(); }
+            }
+        }
+
         // Tie the cooked getTime() shader anims (rot/osc/wispscale/flipbook/VAT) + procedural motes/prism to the EDITOR
         // TIMELINE so pause/scrub/loop control EVERY animation (they were free-running on wall-clock = ignored the
         // timeline). g_animOverride is true while the editor drives the playhead; HSR_ANIMTIME freezes; else (pure
-        // headless) <0 keeps the renderer's own wall-clock.
-        vkRenderer.extAnimTime = g_animOverride ? g_animScrub
+        // headless) <0 keeps the renderer's own wall-clock. FROZEN at t=0 while meshes are still uploading.
+        vkRenderer.extAnimTime = (uploadNext < uploadEnd) ? 0.f
+                               : g_animOverride ? g_animScrub
                                : ((fixedAnimTime >= 0.f) ? fixedAnimTime : -1.f);
         vkRenderer.render();
         glfwPollEvents();
         // (pick + the gizmo are handled immediately in editor.onMouseButton, using the viewport pane rect)
 
-        // Drag-and-drop reload: an .apk was dropped -> relaunch on it (inherits HSR_* params) and exit.
+        // Drag-and-drop reload: swap the env IN PLACE (same window/process - no relaunch, no focus steal).
+        // Headless/scripted modes keep the old relaunch behavior.
         if (g_doReload) {
+            if (interactive) { nextEnv = g_dropPath; g_doReload = false; g_dropPath.clear(); break; }
 #ifdef _WIN32
             relaunchSelf(g_dropPath);
 #endif
             break;
+        }
+        // Editor-driven swap (Cook panel: "Preview cooked (HSL)" / "Back to source") - same in-place reload.
+        if (!editor.swapTo.empty()) {
+            if (interactive) { nextEnv = editor.swapTo; editor.swapTo.clear(); break; }
+            editor.swapTo.clear();
         }
 
         totalFrames++;
@@ -1910,10 +2141,21 @@ int main(int argc, char** argv) {
     }
 
     // Cleanup
-    fprintf(stderr, "\n[MAIN] Shutting down...\n");
+    fprintf(stderr, "\n[MAIN] Shutting down%s...\n", nextEnv.empty() ? "" : " (in-place env swap)");
     if (!std::getenv("HSR_NOUI")) editor.shutdown();
     vkRenderer.cleanup();
+    if (!nextEnv.empty() && interactive) {
+        // IN-PLACE SWAP: same window, fresh renderer/editor/scene on the new env. The GDI loading
+        // splash takes over the window again while the new env parses on the worker thread.
+        apkPath = nextEnv;
+        envBaseName = apkPath;
+        { size_t sl = envBaseName.find_last_of("/\\"); if (sl != std::string::npos) envBaseName = envBaseName.substr(sl + 1); }
+        glfwSetWindowTitle(g_window, ("HSR Renderer - loading " + envBaseName + " ...").c_str());
+        fprintf(stderr, "[MAIN] IN-PLACE ENV SWAP -> %s\n\n", apkPath.c_str());
+        continue;
+    }
     glfwDestroyWindow(g_window);
     glfwTerminate();
     return 0;
+    }   // end IN-PLACE ENV RELOAD LOOP
 }

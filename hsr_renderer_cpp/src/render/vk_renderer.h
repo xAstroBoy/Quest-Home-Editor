@@ -58,6 +58,8 @@ struct VkGpuMesh {
     VkImage texImage = VK_NULL_HANDLE;
     VkDeviceMemory texMem = VK_NULL_HANDLE;
     VkImageView texView = VK_NULL_HANDLE;
+    bool texShared = false;   // base texture handles are owned by the dedup texCache (don't free per-mesh)
+    float editTint[4] = {1.f, 1.f, 1.f, 1.f};   // editor per-mesh material tint (live, persisted in the session)
     VkBuffer globalUbo = VK_NULL_HANDLE;       // set0 bind0: GlobalUniforms 736B
     VkDeviceMemory globalUboMem = VK_NULL_HANDLE;
     // Scene fog (nuxd SceneSettings: distanceFog=[0,19], heightFog=[0,1500], fogColor=[0,0,0,0]).
@@ -259,6 +261,9 @@ public:
     VkSampler shadowSampler = VK_NULL_HANDLE;
     // Neutral ambient radiance used for synthesized IBL + lightprobe SH (warm white).
     // The shell normally provides this from the room; we approximate a bright interior.
+    // GLOBAL light manipulation (editor "Lighting" panel): multiplies every draw's color push-constant
+    // (rgb = light color/brightness, a = global opacity). Live — no re-upload needed. {1,1,1,1} = faithful.
+    float lightMul[4] = {1.f, 1.f, 1.f, 1.f};
     float ambientRGB[3] = {0.95f, 0.90f, 0.83f};   // synth default (used when the env has NO real lightprobes)
     bool  hasEnvAmbient = false;                    // set by main when the env's REAL ambient was parsed from its
                                                     // LightprobesPlatformComponent .lprb (field2 L00/3.5449). When true,
@@ -851,18 +856,41 @@ public:
         // 2900x866 flame strip aliases into harsh wisps as a raw ASTC upload with no mips). Small ASTC
         // atlases keep the compressed fast path.
         bool wantMip = !md.texRGBA.empty() && (md.texW >= 1024 || md.texH >= 1024);
-        if (astcLdrSupported && !md.astcRaw.empty() && !wantMip) {
-            texFmt = astcVkFormat(md.astcBw, md.astcBh);
-            createTextureImageRaw(md.astcRaw.data(), (u32)md.astcRaw.size(),
-                                  md.texW, md.texH, texFmt, gm.texImage, gm.texMem);
-        } else if (md.useBlend) {
-            // BLEND texture: alpha-weighted mips so transparent "garbage" RGB (e.g. dust's white α=0
-            // texels) can't bleed a bright halo onto the card silhouette at minified/grazing edges.
-            createTextureImageAW(md.texRGBA.data(), md.texW, md.texH, gm.texImage, gm.texMem);
-        } else {
-            createTextureImage(md.texRGBA.data(), md.texW, md.texH, gm.texImage, gm.texMem);
+        // ── BASE-TEXTURE DEDUP ─────────────────────────────────────────────────────────────────────
+        // Many envs reference ONE decoded sheet from dozens/hundreds of submeshes (storybook: ~60
+        // River_MAT submeshes each carrying the same 4096x4096 RGBA). Uploading a fresh mipmapped
+        // VkImage per submesh exhausted VRAM mid-upload -> VK_ERROR_DEVICE_LOST -> permanent white/
+        // black window (THE storybook white-screen). Key = content hash of the exact bytes uploaded;
+        // identical textures share one VkImage/view (cache owns the handles; freed in cleanup()).
+        {
+            bool astcPath = astcLdrSupported && !md.astcRaw.empty() && !wantMip;
+            const u8* hd; size_t hn; u32 hmode;
+            if (astcPath)         { hd = md.astcRaw.data(); hn = md.astcRaw.size(); hmode = 2u | ((u32)md.astcBw<<8) | ((u32)md.astcBh<<16); }
+            else if (md.useBlend) { hd = md.texRGBA.data(); hn = md.texRGBA.size(); hmode = 1u; }
+            else                  { hd = md.texRGBA.data(); hn = md.texRGBA.size(); hmode = 0u; }
+            unsigned long long tk = texHash(hd, hn, md.texW, md.texH, hmode);
+            auto tit = texCache.find(tk);
+            if (tit != texCache.end()) {
+                gm.texImage = tit->second.image; gm.texMem = tit->second.mem; gm.texView = tit->second.view;
+                texFmt = tit->second.fmt; lastTexMip = tit->second.mip;
+                gm.texShared = true;
+            } else {
+                if (astcPath) {
+                    texFmt = astcVkFormat(md.astcBw, md.astcBh);
+                    createTextureImageRaw(md.astcRaw.data(), (u32)md.astcRaw.size(),
+                                          md.texW, md.texH, texFmt, gm.texImage, gm.texMem);
+                } else if (md.useBlend) {
+                    // BLEND texture: alpha-weighted mips so transparent "garbage" RGB (e.g. dust's white α=0
+                    // texels) can't bleed a bright halo onto the card silhouette at minified/grazing edges.
+                    createTextureImageAW(md.texRGBA.data(), md.texW, md.texH, gm.texImage, gm.texMem);
+                } else {
+                    createTextureImage(md.texRGBA.data(), md.texW, md.texH, gm.texImage, gm.texMem);
+                }
+                gm.texView = createImageView(gm.texImage, texFmt, lastTexMip);
+                texCache[tk] = { gm.texImage, gm.texMem, gm.texView, lastTexMip, texFmt };
+                gm.texShared = true;   // the CACHE owns these handles (cleanup frees the cache, not the mesh)
+            }
         }
-        gm.texView = createImageView(gm.texImage, texFmt, lastTexMip);
 
         // Per-material role textures (linear for normal/ORM, sRGB for lightmap). Bound to
         // the shader's named texture slots below. Fallbacks: flat-normal / white.
@@ -1418,12 +1446,19 @@ public:
           // (renders OPAQUE, ignores texture alpha) + a HAS_ALPHACUTOFF variant that `discard`s alpha<AlphaCutoff. The
           // V79 source flags are IDENTICAL for cliff/mountains AND fog/leaves (all Transparent:true,AlphaTest:false), so
           // the device/cooker picks the variant by the TEXTURE's opaque fraction (decoded from the real ASTC):
-          //   cliff/mountains/trunk = 47-100% opaque, <3% mid  -> MAKEOPAQUE cutout (opaque pass + discard silhouette +
-          //                                                        DEPTH-WRITE) = SOLID & occludes. (was rendering see-
-          //                                                        through in the no-depth-write blend pass = the bug.)
-          //   leaves 22% / fog,smoke,waterfall ~0% opaque, lots of soft/mid alpha -> alpha BLEND (soft, no depth-write).
-          // Clean separation at opaque>~35% (terrain min 47% vs foliage max 22%). Routes to the alpha-test (opaque+
-          // discard, depth-write) pipeline. EXEMPT additive/overlay/computesAlpha FX.
+          // The V79 discriminator is the ALPHA SHAPE, not the opaque FRACTION: libshell has a dedicated
+          // MeshShellEnvMaskDepthWrite / EnvDepthWriteMaskMaterial (a depth-write-mask pass) + HAS_ALPHACUTOFF
+          // (`if(color.a<AlphaCutoff) discard;`). A HARD-EDGED / BIMODAL texture (pixels ~all opaque or fully
+          // transparent, negligible mid-alpha gradient) survives the alpha-cutoff as a SOLID silhouette that
+          // WRITES DEPTH and occludes; a SOFT-gradient texture (fog/smoke/waterfall/glow: lots of mid alpha) is
+          // mostly discarded/soft -> stays a no-depth-write alpha BLEND. So split on BIMODALITY (midF ~ 0), which
+          // is INDEPENDENT of how sparse the silhouette is:
+          //   cliff/mountains/trunk (47-100% opaque, midF~0), vista/train/tree CARDS (opaque 1-51%, midF=0.00-0.01)
+          //     -> MAKEOPAQUE cutout (opaque pass + discard silhouette + DEPTH-WRITE) = SOLID & occludes. The OLD
+          //        opaque>35% rule missed the sparse tree/vista/train cards (opF 1-5%) -> they stayed no-depth-write
+          //        blend -> saw-through (user: trees/train "no depth", elements behind show through the card).
+          //   fog/smoke/waterfall (opF~0) + soft glow/ice/leaves (midF>=0.13) -> alpha BLEND (soft, no depth-write).
+          // EXEMPT additive/overlay/computesAlpha FX. Mirrors the cook's bimodal cutout (hsl_cooker.h).
           // GUARD: only the OPA/V79 built-in path (alphaTestFragSpirv = the discard frag) can actually CUT OUT the
           // silhouette. The COOKED-env path draws per-material programs whose alpha-test pipeline does NOT discard
           // (p.pipeAlphaTest = p.pipe), so flipping a cooked unlitblend mountain card to alphaTest there left it OPAQUE
@@ -1431,7 +1466,7 @@ public:
           // cook already ships these as unlitblend (md flags) -> in HSL preview keep them BLEND. So require the discard frag.
           if (!alphaTestFragSpirv.empty() && gm.progIdx < 0
               && gm.useBlend && !gm.alphaTest && !gm.additive && !gm.overlayKind && !computesAlpha && taN>0
-              && (float)taOpq/(float)taN > 0.35f && (float)taMid/(float)taN < 0.10f) {
+              && (float)taMid/(float)taN < 0.05f && (float)taOpq/(float)taN > 0.004f) {   // BIMODAL (hard-edged) + has real opaque content
               gm.alphaTest = true; gm.useBlend = false;   // MAKEOPAQUE cutout: SOLID scenery depth-writes + discards its silhouette (OPA preview only)
           }
           log("  GPU mesh uploaded: [%zu] '%s' nVerts=%u nIdx=%u tex=%ux%u mdBlend=%d gmBlend=%d aTest=%d add=%d skinned=%d stride=%u uvOff=%u texA[%d/%.0f/%d] worldC=(%.2f,%.2f,%.2f)",
@@ -1459,6 +1494,7 @@ public:
         if (md.useBlend) createTextureImageAW(md.texRGBA.data(), md.texW, md.texH, gm.texImage, gm.texMem);
         else             createTextureImage(md.texRGBA.data(), md.texW, md.texH, gm.texImage, gm.texMem);
         gm.texView = createImageView(gm.texImage, VK_FORMAT_R8G8B8A8_SRGB, lastTexMip);
+        gm.texShared = false;   // the replacement is UNIQUE to this mesh (not in the dedup cache) -> per-mesh free
         // Re-point the base-color slot at the new view. The old image is ORPHANED (not freed), so even if a shader
         // binds base at a different slot than s2base this never dereferences freed memory (no crash) — worst case the
         // live preview keeps the old texture, but the COOK always ships the new md.texRGBA.
@@ -1470,6 +1506,39 @@ public:
         if (gm.descSet2)     { w.dstSet = gm.descSet2;     vkUpdateDescriptorSets(device, 1, &w, 0, nullptr); }
         if (gm.descSet2Skin) { w.dstSet = gm.descSet2Skin; vkUpdateDescriptorSets(device, 1, &w, 0, nullptr); }
         return true;
+    }
+
+    // ── LIVE SHADER HOT-RELOAD (in-editor decompile -> edit GLSL -> compile -> APPLY) ─────────────────────────
+    // Swap the SPIR-V of the mesh's ACTIVE shader and rebuild its pipelines in place. Per-material programs
+    // rebuild their own pipeline set (the edited GLSL must keep the same descriptor bindings — Vulkan treats
+    // structurally identical set layouts as compatible, so live descriptor sets keep working); the global /
+    // builtin path (V79/OPA envs) rebuilds every global pipeline, affecting all builtin-shaded meshes.
+    bool reloadShaderFor(int meshIdx, const std::vector<u32>& vs, const std::vector<u32>& fs) {
+        if (vs.size() < 5 || fs.size() < 5) return false;
+        if (meshIdx < 0 || meshIdx >= (int)gpuMeshes.size()) return false;
+        vkDeviceWaitIdle(device);
+        auto D = [&](VkPipeline& pp){ if (pp) { vkDestroyPipeline(device, pp, nullptr); pp = VK_NULL_HANDLE; } };
+        int pi = gpuMeshes[meshIdx].progIdx;
+        if (pi >= 0 && pi < (int)programs.size()) {
+            ShaderProgram& p = programs[pi];
+            D(p.pipe); D(p.pipeBlend); D(p.pipeCull); D(p.pipeBlendCull); D(p.pipeAdditive); D(p.pipeAlphaTest); D(p.pipeWire);
+            // old layouts/desc-sets are ORPHANED (live sets still reference them); buildProgram makes
+            // structurally identical replacements, which Vulkan binds compatibly.
+            p.vert = vs; p.frag = fs;
+            buildProgram(p);
+            for (auto& ls : loadedShaders) if (ls.surface == p.surface) { ls.vert = vs; ls.frag = fs; }   // edits survive later rebuilds
+            log("shader HOT-RELOAD: program '%s' rebuilt (%s)", p.surface.c_str(), p.pipe ? "ok" : "PIPELINE FAILED");
+            return p.pipe != VK_NULL_HANDLE;
+        }
+        // global/builtin pipelines (V79/OPA)
+        D(graphicsPipeline); D(wireframePipeline); D(blendPipeline); D(graphicsPipelineCull);
+        D(blendPipelineCull); D(additivePipeline); D(additivePipelineHard); D(alphaTestPipeline); D(skinnedPipeline);
+        if (pipelineLayout)        { vkDestroyPipelineLayout(device, pipelineLayout, nullptr); pipelineLayout = VK_NULL_HANDLE; }
+        if (skinnedPipelineLayout) { vkDestroyPipelineLayout(device, skinnedPipelineLayout, nullptr); skinnedPipelineLayout = VK_NULL_HANDLE; }
+        vertSpirv = vs; fragSpirv = fs;
+        createGraphicsPipeline();
+        log("shader HOT-RELOAD: GLOBAL builtin pipelines rebuilt (%s)", graphicsPipeline ? "ok" : "PIPELINE FAILED");
+        return graphicsPipeline != VK_NULL_HANDLE;
     }
 
     // ── Render frame ────────────────────────────────────────────
@@ -1553,8 +1622,11 @@ public:
             // UniformColor = MaterialTint * lightmappower (ModmapFactor). Folding lightmappower into the
             // tint applies it IN-SHADER as diffuse*lightmap*lightmappower (HDR order, clamped once at output)
             // — faithful to the captured MeshShellEnv, vs the old pre-baked+LDR-clamped lightmap (clipped).
-            pcData[16] = gm.curTint[0]*gm.lmPow[0]; pcData[17] = gm.curTint[1]*gm.lmPow[1];
-            pcData[18] = gm.curTint[2]*gm.lmPow[2]; pcData[19] = gm.curTint[3];
+            // lightMul = editor's GLOBAL light manipulation; editTint = per-mesh material-tint edit. Both live.
+            pcData[16] = gm.curTint[0]*gm.lmPow[0]*lightMul[0]*gm.editTint[0];
+            pcData[17] = gm.curTint[1]*gm.lmPow[1]*lightMul[1]*gm.editTint[1];
+            pcData[18] = gm.curTint[2]*gm.lmPow[2]*lightMul[2]*gm.editTint[2];
+            pcData[19] = gm.curTint[3]*lightMul[3]*gm.editTint[3];
             vkCmdPushConstants(cmd, pl,
                 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80, pcData);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1637,8 +1709,8 @@ public:
                     vkCmdBindIndexBuffer(cmd, gm.ibo, 0, VK_INDEX_TYPE_UINT32);
                     float pcData[32] = {};
                     memcpy(pcData, gm.model, 64);
-                    pcData[16] = 1.0f; pcData[17] = 1.0f;
-                    pcData[18] = 1.0f; pcData[19] = 1.0f;
+                    pcData[16] = lightMul[0]*gm.editTint[0]; pcData[17] = lightMul[1]*gm.editTint[1];
+                    pcData[18] = lightMul[2]*gm.editTint[2]; pcData[19] = lightMul[3]*gm.editTint[3];
                     vkCmdPushConstants(cmd, skinnedPipelineLayout,
                         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80, pcData);
                     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1715,7 +1787,15 @@ public:
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = signalSems;
 
-        vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFence);
+        // A failed submit was previously IGNORED: every frame silently failed, the loop kept spinning at
+        // full FPS, and the window stayed white/black forever with zero diagnostics ("white screen").
+        // Surface it loudly (first few occurrences) so a device-lost/poison frame is visible in the log.
+        VkResult subRes = vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFence);
+        if (subRes != VK_SUCCESS) {
+            static int subErrs = 0;
+            if (subErrs++ < 8) log("ERROR: vkQueueSubmit failed: %d%s — frame NOT rendered", subRes,
+                                   subRes == VK_ERROR_DEVICE_LOST ? " (VK_ERROR_DEVICE_LOST — GPU hang/bad draw)" : "");
+        }
 
         VkPresentInfoKHR presentInfo = {};
         presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -1730,6 +1810,9 @@ public:
         if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || framebufferResized) {
             framebufferResized = false;
             recreateSwapchain();
+        } else if (result != VK_SUCCESS) {
+            static int presErrs = 0;
+            if (presErrs++ < 8) log("ERROR: vkQueuePresentKHR failed: %d — frame NOT shown", result);
         }
     }
 
@@ -1861,9 +1944,11 @@ public:
             vkFreeMemory(device, gm.vboMem, nullptr);
             vkDestroyBuffer(device, gm.ibo, nullptr);
             vkFreeMemory(device, gm.iboMem, nullptr);
-            vkDestroyImage(device, gm.texImage, nullptr);
-            vkFreeMemory(device, gm.texMem, nullptr);
-            vkDestroyImageView(device, gm.texView, nullptr);
+            if (!gm.texShared) {   // shared base textures are owned + freed by texCache below
+                vkDestroyImage(device, gm.texImage, nullptr);
+                vkFreeMemory(device, gm.texMem, nullptr);
+                vkDestroyImageView(device, gm.texView, nullptr);
+            }
             vkDestroyBuffer(device, gm.globalUbo, nullptr);
             vkFreeMemory(device, gm.globalUboMem, nullptr);
             vkDestroyBuffer(device, gm.matUbo, nullptr);
@@ -1871,6 +1956,12 @@ public:
             if (gm.skinUbo)    vkDestroyBuffer(device, gm.skinUbo, nullptr);
             if (gm.skinUboMem) vkFreeMemory(device, gm.skinUboMem, nullptr);
         }
+        for (auto& [k, e] : texCache) {   // the dedup cache owns the shared base textures
+            vkDestroyImageView(device, e.view, nullptr);
+            vkDestroyImage(device, e.image, nullptr);
+            vkFreeMemory(device, e.mem, nullptr);
+        }
+        texCache.clear();
         vkDestroyDescriptorPool(device, descPool, nullptr);
         vkDestroyDescriptorSetLayout(device, descSetLayouts[0], nullptr);
         vkDestroyDescriptorSetLayout(device, descSetLayouts[1], nullptr);
@@ -3628,6 +3719,24 @@ public:
 
     u32 lastTexMip = 1;   // mip count of the most recent createTextureImage (for the view)
 
+public:
+    // ── base-texture dedup cache (see uploadMesh): content hash -> ONE shared VkImage/view.
+    // Owns the handles; cleanup() frees them once. Fixes VRAM exhaustion (device-lost) on envs
+    // that re-reference one big sheet from hundreds of submeshes (storybook River_MAT 4096²).
+    struct TexCacheEntry { VkImage image=VK_NULL_HANDLE; VkDeviceMemory mem=VK_NULL_HANDLE;
+                           VkImageView view=VK_NULL_HANDLE; u32 mip=1; VkFormat fmt=VK_FORMAT_R8G8B8A8_SRGB; };
+    std::unordered_map<unsigned long long, TexCacheEntry> texCache;
+    static unsigned long long texHash(const u8* d, size_t n, u32 w, u32 h, u32 mode) {
+        unsigned long long k = 1469598103934665603ull;
+        auto mix = [&](unsigned long long v){ k ^= v; k *= 1099511628211ull; };
+        mix(w); mix(h); mix(mode); mix((unsigned long long)n);
+        if (d && n) {
+            size_t stride = n > 16384 ? n / 16384 : 1;   // ≤16k sampled bytes — fast, dedup-grade discrimination
+            for (size_t i = 0; i < n; i += stride) mix(d[i]);
+        }
+        return k;
+    }
+
     // ── Alpha-weighted mip chain for BLEND textures ──────────────────────────────────────────
     // The GPU blit mip-chain (generateMipmaps) box-averages RGB with STRAIGHT alpha, so texels that
     // are fully TRANSPARENT (alpha≈0) but carry bright "garbage" RGB bleed into the small mips. The
@@ -3882,12 +3991,14 @@ public:
         for (auto& gm : gpuMeshes) {
             for (int c = 0; c < 8; ++c) {
                 float x=(c&1)?gm.bbMax[0]:gm.bbMin[0], y=(c&2)?gm.bbMax[1]:gm.bbMin[1], z=(c&4)?gm.bbMax[2]:gm.bbMin[2];
-                float d = x*x + y*y + z*z; if (d > r2) r2 = d;
+                float d = x*x + y*y + z*z;
+                if (!std::isfinite(d)) continue;   // one NaN/inf-bounds mesh must not poison the projection (black frame)
+                if (d > r2) r2 = d;
             }
         }
         float radius = std::sqrt(r2);
         float fit = radius * 2.0f + 200.0f;
-        if (fit > cam.farZ) { cam.farZ = fit; log("  far plane fit to scenery: radius=%.0f -> farZ=%.0f", radius, cam.farZ); }
+        if (std::isfinite(fit) && fit > cam.farZ) { cam.farZ = fit; log("  far plane fit to scenery: radius=%.0f -> farZ=%.0f", radius, cam.farZ); }
     }
 
     // ── V205 device culling replica (RenderableCullJob__9BA420 — IDA-read): per renderable, (1) frustum side

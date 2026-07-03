@@ -44,6 +44,20 @@ set(ASTCENC_CLI         OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(astcenc)
 set(ASTCENC_LIB astcenc-avx2-static)
 
+# ── libopus (xiph) — DECODER for Ogg-Opus env audio. Half the official V79 envs (storybook,
+#    polarvillage, underwater, ...) ship their background loop as Ogg-OPUS, which stb_vorbis can't
+#    decode (PC preview silent + "0 Hz" cook). The tiny Ogg page demux is hand-rolled in
+#    audio_convert.h; opus itself does the packet decode. ──
+FetchContent_Declare(opus
+    GIT_REPOSITORY https://github.com/xiph/opus.git
+    GIT_TAG v1.5.2
+    GIT_SHALLOW TRUE
+)
+set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(opus)
+
 # ── GLFW — FetchContent or find ─────────────────────────────────
 find_package(glfw3 QUIET)
 if(NOT glfw3_FOUND)
@@ -85,6 +99,7 @@ add_executable(hsr_renderer
     src/impl/miniaudio_impl.c
     src/impl/stb_vorbis_impl.c
     src/impl/stb_image_impl.c
+    src/impl/stb_image_write_impl.c
     src/impl/stb_truetype_impl.c
     src/cook/hzanim_acl.cpp
     src/cook/physx_navmesh.cpp
@@ -119,6 +134,7 @@ target_link_libraries(hsr_renderer PRIVATE
     miniz
     ${GLFW_TARGET}
     ${ASTCENC_LIB}
+    opus
 )
 
 # ── PhysX (optional) — only when -DHSR_HAVE_PHYSX=ON + the vendored libs are present ──
@@ -139,7 +155,7 @@ if(WIN32)
     # volk loads Vulkan at runtime — no vulkan-1.lib needed
     # miniaudio WASAPI backend needs COM (ole32) + winmm ; dbghelp = symbolized crash stack traces ;
     # ws2_32 = the HSR_LIVE HTTP control server (Winsock)
-    target_link_libraries(hsr_renderer PRIVATE ole32 winmm dbghelp ws2_32 opengl32)   # opengl32 = the pre-load "drop an .apk" window draws a simple GL splash
+    target_link_libraries(hsr_renderer PRIVATE ole32 winmm dbghelp ws2_32 gdi32 msimg32)   # gdi32/msimg32 = the in-window GDI loading splash (GradientFill)
 elseif(APPLE)
     find_library(COCOA_LIBRARY Cocoa REQUIRED)
     find_library(IOKIT_LIBRARY IOKit REQUIRED)

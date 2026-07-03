@@ -9,6 +9,7 @@
 //   V9.gltf (JSON), V9.bin (buffer), *.ktx (ASTC 8x8).
 
 #include "core/types.h"
+#include "core/load_progress.h"   // live stage/counter for the loading splash
 #include "core/tinyjson.h"
 #include "loaders/rendtxtr_parser.h"   // astc::decodeASTC
 #include "miniz.h"
@@ -266,7 +267,9 @@ public:
         std::vector<Img> images;
         if (root.has("images")) {
             const auto& imgs = root["images"];
+            g_loadProgress.set("Decoding textures...", 0, (int)imgs.size());
             for (size_t i=0;i<imgs.size();++i) {
+                g_loadProgress.tick((int)i);
                 Img im;
                 std::string uri = imgs[i].has("uri") ? imgs[i]["uri"].asString() : "";
                 if (!uri.empty()) {
@@ -293,6 +296,7 @@ public:
                 images.push_back(std::move(im));
             }
         }
+        g_loadProgress.set("Building meshes...");
         // material -> image index (via baseColorTexture -> textures[].source)
         auto matBaseImage = [&](int matIdx) -> int {
             if (matIdx < 0 || !root.has("materials")) return -1;

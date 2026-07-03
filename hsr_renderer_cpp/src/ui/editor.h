@@ -39,6 +39,8 @@
 #include <chrono>
 #include <atomic>
 #include <mutex>
+#include <set>
+#include <map>
 
 struct Editor {
     // ── bindings ──
@@ -110,7 +112,7 @@ struct Editor {
         if(audioconv::decode(bgOgg.data(),bgOgg.size(),pcm)){
             float secs = pcm.sampleRate>0 ? pcm.frames()/(float)pcm.sampleRate : 0.f;
             snprintf(b,sizeof b,"%s  %d Hz  %d ch  %.1fs  (%.2f MB)",fmt,pcm.sampleRate,pcm.channels,secs,bgOgg.size()/1048576.0);
-        } else snprintf(b,sizeof b,"%s (%.2f MB) — decode failed",fmt,bgOgg.size()/1048576.0);
+        } else snprintf(b,sizeof b,"%s (%.2f MB) - decode failed",fmt,bgOgg.size()/1048576.0);
         audioInfo=b;
     }
     void restartAudioPreview(){
@@ -125,17 +127,17 @@ struct Editor {
         std::vector<uint8_t> raw((size_t)(n>0?n:0)); if(n>0){ size_t rd=fread(raw.data(),1,(size_t)n,f); (void)rd; } fclose(f);
         const char* fmt=audioconv::sniff(raw.data(),raw.size());
         audioconv::Pcm pcm; std::string err;
-        if(!audioconv::decode(raw.data(),raw.size(),pcm,&err)){ setStatus("audio decode FAILED ("+std::string(fmt)+"): "+err+" — use OGG / WAV / MP3 / FLAC"); return false; }
+        if(!audioconv::decode(raw.data(),raw.size(),pcm,&err)){ setStatus("audio decode FAILED ("+std::string(fmt)+"): "+err+" - use OGG / WAV / MP3 / FLAC"); return false; }
         bgOgg = audioconv::fmodNative(fmt) ? std::move(raw) : audioconv::toWav(pcm);   // raw when FMOD reads it natively (compact), else WAV
         audioOvrPath=path; refreshAudioInfo();
         if(audio){ if(audio->ok) audio->stop(); audio->startPCM(pcm.samples.data(),pcm.frames(),pcm.channels,pcm.sampleRate); }
-        setStatus("Audio set from "+path+" — previews now, ships in the cook as the background loop");
+        setStatus("Audio set from "+path+" - previews now, ships in the cook as the background loop");
         return true;
     }
     void clearAudioOverride(){
         if(audioOvrPath.empty()) return;
         audioOvrPath.clear(); bgOgg=envOgg; refreshAudioInfo(); restartAudioPreview();
-        setStatus(envOgg.empty()?"Audio override cleared — this env ships no own audio (silent)":"Audio override cleared — env's own theme restored");
+        setStatus(envOgg.empty()?"Audio override cleared - this env ships no own audio (silent)":"Audio override cleared - env's own theme restored");
     }
     bool exportAudio(){
         if(bgOgg.empty()){ setStatus("no audio to export"); return false; }
@@ -160,8 +162,8 @@ struct Editor {
     std::vector<int> sel;          // the full selection set (multi-select); `selected` is its active member
     bool showLocal = false;
     bool inSel(int i) const { for (int s : sel) if (s==i) return true; return false; }
-    void selectOne(int i){ sel.clear(); if (i>=0) sel.push_back(i); selected=i; r->selectedMesh=i; }
-    void toggleSel(int i){ if (i<0) return; for (size_t k=0;k<sel.size();++k) if (sel[k]==i){ sel.erase(sel.begin()+k); selected = sel.empty()?-1:sel.back(); r->selectedMesh=selected; return; } sel.push_back(i); selected=i; r->selectedMesh=i; }
+    void selectOne(int i){ sel.clear(); if (i>=0) sel.push_back(i); selected=i; r->selectedMesh=i; selItems.clear(); }
+    void toggleSel(int i){ if (i<0) return; selItems.clear(); for (size_t k=0;k<sel.size();++k) if (sel[k]==i){ sel.erase(sel.begin()+k); selected = sel.empty()?-1:sel.back(); r->selectedMesh=selected; return; } sel.push_back(i); selected=i; r->selectedMesh=i; }
     void deselectAll(){ sel.clear(); selected=-1; r->selectedMesh=-1; }
 
     // ── mesh DELETE (toggle) — drop the selected mesh(es) from the render AND the cook (non-destructive: the mesh
@@ -170,7 +172,8 @@ struct Editor {
         if (sel.empty() || !r) return;
         bool anyLive=false; for (int m:sel) if (!r->isDeleted((size_t)m)) anyLive=true;
         for (int m:sel) r->setDeleted((size_t)m, anyLive);
-        setStatus(anyLive ? ("Deleted "+std::to_string(sel.size())+" mesh(es) — removed from render + cook (Del again to restore)")
+        pushDeleteUndo(sel, anyLive);   // part of the edit HISTORY: Ctrl+Z restores deleted meshes
+        setStatus(anyLive ? ("Deleted "+std::to_string(sel.size())+" mesh(es) - removed from render + cook (Ctrl+Z or Del to restore)")
                           : ("Restored "+std::to_string(sel.size())+" mesh(es)"));
     }
     // ── mesh DUPLICATE (Ctrl+D) — clone the selected mesh(es) into a fresh GPU mesh (its own buffers) offset in place,
@@ -196,8 +199,223 @@ struct Editor {
         }
         r->hiddenMeshes.resize(r->gpuMeshes.size(), false);   // keep the hide/delete bitsets sized to the grown list
         r->deletedMeshes.resize(r->gpuMeshes.size(), false);
+        if (!made.empty()) pushDeleteUndo(made, false);       // duplicates are part of the HISTORY: Ctrl+Z removes them
         sel=made; selected=made.empty()?-1:made.back(); r->selectedMesh=selected; selItem=-1;
-        setStatus("Duplicated "+std::to_string(made.size())+" mesh(es) — move/edit/cook independently");
+        setStatus("Duplicated "+std::to_string(made.size())+" mesh(es) - move/edit/cook independently (Ctrl+Z removes)");
+    }
+
+    // ── mesh EXTEND (geometry "stretch"): grow NEW triangles off the mesh's OPEN boundary edges to fill
+    //    holes/blanks. New verts copy their source vert's UV, so the texture CONTINUES from the border
+    //    (edge texels stretch across the new strip - no re-unwrap needed). Non-destructive: the extended
+    //    mesh is appended as a fresh mesh (+ cooks), the original is soft-DELETED (Ctrl+Z restores it).
+    //    dir: 0 = down (-Y, floor gaps), 1 = outward (away from centroid, horizontal), 2 = up (+Y).
+    void extendMeshBoundary(int mi, float dist, int dir){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
+        MeshData md = (*sceneMeshes)[(size_t)mi];   // clone; we append the modified copy
+        size_t nv = md.positions.size()/3;
+        if (nv < 3 || md.indices.size() < 3) { setStatus("extend: mesh has no editable geometry"); return; }
+        // boundary edges = used by exactly ONE triangle
+        std::map<std::pair<uint32_t,uint32_t>,int> ec;
+        auto key=[&](uint32_t a, uint32_t b){ return a<b?std::make_pair(a,b):std::make_pair(b,a); };
+        for (size_t k=0;k+2<md.indices.size();k+=3){ uint32_t a=md.indices[k],b=md.indices[k+1],c=md.indices[k+2];
+            ec[key(a,b)]++; ec[key(b,c)]++; ec[key(c,a)]++; }
+        float cx0=0,cy0=0,cz0=0; for(size_t v2=0;v2<nv;++v2){ cx0+=md.positions[v2*3]; cy0+=md.positions[v2*3+1]; cz0+=md.positions[v2*3+2]; }
+        cx0/=nv; cy0/=nv; cz0/=nv;
+        std::map<uint32_t,uint32_t> cloneOf;   // src vert -> its extruded twin
+        auto extrude=[&](uint32_t v2)->uint32_t{
+            auto it=cloneOf.find(v2); if (it!=cloneOf.end()) return it->second;
+            float px=md.positions[v2*3], py=md.positions[v2*3+1], pz=md.positions[v2*3+2];
+            float ox=0, oy=0, oz=0;
+            if (dir==0) oy=-dist; else if (dir==2) oy=dist;
+            else { float dx=px-cx0, dz=pz-cz0, l=std::sqrt(dx*dx+dz*dz); if (l<1e-4f){dx=1;dz=0;l=1;} ox=dx/l*dist; oz=dz/l*dist; }
+            uint32_t nvi=(uint32_t)(md.positions.size()/3);
+            md.positions.push_back(px+ox); md.positions.push_back(py+oy); md.positions.push_back(pz+oz);
+            if (md.uvs.size() >= nv*2)     { md.uvs.push_back(md.uvs[v2*2]); md.uvs.push_back(md.uvs[v2*2+1]); }           // CONTINUE the border UV
+            if (md.uvs2.size() >= nv*2)    { md.uvs2.push_back(md.uvs2[v2*2]); md.uvs2.push_back(md.uvs2[v2*2+1]); }
+            cloneOf[v2]=nvi; return nvi;
+        };
+        int added=0;
+        for (size_t k=0;k+2<md.indices.size() && added<200000;k+=3){ uint32_t tri[3]={md.indices[k],md.indices[k+1],md.indices[k+2]};
+            for (int e=0;e<3;e++){ uint32_t a=tri[e], b=tri[(e+1)%3];
+                if (ec[key(a,b)]!=1) continue;                       // interior edge
+                uint32_t a2=extrude(a), b2=extrude(b);
+                md.indices.push_back(a); md.indices.push_back(b);  md.indices.push_back(b2);
+                md.indices.push_back(a); md.indices.push_back(b2); md.indices.push_back(a2);
+                added+=2; } }
+        if (!added) { setStatus("extend: mesh is CLOSED (no boundary edges) - nothing to grow"); return; }
+        md.name += " extended";
+        if (commitGeomEdit(mi, std::move(md), "extend"))
+            setStatus("Extended "+std::to_string(added)+" tris off the boundary (texture continued) - Ctrl+Z reverts");
+    }
+
+    // ── mesh SEAL HOLES: find closed BOUNDARY LOOPS (holes in the triangulation - "wireframe looks fuller
+    //    than the surface") and FAN-FILL each with real triangles around the loop's centroid. UVs/uv2 are
+    //    averaged from the rim, so the texture blends across the patch. Same non-destructive append+history
+    //    flow as extendMeshBoundary. Run on every selected mesh via the context menu.
+    void sealMeshHoles(int mi){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
+        MeshData md = (*sceneMeshes)[(size_t)mi];
+        size_t nv = md.positions.size()/3;
+        if (nv < 3 || md.indices.size() < 3) return;
+        std::map<std::pair<uint32_t,uint32_t>,int> ec;
+        auto key=[&](uint32_t a,uint32_t b){ return a<b?std::make_pair(a,b):std::make_pair(b,a); };
+        for (size_t k=0;k+2<md.indices.size();k+=3){ uint32_t a=md.indices[k],b=md.indices[k+1],c=md.indices[k+2];
+            ec[key(a,b)]++; ec[key(b,c)]++; ec[key(c,a)]++; }
+        std::multimap<uint32_t,uint32_t> adj;   // undirected boundary adjacency
+        for (auto& kv : ec) if (kv.second==1) { adj.insert({kv.first.first,kv.first.second}); adj.insert({kv.first.second,kv.first.first}); }
+        std::set<std::pair<uint32_t,uint32_t>> used;
+        int holes=0, added=0;
+        std::vector<uint32_t> loop;
+        for (auto& st : adj) {
+            if (used.count(key(st.first,st.second))) continue;
+            loop.clear(); uint32_t start=st.first, cur=st.second, prev=start; loop.push_back(start);
+            used.insert(key(start,cur));
+            bool closed=false;
+            for (int guard=0; guard<100000; ++guard) {
+                loop.push_back(cur);
+                if (cur==start) { closed=true; break; }
+                uint32_t next=UINT32_MAX;
+                auto rng=adj.equal_range(cur);
+                for (auto it2=rng.first; it2!=rng.second; ++it2)
+                    if (it2->second!=prev && !used.count(key(cur,it2->second))) { next=it2->second; break; }
+                if (next==UINT32_MAX) break;
+                used.insert(key(cur,next)); prev=cur; cur=next;
+            }
+            if (!closed || loop.size()<4 || loop.size()>20000) continue;   // loop includes start twice at the end
+            loop.pop_back();                                               // drop the repeated start
+            ++holes;
+            // centroid vert (pos+uvs averaged over the rim)
+            float px=0,py=0,pz=0,u0=0,v0=0,u1=0,v1=0; size_t n=loop.size();
+            bool hasUV=md.uvs.size()>=nv*2, hasUV2=md.uvs2.size()>=nv*2;
+            for (uint32_t v2 : loop){ px+=md.positions[v2*3]; py+=md.positions[v2*3+1]; pz+=md.positions[v2*3+2];
+                if (hasUV){ u0+=md.uvs[v2*2]; v0+=md.uvs[v2*2+1]; } if (hasUV2){ u1+=md.uvs2[v2*2]; v1+=md.uvs2[v2*2+1]; } }
+            uint32_t cvi=(uint32_t)(md.positions.size()/3);
+            md.positions.push_back(px/n); md.positions.push_back(py/n); md.positions.push_back(pz/n);
+            if (hasUV) { md.uvs.push_back(u0/n);  md.uvs.push_back(v0/n); }
+            if (hasUV2){ md.uvs2.push_back(u1/n); md.uvs2.push_back(v1/n); }
+            for (size_t i2=0;i2<n;++i2){ uint32_t a=loop[i2], b=loop[(i2+1)%n];
+                md.indices.push_back(a); md.indices.push_back(b); md.indices.push_back(cvi); ++added; }
+        }
+        if (!holes) { setStatus("seal: no closed holes found on '"+md.name+"'"); return; }
+        md.name += " sealed";
+        if (commitGeomEdit(mi, std::move(md), "seal"))
+            setStatus("Sealed "+std::to_string(holes)+" hole(s) with "+std::to_string(added)+" tris - Ctrl+Z reverts");
+    }
+
+    // ── mesh MIRROR: flip the geometry across an axis (about its own local center) so it FACES THE
+    //    OTHER SIDE. Triangle winding is reversed (a mirror inverts orientation) so faces stay correct;
+    //    the texture flips with the geometry. axis: 0=X 1=Y 2=Z. Non-destructive (Ctrl+Z reverts).
+    void mirrorMesh(int mi, int axis){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
+        MeshData md = (*sceneMeshes)[(size_t)mi];
+        size_t nv = md.positions.size()/3;
+        if (nv<3) return;
+        float lo=1e30f, hi=-1e30f;
+        for (size_t v2=0;v2<nv;++v2){ float p=md.positions[v2*3+axis]; lo=std::min(lo,p); hi=std::max(hi,p); }
+        float c = (lo+hi)*0.5f;
+        for (size_t v2=0;v2<nv;++v2) md.positions[v2*3+axis] = 2.f*c - md.positions[v2*3+axis];
+        for (size_t k=0;k+2<md.indices.size();k+=3) std::swap(md.indices[k+1], md.indices[k+2]);   // fix winding
+        const char* an[3]={"X","Y","Z"};
+        md.name += std::string(" mirror") + an[axis];
+        if (commitGeomEdit(mi, std::move(md), "mirror"))
+            setStatus(std::string("Mirrored across ")+an[axis]+" (faces the other side now) - Ctrl+Z reverts");
+    }
+
+    // shared tail of the geometry tools: append the edited clone, carry the transform/tint, soft-delete
+    // the original into the undo history, select the new mesh.
+    bool commitGeomEdit(int mi, MeshData&& md, const char* what){
+        sceneMeshes->push_back(std::move(md));
+        size_t ni=r->gpuMeshes.size();
+        r->uploadMesh(sceneMeshes->back());
+        if (r->gpuMeshes.size()!=ni+1){ setStatus(std::string(what)+": GPU upload failed"); sceneMeshes->pop_back(); return false; }
+        VkGpuMesh& ng=r->gpuMeshes[ni]; const VkGpuMesh& og=r->gpuMeshes[(size_t)mi];
+        memcpy(ng.editT,og.editT,sizeof ng.editT); memcpy(ng.editR,og.editR,sizeof ng.editR); memcpy(ng.editS,og.editS,sizeof ng.editS);
+        memcpy(ng.editTint,og.editTint,sizeof ng.editTint); recomputeModel(ng);
+        r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
+        r->setDeleted((size_t)mi, true);
+        pushDeleteUndo({mi,(int)ni}, std::vector<uint8_t>{1,0});   // ONE history entry: Ctrl+Z restores the original AND removes the result
+        selectOne((int)ni);
+        return true;
+    }
+
+    // ── mesh CUT HOLE: delete every triangle whose centroid lies within `radius` of the WORLD point
+    //    (the spot you right-clicked). Makes doorways/entrances: the render gap opens AND the cooked
+    //    collision follows the new geometry (re-bake), so you can walk through. Non-destructive.
+    void cutMeshHole(int mi, const float wp[3], float radius){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
+        MeshData md = (*sceneMeshes)[(size_t)mi];
+        if (md.indices.size() < 3) return;
+        const float* M = r->gpuMeshes[(size_t)mi].model;
+        float r2 = radius*radius;
+        std::vector<u32> keep; keep.reserve(md.indices.size());
+        int cut=0;
+        auto W=[&](uint32_t v2, float o[3]){ const float* p=&md.positions[v2*3];
+            o[0]=M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12]; o[1]=M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13]; o[2]=M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14]; };
+        for (size_t k=0;k+2<md.indices.size();k+=3){
+            uint32_t a=md.indices[k],b=md.indices[k+1],c=md.indices[k+2];
+            float wa[3],wb[3],wc[3]; W(a,wa); W(b,wb); W(c,wc);
+            float cx0=(wa[0]+wb[0]+wc[0])/3-wp[0], cy0=(wa[1]+wb[1]+wc[1])/3-wp[1], cz0=(wa[2]+wb[2]+wc[2])/3-wp[2];
+            if (cx0*cx0+cy0*cy0+cz0*cz0 <= r2) { ++cut; continue; }   // inside the hole -> drop
+            keep.push_back(a); keep.push_back(b); keep.push_back(c);
+        }
+        if (!cut) { setStatus("cut: no triangles within "+std::to_string(radius)+"m of the clicked point"); return; }
+        md.indices = std::move(keep);
+        md.name += " cut";
+        if (commitGeomEdit(mi, std::move(md), "cut"))
+            setStatus("Cut "+std::to_string(cut)+" tris (r="+std::to_string(radius)+"m) - re-bake/collision follows; original in history (Ctrl+Z)");
+    }
+
+    // ── mesh SPLIT: separate into CONNECTED PIECES (verts shared by triangles = same piece). Each piece
+    //    becomes its own mesh (same texture/material) so parts can be moved/deleted/collision-excluded
+    //    independently. Original goes to history.
+    void splitMeshParts(int mi){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
+        const MeshData& src = (*sceneMeshes)[(size_t)mi];
+        size_t nv = src.positions.size()/3;
+        if (nv<3 || src.indices.size()<3) return;
+        std::vector<uint32_t> parent(nv); for (size_t i2=0;i2<nv;++i2) parent[i2]=(uint32_t)i2;
+        std::function<uint32_t(uint32_t)> find = [&](uint32_t v2)->uint32_t{ while (parent[v2]!=v2){ parent[v2]=parent[parent[v2]]; v2=parent[v2]; } return v2; };
+        for (size_t k=0;k+2<src.indices.size();k+=3){ uint32_t a=find(src.indices[k]),b=find(src.indices[k+1]),c=find(src.indices[k+2]);
+            parent[b]=a; parent[c]=a; }
+        std::map<uint32_t,int> compOf; int nComp=0;
+        for (size_t k=0;k<src.indices.size();k+=3){ uint32_t rt=find(src.indices[k]); if(!compOf.count(rt)) compOf[rt]=nComp++; }
+        if (nComp<=1) { setStatus("split: mesh is ONE connected piece already"); return; }
+        if (nComp>256){ setStatus("split: "+std::to_string(nComp)+" pieces is too many (max 256)"); return; }
+        bool hasUV=src.uvs.size()>=nv*2, hasUV2=src.uvs2.size()>=nv*2;
+        std::vector<MeshData> parts((size_t)nComp);
+        std::vector<std::map<uint32_t,uint32_t>> remap((size_t)nComp);
+        for (int c2=0;c2<nComp;++c2){ parts[c2]=src; parts[c2].positions.clear(); parts[c2].uvs.clear(); parts[c2].uvs2.clear(); parts[c2].indices.clear();
+            parts[c2].name = src.name + " part" + std::to_string(c2+1); }
+        for (size_t k=0;k+2<src.indices.size();k+=3){
+            int c2 = compOf[find(src.indices[k])]; auto& pt=parts[c2]; auto& rm=remap[c2];
+            for (int e=0;e<3;e++){ uint32_t v2=src.indices[k+e];
+                auto it=rm.find(v2); uint32_t nvi;
+                if (it!=rm.end()) nvi=it->second;
+                else { nvi=(uint32_t)(pt.positions.size()/3);
+                       pt.positions.push_back(src.positions[v2*3]); pt.positions.push_back(src.positions[v2*3+1]); pt.positions.push_back(src.positions[v2*3+2]);
+                       if (hasUV){ pt.uvs.push_back(src.uvs[v2*2]); pt.uvs.push_back(src.uvs[v2*2+1]); }
+                       if (hasUV2){ pt.uvs2.push_back(src.uvs2[v2*2]); pt.uvs2.push_back(src.uvs2[v2*2+1]); }
+                       rm[v2]=nvi; }
+                pt.indices.push_back(nvi); } }
+        // append every piece (carry transform/tint), then soft-delete the original (ONE history entry
+        // covering original + every part - Ctrl+Z removes the parts AND restores the original)
+        const VkGpuMesh og = r->gpuMeshes[(size_t)mi];   // copy - gpuMeshes reallocates as parts upload
+        int made=0;
+        std::vector<int> hist{mi}; std::vector<uint8_t> histA{1};
+        for (auto& pt : parts) {
+            sceneMeshes->push_back(std::move(pt));
+            size_t ni=r->gpuMeshes.size();
+            r->uploadMesh(sceneMeshes->back());
+            if (r->gpuMeshes.size()!=ni+1){ sceneMeshes->pop_back(); continue; }
+            VkGpuMesh& ng=r->gpuMeshes[ni];
+            memcpy(ng.editT,og.editT,sizeof ng.editT); memcpy(ng.editR,og.editR,sizeof ng.editR); memcpy(ng.editS,og.editS,sizeof ng.editS);
+            memcpy(ng.editTint,og.editTint,sizeof ng.editTint); recomputeModel(ng); ++made;
+            hist.push_back((int)ni); histA.push_back(0);
+        }
+        r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
+        r->setDeleted((size_t)mi, true); pushDeleteUndo(hist, histA);
+        deselectAll();
+        setStatus("Split into "+std::to_string(made)+" pieces - move/delete/collision-exclude them independently (Ctrl+Z reverts)");
     }
 
     // ── TEXTURE edit: set a mesh's (e.g. the SKYBOX dome's) base texture from a PNG/JPG image, and export it back ──
@@ -243,7 +461,7 @@ struct Editor {
     void setSkyColor(float rr,float gg,float bb){
         skyColor[0]=rr; skyColor[1]=gg; skyColor[2]=bb;
         if(r){ r->clearRGB[0]=rr; r->clearRGB[1]=gg; r->clearRGB[2]=bb; }
-        char b[112]; snprintf(b,sizeof b,"Skybox/background color = (%.3f, %.3f, %.3f) — background layer only, env meshes untouched",rr,gg,bb);
+        char b[112]; snprintf(b,sizeof b,"Skybox/background color = (%.3f, %.3f, %.3f) - background layer only, env meshes untouched",rr,gg,bb);
         setStatus(b);
     }
     void clearSkyColor(){ skyColor[0]=skyColor[1]=skyColor[2]=-1.f; setStatus("Skybox color cleared"); }
@@ -257,7 +475,7 @@ struct Editor {
         if(!px){ setStatus("skybox image decode FAILED (PNG/JPG): "+path); return false; }
         skyImageRGBA.assign(px,px+(size_t)w*h*4); skyImageW=w; skyImageH=h; stbi_image_free(px); skyImagePath=path;
         previewSkybox();
-        setStatus("Skybox image set "+std::to_string(w)+"x"+std::to_string(h)+" (equirect) — previews + cooks onto a sky sphere");
+        setStatus("Skybox image set "+std::to_string(w)+"x"+std::to_string(h)+" (equirect) - previews + cooks onto a sky sphere");
         return true;
     }
     void clearSkyImage(){ skyImageRGBA.clear(); skyImageW=skyImageH=0; skyImagePath.clear(); previewSkybox(); setStatus("Skybox image cleared"); }
@@ -269,7 +487,7 @@ struct Editor {
         if(!md.hasTexture || md.texRGBA.size()<(size_t)md.texW*md.texH*4 || md.texW<1||md.texH<1){ setStatus("mesh "+std::to_string(mi)+" has no texture to use as skybox"); return false; }
         skyImageRGBA=md.texRGBA; skyImageW=md.texW; skyImageH=md.texH; skyImagePath="mesh:"+std::to_string(mi);
         previewSkybox();
-        setStatus("Skybox = texture of mesh ["+std::to_string(mi)+"] "+std::to_string(md.texW)+"x"+std::to_string(md.texH)+" — previews + cooks onto a sky sphere");
+        setStatus("Skybox = texture of mesh ["+std::to_string(mi)+"] "+std::to_string(md.texW)+"x"+std::to_string(md.texH)+" - previews + cooks onto a sky sphere");
         return true;
     }
     // Export the CURRENT skybox texture (imported image / reused texture) to a PNG. "export skybox texture if any."
@@ -353,8 +571,25 @@ struct Editor {
     bool  didAutoSel = false;      // auto-select a centered object once (frame 1)
     // right-click context menu
     bool  ctxOpen = false; float ctxX = 0, ctxY = 0; int ctxMesh = -1;
+    int   ctxItem = -1;   // >=0: the context menu targets THIS scene item (outliner right-click), not a mesh
     float ctxRX = 0, ctxRY = 0, ctxRW = 0, ctxRH = 0;   // its on-screen rect (so clicks route to it)
     bool  insideCtx(float x, float y) const { return x>=ctxRX && y>=ctxRY && x<ctxRX+ctxRW && y<ctxRY+ctxRH; }
+    // outliner section collapse (click the SCENE ITEMS / MESHES headers)
+    bool  itemsCollapsed = false, meshesCollapsed = false;
+    // progressive GPU upload progress (main sets these while streaming; the viewport draws a loading bar)
+    int   uploadCur = 0, uploadTotal = 0;
+    bool  showKeybinds = false;        // F1: the all-shortcuts overlay
+    std::vector<int> meshClipboard;    // Ctrl+C on meshes stores the selection; Ctrl+V pastes independent clones
+    std::vector<int> selItems;         // scene-item MULTI-selection (list ops: hide/space/Del/Remove); selItem = active
+    // IN-PLACE env swap (NO process restart): setting swapTo makes main tear down the scene and load this
+    // path in the SAME window - cook preview (any source -> its cooked HSL APK) and back again.
+    std::string swapTo;
+    std::string sourceEnvPath;         // the ORIGINAL env this session started from ("Back to source")
+    float extendDist = 1.0f;           // manual extend distance (Object tab "Geometry" section)
+    float cutRadius  = 1.0f;           // manual cut-hole radius (Object tab "Geometry" section)
+    std::set<int> noColMeshes;         // meshes EXCLUDED from collision (walk-through); persisted as NOCOL
+    float ctxHitP[3] = {0,0,0}; bool ctxHitValid = false;   // world point under the cursor when the ctx menu opened (cut-hole target)
+    bool  popupAtePress = false;   // a popup consumed the left PRESS -> its RELEASE must not pick a mesh behind the menu
 
     // ── scene items (spawn/chair/collider/navmesh/wall/hotspot — addable/removable/positionable/cookable) ──
     std::vector<sitem::Item> items;
@@ -579,6 +814,17 @@ struct Editor {
         if(!skyImagePath.empty()){ s += "SKYIMG "+skyImagePath+"\n"; }   // skybox image file path OR "mesh:N" (reused texture)
         if(!audioOvrPath.empty()){ s += "AUDIOOVR "+audioOvrPath+"\n"; }   // replaced/added background audio (re-loaded from the file on open)
         { int n=0; for(auto& it:items) if(it.hidden) n++; if(n){ s+="IHIDE "+std::to_string(n); for(int i=0;i<(int)items.size();++i) if(items[i].hidden){ snprintf(b,sizeof b," %d",i); s+=b; } s+="\n"; } }
+        // global light manipulation (only when edited off default)
+        if (r->lightMul[0]!=1.f||r->lightMul[1]!=1.f||r->lightMul[2]!=1.f||r->lightMul[3]!=1.f){
+            snprintf(b,sizeof b,"LIGHT %.4f %.4f %.4f %.4f\n", r->lightMul[0],r->lightMul[1],r->lightMul[2],r->lightMul[3]); s+=b; }
+        // per-mesh material edits (tint + flags) — MATF idx blend additive alphaTest cullBack tintR G B A
+        for (int i : matEdited) { if (i<0||i>=(int)r->gpuMeshes.size()) continue; auto& gm=r->gpuMeshes[i];
+            snprintf(b,sizeof b,"MATF %d %d %d %d %d %.4f %.4f %.4f %.4f\n", i,
+                gm.useBlend?1:0, gm.additive?1:0, gm.alphaTest?1:0, gm.cullBack?1:0,
+                gm.editTint[0],gm.editTint[1],gm.editTint[2],gm.editTint[3]); s+=b; }
+        // collision-excluded meshes (walk-through)
+        if (!noColMeshes.empty()) { s+="NOCOL "+std::to_string(noColMeshes.size());
+            for (int m : noColMeshes) { snprintf(b,sizeof b," %d",m); s+=b; } s+="\n"; }
         return s;
     }
     void saveProject(){
@@ -625,6 +871,7 @@ struct Editor {
     // Parse + apply a .hsledit session text (shared by loadProject and the auto-save recovery banner).
     void applySessionText(const std::string& all, int& meshN, int& itemN){
         items.clear(); selItem=-1; deselectAll(); animColliders.clear(); skyboxMeshes.clear();
+        matEdited.clear(); noColMeshes.clear(); for(int k=0;k<4;k++) r->lightMul[k]=1.f;   // reset light/material/collision edits; LIGHT/MATF/NOCOL lines re-apply
         clearAudioOverride();   // reset to the env's own theme; an AUDIOOVR line below re-applies the replacement (no-op when none was active)
         const bool cooked = envIsCookedApk();   // a cook OUTPUT: take the session's scene ITEMS but NOT its index-based MESH transforms (already baked into the cook) — re-derive the navmesh from THIS env's ground by name
         size_t p=0; meshN=0; itemN=0;
@@ -657,6 +904,16 @@ struct Editor {
             else if(t[0]=="SKYCOL" && (int)t.size()>=4){ setSkyColor((float)atof(t[1].c_str()),(float)atof(t[2].c_str()),(float)atof(t[3].c_str())); }   // general skybox color -> drives clearRGB
             else if(t[0]=="SKYIMG" && (int)t.size()>=2){ std::string p=t[1]; for(size_t k=2;k<t.size();++k) p+=" "+t[k]; if(p.rfind("mesh:",0)==0) setSkyImageFromMesh(atoi(p.c_str()+5)); else setSkyImage(p); }   // restore skybox image/texture
             else if(t[0]=="AUDIOOVR" && (int)t.size()>=2){ std::string p=t[1]; for(size_t k=2;k<t.size();++k) p+=" "+t[k]; setAudioFromFile(p); }   // restore the replaced/added background audio
+            else if(t[0]=="LIGHT" && t.size()>=5){ for(int k=0;k<4;k++) r->lightMul[k]=(float)atof(t[1+k].c_str()); }   // global light manipulation
+            else if(t[0]=="NOCOL" && !cooked){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) noColMeshes.insert(atoi(t[2+k].c_str())); }   // collision-excluded meshes
+            else if(t[0]=="MATF" && t.size()>=10 && !cooked){ int mi=atoi(t[1].c_str());   // per-mesh material flags + tint
+                if (mi>=0 && mi<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[mi];
+                    gm.useBlend=atoi(t[2].c_str())!=0; gm.additive=atoi(t[3].c_str())!=0;
+                    gm.alphaTest=atoi(t[4].c_str())!=0; gm.cullBack=atoi(t[5].c_str())!=0;
+                    for(int k=0;k<4;k++) gm.editTint[k]=(float)atof(t[6+k].c_str());
+                    if (sceneMeshes && mi<(int)sceneMeshes->size()){ auto& md=(*sceneMeshes)[mi];   // cook ships the same flags
+                        md.useBlend=gm.useBlend; md.additive=gm.additive; md.alphaTest=gm.alphaTest; md.doubleSided=!gm.cullBack; }
+                    matEdited.insert(mi); } }
         }
     }
     // ── AUTO-SAVE (Phase-1 crash resistance): every autoSaveIntervalS seconds, if the session text changed since the
@@ -671,6 +928,7 @@ struct Editor {
     std::chrono::steady_clock::time_point recoverOfferAt{};   // when the recovery banner appeared (auto-hides after 5s)
     void autoSaveTick(double now){
         if (!autoSaveOn || cooking || !r || r->gpuMeshes.empty()) return;
+        if (projectPath.empty() || (uploadTotal > 0 && uploadCur < uploadTotal)) return;   // still streaming meshes in (projectPath binds on completion) — nothing valid to snapshot yet
         if (lastAutoSaveT == 0.0) { lastAutoSaveT = now;               // first tick arms the timer + captures the dirty
             if (lastSessionSnap.empty()) lastSessionSnap = serializeSession(); return; }   // baseline (no-session envs: don't autosave an untouched scene)
         if (now - lastAutoSaveT < autoSaveIntervalS) return;
@@ -701,7 +959,7 @@ struct Editor {
         int meshN=0, itemN=0; applySessionText(all, meshN, itemN);
         didAutoSel = true; applyTexOverrides();
         lastSessionSnap = std::move(all); recoverOffer = false;
-        setStatus("Recovered auto-save ("+std::to_string(meshN)+" mesh edits + "+std::to_string(itemN)+" items) — Save to keep it");
+        setStatus("Recovered auto-save ("+std::to_string(meshN)+" mesh edits + "+std::to_string(itemN)+" items) - Save to keep it");
     }
     void dismissAutosave(){ std::error_code ec; std::filesystem::remove(recoverPath, ec); recoverOffer=false; }
     // V79 stores NO navmesh file — the LocomotionSystem generates it from the walkable ground geometry at runtime.
@@ -730,8 +988,19 @@ struct Editor {
     // ── undo/redo ──
     struct Xform { float t[3]={0,0,0}, r[4]={0,0,0,1}, s[3]={1,1,1}; };
     struct UndoOp { std::vector<int> m; std::vector<Xform> b, a;       // mesh-transform op (multi-mesh = one drag = one op)
-                    bool isItems=false; std::vector<sitem::Item> itemsState; };   // OR a scene-items snapshot (add/delete/move/paste)
+                    bool isItems=false; std::vector<sitem::Item> itemsState;      // OR a scene-items snapshot (add/delete/move/paste)
+                    bool isDelete=false; std::vector<int> delM; std::vector<uint8_t> delA; };  // OR mesh delete/restore states (delA[i]=deleted AFTER the op)
     std::vector<UndoOp> undoStack, redoStack;
+    // mesh DELETE/RESTORE (and duplicate/geometry-tool results) are part of the edit history: Ctrl+Z
+    // restores deleted meshes AND removes clones an op created; Ctrl+Y re-applies. Per-mesh states so a
+    // combined op ("original deleted + clone added") round-trips exactly.
+    void pushDeleteUndo(const std::vector<int>& m, const std::vector<uint8_t>& after){
+        UndoOp op; op.isDelete=true; op.delM=m; op.delA=after;
+        undoStack.push_back(std::move(op)); redoStack.clear(); if (undoStack.size()>256) undoStack.erase(undoStack.begin());
+    }
+    void pushDeleteUndo(const std::vector<int>& m, bool nowDeleted){
+        pushDeleteUndo(m, std::vector<uint8_t>(m.size(), nowDeleted?1:0));
+    }
     sitem::Item clipboardItem; bool hasClipboard=false;   // copy/paste one scene item
     std::vector<sitem::Item> itemsBeforeDrag;             // snapshot captured when an item gizmo-drag starts (pushed on release)
     // snapshot the items vector BEFORE a mutation so Ctrl+Z can restore it (swap-based: the op holds the other state).
@@ -804,6 +1073,9 @@ struct Editor {
         mono = font;   // the UI pipeline binds ONE atlas (the main font); "mono" MUST share it or its glyph UVs index garbage
         uiDraw.init(r, &font);
         cx.font = &font; cx.mono = &font;
+        // text-field clipboard (Ctrl+C/X/V) -> the OS clipboard via GLFW
+        cx.setClip = [this](const char* s){ if (win && s) glfwSetClipboardString(win, s); };
+        cx.getClip = [this]() -> std::string { const char* c = win ? glfwGetClipboardString(win) : nullptr; return c ? c : ""; };
         // capture UNSCALED theme metrics, then scale for DPI; recomputeUiScale() re-derives them from these on every resize
         baseRowH=cx.th.rowH; baseHeaderH=cx.th.headerH; basePad=cx.th.pad; baseIndent=cx.th.indent; baseTimelineH=timelineH;
         cx.th.rowH *= uiScale; cx.th.headerH *= uiScale; cx.th.pad *= uiScale; cx.th.indent *= uiScale;
@@ -846,7 +1118,7 @@ struct Editor {
         if (b < 0) return;
         cx.in.shift = (mods&GLFW_MOD_SHIFT)!=0; cx.in.ctrl=(mods&GLFW_MOD_CONTROL)!=0; cx.in.alt=(mods&GLFW_MOD_ALT)!=0;
         if (b == 0 && (ctxOpen || addMenuOpen)) {               // an open popup owns the mouse
-            if (action == GLFW_PRESS) { cx.in.down[0]=true; cx.in.pressed[0]=true; cx.in.pressX[0]=cx.in.mx; cx.in.pressY[0]=cx.in.my; if (!insideCtx(cx.in.mx,cx.in.my)) { ctxOpen=false; addMenuOpen=false; } }
+            if (action == GLFW_PRESS) { cx.in.down[0]=true; cx.in.pressed[0]=true; cx.in.pressX[0]=cx.in.mx; cx.in.pressY[0]=cx.in.my; popupAtePress=true; if (!insideCtx(cx.in.mx,cx.in.my)) { ctxOpen=false; addMenuOpen=false; } }
             else { cx.in.down[0]=false; cx.in.released[0]=true; }
             return;                                             // (item action is performed in drawContextMenu / drawAddMenu)
         }
@@ -877,6 +1149,7 @@ struct Editor {
                 if (gizmoSel.empty() && !itemsBeforeDrag.empty()) { pushItemUndo(std::move(itemsBeforeDrag)); itemsBeforeDrag.clear(); }   // item drag -> item undo
                 else { std::vector<Xform> after; for (int m:gizmoSel) after.push_back(captureX(r->gpuMeshes[m])); pushUndo(gizmoSel, gizmoBeforeV, after); }
                 gizmoDrag=false; gizmoAxis=-1; }
+            else if (b == 0 && popupAtePress) { popupAtePress = false; }   // the press went to a MENU: its release must NOT pick a mesh behind the popup
             else if (b == 0 && in3D && !wasExit) {   // a click (pick) OR a Ctrl/Shift box-drag (rubber-band multi-select)
                 float dx=cx.in.mx-(float)cx.in.pressX[0], dy=cx.in.my-(float)cx.in.pressY[0];
                 if (wasBox && dx*dx+dy*dy >= 25.f*uiScale*uiScale) boxSelectRect(boxX0, boxY0, (float)cx.in.mx, (float)cx.in.my, cx.in.ctrl);   // Ctrl box = toggle/unpick, Shift box = add
@@ -886,12 +1159,14 @@ struct Editor {
                 float dx=cx.in.mx-(float)cx.in.pressX[1], dy=cx.in.my-(float)cx.in.pressY[1];
                 if (dx*dx+dy*dy < 25.f*uiScale*uiScale) {
                     int it = pickItem(cx.in.mx, cx.in.my);
-                    if (it>=0) { selItem=it; deselectAll(); }                       // scene-item marker
+                    if (it>=0) { selItem=it; deselectAll();                          // scene-item marker -> its own context menu (focus/hide/duplicate/remove)
+                        ctxItem=it; ctxMesh=-1; ctxOpen=true; ctxX=cx.in.mx; ctxY=cx.in.my; }
                     else { int hit = pickIndex(cx.in.mx, cx.in.my);
                         if (hit>=0) {
                             if (!inSel(hit)) selectOne(hit);                        // right-clicked an UNSELECTED mesh -> select just it;
                             // ELSE: keep the existing multi-selection so the menu can act on ALL of them
-                            selItem=-1; ctxMesh=hit; ctxOpen=true; ctxX=cx.in.mx; ctxY=cx.in.my;
+                            selItem=-1; ctxMesh=hit; ctxItem=-1; ctxOpen=true; ctxX=cx.in.mx; ctxY=cx.in.my;
+                            float hn[3]; ctxHitValid = screenRayHitMesh(cx.in.mx, cx.in.my, hit, ctxHitP, hn);   // exact surface point (cut-hole target)
                         }
                     }
                 }
@@ -924,8 +1199,69 @@ struct Editor {
             if (key=='Y') lockAxis[1]=!lockAxis[1];
             if (key=='Z') lockAxis[2]=!lockAxis[2];
         }
-        if (key==GLFW_KEY_DELETE) { if (selItem>=0) deleteSelItem(); else if (!sel.empty()) toggleDeleteSelected(); }   // Del: remove selected scene item, else delete/restore selected mesh(es)
+        if (key==GLFW_KEY_DELETE) {   // Del: remove selected scene item(s), else delete/restore selected mesh(es)
+            if (!selItems.empty() && selItems.size()>1) {   // MULTI item delete (one undo snapshot)
+                pushItemUndo(items);
+                std::vector<int> del=selItems; std::sort(del.rbegin(), del.rend());
+                for (int i : del) if (i>=0 && i<(int)items.size()) items.erase(items.begin()+i);
+                selItems.clear(); selItem=-1;
+            }
+            else if (selItem>=0) deleteSelItem();
+            else if (!sel.empty()) toggleDeleteSelected();
+        }
         if ((mods&GLFW_MOD_CONTROL) && key=='D' && selItem<0 && !sel.empty()) duplicateSelected();   // Ctrl+D on meshes = duplicate (clone + offset), editable independently
+        if ((mods&GLFW_MOD_CONTROL) && key=='C' && selItem<0 && !sel.empty()) { meshClipboard=sel; setStatus("Copied "+std::to_string(sel.size())+" mesh(es) - Ctrl+V pastes clones"); }   // mesh COPY (names already went to the OS clipboard above)
+        if ((mods&GLFW_MOD_CONTROL) && key=='V' && selItem<0 && !meshClipboard.empty()) {            // mesh PASTE = clone the copied set
+            sel.clear(); for (int m : meshClipboard) if (m>=0 && m<(int)r->gpuMeshes.size()) sel.push_back(m);
+            if (!sel.empty()) { selected=sel.back(); r->selectedMesh=selected; duplicateSelected(); }
+        }
+        if (key==GLFW_KEY_F1) showKeybinds = !showKeybinds;   // all-shortcuts overlay
+        if (key==GLFW_KEY_SPACE && !playSim) {   // SPACE = toggle visibility of the selection (meshes or scene items)
+            if (!selItems.empty()) { bool anyVis=false; for (int i:selItems) if (i>=0&&i<(int)items.size()&&!items[i].hidden) anyVis=true;
+                                     for (int i:selItems) if (i>=0&&i<(int)items.size()) items[i].hidden = anyVis; }
+            else if (selItem>=0 && selItem<(int)items.size()) items[selItem].hidden = !items[selItem].hidden;
+            else if (!sel.empty() && r) {
+                bool anyVis=false; for (int m:sel) if (!r->isHidden((size_t)m)) anyVis=true;   // mixed state -> hide all first
+                for (int m:sel) r->setHidden((size_t)m, anyVis);
+                setStatus((anyVis?"Hid ":"Showed ")+std::to_string(sel.size())+" mesh(es)  [Space toggles]");
+            }
+        }
+    }
+    // ── F1 keybinds overlay: every shortcut in one panel ──
+    void drawKeybindsPanel() {
+        if (!showKeybinds) return;
+        auto& th=cx.th; float rh=th.rowH;
+        static const char* rows[][2] = {
+            {"WASD + QE",          "fly camera (drag = look, scroll = speed)"},
+            {"F (hover a row)",    "focus / frame the object"},
+            {"Double-click row",   "focus / frame the object"},
+            {"Click / Ctrl+Click", "select / add to multi-selection"},
+            {"Shift+Drag rows",    "drag-paint multi-select"},
+            {"Ctrl+A",             "select all (filtered, visible)"},
+            {"Space",              "toggle visibility of the selection"},
+            {"Ctrl+C / Ctrl+V",    "copy / paste (clone) meshes or scene items"},
+            {"Ctrl+D",             "duplicate selection"},
+            {"Del",                "delete / restore selection (undoable)"},
+            {"Ctrl+Z / Ctrl+Y",    "undo / redo (transforms, items, deletes)"},
+            {"Move/Rotate/Scale",  "gizmo mode pills (Scale = stretch per-axis)"},
+            {"Shift+X / Y / Z",    "lock a gizmo axis"},
+            {"Right-click",        "context menu (viewport or outliner rows)"},
+            {"P",                  "walk the env (player simulator)"},
+            {"Ctrl+S / Ctrl+L",    "save / load the session"},
+            {"Tab / N / B",        "cycle mesh selection"},
+            {"F1",                 "toggle this panel"},
+        };
+        int n = (int)(sizeof rows / sizeof rows[0]);
+        float w = 560*uiScale, h = (n+2)*rh + 16*uiScale;
+        float x = (fbW-w)*0.5f, y = (fbH-h)*0.5f;
+        dl.rect(x,y,w,h, ui::rgba(24,26,33,242)); dl.border(x,y,w,h, th.accent);
+        cx.textAligned(x, y+4*uiScale, w, rh, "KEYBINDS   (F1 or click to close)", th.text, 1);
+        float ry = y + rh + 10*uiScale;
+        for (int i=0;i<n;++i, ry+=rh) {
+            cx.textAligned(x+16*uiScale,  ry, 170*uiScale, rh, rows[i][0], th.accentHot, 0);
+            cx.textAligned(x+195*uiScale, ry, w-205*uiScale, rh, rows[i][1], th.text, 0);
+        }
+        if (cx.in.pressed[0] && cx.hover(x,y,w,h)) showKeybinds=false;
     }
     int winW() const { int w=0,h=0; glfwGetWindowSize(win,&w,&h); return w; }
     int winH() const { int w=0,h=0; glfwGetWindowSize(win,&w,&h); return h; }
@@ -950,7 +1286,11 @@ struct Editor {
         cx.th.rowH=baseRowH*uiScale; cx.th.headerH=baseHeaderH*uiScale; cx.th.pad=basePad*uiScale; cx.th.indent=baseIndent*uiScale;
         timelineH = baseTimelineH*uiScale;
         int px = (int)(baseFontPx*uiScale + 0.5f);
-        if (px >= 8 && px != (int)(font.pixelHeight + 0.5f)) { loadUIFont(font, (float)px, false); uiDraw.reloadFont(); }
+        if (px >= 8 && px != (int)(font.pixelHeight + 0.5f)) {
+            loadUIFont(font, (float)px, false); uiDraw.reloadFont();
+            mono = font;   // keep "mono" on the SAME re-baked atlas — a stale copy indexes the new atlas
+                           // with the OLD glyph UVs = the garbled component-class rows in the Scene tab
+        }
     }
     void buildFrame() {
         if (!ready) return;
@@ -1020,6 +1360,7 @@ struct Editor {
         drawSplitters();
         drawContextMenu();                                      // floating; drawn last = on top
         drawAddMenu();
+        drawKeybindsPanel();                                    // F1 overlay: every shortcut in one place
         cx.drawTooltip();                                       // deferred hover tooltips — drawn ABOVE everything
         cx.in.newFrame();                                       // consume per-frame input edges/deltas
     }
@@ -1111,9 +1452,55 @@ struct Editor {
         cx.textAligned(x+128*uiScale, y, w-136*uiScale, hh, b, th.textDim, 2);
     }
 
+    // Floating context menu for a SCENE ITEM (right-click on its marker or its outliner row):
+    // focus / hide / duplicate / remove — so colliders & co. are removable without hunting the 'x'.
+    void drawItemContextMenu() {
+        if (ctxItem < 0 || ctxItem >= (int)items.size()) { ctxOpen=false; ctxItem=-1; return; }
+        auto& th=cx.th; auto& it=items[ctxItem];
+        // acts on the WHOLE item multi-selection when the clicked row is part of it
+        bool multiHit=false; for (int s:selItems) if (s==ctxItem) multiHit=true;
+        std::vector<int> tgt = (multiHit && selItems.size()>1) ? selItems : std::vector<int>{ctxItem};
+        std::string suf = tgt.size()>1 ? (" ("+std::to_string(tgt.size())+")") : std::string();
+        std::vector<std::pair<std::string,int>> rows = {
+            { it.name + "   " + sitem::typeName(it.type) + suf, -1 },
+            { "Focus / teleport", 0 },
+            { std::string(it.hidden ? "Show" : "Hide")+suf+"  (Space)", 1 },
+            { std::string("Duplicate")+suf, 2 },
+            { std::string("Remove")+suf, 3 } };
+        float rh=th.rowH+2*uiScale, w=200*uiScale, h=rows.size()*rh+6*uiScale;
+        float x=ctxX, y=ctxY; if (x+w>fbW) x=fbW-w; if (y+h>fbH) y=fbH-h; if (x<0)x=0; if (y<0)y=0;
+        ctxRX=x; ctxRY=y; ctxRW=w; ctxRH=h;
+        dl.rect(x,y,w,h, th.panelBg); dl.border(x,y,w,h, th.border);
+        dl.pushClip(x,y,w,h);
+        float ry=y+3*uiScale;
+        for (auto& rw : rows) {
+            if (rw.second<0) { cx.textAligned(x+8*uiScale,ry,w-10*uiScale,rh, rw.first.c_str(), th.textDim, 0); dl.rect(x+4*uiScale,ry+rh-1,w-8*uiScale,1,th.border); ry+=rh; continue; }
+            bool hv=cx.hover(x,ry,w,rh);
+            if (hv) dl.rect(x+1,ry,w-2,rh, th.accent);
+            cx.textAligned(x+12*uiScale,ry,w-14*uiScale,rh, rw.first.c_str(), hv?th.textSel:th.text, 0);
+            if (hv && cx.in.pressed[0]) {
+                int a=rw.second;
+                if      (a==0) focusItem(ctxItem);
+                else if (a==1) { bool anyVis=false; for (int t:tgt) if (t<(int)items.size() && !items[t].hidden) anyVis=true;
+                                 for (int t:tgt) if (t<(int)items.size()) items[t].hidden = anyVis; }
+                else if (a==2) { pushItemUndo(items);
+                                 for (int t:tgt) if (t<(int)items.size()) { sitem::Item cp=items[t]; cp.pos[0]+=0.5f; cp.pos[2]+=0.5f; cp.name+=" copy"; items.push_back(std::move(cp)); }
+                                 selItem=(int)items.size()-1; selItems.clear(); deselectAll(); }
+                else if (a==3) { pushItemUndo(items); std::vector<int> del=tgt; std::sort(del.rbegin(), del.rend());
+                                 for (int t:del) if (t<(int)items.size()) items.erase(items.begin()+t);
+                                 selItem=-1; selItems.clear(); }
+                ctxOpen=false; ctxItem=-1;
+                dl.popClip(); return;   // items may have been mutated — stop iterating this frame
+            }
+            ry+=rh;
+        }
+        dl.popClip();
+    }
+
     // Floating object context menu (right-click in the viewport). Items act on ctxMesh.
     void drawContextMenu() {
         if (!ctxOpen) return;
+        if (ctxItem >= 0) { drawItemContextMenu(); return; }   // scene-item variant (outliner/marker right-click)
         if (ctxMesh<0 || ctxMesh>=(int)r->gpuMeshes.size()) { ctxOpen=false; return; }
         auto& th=cx.th; VkGpuMesh& gm=r->gpuMeshes[ctxMesh];
         bool soloed=(r->soloMesh==ctxMesh), hidden=r->isHidden(ctxMesh);
@@ -1122,9 +1509,21 @@ struct Editor {
         int nHidden=0; for (int i=0;i<(int)r->gpuMeshes.size();++i) if (r->isHidden(i)) nHidden++;
         std::string colLbl = gm.dynamicVerts ? (isAnimCollider(ctxMesh) ? "Remove Animated Collider" : "Animated Collider (follows anim)")
                                               : (std::string("Make Mesh Collider (exact)")+suf);
+        bool deleted = r->isDeleted((size_t)ctxMesh);
         std::vector<std::pair<std::string,int>> items = {
             {gm.name, -1}, {"Focus / teleport",0}, {soloed?"Unsolo":"Solo only",1},
-            {std::string(hidden?"Unhide":"Hide")+suf,2}, {std::string("Reset transform")+suf,3}, {"Copy name",4},
+            {std::string(hidden?"Unhide":"Hide")+suf+"  (Space)",2},
+            {std::string("Duplicate")+suf+"  (Ctrl+D)",8},                                    // clone -> move/stretch/cook independently
+            {std::string(deleted?"Restore (render+cook)":"Delete (render+cook)")+suf+"  (Del)",9},
+            {"Stretch / scale (per-axis gizmo)",18},                                          // Scale gizmo + Object-tab Scale fields
+            {"Extend edges DOWN 1m (fill gaps)",19},                                          // grow REAL triangles off open boundary edges,
+            {"Extend edges OUTWARD 1m (fill gaps)",20},                                       // texture continued from the border (repeatable)
+            {std::string("Seal holes (auto-fill)")+suf,21},                                   // fan-fill closed boundary loops on the whole selection
+            {std::string("Cut hole HERE (r=")+std::to_string((int)(cutRadius*100)/100.f).substr(0,4)+"m)",22},   // carve the clicked spot open (doorways)
+            {"Split into connected pieces",23},                                               // separate disjoint parts into own meshes
+            {"Mirror X",24},{"Mirror Y",25},{"Mirror Z",26},                                  // flip to face the other side (winding fixed)
+            {std::string(noColMeshes.count(ctxMesh)?"Collision: INCLUDE again":"Collision: EXCLUDE (walk-through)")+suf,27},
+            {std::string("Reset transform")+suf,3}, {"Copy name",4},
             {colLbl,5},
             {std::string(isSkyboxMesh(ctxMesh)?"Unmark skybox backdrop":"Make skybox backdrop")+suf, 6} };   // -> SkyboxPlatformComponent (far-clip-exempt)
         // CREATE a Meta Component fitted to this mesh (the user wanted every Meta Component reachable from right-click).
@@ -1166,6 +1565,25 @@ struct Editor {
                     setStatus(std::string(makeSky?"Marked ":"Unmarked ")+std::to_string(tg.size())+" mesh(es) as skybox backdrop (far-clip-exempt)");
                 }
                 else if (a==7) { for (int i=0;i<(int)r->gpuMeshes.size();++i) r->setHidden(i,false); setStatus("Unhid ALL meshes"); }   // unhide everything
+                else if (a==8) { if (!inSel(ctxMesh)) selectOne(ctxMesh); duplicateSelected(); }   // clone selection (independent copy, cooks too)
+                else if (a==9) { if (!inSel(ctxMesh)) selectOne(ctxMesh); toggleDeleteSelected(); }  // drop from render + cook (Del again restores)
+                else if (a==18) { if (!inSel(ctxMesh)) selectOne(ctxMesh); gizmoOp=2; tab=TAB_OBJECT;   // STRETCH: per-axis Scale gizmo + the Object tab's Scale fields
+                                  setStatus("Scale gizmo ON - drag a box handle to stretch per-axis (or type in Object > Scale)"); }
+                else if (a==19) extendMeshBoundary(ctxMesh, extendDist, 0);   // grow triangles DOWN off open edges (floor gaps)
+                else if (a==20) extendMeshBoundary(ctxMesh, extendDist, 1);   // grow triangles OUTWARD (radial, horizon gaps)
+                else if (a==21) { std::vector<int> tg2 = tg; std::sort(tg2.rbegin(), tg2.rend());   // seal EVERY selected mesh
+                                  for (int t2 : tg2) sealMeshHoles(t2); }
+                else if (a==22) { if (ctxHitValid) cutMeshHole(ctxMesh, ctxHitP, cutRadius);   // carve a doorway at the clicked spot
+                                  else setStatus("cut: no surface point under the cursor (right-click ON the mesh)"); }
+                else if (a==23) splitMeshParts(ctxMesh);                       // separate connected pieces
+                else if (a==24) mirrorMesh(ctxMesh, 0);
+                else if (a==25) mirrorMesh(ctxMesh, 1);
+                else if (a==26) mirrorMesh(ctxMesh, 2);
+                else if (a==27) { bool exc = !noColMeshes.count(ctxMesh);      // collision walk-through toggle (whole selection)
+                                  for (int t2:tg) { if (exc) noColMeshes.insert(t2); else noColMeshes.erase(t2); }
+                                  bakeNavmeshes(this->items);                  // preview + cook collision re-bake immediately ("items" here = the MENU rows)
+                                  setStatus(exc ? "Collision EXCLUDED - you can walk through these (cook follows)"
+                                                : "Collision INCLUDED again"); }
                 // "Make component from mesh" — BULK: one component per mesh in the whole selection (tg), not just the clicked one.
                 else if (a==10) for(int t:tg) addItemFromMesh(sitem::BOXCOL, t);
                 else if (a==11) for(int t:tg) addItemFromMesh(sitem::WALLPLACE, t);
@@ -1223,7 +1641,7 @@ struct Editor {
         auto& th = cx.th; float y = (float)rcHeader.extent.height, h = 26*uiScale;
         float W = (float)rcViewport.extent.width;   // span the viewport pane; the right column stays usable
         dl.rect(0, y, W, h, ui::rgba(115,85,20,240)); dl.rect(0, y+h-1, W, 1, th.splitLine);
-        cx.textAligned(8*uiScale, y, W-190*uiScale, h, "Auto-save found (newer than your last save) — restore the recovered session?", ui::rgba(255,232,170), 0);
+        cx.textAligned(8*uiScale, y, W-190*uiScale, h, "Auto-save found (newer than your last save) - restore the recovered session?", ui::rgba(255,232,170), 0);
         float bw = 84*uiScale, bh = h-6*uiScale;
         if (cx.button(ui::hashId("asrest"), W-2*bw-16*uiScale, y+3*uiScale, bw, bh, "Restore", true)) restoreAutosave();
         if (cx.button(ui::hashId("asdism"), W-bw-8*uiScale,    y+3*uiScale, bw, bh, "Dismiss")) dismissAutosave();
@@ -1258,14 +1676,22 @@ struct Editor {
         // X-RAY: selected mesh wireframe over the boxes (align colliders to meshes without camera-angle ambiguity)
         { const char* s = "X-ray"; float w=dl.textW(s)+16*uiScale;
           if (cx.tab(ui::hashId("hdrxray"), px+8*uiScale, v.offset.y, w, bh, s, xrayMesh)) xrayMesh=!xrayMesh; px+=w+8*uiScale; }
-        if (playSim) cx.textAligned(v.offset.x+8*uiScale, v.offset.y+v.extent.height-40*uiScale, v.extent.width-16, 18*uiScale, "WALK MODE — WASD+mouse to walk the navmesh, P to exit", ui::rgba(120,230,140), 0);
-        // overlay toggles (the navmesh/collider/spawn gizmos) — SEPARATE + all OFF by default, right of the header
-        const char* ov[5]={"Navmesh","Colliders","Spawn","Far-clip","Collision"}; bool* ovp[5]={&r->showNavmesh,&r->showCollision,&r->showSpawn,&showFarClip,&showMeshCol};
-        float ox = v.offset.x + v.extent.width - 6*uiScale;
-        for (int i=4;i>=0;--i){ float ow=dl.textW(ov[i])+16*uiScale; ox-=ow+3*uiScale; if (cx.tab(ui::hashId(2100+i,9), ox, (float)v.offset.y, ow, bh, ov[i], *ovp[i])) *ovp[i]=!*ovp[i]; }
+        if (playSim) cx.textAligned(v.offset.x+8*uiScale, v.offset.y+v.extent.height-40*uiScale, v.extent.width-16, 18*uiScale, "WALK MODE - WASD+mouse to walk the navmesh, P to exit", ui::rgba(120,230,140), 0);
+        // (overlay/gizmo toggles moved to their single home: the Scene tab "Gizmos / overlays" section —
+        //  they used to duplicate here in the viewport header, which read as a confusing second selector)
         // stats (bottom-left)
         char st[128]; snprintf(st,sizeof st,"%zu objects   sel: %s", r->gpuMeshes.size(), selected>=0?r->gpuMeshes[selected].name.c_str():"-");
         cx.textAligned(v.offset.x+8*uiScale, v.offset.y+v.extent.height-20*uiScale, v.extent.width-16, 18*uiScale, st, th.textDim, 0);
+        // GPU-upload loading bar (progressive streaming): centered at the bottom until every mesh has landed.
+        if (uploadTotal > 0 && uploadCur < uploadTotal) {
+            float bw = std::min(420.f*uiScale, v.extent.width*0.55f), bh2 = 9*uiScale;
+            float bx = v.offset.x + (v.extent.width-bw)*0.5f, by = v.offset.y + v.extent.height - 44*uiScale;
+            char lb[96]; snprintf(lb,sizeof lb,"Loading meshes onto GPU   %d / %d", uploadCur, uploadTotal);
+            cx.textAligned(bx, by-20*uiScale, bw, 18*uiScale, lb, th.text, 1);
+            dl.rect(bx, by, bw, bh2, ui::rgba(28,32,44));
+            dl.rect(bx, by, bw*(float)uploadCur/(float)uploadTotal, bh2, th.accent);
+            dl.border(bx, by, bw, bh2, th.border);
+        }
         dl.popClip();
     }
 
@@ -1315,47 +1741,89 @@ struct Editor {
         dl.pushClip(x, listY, w, listH);
         if (cx.hover(x,listY,w,listH) && cx.in.wheel!=0) outlinerScroll -= cx.in.wheel*rowH*3;
         int nItems=(int)items.size(), nMesh=(int)r->gpuMeshes.size();
-        float total = (nItems?(nItems+1)*rowH:0) + (nMesh+1)*rowH;
+        // FILTERED count for the scroll extent: with a search active only matching rows take space, so the scroll must
+        // clamp to the FILTERED height — else a stale scroll offset (from before the search) leaves the packed matches
+        // scrolled ABOVE the viewport => "search shows nothing" (the bug). Lowercase substring = case-insensitive.
+        // The search now covers SCENE ITEMS too (name + type, e.g. "collider" lists every collider).
+        std::string lsq = search; for (char& c : lsq) c=(char)tolower((unsigned char)c);
+        auto meshMatches=[&](int i){ if(!search[0]) return true; std::string ln=r->gpuMeshes[i].name; for(char&c:ln)c=(char)tolower((unsigned char)c); return ln.find(lsq)!=std::string::npos; };
+        auto itemMatches=[&](int i){ if(!search[0]) return true;
+            std::string ln=items[i].name; ln+=' '; ln+=sitem::typeName(items[i].type);
+            for(char&c:ln)c=(char)tolower((unsigned char)c); return ln.find(lsq)!=std::string::npos; };
+        int nMeshShown = nMesh;
+        if (search[0]) { nMeshShown=0; for (int i=0;i<nMesh;i++) if (meshMatches(i)) nMeshShown++; }
+        int nItemsShown = nItems;
+        if (search[0]) { nItemsShown=0; for (int i=0;i<nItems;i++) if (itemMatches(i)) nItemsShown++; }
+        float total = (nItems?(1+(itemsCollapsed?0:nItemsShown))*rowH:0) + (1+(meshesCollapsed?0:nMeshShown))*rowH;
         outlinerScroll = std::clamp(outlinerScroll, 0.f, std::max(0.f, total-listH));
         float ry = listY - outlinerScroll;
         auto onScreen=[&](float yy){ return yy+rowH>listY && yy<listY+listH; };
+        // Collapsible section header: "v NAME (count)" / "> NAME (count)" — click toggles.
+        auto sectionHeader=[&](const char* name, int count, bool& collapsed)->void{
+            if (onScreen(ry)) {
+                bool hv = cx.hover(x,ry,w,rowH);
+                if (hv) dl.rect(x,ry,w,rowH,th.rowHover);
+                char hd[96]; snprintf(hd,sizeof hd,"%s %s  (%d)", collapsed?">":"v", name, count);
+                cx.textAligned(x+6*uiScale,ry,w,rowH,hd,th.textDim,0);
+                if (hv && cx.in.pressed[0] && !addMenuOpen && !ctxOpen) collapsed = !collapsed;
+            }
+            ry+=rowH;
+        };
         if (nItems) {
-            if (onScreen(ry)) cx.textAligned(x+6*uiScale,ry,w,rowH,"SCENE ITEMS",th.textDim,0); ry+=rowH;
-            for (int i=0;i<nItems;++i, ry+=rowH) { if (!onScreen(ry)) continue;
-                auto& it=items[i]; bool seld=(i==selItem);
+            sectionHeader("SCENE ITEMS", nItemsShown, itemsCollapsed);
+            if (!itemsCollapsed) for (int i=0;i<nItems;++i) { if (!itemMatches(i)) continue;
+                if (!onScreen(ry)) { ry+=rowH; continue; }
+                auto& it=items[i];
+                bool inMulti=false; for (int s:selItems) if (s==i) inMulti=true;
+                bool seld=(i==selItem)||inMulti;
                 if (seld) dl.rect(x,ry,w,rowH,th.rowSel); else if (cx.hover(x,ry,w,rowH)) dl.rect(x,ry,w,rowH,th.rowHover);
-                // VISIBILITY EYE (same as the mesh rows) — hides this item's marker + gizmo. Was missing: scene items only had the 'x' delete.
+                // VISIBILITY EYE (same as the mesh rows) — hides this item's marker + gizmo.
                 bool vis=!it.hidden; bool eyeClicked = eyeToggle(x+12*uiScale, ry+rowH*0.5f, vis); if (eyeClicked) it.hidden=!vis;
                 char lbl[180]; snprintf(lbl,sizeof lbl,"%s   %s", it.name.c_str(), sitem::typeName(it.type));
                 cx.textAligned(x+28*uiScale,ry,w-48*uiScale,rowH,lbl, it.hidden?th.textDim:(seld?th.textSel:th.text), 0);
                 float ex=x+w-15*uiScale; bool dh=cx.hover(ex-3*uiScale,ry,18*uiScale,rowH);
                 cx.textAligned(ex,ry,14*uiScale,rowH,"x", dh?ui::rgba(255,120,120):th.textDim, 0);
-                if (!addMenuOpen && !eyeClicked && cx.hover(x,ry,w,rowH) && cx.in.pressed[0]) { if (dh) { pushItemUndo(items); items.erase(items.begin()+i); selItem=-1; dl.popClip(); return; }
-                    bool dbl = (selItem==i) && (cx.t - lastItemClickT < 0.35f); selItem=i; deselectAll(); lastItemClickT=cx.t;
-                    if (dbl) focusItem(i); }   // SELECT only (no teleport); DOUBLE-click (or the Focus button) frames it — so a stray click doesn't fling the camera
+                // RIGHT-CLICK -> the scene-item context menu (focus/hide/duplicate/REMOVE — acts on the whole multi-selection)
+                if (!addMenuOpen && !ctxOpen && cx.hover(x,ry,w,rowH) && cx.in.pressed[1]) {
+                    if (!inMulti) { selItems.assign(1,i); selItem=i; deselectAll(); }
+                    ctxItem=i; ctxMesh=-1; ctxOpen=true; ctxX=cx.in.mx; ctxY=cx.in.my;
+                }
+                if (!addMenuOpen && !ctxOpen && !eyeClicked && cx.hover(x,ry,w,rowH) && cx.in.pressed[0]) { if (dh) { pushItemUndo(items); items.erase(items.begin()+i); selItem=-1; selItems.clear(); dl.popClip(); return; }
+                    bool dbl = (selItem==i) && (cx.t - lastItemClickT < 0.35f);
+                    if (cx.in.shift||cx.in.ctrl) {   // MULTI-select scene items (Ctrl/Shift+click, like mesh rows)
+                        bool was=false; for (size_t k=0;k<selItems.size();++k) if (selItems[k]==i){ selItems.erase(selItems.begin()+k); was=true; break; }
+                        if (!was) selItems.push_back(i);
+                        selItem = selItems.empty()?-1:selItems.back(); deselectAll();
+                    } else { selItems.assign(1,i); selItem=i; deselectAll(); }
+                    lastItemClickT=cx.t;
+                    if (dbl) focusItem(i); }   // SELECT only (no teleport); DOUBLE-click (or the Focus button) frames it
+                ry+=rowH;
             }
         }
-        if (onScreen(ry)) cx.textAligned(x+6*uiScale,ry,w,rowH,"MESHES",th.textDim,0); ry+=rowH;
-        for (int i=0;i<nMesh;i++, ry+=rowH) {
-            if (!onScreen(ry)) continue;
+        sectionHeader("MESHES", nMeshShown, meshesCollapsed);
+        if (!meshesCollapsed) for (int i=0;i<nMesh;i++) {
+            // FILTER FIRST: a non-matching row takes NO space (so matches pack from the top and the scroll extent above
+            // matches the visible list). Checking on-screen first (old code) advanced ry for filtered-out off-screen rows,
+            // desyncing the packed layout. Case-insensitive (CamelCase names vs lowercase query, e.g. "tree"->"gazeboTrees").
+            if (!meshMatches(i)) continue;
+            if (!onScreen(ry)) { ry+=rowH; continue; }
             auto& gm = r->gpuMeshes[i];
-            // CASE-INSENSITIVE substring match (mesh names are CamelCase; a lowercase query must still match —
-            // the old case-sensitive find made the search look broken / "no mesh search").
-            if (search[0]) {
-                std::string ln=gm.name, ls=search;
-                for(char&c:ln)c=(char)tolower((unsigned char)c); for(char&c:ls)c=(char)tolower((unsigned char)c);
-                if (ln.find(ls)==std::string::npos) { ry-=rowH; continue; }
-            }
             bool vis = !r->isHidden(i);
-            auto rr = cx.treeRow(ui::hashId(3000+i,11), x, ry, w, rowH, (gm.name+"  ["+std::to_string(i)+"]"+(isSkyboxMesh(i)?"  *SKY*":"")).c_str(), 0, false, false, inSel(i), vis);
-            if (addMenuOpen) rr = ui::Context::RowResult{};   // the Add menu overlays the list -> ignore row clicks under it
+            auto rr = cx.treeRow(ui::hashId(3000+i,11), x, ry, w, rowH, (gm.name+"  ["+std::to_string(i)+"]"+(isSkyboxMesh(i)?"  *SKY*":"")+(r->isDeleted(i)?"  [DEL]":"")).c_str(), 0, false, false, inSel(i), vis);
+            if (addMenuOpen || ctxOpen) rr = ui::Context::RowResult{};   // an open menu overlays the list -> ignore row clicks under it
             if (rr.clicked) { selItem=-1; if (cx.in.shift||cx.in.ctrl) toggleSel(i); else selectOne(i); }   // Ctrl/Shift = add to multi-selection
             if (rr.toggledVis) r->setHidden(i, vis);
             if (rr.clicked && cx.in.pressed[0] && (cx.t - lastClickT < 0.3f) && lastClickIdx==i) focusMesh(gm);
             if (rr.clicked) { lastClickT = cx.t; lastClickIdx = i; }
+            // RIGHT-CLICK on the row -> the SAME mesh context menu as the viewport (hide/duplicate/delete/colliders/...)
+            if (!addMenuOpen && !ctxOpen && cx.hover(x,ry,w,rowH) && cx.in.pressed[1]) {
+                if (!inSel(i)) selectOne(i);
+                selItem=-1; ctxMesh=i; ctxItem=-1; ctxOpen=true; ctxX=cx.in.mx; ctxY=cx.in.my;
+            }
             // DRAG-PAINT multi-select: press a row, then drag over more rows (mouse held) to add them to the selection
-            if (cx.in.pressed[0] && cx.hover(x,ry,w,rowH)) outlinerDragRow=i;
-            else if (cx.in.down[0] && outlinerDragRow>=0 && i!=outlinerDragRow && cx.hover(x,ry,w,rowH) && !inSel(i)) { sel.push_back(i); selected=i; r->selectedMesh=i; selItem=-1; }
+            if (!ctxOpen && cx.in.pressed[0] && cx.hover(x,ry,w,rowH)) outlinerDragRow=i;
+            else if (!ctxOpen && cx.in.down[0] && outlinerDragRow>=0 && i!=outlinerDragRow && cx.hover(x,ry,w,rowH) && !inSel(i)) { sel.push_back(i); selected=i; r->selectedMesh=i; selItem=-1; }
+            ry += rowH;   // advance ONLY for shown (matching, on-screen) rows
         }
         if (!cx.in.down[0]) outlinerDragRow=-1;   // end the drag-paint when the button is released
         dl.popClip();
@@ -1500,6 +1968,27 @@ struct Editor {
     // The Meta-Component manager: per haven component type — colour swatch, EYE visibility toggle, count, + Add, Meta class.
     void drawScenePanel(float x, float y, float w){
         auto& th=cx.th; float rh=th.rowH;
+        // ── GIZMOS / OVERLAYS — single home for the viewport overlay toggles (they used to sit in the
+        //    viewport header AND partly here = the confusing duplicate row; now this tab owns them). ──
+        cx.label(x,y,w,rh,"Gizmos / overlays",th.text); y+=rh+2*uiScale;
+        cx.checkbox(ui::hashId("gzNav"),  x, y, "Navmesh (walkable preview)", r->showNavmesh); y+=rh;
+        cx.checkbox(ui::hashId("gzCol"),  x, y, "Colliders / walls", r->showCollision); y+=rh;
+        cx.checkbox(ui::hashId("gzSpn"),  x, y, "Spawn markers", r->showSpawn); y+=rh;
+        cx.checkbox(ui::hashId("gzFar"),  x, y, "Far-clip dome (device 5000m)", showFarClip); y+=rh;
+        cx.checkbox(ui::hashId("gzMCol"), x, y, "Mesh collision (exact tris)", showMeshCol); y+=rh+6*uiScale;
+        dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
+        // ── LIGHTING — global light manipulation (multiplies every draw's color; live, persisted, ships in session) ──
+        cx.label(x,y,w,rh,"Lighting  (global, live)",th.text); y+=rh+2*uiScale;
+        { float lw=26*uiScale, fw=(w-lw*4)/4 - 2*uiScale; const char* nm[4]={"R","G","B","A"};
+          for (int k=0;k<4;k++){ float fx=x+k*(lw+fw+2*uiScale);
+              cx.label(fx,y,lw,rh,nm[k],th.textDim);
+              cx.dragFloat(ui::hashId(9200u+(unsigned)k,17u), fx+lw, y, fw, rh, r->lightMul[k], 0.005f, "%.2f"); }
+          y+=rh+2*uiScale;
+          float bw2=(w-8*uiScale)/2;
+          if (cx.button(ui::hashId("litreset"), x, y, bw2, rh, "Reset lighting")) { for(int k=0;k<4;k++) r->lightMul[k]=1.f; }
+          if (cx.button(ui::hashId("litnight"), x+bw2+6*uiScale, y, bw2, rh, "Night preview")) { r->lightMul[0]=0.35f; r->lightMul[1]=0.40f; r->lightMul[2]=0.55f; r->lightMul[3]=1.f; }
+          y+=rh+8*uiScale; }
+        dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
         cx.label(x,y,w,rh,"Meta Components",th.text); y+=rh;
         cx.label(x,y,w,rh*0.9f,"eye = show markers     + Add = spawn one",th.textDim); y+=rh+4*uiScale;
         int types[]={sitem::SPAWN,sitem::CHAIR,sitem::BOXCOL,sitem::NAVMESH,sitem::WALLPLACE,sitem::HOTSPOT,sitem::BOUNDARY};
@@ -1540,7 +2029,7 @@ struct Editor {
         { bool have = selected>=0 && sceneMeshes && selected<(int)sceneMeshes->size();
           y0=y; if (cx.button(ui::hashId("skyfromsel"), x+88*uiScale+56*uiScale, y, w-88*uiScale-56*uiScale, rh,
                 have?"Use selected mesh's texture":"Use selected mesh's texture (select a mesh first)") && have) setSkyImageFromMesh(selected);
-          cx.tip(x,y0,w,rh,"Reuse the SELECTED mesh's texture as the skybox (e.g. the env's\nown sky dome texture) — no external image file needed."); }
+          cx.tip(x,y0,w,rh,"Reuse the SELECTED mesh's texture as the skybox (e.g. the env's\nown sky dome texture) - no external image file needed."); }
         y+=rh+4*uiScale;
         // current state line
         { std::string cur = "current: ";
@@ -1607,6 +2096,35 @@ struct Editor {
         }
         if (cx.button(ui::hashId("focusx"), x+126*uiScale, y, 80*uiScale, th.rowH, "Focus")) focusMesh(gm);
         y += th.rowH+8*uiScale;
+        // ── GEOMETRY: manual extend/seal (the context menu has 1-click presets; this is the dialed version).
+        //    Both AUTO-ADJUST THE TEXTURE: extend continues the border UVs, seal blends the rim UVs. ──
+        dl.rect(x,y,w,1,th.splitLine); y+=5*uiScale;
+        cx.label(x,y,w,th.rowH,"Geometry (fill gaps/holes)",th.text); y+=th.rowH+2*uiScale;
+        cx.label(x,y,70*uiScale,th.rowH,"Distance",th.textDim);
+        cx.dragFloat(ui::hashId("extdist"), x+72*uiScale, y, 80*uiScale, th.rowH, extendDist, 0.01f, "%.2f"); y+=th.rowH+3*uiScale;
+        { float bw3=(w-10*uiScale)/3;
+          if (cx.button(ui::hashId("extdn"),  x,                 y, bw3, th.rowH, "Extend Down"))    extendMeshBoundary(selected, extendDist, 0);
+          if (cx.button(ui::hashId("extout"), x+bw3+5*uiScale,   y, bw3, th.rowH, "Extend Out"))     extendMeshBoundary(selected, extendDist, 1);
+          if (cx.button(ui::hashId("extup"),  x+2*(bw3+5*uiScale), y, bw3, th.rowH, "Extend Up"))    extendMeshBoundary(selected, extendDist, 2);
+          y+=th.rowH+3*uiScale; }
+        if (cx.button(ui::hashId("sealhx"), x, y, w, th.rowH, "Seal holes (auto-fill loops)")) sealMeshHoles(selected);
+        y += th.rowH+3*uiScale;
+        cx.label(x,y,70*uiScale,th.rowH,"Cut radius",th.textDim);
+        cx.dragFloat(ui::hashId("cutrad"), x+72*uiScale, y, 80*uiScale, th.rowH, cutRadius, 0.01f, "%.2f"); y+=th.rowH+3*uiScale;
+        cx.label(x,y,w,th.rowH*0.9f,"(cut: RIGHT-CLICK the exact spot -> 'Cut hole HERE')",th.textDim); y+=th.rowH*0.9f+2*uiScale;
+        { float bw3=(w-10*uiScale)/3;
+          if (cx.button(ui::hashId("mirx"), x,                   y, bw3, th.rowH, "Mirror X")) mirrorMesh(selected, 0);
+          if (cx.button(ui::hashId("miry"), x+bw3+5*uiScale,     y, bw3, th.rowH, "Mirror Y")) mirrorMesh(selected, 1);
+          if (cx.button(ui::hashId("mirz"), x+2*(bw3+5*uiScale), y, bw3, th.rowH, "Mirror Z")) mirrorMesh(selected, 2);
+          y+=th.rowH+3*uiScale; }
+        { float bw2=(w-6*uiScale)/2;
+          if (cx.button(ui::hashId("splitp"), x, y, bw2, th.rowH, "Split pieces")) splitMeshParts(selected);
+          bool exc = noColMeshes.count(selected)!=0;
+          if (cx.button(ui::hashId("nocol"), x+bw2+6*uiScale, y, bw2, th.rowH, exc?"Collision: OFF":"Collision: ON", exc)) {
+              if (exc) noColMeshes.erase(selected); else noColMeshes.insert(selected);
+              bakeNavmeshes(items);
+          }
+          y+=th.rowH+8*uiScale; }
         char b[96]; snprintf(b,sizeof b,"indices: %u    centroid %.1f %.1f %.1f", gm.nIdx, gm.centroid[0],gm.centroid[1],gm.centroid[2]);
         cx.label(x,y,w,th.rowH,b,th.textDim); y+=th.rowH;
         snprintf(b,sizeof b,"skinned: %s   dynamic: %s", gm.isSkinned?"yes":"no", gm.dynamicVerts?"yes":"no");
@@ -1660,13 +2178,132 @@ struct Editor {
             y += 3*uiScale;
         }
     }
+    // ── MATERIAL EDITOR: live-editable flags + tint, texture swap/export, shader inspector.
+    // Flag edits write BOTH the GPU mesh (live preview) AND the CPU MeshData (so the cook ships them);
+    // tint rides the per-draw color push constant (live). All persisted in the .hsledit session.
     void drawMaterialTab(VkGpuMesh& gm, float x, float y, float w) {
-        auto& th=cx.th; char b[96];
-        snprintf(b,sizeof b,"blend: %s", gm.useBlend?"alpha":(gm.additive?"additive":"opaque")); cx.label(x,y,w,th.rowH,b,th.text); y+=th.rowH;
-        snprintf(b,sizeof b,"alphaTest (cutout): %s", gm.alphaTest?"yes":"no"); cx.label(x,y,w,th.rowH,b,th.text); y+=th.rowH;
-        snprintf(b,sizeof b,"cull: %s", gm.cullBack?"back (single-sided)":"none (double-sided)"); cx.label(x,y,w,th.rowH,b,th.text); y+=th.rowH;
-        if (cx.button(ui::hashId("solox"), x, y+4*uiScale, 90*uiScale, th.rowH, r->soloMesh==selected?"Unsolo":"Solo only")) r->soloMesh = (r->soloMesh==selected)?-1:selected;
+        auto& th=cx.th; float rh=th.rowH; char b[192];
+        MeshData* md = (sceneMeshes && selected>=0 && selected<(int)sceneMeshes->size()) ? &(*sceneMeshes)[selected] : nullptr;
+        // ── SHADER INSPECTOR ─────────────────────────────────────────────
+        cx.label(x,y,w,rh,"Shader",th.text); y+=rh;
+        { std::string sn = (gm.progIdx>=0 && gm.progIdx<(int)r->programs.size())
+                             ? r->programs[gm.progIdx].surface
+                             : (r->globalShaderPath.empty() ? std::string("built-in V79 unlit (texture RGBA)") : r->globalShaderPath);
+          size_t sl=sn.find_last_of('/'); if (sl!=std::string::npos) sn=sn.substr(sl+1);
+          snprintf(b,sizeof b,"  %s%s", sn.c_str(), gm.isSkinned?"  [skinned]":""); cx.label(x,y,w,rh,b,th.textDim); y+=rh;
+          snprintf(b,sizeof b,"  progIdx %d   stride %u   idx %u", gm.progIdx, gm.vboStride, gm.nIdx);
+          cx.label(x,y,w,rh,b,th.textDim); y+=rh+4*uiScale; }
+        dl.rect(x,y,w,1,th.splitLine); y+=5*uiScale;
+        // ── FLAGS (live + cook) ──────────────────────────────────────────
+        cx.label(x,y,w,rh,"Material flags  (live + cook)",th.text); y+=rh+2*uiScale;
+        bool ch=false, v;
+        v=gm.useBlend;  if (cx.checkbox(ui::hashId("mfblend"), x, y, "Alpha blend (transparent)", v)) { gm.useBlend=v;  if(md) md->useBlend=v;  ch=true; } y+=rh;
+        v=gm.additive;  if (cx.checkbox(ui::hashId("mfadd"),   x, y, "Additive (glow / god-rays)", v)) { gm.additive=v;  if(md) md->additive=v;  ch=true; } y+=rh;
+        v=gm.alphaTest; if (cx.checkbox(ui::hashId("mfatest"), x, y, "Alpha test (cutout, depth-writes)", v)) { gm.alphaTest=v; if(md) md->alphaTest=v; ch=true; } y+=rh;
+        v=gm.cullBack;  if (cx.checkbox(ui::hashId("mfcull"),  x, y, "Back-face cull (single-sided)", v)) { gm.cullBack=v;  if(md) md->doubleSided=!v; ch=true; } y+=rh+4*uiScale;
+        if (ch) matEdited.insert(selected);   // session: persist a MATF line for this mesh
+        // ── TINT (live, rides the color push constant) ───────────────────
+        cx.label(x,y,w,rh,"Tint  (r g b a, live)",th.text); y+=rh+2*uiScale;
+        { float lw=26*uiScale, fw=(w-lw*4)/4 - 2*uiScale; const char* nm[4]={"R","G","B","A"}; bool tch=false;
+          for (int k=0;k<4;k++){ float fx=x+k*(lw+fw+2*uiScale);
+              cx.label(fx,y,lw,rh,nm[k],th.textDim);
+              if (cx.dragFloat(ui::hashId(9100u+(unsigned)k,13u), fx+lw, y, fw, rh, gm.editTint[k], 0.005f, "%.2f")) tch=true; }
+          y+=rh+2*uiScale;
+          if (cx.button(ui::hashId("tintreset"), x, y, 120*uiScale, rh, "Reset tint")) { for(int k=0;k<4;k++) gm.editTint[k]=1.f; tch=true; }
+          if (tch) matEdited.insert(selected);
+          y+=rh+4*uiScale; }
+        dl.rect(x,y,w,1,th.splitLine); y+=5*uiScale;
+        // ── TEXTURE (swap / export) ──────────────────────────────────────
+        cx.label(x,y,w,rh,"Base texture",th.text); y+=rh;
+        snprintf(b,sizeof b,"  %dx%d%s", md?md->texW:0, md?md->texH:0, texOverride.count(selected)?"  (REPLACED)":"");
+        cx.label(x,y,w,rh,b,th.textDim); y+=rh+2*uiScale;
+        { float bw2=(w-8*uiScale)/2;
+          if (cx.button(ui::hashId("mtset"), x, y, bw2, rh+2*uiScale, "Set texture...", true)) {
+              std::string p=pickFileWin32(L"Choose texture (PNG / JPG)");
+              if (!p.empty()) setMeshTexture(selected, p);
+          }
+          if (cx.button(ui::hashId("mtexp"), x+bw2+6*uiScale, y, bw2, rh+2*uiScale, "Export PNG") && md && !md->texRGBA.empty()) {
+              std::string safe = "saved/"; for (char c : gm.name) safe += (c=='/'||c=='\\'||c==':')?'_':c; safe += "_tex.png";
+              if (stbi_write_png(safe.c_str(), md->texW, md->texH, 4, md->texRGBA.data(), md->texW*4))
+                  setStatus("Exported texture -> "+safe);
+              else setStatus("Texture export FAILED: "+safe);
+          }
+          y+=rh+8*uiScale; }
+        // ── SHADER DECOMPILER + COMPILER (full in-editor round trip) ───────────────────
+        // Decompile: active program SPIR-V -> GLSL (tools/spirv-cross), opened for editing.
+        // Compile+Apply: edited GLSL -> SPIR-V (tools/glslangValidator) -> pipelines HOT-RELOADED live.
+        { float bw2=(w-8*uiScale)/2;
+          if (cx.button(ui::hashId("shdec"), x, y+4*uiScale, bw2, rh+2*uiScale, "Decompile -> GLSL", true)) decompileShaderFor(selected);
+          if (cx.button(ui::hashId("shcmp"), x+bw2+6*uiScale, y+4*uiScale, bw2, rh+2*uiScale, "Compile + APPLY", true)) compileApplyShaderFor(selected);
+          y+=rh+10*uiScale;
+          if (cx.button(ui::hashId("solox"), x, y, bw2, rh, r->soloMesh==selected?"Unsolo":"Solo only")) r->soloMesh = (r->soloMesh==selected)?-1:selected;
+          y+=rh+4*uiScale;
+          cx.label(x,y,w,rh*0.9f,"Decompile writes saved/shaders/<name>.{vert,frag}.glsl and",th.textDim); y+=rh*0.85f;
+          cx.label(x,y,w,rh*0.9f,"opens them; edit, then Compile+APPLY hot-reloads them LIVE.",th.textDim); }
     }
+    // Compile the (edited) GLSL for this mesh's shader back to SPIR-V with the vendored glslangValidator
+    // and HOT-RELOAD the pipelines live (r->reloadShaderFor). Compile errors land in the status line.
+    void compileApplyShaderFor(int mi) {
+        if (!r || mi<0 || mi>=(int)r->gpuMeshes.size()) return;
+        auto& gm = r->gpuMeshes[mi];
+        std::string sn = "builtin_v79_unlit";
+        if (gm.progIdx>=0 && gm.progIdx<(int)r->programs.size()) sn = r->programs[gm.progIdx].surface;
+        std::string safe; for (char c : sn) safe += (isalnum((unsigned char)c)||c=='_'||c=='-')?c:'_';
+        std::string vg="saved/shaders/"+safe+".vert.glsl", fg="saved/shaders/"+safe+".frag.glsl";
+        if (!std::filesystem::exists(vg) || !std::filesystem::exists(fg)) { setStatus("Compile: run 'Decompile -> GLSL' first ("+vg+" missing)"); return; }
+#ifdef _WIN32
+        std::string gv = AppConfig::s_exeDir + "\\..\\tools\\glslangValidator.exe";
+        if (FILE* t=fopen(gv.c_str(),"rb")) fclose(t); else gv = "tools/glslangValidator.exe";
+        std::string vs="saved/shaders/"+safe+".vert.edit.spv", fs="saved/shaders/"+safe+".frag.edit.spv", lg="saved/shaders/_compile.log";
+        std::error_code ec; std::filesystem::remove(vs,ec); std::filesystem::remove(fs,ec);
+        system(("cmd /C \""+gv+"\" -V -S vert \""+vg+"\" -o \""+vs+"\" > \""+lg+"\" 2>&1").c_str());
+        system(("cmd /C \""+gv+"\" -V -S frag \""+fg+"\" -o \""+fs+"\" >> \""+lg+"\" 2>&1").c_str());
+        auto rd=[&](const std::string& p, std::vector<u32>& out)->bool{ FILE* f=fopen(p.c_str(),"rb"); if(!f) return false;
+            fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+            if (n<20 || (n&3)){ fclose(f); return false; } out.resize((size_t)n/4); fread(out.data(),4,out.size(),f); fclose(f); return true; };
+        std::vector<u32> vspv, fspv;
+        if (!rd(vs,vspv) || !rd(fs,fspv)) {
+            std::string err; FILE* f=fopen(lg.c_str(),"rb");   // surface the FIRST validator error
+            if (f){ char buf[512]; size_t n2=fread(buf,1,sizeof buf-1,f); buf[n2]=0; fclose(f);
+                    for (char* c=buf;*c;++c) if(*c=='\r'||*c=='\n') *c=' '; err=buf; }
+            setStatus("Shader compile FAILED: "+err.substr(0,220));
+            return;
+        }
+        bool ok = r->reloadShaderFor(mi, vspv, fspv);
+        setStatus(ok ? ("Shader '"+sn+"' compiled + HOT-RELOADED - the change is LIVE in the viewport")
+                     : "Shader compiled but pipeline rebuild FAILED (kept old shader) - check bindings match");
+#endif
+    }
+    // Dump the mesh's ACTIVE shader program (per-material or global) to saved/shaders/ as .spv, then
+    // run the vendored tools/spirv-cross.exe to emit readable GLSL beside it and open the folder.
+    // Recompile path: edit the GLSL -> tools/glsl_to_surface.py (glslangValidator) -> cookable .surface.
+    void decompileShaderFor(int mi) {
+        if (!r || mi<0 || mi>=(int)r->gpuMeshes.size()) return;
+        auto& gm = r->gpuMeshes[mi];
+        const std::vector<u32>* vs = &r->vertSpirv; const std::vector<u32>* fs = &r->fragSpirv;
+        std::string sn = "builtin_v79_unlit";
+        if (gm.progIdx>=0 && gm.progIdx<(int)r->programs.size()) {
+            sn = r->programs[gm.progIdx].surface;
+            for (auto& ls : r->loadedShaders) if (ls.surface==sn && !ls.vert.empty() && !ls.frag.empty()) { vs=&ls.vert; fs=&ls.frag; break; }
+        }
+        std::string safe; for (char c : sn) safe += (isalnum((unsigned char)c)||c=='_'||c=='-')?c:'_';
+        std::filesystem::create_directories("saved/shaders");
+        std::string vp = "saved/shaders/"+safe+".vert.spv", fp = "saved/shaders/"+safe+".frag.spv";
+        auto wr=[&](const std::string& p, const std::vector<u32>& d){ FILE* f=fopen(p.c_str(),"wb"); if(f){ fwrite(d.data(),4,d.size(),f); fclose(f);} };
+        wr(vp,*vs); wr(fp,*fs);
+#ifdef _WIN32
+        std::string sc = AppConfig::s_exeDir + "\\..\\tools\\spirv-cross.exe";
+        if (FILE* t=fopen(sc.c_str(),"rb")) fclose(t); else sc = "tools/spirv-cross.exe";   // repo-root fallback
+        std::string cmd = "\""+sc+"\" --version 450 \""+vp+"\" --output \"saved/shaders/"+safe+".vert.glsl\""
+                          " & \""+sc+"\" --version 450 \""+fp+"\" --output \"saved/shaders/"+safe+".frag.glsl\"";
+        system(("cmd /C "+cmd+" >NUL 2>&1").c_str());
+        // open both GLSL files for editing right away (default editor), + the folder for context
+        system(("cmd /C start \"\" notepad \"saved\\shaders\\"+safe+".vert.glsl\" >NUL 2>&1").c_str());
+        system(("cmd /C start \"\" notepad \"saved\\shaders\\"+safe+".frag.glsl\" >NUL 2>&1").c_str());
+#endif
+        setStatus("Shader '"+sn+"' -> saved/shaders/"+safe+".{vert,frag}.glsl OPENED - edit, then 'Compile + APPLY' hot-reloads it live");
+    }
+    std::set<int> matEdited;   // meshes whose material flags/tint were edited (session MATF/TINT lines)
     void drawAnimTab(float x, float y, float w) {
         auto& th=cx.th;
         if (!animOverride || !animScrub) { cx.label(x,y,w,th.rowH,"(no animation plumbed)",th.textDim); return; }
@@ -1718,15 +2355,15 @@ struct Editor {
           cx.label(x+14*uiScale, y, w, th.rowH, jt, js==2?ui::rgba(230,160,80):th.textDim); y+=th.rowH; }
         y0=y; cx.checkbox(ui::hashId("spoof"), x, y, "Emit haven2025 spoof (no-root install)", spoofHaven);
         cx.tip(x,y0,w,th.rowH,"Also build <env>_NoRoot-Spoof.apk, which masquerades as\nMeta's haven2025 home. This is the ONLY way to install on a\nNON-rooted Quest: it replaces haven2025, then you pick\n\"Haven 2025\" in the home menu. Keep this ON."); y+=th.rowH;
-        y0=y; cx.checkbox(ui::hashId("hzanim"), x, y, "Animate skinned meshes (HZANIM — EXPERIMENTAL)", animSkinned);
+        y0=y; cx.checkbox(ui::hashId("hzanim"), x, y, "Animate skinned meshes (HZANIM - EXPERIMENTAL)", animSkinned);
         cx.tip(x,y0,w,th.rowH,"Emit skeletal animation for skinned meshes (clouds/koi/\ndroids). EXPERIMENTAL: the clip cook can still crash the\nenvironment on the device. Leave OFF unless testing."); y+=th.rowH+6*uiScale;
-        y0=y; cx.checkbox(ui::hashId("nocull"), x, y, "Draw everything — disable culling (fixes clipping, V79-style)", noCull);
+        y0=y; cx.checkbox(ui::hashId("nocull"), x, y, "Draw everything - disable culling (fixes clipping, V79-style)", noCull);
         cx.tip(x,y0,w,th.rowH,"Emit scene-spanning bounds so the V205 shell NEVER culls/clips\nyour meshes (frustum + Hi-Z occlusion + distance + CLOD budget).\nThe old V79 shell had NO environment culler, so this matches how\nold homes looked. Geometry still sits at its real position; only\nculling is defeated. Trades the Quest's culling perf for full\nvisibility. Keep ON if cooked homes clip / disappear at distance."); y+=th.rowH+6*uiScale;
         y0=y; cx.checkbox(ui::hashId("cookaudio"), x, y, "Ship background audio loop", cookAudio);
         cx.tip(x,y0,w,th.rowH,"Bake the environment's background audio loop into the cooked APK\n(FMOD asset placed at the spawn). Turn OFF for a silent home."); y+=th.rowH+2*uiScale;
         // ── the AUDIO COOKER UI: shows what will ship + Replace/Add/Export/Revert (backend above: setAudioFromFile etc.) ──
         { if(audioInfo.empty() && !bgOgg.empty()) refreshAudioInfo();
-          std::string al = bgOgg.empty() ? "  audio: none — Add one below"
+          std::string al = bgOgg.empty() ? "  audio: none - Add one below"
                                          : ("  audio: "+audioInfo+(audioOvrPath.empty()?"  (env's own)":"  (REPLACED)"));
           cx.label(x+14*uiScale, y, w-14*uiScale, th.rowH*0.9f, al.c_str(), th.textDim); y+=th.rowH*0.95f;
           float bw3=(w-14*uiScale-8*uiScale)/3.f, bx3=x+14*uiScale;
@@ -1737,15 +2374,15 @@ struct Editor {
           }
           if (cx.button(ui::hashId("audexp"), bx3+bw3+4*uiScale, y, bw3, th.rowH, "Export")) exportAudio();
           if (cx.button(ui::hashId("audrev"), bx3+2*(bw3+4*uiScale), y, bw3, th.rowH, "Revert to env")) clearAudioOverride();
-          cx.tip(x,y0,w,th.rowH,"Replace (or ADD, for a silent env) the background loop from ANY\nogg/wav/mp3/flac file — previews immediately on the PC and ships\nin the cook (FMOD-native formats raw; flac transcodes to WAV).\nExport writes the current loop next to the session in saved/.\nRevert restores the env's own theme. Persists in the session."); y+=th.rowH+6*uiScale;
+          cx.tip(x,y0,w,th.rowH,"Replace (or ADD, for a silent env) the background loop from ANY\nogg/wav/mp3/flac file - previews immediately on the PC and ships\nin the cook (FMOD-native formats raw; flac transcodes to WAV).\nExport writes the current loop next to the session in saved/.\nRevert restores the env's own theme. Persists in the session."); y+=th.rowH+6*uiScale;
         }
         // (PC preview-audio toggle moved to the viewport header strip — always visible, not buried here.)
         y0=y; cx.checkbox(ui::hashId("solidcol"), x, y, "Solid wall collision (trimesh)", solidCollision);
-        cx.tip(x,y0,w,th.rowH,"Cook a REAL double-sided triangle-mesh collider for the whole env —\nwalk on floors AND get blocked by walls/columns, enter rooms through\ndoorways (haven2025's cooked-PhysX SEBD format, device-verified).\nOFF = a floor-only ColliderBox grid (walkable but you phase walls)."); y+=th.rowH+6*uiScale;
+        cx.tip(x,y0,w,th.rowH,"Cook a REAL double-sided triangle-mesh collider for the whole env -\nwalk on floors AND get blocked by walls/columns, enter rooms through\ndoorways (haven2025's cooked-PhysX SEBD format, device-verified).\nOFF = a floor-only ColliderBox grid (walkable but you phase walls)."); y+=th.rowH+6*uiScale;
         if (solidCollision != prevSolidCol) { prevSolidCol = solidCollision; bakeNavmeshes(items); }   // re-bake so the gizmo shows floor+walls (on) / floor-only (off)
         g_audioMuted.store(!previewAudio, std::memory_order_relaxed);   // bind the toggle to the live audio-callback mute flag
         y0=y; cx.checkbox(ui::hashId("skybox"), x, y, "Far backdrop -> skybox (escapes the 5000 far-clip dome)", skybox);
-        cx.tip(x,y0,w,th.rowH,"Route distant geometry (centroid > the meters below) to the\nSkyboxPlatformComponent pass, which is EXEMPT from the shell's\nhard PortalStereoCamera far=5000 clip (the black dome locked to\nyour head). This is the ONLY way official homes/vistas show km-\ndistant scenery — they skybox it, they do NOT use a bigger far.\nThe backdrop becomes camera-locked (no walk-up parallax), which\nis imperceptible at km range. Near/mid geometry stays walkable."); y+=th.rowH+2*uiScale;
+        cx.tip(x,y0,w,th.rowH,"Route distant geometry (centroid > the meters below) to the\nSkyboxPlatformComponent pass, which is EXEMPT from the shell's\nhard PortalStereoCamera far=5000 clip (the black dome locked to\nyour head). This is the ONLY way official homes/vistas show km-\ndistant scenery - they skybox it, they do NOT use a bigger far.\nThe backdrop becomes camera-locked (no walk-up parallax), which\nis imperceptible at km range. Near/mid geometry stays walkable."); y+=th.rowH+2*uiScale;
         if (skybox) { y0=y; cx.label(x,y,150*uiScale,th.rowH,"  skybox distance (m)",th.textDim);
             char sdb[32]; snprintf(sdb,sizeof sdb,"%.0f",skyboxDist); std::string sds=sdb;
             cx.textField(ui::hashId("skyboxdist"), x+152*uiScale, y, w-152*uiScale, th.rowH, sds);
@@ -1797,7 +2434,33 @@ struct Editor {
                 restoreThread = std::thread([this]{ restoreHaven(); restoring.store(false); });
             }
             cx.tip(x,y0,w,th.rowH,"Reinstall the ORIGINAL Haven 2025 from the auto-backup\n(folder \"Haven2025_Backup\" beside the exe) + relaunch the shell.\nUse this to undo a spoof install."); y += th.rowH+8*uiScale;
-        } else if (restoring.load()) { cx.label(x,y,w,th.rowH,"Restoring Haven 2025…",th.textDim); y += th.rowH+8*uiScale; }
+        } else if (restoring.load()) { cx.label(x,y,w,th.rowH,"Restoring Haven 2025...",th.textDim); y += th.rowH+8*uiScale; }
+        // PREVIEW THE COOK IN-PLACE: swap this SAME window to the freshest cooked APK, rendered the
+        // HSL/V203 way (exactly what the device gets) - and swap BACK to the source, no restart ever.
+        if (!busy) {
+            std::string newest; std::filesystem::file_time_type newestT{};
+            std::error_code ec;
+            for (auto& de : std::filesystem::directory_iterator(cookOutPath(), ec)) {
+                if (de.path().extension() != ".apk") continue;
+                auto t = std::filesystem::last_write_time(de, ec);
+                if (newest.empty() || t > newestT) { newest = de.path().string(); newestT = t; }
+            }
+            bool onCooked = !sourceEnvPath.empty() && projectPath != sourceEnvPath;
+            if (!newest.empty() && !onCooked) {
+                std::string bn = newest; size_t sl = bn.find_last_of("/\\"); if (sl != std::string::npos) bn = bn.substr(sl+1);
+                y0=y; if (cx.button(ui::hashId("cookprev"), x, y, w, th.rowH+2*uiScale, ("Preview cooked (HSL): "+bn).c_str(), true))
+                    swapTo = newest;   // main swaps the scene IN THIS WINDOW (no new process)
+                cx.tip(x,y0,w,th.rowH+2*uiScale,"Reload THIS window with the newest cooked APK, rendered the\nHSL/V203 way (exactly what the device gets). 'Back to source'\nthen returns to this env - no restart, same window.");
+                y += th.rowH+8*uiScale;
+            }
+            if (onCooked) {
+                std::string sb = sourceEnvPath; size_t sl = sb.find_last_of("/\\"); if (sl != std::string::npos) sb = sb.substr(sl+1);
+                y0=y; if (cx.button(ui::hashId("cookback"), x, y, w, th.rowH+2*uiScale, ("Back to source: "+sb).c_str(), true))
+                    swapTo = sourceEnvPath;
+                cx.tip(x,y0,w,th.rowH+2*uiScale,"Swap this window back to the ORIGINAL source env (OPA/V79/glTF\nmode) - same window, no restart.");
+                y += th.rowH+8*uiScale;
+            }
+        }
         std::string st; { std::lock_guard<std::mutex> l(statusMx); st = cookStatus; }
         if (!st.empty()) {
             // word-ish wrap into the panel width
@@ -2039,6 +2702,15 @@ struct Editor {
             if (editExit && it.type==sitem::CHAIR) { origin[0]=it.pos[0]+it.exitPos[0]; origin[1]=it.pos[1]+it.exitPos[1]; origin[2]=it.pos[2]+it.exitPos[2]; gizQuat[0]=gizQuat[1]=gizQuat[2]=0; gizQuat[3]=1; }   // gizmo on the EXIT point
             else { itemMarkerPos(it, origin); eulerToQuat(it.rot, gizQuat); }   // navmesh gizmo sits on its geometry, not origin
         }
+        else if (sel.size() > 1) {
+            // MULTI-selection: pivot at the SELECTION CENTROID (average of all selected meshes), not the
+            // active mesh — the natural group pivot, and far less likely to sit off-screen than one member.
+            VkGpuMesh& agm=r->gpuMeshes[selected]; memcpy(gizQuat,agm.editR,16);
+            origin[0]=origin[1]=origin[2]=0.f; int n=0;
+            for (int s : sel) if (s>=0 && s<(int)r->gpuMeshes.size()) { auto& g=r->gpuMeshes[s];
+                origin[0]+=g.centroid[0]+g.editT[0]; origin[1]+=g.centroid[1]+g.editT[1]; origin[2]+=g.centroid[2]+g.editT[2]; ++n; }
+            if (n) { origin[0]/=n; origin[1]/=n; origin[2]/=n; }
+        }
         else { VkGpuMesh& gm=r->gpuMeshes[selected]; origin[0]=gm.centroid[0]+gm.editT[0]; origin[1]=gm.centroid[1]+gm.editT[1]; origin[2]=gm.centroid[2]+gm.editT[2]; memcpy(gizQuat,gm.editR,16); }
         float ds[3]={ origin[0]-r->cam.pos[0], origin[1]-r->cam.pos[1], origin[2]-r->cam.pos[2] };
         float dist = std::sqrt(ds[0]*ds[0]+ds[1]*ds[1]+ds[2]*ds[2]); if (dist<0.1f) dist=0.1f;
@@ -2048,7 +2720,15 @@ struct Editor {
         float ax[3][3] = {{1,0,0},{0,1,0},{0,0,1}};
         if (gizmoLocal) for (int k=0;k<3;k++){ float a[3]={ax[k][0],ax[k][1],ax[k][2]},o[3]; quatRotVec(gizQuat,a,o); memcpy(ax[k],o,12); }
         memcpy(gzAxisW, ax, sizeof ax);
-        float os[2]; if (!worldToScreen(origin, os[0], os[1])) return;
+        float os[2];
+        if (!worldToScreen(origin, os[0], os[1])) {
+            // Pivot is BEHIND the camera / outside the frustum: the gizmo used to silently vanish
+            // ("gizmo goes invisible"). Say so + how to get it back, instead of drawing nothing.
+            cx.textAligned((float)rcViewport.offset.x, (float)rcViewport.offset.y+rcViewport.extent.height-60*uiScale,
+                           (float)rcViewport.extent.width, 18*uiScale,
+                           "Selection is off-screen  -  double-click its row (or press F while hovering) to focus it", ui::rgba(255,210,120), 1);
+            return;
+        }
         gzOrigin[0]=os[0]; gzOrigin[1]=os[1];
         const uint32_t col[3]={ ui::rgba(232,72,72), ui::rgba(96,210,96), ui::rgba(80,130,245) };
         const char* axn[3]={"X","Y","Z"};
@@ -2305,7 +2985,7 @@ struct Editor {
         }
         // ── auto-install: ROOT -> own package (+auto-select); else back up haven2025 and install the spoof ──
         if (installAfterCook && !deviceConnected()) {
-            progress(1.0f, "no device — APKs written");
+            progress(1.0f, "no device - APKs written");
             msg += "  || NO DEVICE connected (adb) -> skipped auto-install; the APK files are written. Connect the Quest (USB or `adb connect`) and re-cook, or install the APK manually.";
         } else if (installAfterCook) {
             progress(0.9f, "detect root");
@@ -2323,7 +3003,7 @@ struct Editor {
                     setStatus("Replacing Haven 2025: it's signed with Meta's certificate (not ours), so the ORIGINAL is uninstalled first (backup kept in "+havenBackupDir()+"). Restore anytime: --restore-haven.");
                     bool inst = installToDevice(finalSpoof, HAVEN_PKG(), progress, /*uninstallFirst=*/true);
                     msg += inst ? ("  || no root -> "+std::string(hb==HB_OK?("backed up Haven 2025 ("+havenBackupDir()+"), "):"")+"uninstalled the original + installed the SPOOF + relaunched shell. It loads where Haven 2025 does (unrooted can't switch envs); set Haven 2025 as your home if it isn't already. Restore: --restore-haven.")
-                                : "  || spoof install FAILED (adb/device? Haven 2025 may be a non-removable system app — try the Rooted-System APK). Restore the original with --restore-haven if needed.";
+                                : "  || spoof install FAILED (adb/device? Haven 2025 may be a non-removable system app - try the Rooted-System APK). Restore the original with --restore-haven if needed.";
                 }
             } else {
                 msg += rooted ? "  || ROOT but no system APK" : "  || no root and no spoof APK (enable the spoof toggle)";
@@ -2615,7 +3295,7 @@ struct Editor {
         STARTUPINFOW si = { sizeof si }; PROCESS_INFORMATION pi = {};
         if (CreateProcessW(exe, cmdbuf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
             CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-            setStatus("Imported project opened in a NEW editor window — close this one when ready");
+            setStatus("Imported project opened in a NEW editor window - close this one when ready");
         } else setStatus("Blender import: failed to launch the editor");
 #else
         setStatus("Blender import is Windows-only for now");
@@ -2667,6 +3347,9 @@ struct Editor {
     void bakeNavGeometry(sitem::Item& si){
         si.navVerts.clear(); si.navIdx.clear();
         std::vector<int> ms = navSourceMeshes(si);
+        // per-mesh COLLISION EXCLUSION ("walk-through") + editor-deleted meshes never contribute collision
+        ms.erase(std::remove_if(ms.begin(), ms.end(), [&](int m){
+            return noColMeshes.count(m)!=0 || (r && r->isDeleted((size_t)m)); }), ms.end());
         bool forceFlat = si.navMode==0 || std::getenv("HSR_NAVFLAT");   // diag: force a 2-tri flat quad (isolate cook vs geometry)
         if (forceFlat){                                       // FLAT — a single ground plane
             float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f};
@@ -2898,9 +3581,12 @@ struct Editor {
         float D[3]={F[0]-O[0],F[1]-O[1],F[2]-O[2]};
         float dl_=std::sqrt(D[0]*D[0]+D[1]*D[1]+D[2]*D[2]); if (dl_<1e-6f) return -1; D[0]/=dl_;D[1]/=dl_;D[2]/=dl_;
         int best=-1; float bestT=std::numeric_limits<float>::max();
+        // EVERY mesh is clickable — including the sky dome/backdrop (it's a mesh: select it to
+        // retexture/tint/hide it). Nearest triangle hit wins, so the dome only picks when nothing
+        // closer is under the cursor. (The old isBackdrop click-through made domes unselectable.)
         for (int i=0;i<(int)r->gpuMeshes.size();++i) {
-            if (r->isHidden(i)) continue; auto& gm=r->gpuMeshes[i];
-            if (isBackdrop(gm.name)) continue;                             // the sky/backdrop isn't selectable (click-through = deselect)
+            if (r->isHidden(i) || r->isDeleted(i)) continue;   // deleted meshes are GONE: invisible AND unclickable
+            auto& gm=r->gpuMeshes[i];
             float mn[3],mx2[3]; worldAabb(gm,mn,mx2); float taabb;
             if (!rayAabb(O,D,mn,mx2,taabb)) continue; if (taabb-0.02f>bestT) continue;
             const std::vector<float>& P=gm.pickPos; const std::vector<uint32_t>& I=gm.pickIdx;
@@ -2919,7 +3605,7 @@ struct Editor {
         float O[3]={r->cam.pos[0],r->cam.pos[1],r->cam.pos[2]};
         float cp=std::cos(r->cam.pitch); float D[3]={std::sin(r->cam.yaw)*cp, std::sin(r->cam.pitch), -std::cos(r->cam.yaw)*cp};
         float bestT=1e30f; bool hit=false;
-        for (int i=0;i<(int)r->gpuMeshes.size();++i){ if(r->isHidden(i))continue; auto&gm=r->gpuMeshes[i]; if(isBackdrop(gm.name))continue;
+        for (int i=0;i<(int)r->gpuMeshes.size();++i){ if(r->isHidden(i)||r->isDeleted(i))continue; auto&gm=r->gpuMeshes[i]; if(isBackdrop(gm.name))continue;
             float mn[3],mx[3]; worldAabb(gm,mn,mx); float ta; if(!rayAabb(O,D,mn,mx,ta))continue; if(ta-0.02f>bestT)continue;
             const auto&P=gm.pickPos; const auto&I=gm.pickIdx; if(P.empty()||I.size()<3)continue;
             for(size_t k=0;k+2<I.size();k+=3){ uint32_t a=I[k],b=I[k+1],c=I[k+2];
@@ -3060,9 +3746,13 @@ struct Editor {
     void endEdit(const VkGpuMesh& gm){ if (!editing) return; pushUndo(editMesh, editBefore, captureX(gm)); editing=false; }
     void restoreOp(const UndoOp& op, bool redo){ for (size_t i=0;i<op.m.size();++i) if (op.m[i]>=0&&op.m[i]<(int)r->gpuMeshes.size()) applyX(r->gpuMeshes[op.m[i]], redo?op.a[i]:op.b[i]); sel=op.m; selected=op.m.empty()?-1:op.m.back(); r->selectedMesh=selected; }
     void doUndo(){ if (undoStack.empty()) return; UndoOp op=undoStack.back(); undoStack.pop_back();
-        if (op.isItems){ std::swap(op.itemsState, items); selItem=-1; } else restoreOp(op,false); redoStack.push_back(std::move(op)); }
+        if (op.isItems){ std::swap(op.itemsState, items); selItem=-1; }
+        else if (op.isDelete){ for (size_t i=0;i<op.delM.size();++i) r->setDeleted((size_t)op.delM[i], i<op.delA.size() ? !op.delA[i] : false); }   // undo = INVERT each state (restores originals, removes created clones)
+        else restoreOp(op,false); redoStack.push_back(std::move(op)); }
     void doRedo(){ if (redoStack.empty()) return; UndoOp op=redoStack.back(); redoStack.pop_back();
-        if (op.isItems){ std::swap(op.itemsState, items); selItem=-1; } else restoreOp(op,true); undoStack.push_back(std::move(op)); }
+        if (op.isItems){ std::swap(op.itemsState, items); selItem=-1; }
+        else if (op.isDelete){ for (size_t i=0;i<op.delM.size();++i) r->setDeleted((size_t)op.delM[i], i<op.delA.size() ? op.delA[i]!=0 : true); }
+        else restoreOp(op,true); undoStack.push_back(std::move(op)); }
     // ── focus ──
     void focusOn(float cx_,float cy,float cz){ Camera& c=r->cam; float ex=cx_,ey=cy+1.2f,ez=cz+3.5f; c.pos[0]=ex;c.pos[1]=ey;c.pos[2]=ez; float dx=cx_-ex,dy=cy-ey,dz=cz-ez,L=std::sqrt(dx*dx+dy*dy+dz*dz); if (L<1e-4f) L=1.f; c.yaw=std::atan2(dx,-dz); c.pitch=std::asin(dy/L); }
     void focusMesh(VkGpuMesh& gm){   // frame the whole object by its world AABB size (so big meshes aren't clipped)

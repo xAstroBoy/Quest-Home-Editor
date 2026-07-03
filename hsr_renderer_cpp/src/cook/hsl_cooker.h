@@ -270,7 +270,11 @@ enum : uint32_t { TGT_MESH = 0x4D455348, TGT_TEX = 0x6E4CC522, TGT_SURFACE = 0xA
 // formatCode = color/pixel format enum (11 = sRGB albedo, like nuxd's tx_dome). f2 = ASTC block enum
 // (6x6->18, 8x8->20, 12x12->24). The device GPU-uploads the full mip chain (ErrorInvalidArg without it / with a
 // bad format). A box-filtered RGBA mip chain down to 1x1, each level ASTC-encoded and concatenated into f9.
-inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, int bw = 8, int bh = 8, uint8_t formatCode = 11, bool alphaWeighted = false) {
+inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, int bw = 8, int bh = 8, uint8_t formatCode = 11, bool alphaWeighted = false, int capCols = 1, int capRows = 1) {
+    // capCols/capRows > 1: SPRITESHEET flipbook atlas (capCols×capRows cells). CAP the mip chain so coarse mips never
+    // AVERAGE ADJACENT CELLS (device "borders around the animated cards": at distance the GPU picks a coarse mip where
+    // all cells blur together, bleeding the neighbour frame in as a rectangular border; desktop uses mip0 so it's clean).
+    // Stop the chain while each cell is still >= 2 ASTC blocks.
     // alphaWeighted: for BLEND (transparent) textures, downsample mip RGB weighted by alpha
     // (mipRGB = Σ rgb·a / Σ a) instead of a straight box average. Straight-box lets fully-transparent
     // "garbage" RGB (the dust atlas is 21% α≈0 and some of those texels are pure white) bleed into the
@@ -284,7 +288,8 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
     uint64_t hsh = 1469598103934665603ull; auto mix=[&](uint64_t v){ hsh=(hsh^v)*1099511628211ull; };
     { size_t nb=(size_t)w*h*4, n64=nb/8; const uint64_t* p=(const uint64_t*)rgba;
       for (size_t k=0;k<n64;k++) mix(p[k]); for (size_t k=n64*8;k<nb;k++) mix(rgba[k]);
-      mix(((uint64_t)(uint32_t)w<<32)|(uint32_t)h); mix(((uint64_t)bw<<8)|(uint32_t)bh); mix(alphaWeighted?0x4157u:0u); }
+      mix(((uint64_t)(uint32_t)w<<32)|(uint32_t)h); mix(((uint64_t)bw<<8)|(uint32_t)bh); mix(alphaWeighted?0x4157u:0u);
+      mix(((uint64_t)(uint32_t)capCols<<32)|(uint32_t)capRows); }   // cap is part of the mip chain -> distinct cache entry
     std::error_code _ec; std::filesystem::path cdir = std::filesystem::temp_directory_path()/"hsr_texcache";
     bool useCache = !std::getenv("HSR_NOTEXCACHE");
     if (useCache) std::filesystem::create_directories(cdir,_ec);
@@ -292,6 +297,14 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
     std::filesystem::path cf = cdir/cn;
     std::vector<uint8_t> data;                                  // concatenated ASTC mip chain
     int mipCount = 0; { int d0 = w>h?w:h; while (true){ mipCount++; if (d0<=1) break; d0/=2; } }
+    if (capCols > 1 || capRows > 1) {   // SPRITESHEET: keep each cell >= 4 ASTC blocks at the coarsest mip so cells NEVER
+        // average together (no cross-cell bleed = no seam). 4 blocks (not 2) leaves a wider guard band -> the faint
+        // residual seam the user saw at 2 blocks disappears. Slightly fewer mips = negligible extra shimmer on a small card.
+        int cellW = w / (capCols>0?capCols:1), cellH = h / (capRows>0?capRows:1);
+        int minCell = cellW < cellH ? cellW : cellH, blk = bw > bh ? bw : bh;
+        int lvls = 1; while (lvls < mipCount && (minCell >> lvls) >= 4*blk) lvls++;   // coarsest level keeping cell >= 4 blocks
+        if (lvls < mipCount) mipCount = lvls;
+    }
     if (useCache) { std::ifstream f(cf,std::ios::binary); if (f){ data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()); } }
     if (data.empty()) {                                        // cache miss -> ENCODE (multi-threaded by default)
         astcenc_config cfg{};
@@ -299,7 +312,7 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
         const astcenc_swizzle swz = { ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
         unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());   // ASTC compress parallelizes across all cores
         astcenc_context* ctx = nullptr; if (astcenc_context_alloc(&cfg, nthreads, &ctx) != ASTCENC_SUCCESS) return {};
-        std::vector<uint8_t> cur(rgba, rgba + (size_t)w * h * 4); int cw = w, ch = h; bool fail=false;
+        std::vector<uint8_t> cur(rgba, rgba + (size_t)w * h * 4); int cw = w, ch = h; bool fail=false; int genLvl = 0;
         while (true) {
             int cols = (cw + bw - 1) / bw, rows = (ch + bh - 1) / bh;
             std::vector<uint8_t> blocks((size_t)cols * rows * 16);
@@ -311,7 +324,7 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
             for (auto& th:pool) th.join();
             if (e != ASTCENC_SUCCESS) { fail=true; break; }
             data.insert(data.end(), blocks.begin(), blocks.end());
-            if (cw == 1 && ch == 1) break;
+            if (++genLvl >= mipCount || (cw == 1 && ch == 1)) break;   // stop at the (possibly cell-capped) mip count
             astcenc_compress_reset(ctx);                        // reuse the (multi-thread) context for the next mip
             int nw = cw > 1 ? cw / 2 : 1, nh = ch > 1 ? ch / 2 : 1;
             std::vector<uint8_t> nx((size_t)nw * nh * 4);
@@ -1342,6 +1355,7 @@ struct ExportMesh {
     bool skybox = false;            // user-marked far backdrop -> SkyboxPlatformComponent (depth-clamped, EXEMPT from the PortalStereoCamera far=5000 clip)
     // V79 node Y-ROTATION (Outer Wilds skybox/Interloper) -> getTime() Y-rotation shader cooker/rot_<periodms>_<p|m>.surface.
     bool rotAnim = false; float rotOmega = 0.f; float rotAxis[3] = {0,1,0}; float rotPivot[3] = {0,0,0};   // ARBITRARY-axis spin: signed rad/s about rotAxis around rotPivot (node WORLD origin; children orbit it)
+    bool rotReplay = false; int rotReplayN = 0; float rotLoopSec = 0.f; std::vector<float> rotQuats;   // EXACT per-frame QUATERNION replay (aurora): shadergen::ROTREPLAY, (rotReplayN+1)*4 relative quats over rotLoopSec about rotPivot (nlerp+rotate in the vertex shader)
     bool rotOsc = false; float rotAmp = 0.f; float rotPeriod = 0.f;   // OSCILLATION (sway): angle=(amp/2)(1-cos(2pi t/period)) about rotAxis — clips that swing out & back (Snake Way King Kai planet), NOT a spin
     bool uvScroll = false; float uvRate[2] = {0.f, 0.f};   // mat.sanim UV-SCROLL (water/foam/waterfall) -> getTime() uv += uvRate*time shader
     // GENERAL node TRANSLATION replay (Star Trek sliding screens etc.) -> shadergen::TRANSLATE getTime() shader (faithful, any track)
@@ -2018,6 +2032,18 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         if (progress && (i % 8 == 0 || i + 1 == meshesV.size())) { char sb[64]; snprintf(sb, sizeof sb, "Cooking mesh %zu/%zu", i+1, meshesV.size()); prog(0.05f + 0.70f*(float)i/(float)meshesV.size(), sb); }
         const ExportMesh& m = meshesV[i];
         if (m.positions.size() < 9 || m.indices.size() < 3) continue;   // skip empty
+        // GENERIC depth-write discriminator (V79 MeshShellEnvMaskDepthWrite + HAS_ALPHACUTOFF): a HARD-EDGED / BIMODAL
+        // transparent card — pixels are ~all opaque or fully transparent (midF~0) with real opaque content — must OCCLUDE.
+        // Cook it with alpha-cutoff DISCARD + DEPTH-WRITE on WHICHEVER path the mesh takes (static OR skinned/rigid-hzanim:
+        // the moving train card). Soft-gradient transparents (fog/smoke/glow/aurora/ice: midF high) stay alpha BLEND.
+        // Texture-driven, no material names. Computed once so every path (below) agrees.
+        bool bimodalOccluder = false;
+        if (m.blend && !m.additive && m.rgba.size() >= 4) {
+            size_t nt=m.rgba.size()/4, opq=0, mid=0;
+            for (size_t k=3;k<m.rgba.size();k+=4){ uint8_t a=m.rgba[k]; if(a>=230)opq++; if(a>=40&&a<=215)mid++; }
+            float opF = nt?(float)opq/(float)nt:0.f, midF = nt?(float)mid/(float)nt:1.f;
+            bimodalOccluder = (midF < 0.05f) && (opF > 0.004f);
+        }
         // FAR-ONLY remap routing (HSR_DEPTHCLAMP): does this mesh poke past the 5000 clip from the spawn? If so it gets the
         // remap shader (renders past the clip); near meshes stay byte-exact. camPos = spawn.
         bool meshFar = false;
@@ -2101,11 +2127,26 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             texSrc = texOpaque.data();
         }
         bool droidWhite = std::getenv("HSR_DROIDWHITE") && m.hzJointCount > 0;   // diag: force the droid to the white fallback tex (isolate texture vs mesh)
+        // SPRITESHEET FLIPBOOK grid (smoke/fire animated cards): derive cols×rows so the encoder caps the mip chain per
+        // cell (no cross-cell averaging -> no device "borders around the animated cards"). Matrix-replay steps the UV
+        // OFFSET by 1/cols (2x2 identity); the grid-flipbook path stores cols/rows.
+        int capCols = 1, capRows = 1;
+        if (m.flipbook) {
+            if (m.flipUVMats.size() >= 12) {
+                float du = std::fabs(m.flipUVMats[6+2]-m.flipUVMats[2]), dv = std::fabs(m.flipUVMats[6+5]-m.flipUVMats[5]);
+                if (du > 1e-4f) capCols = (int)(1.0f/du + 0.5f);
+                if (dv > 1e-4f) capRows = (int)(1.0f/dv + 0.5f);
+            } else { if (m.flipCols > 1) capCols = m.flipCols; if (m.flipRows > 1) capRows = m.flipRows; }
+            if (capCols < 1) capCols = 1; if (capRows < 1) capRows = 1;
+            if (capCols > 64) capCols = 1; if (capRows > 64) capRows = 1;   // a huge "grid" = a fine continuous SCROLL, not a real spritesheet -> don't mip-cap (was mis-capping the aurora as 278x1)
+        }
         if (m.rgba.size() >= (size_t)m.w * m.h * 4 && m.w && m.h && !droidWhite) {
             uint64_t rh = murmur64A(texSrc, (size_t)m.w * m.h * 4);   // dedup identical textures (esp. the chunks a big mesh was split into)
+            rh ^= (uint64_t)(uint32_t)(capCols*73856093 ^ capRows*19349663);   // spritesheet cap is part of the encoded chain -> distinct entry
             auto cit = texCache.find(rh);
             if (cit != texCache.end()) { texK = cit->second.first; pTex = cit->second.second; }  // reuse the shared texture; leave `tex` empty so it isn't re-encoded/re-pushed
-            else { texK = keyForPath(pTex); tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, 8, 8, 11, m.blend); texCache[rh] = { texK, pTex }; }  // m.blend -> alpha-weighted mips (no white-border bleed on device)
+            else { texK = keyForPath(pTex); tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, 8, 8, 11, m.blend, capCols, capRows); texCache[rh] = { texK, pTex };   // m.blend -> alpha-weighted mips; cols/rows -> per-cell mip cap
+                  if ((capCols>1||capRows>1) && std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SPRITESHEET %dx%d -> mip-capped\n", i, m.name.c_str(), capCols, capRows); }
         }
         if (tex.empty() && texK.tgt == 0) { texK = whiteK; whiteUsed = true; }     // share the white fallback (only when there was NO texture at all, not for a dedup hit)
         // ANIMATED (VAT) mesh -> bake the offset texture + the vatunlitbasecolor MATL (base tex + VAT tex); else
@@ -2265,7 +2306,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 m.hzBoneIdx.size(), vc*4, m.hzBoneWgt.size(), vc*4,
                 m.hzTrsLocal.size(), (size_t)m.hzFrames*m.hzJointCount*10,
                 m.hzRestPos.size(), m.positions.size());
-        bool useRot = !useHz && m.rotAnim && ((m.rotOmega > 1e-5f || m.rotOmega < -1e-5f) || (m.rotOsc && (m.rotAmp > 0.02f || m.rotAmp < -0.02f)));   // node spin OR sway (any axis) -> getTime() Rodrigues shader
+        bool useRot = !useHz && m.rotAnim && ((m.rotOmega > 1e-5f || m.rotOmega < -1e-5f) || (m.rotOsc && (m.rotAmp > 0.02f || m.rotAmp < -0.02f)) || (m.rotReplay && m.rotReplayN >= 2 && (int)m.rotQuats.size() == (m.rotReplayN+1)*4));   // node spin OR sway OR per-frame QUATERNION REPLAY (aurora) -> getTime() vertex shader
         bool useTrans = !useHz && !useRot && m.transAnim && m.transN >= 2 && m.transFrames.size() >= (size_t)m.transN*3;   // GENERAL node-translation replay (sliding screens)
         bool useScale = !useHz && !useRot && !useTrans && m.scaleAnim && m.scaleN >= 2 && m.scaleFrames.size() >= (size_t)m.scaleN*3;   // GENERAL node-SCALE breathe replay (Erebor wisps, per-axis)
         bool useUvScroll = !useHz && !useRot && !useTrans && !useScale && m.uvScroll && (m.uvRate[0]!=0.f || m.uvRate[1]!=0.f);   // mat.sanim UV scroll (water/foam) -> getTime() uv-translate shader
@@ -2278,6 +2319,8 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // BLEND skinned (the SHIELD) -> the transparent-flagged material (field2=2) so it alpha-blends in the
             // transparent pass; OPAQUE skinned (body) -> the plain butterflies template.
             matl = std::getenv("HSR_HZMATTPL") ? matTpl : (m.blend && matSkinB.size() >= 176 ? matSkinB : matSkin2);
+            // (Moving/skinned transparent cards e.g. the TRAIN stay ALPHA-BLEND — a hard alpha-cutoff cutout here
+            //  destroyed the train's soft transparency. Depth-write for MOVING cards is intentionally NOT forced.)
             if (!std::getenv("HSR_HZMATTPL") && matl.size() >= 140) {
                 // field7 shader ref @48(pkg)/@56(ing)/@64(tgt) -> our env-local skinned shader; tgt @64 stays 0xA1767FE9 (murmur3"shader").
                 // BLEND skinned meshes (the omnidroid SHIELD = alphaMode BLEND) use unlitBLENDskinned so the device alpha-blends
@@ -2422,8 +2465,17 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             long ax=(long)(m.rotAxis[0]*1000), ay=(long)(m.rotAxis[1]*1000), az=(long)(m.rotAxis[2]*1000);
             long mv = m.rotOsc ? ((long)(m.rotAmp*100000) ^ ((long)(m.rotPeriod*1000)<<1)) : (long)(m.rotOmega*100000);
             uint32_t h = (uint32_t)(0x9E3779B9u*(uint32_t)ax ^ 0x85EBCA6Bu*(uint32_t)ay ^ 0xC2B2AE35u*(uint32_t)az ^ 0x27D4EB2Fu*(uint32_t)mv ^ (m.rotOsc?0x5BD1E995u:0u));
-            const char* pfx = m.rotOsc ? "osc" : "rot";
-            char rfn[160]; snprintf(rfn, sizeof rfn, "cooker/%s_%08x%s%s.surface.bin", pfx, h, rblend ? "_b" : "", meshFar ? "_dc" : "");   // _dc (FAR mesh): rot generated from the remap base -> inherits infinite projection; separate cache
+            if (m.rotReplay) { h = h*16777619u ^ (uint32_t)(long)(m.rotLoopSec*1000) ^ (uint32_t)(m.rotReplayN*2654435761u);   // ROTREPLAY: fold the angle table + loop + pivot into the cache key
+                for (float a : m.rotQuats) h = h*16777619u ^ (uint32_t)(long)(a*10000);
+                for (int k=0;k<3;k++) h = h*16777619u ^ (uint32_t)(long)(m.rotPivot[k]*100); }
+            // COMBINED node SPIN + material UV-SCROLL (aurora): the node ROTATES the geometry (vertex) AND the mat.sanim
+            // UVTransform scrolls the texture (fragment) — V79's two INDEPENDENT continuous channels (ModelMatrix vs
+            // BaseTextureMtx). Chain them into one shader (UVSCROLL on the frag first, ROTATE on the vertex on top). Fold
+            // the scroll rate into the cache key so a spin+scroll shader is distinct from a plain spin.
+            bool rscroll = m.uvScroll && (m.uvRate[0]!=0.f || m.uvRate[1]!=0.f);
+            if (rscroll) h = h*16777619u ^ (uint32_t)((long)(m.uvRate[0]*100000) ^ ((long)(m.uvRate[1]*100000)<<1));
+            const char* pfx = m.rotReplay ? "rotrep" : (m.rotOsc ? "osc" : "rot");
+            char rfn[160]; snprintf(rfn, sizeof rfn, "cooker/%s_%08x%s%s%s.surface.bin", pfx, h, rscroll ? "s" : "", rblend ? "_b" : "", meshFar ? "_dc" : "");   // _dc (FAR mesh): rot generated from the remap base -> inherits infinite projection; separate cache
             AssetKey3 rotK{};
             auto it = rotShaders.find(rfn);
             if (it != rotShaders.end()) rotK = it->second;
@@ -2431,17 +2483,29 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 auto rbytes = readFileBytes(rfn);
                 if (rbytes.empty()) {   // Rodrigues shader for this exact motion (continuous spin OR (1-cos) sway) — C++ generator
                     const std::vector<uint8_t>& gbase = meshFar ? (rblend ? shadBlendDC : shadDC) : (rblend ? shadBlend : shad);   // FAR -> remap base
-                    if (m.rotOsc) rbytes = shadergen::generate(gbase, shadergen::OSCILLATE, m.rotAmp, m.rotPeriod, m.rotAxis[0], m.rotAxis[1], m.rotAxis[2]);
-                    else          rbytes = shadergen::generate(gbase, shadergen::ROTATE,    m.rotOmega, 0.f,       m.rotAxis[0], m.rotAxis[1], m.rotAxis[2]);
+                    // material UV-SCROLL (FRAGMENT) first, then node SPIN (vertex position) on top — independent SPIR-V stages
+                    // (same chaining as TRANSLATE+UVSCROLL). Gives the aurora a smooth continuous shimmer scroll AND Y-spin.
+                    std::vector<uint8_t> base2 = gbase;
+                    if (rscroll) { auto fb = shadergen::generate(gbase, shadergen::UVSCROLL, m.uvRate[0], m.uvRate[1]); if (!fb.empty()) base2 = fb; }
+                    if (m.rotReplay) {   // AURORA: EXACT per-frame QUATERNION replay (tframes = pivot(3) + (N+1)*4 relative quats).
+                        // useCenter (above) already re-centered the geometry to rotPivot, so the SHADER pivot is ORIGIN (0).
+                        std::vector<float> tf; tf.reserve(3 + m.rotQuats.size());
+                        tf.push_back(0.f); tf.push_back(0.f); tf.push_back(0.f);
+                        tf.insert(tf.end(), m.rotQuats.begin(), m.rotQuats.end());
+                        rbytes = shadergen::generate(base2, shadergen::ROTREPLAY, m.rotLoopSec, 0.f, 0.f, 0.f, 0.f, tf, m.rotReplayN);
+                    }
+                    else if (m.rotOsc) rbytes = shadergen::generate(base2, shadergen::OSCILLATE, m.rotAmp, m.rotPeriod, m.rotAxis[0], m.rotAxis[1], m.rotAxis[2]);
+                    else          rbytes = shadergen::generate(base2, shadergen::ROTATE,    m.rotOmega, 0.f,       m.rotAxis[0], m.rotAxis[1], m.rotAxis[2]);
                     if (!rbytes.empty()) writeFileBytes(rfn, rbytes);   // cache to disk (reused on re-cook + inspectable)
                 }
-                if (!rbytes.empty()) { char rp[160]; snprintf(rp, sizeof rp, "%s/shaders/%s_%08x%s%s.surface/shader", MH.c_str(), pfx, h, rblend ? "_b" : "", meshFar ? "_dc" : "");
+                if (!rbytes.empty()) { char rp[168]; snprintf(rp, sizeof rp, "%s/shaders/%s_%08x%s%s%s.surface/shader", MH.c_str(), pfx, h, rscroll ? "s" : "", rblend ? "_b" : "", meshFar ? "_dc" : "");
                     rotK = keyForPath(rp); assets.push_back({ rp, rotK.tgt, rbytes, rotK }); rotShaders[rfn] = rotK; } }
             matl = rblend ? matBlend : matTpl;                          // blend base for transparent billboards, else opaque unlit
             if (rotK.ing) { memcpy(matl.data() + 48, &rotK.pkg, 8); memcpy(matl.data() + 56, &rotK.ing, 8); }  // field7 -> rot shader (else static = safe fallback)
             memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);                  // base tex
-            if (std::getenv("HSR_VERBOSE")) { if (m.rotOsc) fprintf(stderr, "[COOK] m%03zu '%s' SWAY amp=%+.0fdeg period=%.1fs axis=(%.2f,%.2f,%.2f) dir=%s %s %s\n", i, m.name.c_str(), m.rotAmp*57.2958f, m.rotPeriod, m.rotAxis[0],m.rotAxis[1],m.rotAxis[2], m.rotAmp>=0?"+":"-", rblend ? "BLEND" : "opaque", rotK.ing ? "" : "(MISSING -> static)");
-                else fprintf(stderr, "[COOK] m%03zu '%s' SPIN %.1fs axis=(%.2f,%.2f,%.2f) dir=%s(%+.4f rad/s) %s %s\n", i, m.name.c_str(), 6.2831853f/(m.rotOmega<0?-m.rotOmega:m.rotOmega), m.rotAxis[0],m.rotAxis[1],m.rotAxis[2], m.rotOmega>=0?"CCW":"CW", m.rotOmega, rblend ? "BLEND" : "opaque", rotK.ing ? "" : "(MISSING -> static)"); }
+            if (std::getenv("HSR_VERBOSE")) { if (m.rotReplay) fprintf(stderr, "[COOK] m%03zu '%s' ROTREPLAY %d keys loop=%.1fs axis=(%.2f,%.2f,%.2f) %s %s\n", i, m.name.c_str(), m.rotReplayN, m.rotLoopSec, m.rotAxis[0],m.rotAxis[1],m.rotAxis[2], rblend ? "BLEND" : "opaque", rotK.ing ? "" : "(MISSING -> static)");
+                else if (m.rotOsc) fprintf(stderr, "[COOK] m%03zu '%s' SWAY amp=%+.0fdeg period=%.1fs axis=(%.2f,%.2f,%.2f) dir=%s %s %s\n", i, m.name.c_str(), m.rotAmp*57.2958f, m.rotPeriod, m.rotAxis[0],m.rotAxis[1],m.rotAxis[2], m.rotAmp>=0?"+":"-", rblend ? "BLEND" : "opaque", rotK.ing ? "" : "(MISSING -> static)");
+                else fprintf(stderr, "[COOK] m%03zu '%s' SPIN%s %.1fs axis=(%.2f,%.2f,%.2f) dir=%s(%+.4f rad/s) %s %s\n", i, m.name.c_str(), rscroll?"+UVSCROLL":"", 6.2831853f/(m.rotOmega<0?-m.rotOmega:m.rotOmega), m.rotAxis[0],m.rotAxis[1],m.rotAxis[2], m.rotOmega>=0?"CCW":"CW", m.rotOmega, rblend ? "BLEND" : "opaque", rotK.ing ? "" : "(MISSING -> static)"); }
         } else if (useTrans) {
             // GENERAL node-TRANSLATION replay (Star Trek sliding screens): a shadergen::TRANSLATE getTime() shader that
             // adds the piecewise-linear-interpolated sampled OFFSET to inPos -> FAITHFULLY ports ANY translation track.
@@ -2626,18 +2690,22 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // (LakeTrees etc.: sparser ~22% opaque + soft edges, so the opaque-fraction test misses them) — the user
                 // wants these SOLID, not see-through blend cards with a black border. This branch is STATIC-only (skinned
                 // foreground foliage takes the skinned path), so close soft foliage is unaffected by the tree-name rule.
-                bool treeCard = (m.name.find("Tree")!=std::string::npos || m.name.find("tree")!=std::string::npos) && opF > 0.10f;
-                bool cardCutout = (opF > 0.28f);   // mostly-opaque scenery/foliage CARD (mountains/cliffs/lakeshore + the
-                // merged foliage Planes): DEPTH-WRITE so it OCCLUDES instead of a no-depth-write blend card that z-fights /
-                // overlays its neighbours (user: Plane13718/Plane15 overlaying). Transparent FX (fog/smoke/water opF~0) and
-                // genuinely soft foliage (<0.28 opaque) stay BLEND. This branch is STATIC-only (skinned foliage is elsewhere).
-                if (cardCutout || treeCard) {
+                // GENERIC (no material names): the DEVICE picks cutout-vs-blend by the texture's ALPHA SHAPE
+                // (ShellEnv HAS_ALPHACUTOFF variant = discard alpha<cutoff + depth-write, vs plain alpha BLEND).
+                // A HARD-EDGED / BIMODAL card — pixels are ~all opaque or fully transparent, negligible soft
+                // gradient (midF ~ 0) — is a mask / foliage / vista card that must OCCLUDE: cook it as a
+                // depth-write cutout (discard the transparent gaps). SOFT-alpha transparents (fog / smoke / glow /
+                // aurora / ice: a real mid-alpha gradient, midF high) stay BLEND. This REPLACES the old
+                // name-based "Tree" rule + opaque-fraction threshold, which missed sparse foliage
+                // (winterwonderland gazeboTrees/lodgeTrees opF=0.01-0.05 -> blend -> saw-through). Verified split:
+                // trees midF=0.00, vistaCards midF=0.01 (CUTOUT) vs moonGlow 0.13 / lambert34 0.14 / ice 0.58 (BLEND).
+                bool bimodal   = (midF < 0.05f);   // hard-edged cutout mask (no soft gradient)
+                bool hasOpaque = (opF  > 0.004f);  // has real opaque content (skip near-empty cards)
+                if (bimodal && hasOpaque) {
                     cutoutOK = true;
-                    // CRISP silhouettes (mountains, midF<0.10) use the 0.5 discard (sharp edge); SOFT-edged cards (foliage
-                    // planes/trees, midF>=0.10) use the LOW 0.12 discard so their soft foliage survives instead of vanishing.
-                    isTreeCutout = midF >= 0.10f;
+                    isTreeCutout = true;   // LOW 0.12 discard: depth-writes + keeps any faint soft edge; for midF~0 it equals a 0.5 cut
                 }
-                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' blendcard opF=%.2f midF=%.2f -> %s\n", i, m.name.c_str(), opF, midF, cutoutOK?"CUTOUT":"blend");
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' blendcard opF=%.2f midF=%.2f -> %s\n", i, m.name.c_str(), opF, midF, cutoutOK?"CUTOUT(bimodal)":"blend");
             }
             matl = (m.blend && haveBlend && !cutoutOK) ? matBlend : matTpl;
             if (cutoutOK) {   // CUTOUT = opaque MATL + alpha-test DISCARD shader -> DEPTH-WRITE: authored MASK scenery OCCLUDES (fixes back-overlays-front); discard cuts the hard mask. Double-sided handled by the cook's reversed-tri append.
@@ -2800,8 +2868,21 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             if (!useHz) sIdx = &dsIdx;
         }
         const std::vector<uint32_t>& hzIdx = (wantDouble && useHz) ? dsIdxHz : m.indices;
-        auto mesh = useHz ? encodeRendMeshParts(hzMeshPos, m.uvs, hzIdx, matl, 0, m.hzBoneIdx, m.hzBoneWgt, jointIds, false, vertCol)
-                          : encodeRendMeshParts(*posPtr, m.uvs, *sIdx, matl, useVat ? vc : 0, {}, {}, {}, useRot, vertCol);
+        // SPRITESHEET flipbook (fire/smoke): INSET the card's base UVs a couple texels toward their cell so the per-cell
+        // sample never touches the cell EDGE — kills the residual CLOSE-UP seam (mip0 linear-filter + ASTC-block bleed into
+        // the neighbour cell). The mip-cap handled the distant coarse-mip bleed; this handles up-close. Real grids only.
+        const std::vector<float>* uvPtr = &m.uvs; std::vector<float> insetUv;
+        if ((capCols>1 || capRows>1) && m.uvs.size()>=4) {
+            float umin=1e9f,umax=-1e9f,vmin=1e9f,vmax=-1e9f;
+            for (size_t k=0;k+1<m.uvs.size();k+=2){ float u=m.uvs[k],v=m.uvs[k+1]; if(u<umin)umin=u;if(u>umax)umax=u;if(v<vmin)vmin=v;if(v>vmax)vmax=v; }
+            float du=umax-umin, dv=vmax-vmin, mu=(m.w>0)?8.0f/(float)m.w:0.f, mv=(m.h>0)?8.0f/(float)m.h:0.f;   // inset one ASTC block (8 texels) so the sample clears the cell-boundary block that straddles two cells
+            if (du>4*mu && dv>4*mv) { insetUv=m.uvs; float su=(du-2*mu)/du, sv=(dv-2*mv)/dv;
+                for (size_t k=0;k+1<insetUv.size();k+=2){ insetUv[k]=umin+mu+(insetUv[k]-umin)*su; insetUv[k+1]=vmin+mv+(insetUv[k+1]-vmin)*sv; }
+                uvPtr=&insetUv;
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] m%03zu '%s' UV-INSET 8 texels toward cell (close-up seam fix)\n", i, m.name.c_str()); }
+        }
+        auto mesh = useHz ? encodeRendMeshParts(hzMeshPos, *uvPtr, hzIdx, matl, 0, m.hzBoneIdx, m.hzBoneWgt, jointIds, false, vertCol)
+                          : encodeRendMeshParts(*posPtr, *uvPtr, *sIdx, matl, useVat ? vc : 0, {}, {}, {}, useRot, vertCol);
         // COOK-TIME VERIFY: check the just-cooked skinned RENDMESH against the Meta-shipped reference schema (the
         // device runs the stock flatbuffers verifier; this catches structural divergence — e.g. a field emitted as
         // an offset where the schema wants an inline scalar — BEFORE the asset ever ships to the headset).

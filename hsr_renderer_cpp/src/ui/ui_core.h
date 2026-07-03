@@ -8,12 +8,13 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include <functional>
 
 namespace ui {
 
 // GLFW key codes used by editable fields (match GLFW3 values; editor fills keyPressed[glfwKey]).
 enum { KEY_ESCAPE=256, KEY_ENTER=257, KEY_TAB=258, KEY_BACKSPACE=259, KEY_DELETE=261,
-       KEY_RIGHT=262, KEY_LEFT=263, KEY_HOME=268, KEY_END=269, KEY_A=65, KEY_Z=90 };
+       KEY_RIGHT=262, KEY_LEFT=263, KEY_HOME=268, KEY_END=269, KEY_A=65, KEY_C=67, KEY_V=86, KEY_X=88, KEY_Z=90 };
 
 struct Input {
     float mx=0, my=0, dmx=0, dmy=0, wheel=0;
@@ -25,26 +26,26 @@ struct Input {
     void newFrame() { dmx=dmy=0; wheel=0; for(int i=0;i<3;i++){pressed[i]=released[i]=false;} memset(keyRepeat,0,sizeof keyRepeat); text.clear(); }
 };
 
-struct Theme {                                          // Blender 4.x "Dark" — faithful palette + metrics
-    uint32_t areaBg    = rgba(48,48,48);
-    uint32_t headerBg  = rgba(43,43,43);
-    uint32_t panelBg   = rgba(56,56,56);
-    uint32_t subPanel  = rgba(51,51,51);
-    uint32_t text      = rgba(222,222,222);
-    uint32_t textDim   = rgba(160,160,160);
+struct Theme {                                          // "Slate" — modern dark blue-gray editor palette (professional pass)
+    uint32_t areaBg    = rgba(24,26,32);
+    uint32_t headerBg  = rgba(32,34,42);
+    uint32_t panelBg   = rgba(40,42,52);
+    uint32_t subPanel  = rgba(34,36,45);
+    uint32_t text      = rgba(224,228,236);
+    uint32_t textDim   = rgba(148,155,170);
     uint32_t textSel   = rgba(255,255,255);
-    uint32_t widget    = rgba(84,84,84);                // button / number field
-    uint32_t widgetHot = rgba(102,102,102);
-    uint32_t widgetDown= rgba(120,120,120);
-    uint32_t field     = rgba(38,38,38);                // text/number field inset
-    uint32_t accent    = rgba(56,118,200);              // Blender select blue
-    uint32_t accentHot = rgba(70,135,222);
-    uint32_t toggleOn  = rgba(56,118,200);
-    uint32_t border    = rgba(30,30,30);
-    uint32_t rowSel    = rgba(56,118,200,110);
+    uint32_t widget    = rgba(58,62,76);                // button / number field
+    uint32_t widgetHot = rgba(74,80,98);
+    uint32_t widgetDown= rgba(90,98,120);
+    uint32_t field     = rgba(24,26,33);                // text/number field inset
+    uint32_t accent    = rgba(64,140,235);              // select blue
+    uint32_t accentHot = rgba(88,158,245);
+    uint32_t toggleOn  = rgba(64,140,235);
+    uint32_t border    = rgba(16,17,22);
+    uint32_t rowSel    = rgba(64,140,235,110);
     uint32_t rowHover  = rgba(255,255,255,16);
-    uint32_t splitLine = rgba(28,28,28);
-    float rowH = 21.f, headerH = 26.f, pad = 6.f, indent = 16.f;
+    uint32_t splitLine = rgba(14,15,19);
+    float rowH = 22.f, headerH = 27.f, pad = 6.f, indent = 16.f;
 };
 
 inline uint32_t hashId(const char* s, uint32_t seed=2166136261u) {
@@ -56,6 +57,8 @@ inline uint32_t hashId(uint32_t a, uint32_t salt) { a ^= salt + 0x9e3779b9u + (a
 struct Context {
     DrawList* dl=nullptr; Font* font=nullptr; Font* mono=nullptr; Theme th;
     Input in;
+    // system clipboard bridge for text fields (Ctrl+C/X/V) — bound by the editor to GLFW's clipboard
+    std::function<void(const char*)> setClip; std::function<std::string()> getClip;
     uint32_t hot=0, active=0;        // hovered / pressed widget
     uint32_t kbFocus=0;              // text field with keyboard focus
     std::string editBuf; int editCur=0, editSel=-1;   // text-field edit state (editSel = selection anchor; -1 = no selection)
@@ -108,8 +111,17 @@ struct Context {
             int a=editSel<editCur?editSel:editCur, b=editSel<editCur?editCur:editSel; editBuf.erase(a,b-a); editCur=a; editSel=-1; return true; };
         auto moveTo=[&](int np){ if(np<0)np=0; if(np>(int)editBuf.size())np=(int)editBuf.size();
             if(in.shift){ if(editSel<0) editSel=editCur; } else editSel=-1; editCur=np; };   // Shift = extend the selection
+        auto selText=[&]()->std::string{ if(editSel<0||editSel==editCur) return editBuf;    // no selection -> whole field
+            int a=editSel<editCur?editSel:editCur, b=editSel<editCur?editCur:editSel; return editBuf.substr(a,b-a); };
         if(in.ctrl && in.keyRepeat[KEY_A]){ editSel=0; editCur=(int)editBuf.size(); }         // Ctrl+A = select all (highlight)
-        if(!in.text.empty()){ std::string ins; for(char c:in.text){ if(!numeric || (c>='0'&&c<='9')||c=='.'||c=='-'||c=='+'||c=='e'||c=='E') ins.push_back(c); }
+        // ── system clipboard in text fields: Ctrl+C copy / Ctrl+X cut / Ctrl+V paste ──
+        if(in.ctrl && in.keyRepeat[KEY_C] && setClip) setClip(selText().c_str());
+        if(in.ctrl && in.keyRepeat[KEY_X] && setClip){ setClip(selText().c_str());
+            if(!delSel()){ editBuf.clear(); editCur=0; editSel=-1; } }                        // no selection -> cut the whole field
+        if(in.ctrl && in.keyRepeat[KEY_V] && getClip){ std::string cp=getClip();
+            std::string ins; for(char c:cp){ if(c=='\r'||c=='\n') continue; if(!numeric || (c>='0'&&c<='9')||c=='.'||c=='-'||c=='+'||c=='e'||c=='E') ins.push_back(c); }
+            if(!ins.empty()){ delSel(); editBuf.insert(editCur,ins); editCur+=(int)ins.size(); } }
+        if(!in.text.empty() && !in.ctrl){ std::string ins; for(char c:in.text){ if(!numeric || (c>='0'&&c<='9')||c=='.'||c=='-'||c=='+'||c=='e'||c=='E') ins.push_back(c); }
             if(!ins.empty()){ delSel(); editBuf.insert(editCur,ins); editCur+=(int)ins.size(); } }
         if(in.keyRepeat[KEY_BACKSPACE]){ if(!delSel() && editCur>0){ editBuf.erase(editCur-1,1); editCur--; } }
         if(in.keyRepeat[KEY_DELETE]){ if(!delSel() && editCur<(int)editBuf.size()){ editBuf.erase(editCur,1); } }   // forward delete
