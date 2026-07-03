@@ -410,6 +410,9 @@ struct Editor {
             out.hasOrm=false; out.ormRGBA.clear();
             out.hasEmissive=false; out.emissiveRGBA.clear();
         }
+        // per-vertex side arrays copied from the base would MISALIGN with the concatenated verts — drop them
+        out.colors.clear(); out.uvs3.clear(); out.uvs4.clear();
+        out.boneIndices.clear(); out.boneWeights.clear(); out.hasBones=false;
         float insetU = useAtlas ? 2.0f/(float)cellW : 0.f;    // guard band so mips don't bleed neighbor cells
         float insetV = useAtlas ? 2.0f/(float)cellH : 0.f;
         for (size_t i2=0;i2<src.size();++i2) {
@@ -434,6 +437,7 @@ struct Editor {
             }
             for (u32 ix : md.indices) out.indices.push_back(vb+ix);
         }
+        out.nVerts=(u32)(out.positions.size()/3); out.nIdx=(u32)out.indices.size();   // uploadMesh trusts the EXPLICIT counts
         sceneMeshes->push_back(std::move(out));
         size_t ni=r->gpuMeshes.size();
         r->uploadMesh(sceneMeshes->back());
@@ -458,6 +462,11 @@ struct Editor {
     // shared tail of the geometry tools: append the edited clone (SAME name), carry the transform/tint,
     // soft-delete the original into the undo history, select the new mesh, log the edit invisibly.
     bool commitGeomEdit(int mi, MeshData&& md, const char* what){
+        // uploadMesh trusts the EXPLICIT counts, not the array sizes — a stale nVerts/nIdx from the source
+        // mesh made grown/carved results upload the WRONG vertex count = garbage/invisible geometry (the
+        // treehouse fuse/seal bug). Sync them to what the arrays actually hold now.
+        md.nVerts = (u32)(md.positions.size()/3);
+        md.nIdx   = (u32)md.indices.size();
         sceneMeshes->push_back(std::move(md));
         size_t ni=r->gpuMeshes.size();
         r->uploadMesh(sceneMeshes->back());
@@ -525,10 +534,13 @@ struct Editor {
         for (size_t k=0;k<src.indices.size();k+=3){ uint32_t rt=find(src.indices[k]); if(!compOf.count(rt)) compOf[rt]=nComp++; }
         if (nComp<=1) { setStatus("split: mesh is ONE connected piece already"); return; }
         if (nComp>256){ setStatus("split: "+std::to_string(nComp)+" pieces is too many (max 256)"); return; }
-        bool hasUV=src.uvs.size()>=nv*2, hasUV2=src.uvs2.size()>=nv*2;
+        bool hasUV=src.uvs.size()>=nv*2, hasUV2=src.uvs2.size()>=nv*2, hasCol=src.colors.size()>=nv*4;
         std::vector<MeshData> parts((size_t)nComp);
         std::vector<std::map<uint32_t,uint32_t>> remap((size_t)nComp);
-        for (int c2=0;c2<nComp;++c2){ parts[c2]=src; parts[c2].positions.clear(); parts[c2].uvs.clear(); parts[c2].uvs2.clear(); parts[c2].indices.clear();
+        for (int c2=0;c2<nComp;++c2){ parts[c2]=src;
+            parts[c2].positions.clear(); parts[c2].uvs.clear(); parts[c2].uvs2.clear(); parts[c2].indices.clear();
+            parts[c2].colors.clear(); parts[c2].uvs3.clear(); parts[c2].uvs4.clear();               // remapped below / dropped (stale copies would misalign)
+            parts[c2].boneIndices.clear(); parts[c2].boneWeights.clear(); parts[c2].hasBones=false;
             /* parts KEEP the original name (the [idx] suffix in the outliner disambiguates) */ }
         for (size_t k=0;k+2<src.indices.size();k+=3){
             int c2 = compOf[find(src.indices[k])]; auto& pt=parts[c2]; auto& rm=remap[c2];
@@ -539,8 +551,10 @@ struct Editor {
                        pt.positions.push_back(src.positions[v2*3]); pt.positions.push_back(src.positions[v2*3+1]); pt.positions.push_back(src.positions[v2*3+2]);
                        if (hasUV){ pt.uvs.push_back(src.uvs[v2*2]); pt.uvs.push_back(src.uvs[v2*2+1]); }
                        if (hasUV2){ pt.uvs2.push_back(src.uvs2[v2*2]); pt.uvs2.push_back(src.uvs2[v2*2+1]); }
+                       if (hasCol){ for (int cc=0;cc<4;++cc) pt.colors.push_back(src.colors[v2*4+cc]); }   // vertex colors REMAPPED, not copied wholesale
                        rm[v2]=nvi; }
                 pt.indices.push_back(nvi); } }
+        for (auto& pt : parts) { pt.nVerts=(u32)(pt.positions.size()/3); pt.nIdx=(u32)pt.indices.size(); }   // uploadMesh trusts the explicit counts
         // append every piece (carry transform/tint), then soft-delete the original (ONE history entry
         // covering original + every part - Ctrl+Z removes the parts AND restores the original)
         const VkGpuMesh og = r->gpuMeshes[(size_t)mi];   // copy - gpuMeshes reallocates as parts upload
