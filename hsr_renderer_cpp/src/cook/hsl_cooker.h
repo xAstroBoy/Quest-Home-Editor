@@ -270,7 +270,7 @@ enum : uint32_t { TGT_MESH = 0x4D455348, TGT_TEX = 0x6E4CC522, TGT_SURFACE = 0xA
 // formatCode = color/pixel format enum (11 = sRGB albedo, like nuxd's tx_dome). f2 = ASTC block enum
 // (6x6->18, 8x8->20, 12x12->24). The device GPU-uploads the full mip chain (ErrorInvalidArg without it / with a
 // bad format). A box-filtered RGBA mip chain down to 1x1, each level ASTC-encoded and concatenated into f9.
-inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, int bw = 8, int bh = 8, uint8_t formatCode = 11, bool alphaWeighted = false, int capCols = 1, int capRows = 1) {
+inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, int bw = 8, int bh = 8, uint8_t formatCode = 11, bool alphaWeighted = false, int capCols = 1, int capRows = 1, bool coveragePreserve = false) {
     // capCols/capRows > 1: SPRITESHEET flipbook atlas (capCols×capRows cells). CAP the mip chain so coarse mips never
     // AVERAGE ADJACENT CELLS (device "borders around the animated cards": at distance the GPU picks a coarse mip where
     // all cells blur together, bleeding the neighbour frame in as a rectangular border; desktop uses mip0 so it's clean).
@@ -289,6 +289,7 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
     { size_t nb=(size_t)w*h*4, n64=nb/8; const uint64_t* p=(const uint64_t*)rgba;
       for (size_t k=0;k<n64;k++) mix(p[k]); for (size_t k=n64*8;k<nb;k++) mix(rgba[k]);
       mix(((uint64_t)(uint32_t)w<<32)|(uint32_t)h); mix(((uint64_t)bw<<8)|(uint32_t)bh); mix(alphaWeighted?0x4157u:0u);
+      mix(coveragePreserve?0xC0FEu:0u);   // coverage-preserving alpha mips = distinct chain
       mix(((uint64_t)(uint32_t)capCols<<32)|(uint32_t)capRows); }   // cap is part of the mip chain -> distinct cache entry
     std::error_code _ec; std::filesystem::path cdir = std::filesystem::temp_directory_path()/"hsr_texcache";
     bool useCache = !std::getenv("HSR_NOTEXCACHE");
@@ -313,6 +314,13 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
         unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());   // ASTC compress parallelizes across all cores
         astcenc_context* ctx = nullptr; if (astcenc_context_alloc(&cfg, nthreads, &ctx) != ASTCENC_SUCCESS) return {};
         std::vector<uint8_t> cur(rgba, rgba + (size_t)w * h * 4); int cw = w, ch = h; bool fail=false; int genLvl = 0;
+        // ALPHA-TEST COVERAGE TARGET: the fraction of mip0 texels with alpha >= 128 (the shader's 0.5 discard).
+        // Box-averaging alpha down the chain SHRINKS this coverage every level (leaf silhouettes thin, then the
+        // per-8x8-ASTC-block quantization flips whole blocks under/over the threshold at distance = the "blocky"
+        // leaves the device shows at range). Rescale each coarse mip's alpha so its coverage matches mip0 →
+        // leaves keep their shape + area at every distance instead of dissolving into blocks.
+        double covTarget = 0.0;
+        if (coveragePreserve) { size_t cov=0, tot=(size_t)w*h; for (size_t k=0;k<tot;k++) if (rgba[k*4+3]>=128) cov++; covTarget = tot? (double)cov/tot : 0.0; }
         while (true) {
             int cols = (cw + bw - 1) / bw, rows = (ch + bh - 1) / bh;
             std::vector<uint8_t> blocks((size_t)cols * rows * 16);
@@ -342,6 +350,15 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
                     else o[0] = o[1] = o[2] = 0;                             // fully transparent 2x2 -> no color to carry
                 } else for (int c = 0; c < 3; c++)
                     o[c] = (uint8_t)((p[0][c] + p[1][c] + p[2][c] + p[3][c] + 2) / 4);
+            }
+            if (coveragePreserve && covTarget > 0.0 && covTarget < 1.0) {
+                // find an alpha SCALE s so fraction(alpha*s >= 128) == covTarget (binary search; monotonic in s).
+                size_t np = (size_t)nw*nh;
+                auto coverageAt=[&](float s)->double{ size_t c=0; for (size_t k=0;k<np;k++){ float a=nx[k*4+3]*s; if (a>=128.f) c++; } return (double)c/np; };
+                float lo=0.03f, hi=32.f;
+                for (int it=0; it<18; ++it){ float mid=0.5f*(lo+hi); if (coverageAt(mid) < covTarget) lo=mid; else hi=mid; }
+                float s=0.5f*(lo+hi);
+                for (size_t k=0;k<np;k++){ int a=(int)(nx[k*4+3]*s+0.5f); nx[k*4+3]=(uint8_t)(a<0?0:a>255?255:a); }
             }
             cur.swap(nx); cw = nw; ch = nh;
         }
@@ -2155,7 +2172,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             rh ^= (uint64_t)(uint32_t)(capCols*73856093 ^ capRows*19349663);   // spritesheet cap is part of the encoded chain -> distinct entry
             auto cit = texCache.find(rh);
             if (cit != texCache.end()) { texK = cit->second.first; pTex = cit->second.second; }  // reuse the shared texture; leave `tex` empty so it isn't re-encoded/re-pushed
-            else { texK = keyForPath(pTex); tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, 8, 8, 11, m.blend, capCols, capRows); texCache[rh] = { texK, pTex };   // m.blend -> alpha-weighted mips; cols/rows -> per-cell mip cap
+            else { texK = keyForPath(pTex);
+                  // alpha-test foliage (masked trees/leaves): alpha-weight the mip RGB (no transparent-bg bleed halo) AND
+                  // preserve alpha COVERAGE down the chain, so the leaves don't dissolve into blocky ASTC chunks at range.
+                  bool aw = m.blend || m.alphaTest; bool cov = m.alphaTest && !m.blend;
+                  tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, 8, 8, 11, aw, capCols, capRows, cov); texCache[rh] = { texK, pTex };   // m.blend/alphaTest -> alpha-weighted mips; alphaTest -> coverage-preserving; cols/rows -> per-cell mip cap
                   if ((capCols>1||capRows>1) && std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SPRITESHEET %dx%d -> mip-capped\n", i, m.name.c_str(), capCols, capRows); }
         }
         if (tex.empty() && texK.tgt == 0) { texK = whiteK; whiteUsed = true; }     // share the white fallback (only when there was NO texture at all, not for a dedup hit)
