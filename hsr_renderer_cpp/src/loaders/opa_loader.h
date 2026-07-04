@@ -958,6 +958,42 @@ public:
         }
         return out;
     }
+    // ── COOK: bake ANY node-animated mesh's EXACT per-frame WORLD motion as VAT offsets, by sampling the renderer's
+    //    own evalAnimNodes(t) (the same path the OPA source draws with). Reproduces the motion BYTE-FOR-BYTE — no
+    //    rigid-HZANIM restPos/clip/invBind decomposition (which amplified the stinson city color_beam ~4700u sweep so
+    //    it flew out of the building). offset[f][v] = nodeWorld(t_f)·basePos[v] − nodeWorld(0)·basePos[v]; the static
+    //    bake is frame 0 (animate(0)), so the device shader's pos += offset(t) == the source EXACTLY. ──
+    std::vector<float> bakeNodeAnimVAT(int meshIdx, int frames, int& nvOut, float& loopSec) {
+        nvOut = 0; loopSec = 0.f;
+        const AnimRec* ar = nullptr; for (auto& a : animRecs) if ((int)a.meshIdx == meshIdx) { ar = &a; break; }
+        if (!ar || ar->basePos.size() < 9 || frames < 2) return {};
+        size_t nv = ar->basePos.size()/3; if (nv < 1 || nv > 8192) return {};
+        uint32_t node = ar->nodeIdx;
+        int eff = 0;   // per-node loop period (same as extractNodeRigidHzAnim / the renderer)
+        if (!std::getenv("HSR_NOPERNODELOOP"))
+            for (int g=0,n=(int)node; n>=0 && n<(int)animNodes.size() && g<32; n=animNodes[n].parent,++g){
+                auto it=nodeAnim.find(animNodes[n].name);
+                if(it!=nodeAnim.end()){ const NodeTracks&q=it->second; eff=std::max(eff, std::max(q.t.effFrames, std::max(q.r.effFrames, q.s.effFrames))); } }
+        if (eff < 2) eff = animMaxFrames;
+        float dur = (animFps>0.f) ? (float)eff/animFps : animDuration(); if (dur <= 0.f) return {};
+        loopSec = dur;
+        evalAnimNodes(0.f);
+        Mat4 w0 = (node < nodeWorldAnim.size()) ? nodeWorldAnim[node] : identity();
+        std::vector<float> p0(nv*3);
+        for (size_t v=0; v<nv; v++){ float o[3]; xform(w0, ar->basePos[v*3],ar->basePos[v*3+1],ar->basePos[v*3+2], o); p0[v*3]=o[0];p0[v*3+1]=o[1];p0[v*3+2]=o[2]; }
+        std::vector<float> out((size_t)frames*nv*3);
+        for (int f=0; f<frames; f++){
+            evalAnimNodes(dur * (float)f / (float)frames);   // exclusive endpoint -> seamless loop
+            Mat4 w = (node < nodeWorldAnim.size()) ? nodeWorldAnim[node] : identity();
+            for (size_t v=0; v<nv; v++){ float o[3]; xform(w, ar->basePos[v*3],ar->basePos[v*3+1],ar->basePos[v*3+2], o);
+                out[((size_t)f*nv+v)*3]   = o[0]-p0[v*3];
+                out[((size_t)f*nv+v)*3+1] = o[1]-p0[v*3+1];
+                out[((size_t)f*nv+v)*3+2] = o[2]-p0[v*3+2]; }
+        }
+        animate(0.f);   // restore rest pose (the static geometry bake reads frame 0)
+        nvOut = (int)nv;
+        return out;
+    }
     // ── COOK: batch-fit every node-animated mesh to a SPIN/SWAY about an axis (the V79->V203 port). Samples each
     //    animated mesh's WORLD positions across the clip via animate(t), runs the shared noderot::fit, and returns
     //    meshIdx -> Result. Leaves the meshes at REST (animate(0)) so the static geometry bake is the t=0 pose. The
