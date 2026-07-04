@@ -4797,7 +4797,14 @@ struct Editor {
                    if (hzAnimExtractor) hzAnimExtractor((int)i,64,em); }
             if (md.hasTexture && md.texRGBA.size()>=(size_t)md.texW*md.texH*4){ em.rgba=md.texRGBA; em.w=md.texW; em.h=md.texH;
                 em.srcAstc=md.srcAstc; em.srcAstcBw=md.srcAstcBw; em.srcAstcBh=md.srcAstcBh; em.srcAstcMips=md.srcAstcMips; }
+            // TWO-PASS foliage: skinned masked foliage renders as smooth BLEND (no depth-write). Emit a DEPTH-WRITE
+            // cutout SIBLING (same skinning/geometry, distinct name so it's a separate asset; the skel+anim dedup by
+            // bytes = no extra skeleton) drawn in the opaque pass so the foliage OCCLUDES correctly, with the blend
+            // painting the smooth edges on top. = the device's a2c foliage look (smooth + depth), via two draws.
+            bool foliage2pass = em.alphaTest && em.hzJointCount > 0 && !em.blend && !em.additive && !std::getenv("HSR_NOFOLIAGE2PASS");
+            hslcook::ExportMesh prepass; if (foliage2pass) prepass = em;   // copy BEFORE the move (keeps all skinning)
             ems.push_back(std::move(em));
+            if (foliage2pass) { prepass.depthPrepass = true; prepass.name += "_depthwr"; ems.push_back(std::move(prepass)); }
         }
         if(skyPreviewMesh<0) appendSkyboxMesh(ems);   // GENERAL skybox -> far sky sphere in the cook (if a live preview sphere exists it's already in sceneMeshes, so don't double-emit)
         return ems;

@@ -1375,6 +1375,8 @@ struct ExportMesh {
     uint32_t w = 0, h = 0;
     std::vector<uint8_t> srcAstc;   // LOSSLESS pass-through: source ASTC mip chain (blocks) if the base tex is a plain KTX-ASTC and UNMODIFIED
     uint32_t srcAstcBw = 0, srcAstcBh = 0, srcAstcMips = 0;
+    bool depthPrepass = false;      // TWO-PASS foliage: this copy is the DEPTH-WRITE cutout sibling (opaque pass, occludes);
+                                    // the paired blend copy draws the smooth color on top. Gives smooth edges AND correct depth.
     std::vector<uint8_t> iblVertCol; // FAITHFUL SpecIbl diffuse-irradiance per-vertex RGBA = diffuseCube(worldN)·ambientIBLTint, baked in buildExportMeshes (the renderer's exact uploadMesh bake). Device base·vertexColor0 = env-lit lake water, NOT the dark basecolor (the "black lake" bug). Empty for non-specibl meshes.
     bool blend = false;             // alpha-blended (transparent) -> route to unlitblend.surface
     bool alphaTest = false;         // MASK/cutout (foliage, *_masked scenery): DEPTH-WRITE cutout shader (alpha-test discard) so it OCCLUDES + discards transparent texels — was routed to the no-depth-write blend pass = the lakeside 2D-scenery overlay/flash. Meta cuts depth-write too (unlitfoliage f2,f3 PRESENT).
@@ -2431,7 +2433,10 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // preview" iterations). The stinson zen tree + bougainvillea + palms are all masked skinned foliage → route
         // them to the BLEND skinned pipeline (unlitblendskinned + transparent MATL) so the leaf-mask alpha feathers
         // the edges smoothly on device. HSR_FOLIAGE_CUTOUT restores the old hard-discard path.
-        bool foliageBlend = useHz && m.alphaTest && !m.blend && !m.additive && !std::getenv("HSR_FOLIAGE_CUTOUT");
+        // TWO-PASS foliage: the depthPrepass SIBLING renders as a DEPTH-WRITE cutout (opaque pass) so it occludes;
+        // the primary copy renders as smooth BLEND on top. Together = smooth edges AND correct depth (the a2c the
+        // device foliage uses natively, approximated with two draws). The sibling forces cutout (foliageBlend off).
+        bool foliageBlend = useHz && m.alphaTest && !m.blend && !m.additive && !m.depthPrepass && !std::getenv("HSR_FOLIAGE_CUTOUT");
         std::vector<uint8_t> matl; std::string animatorComp;
         if (useHz) {   // HZANIM: CURRENT-format skinned MATL (field7=shader) + HZAN:SKEL + ACL HZAN:ANIM + AnimatorPlatformComponent
             // BLEND skinned (the SHIELD) -> the transparent-flagged material (field2=2) so it alpha-blends in the

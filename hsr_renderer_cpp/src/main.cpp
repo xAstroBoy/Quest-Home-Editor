@@ -1604,6 +1604,17 @@ int main(int argc, char** argv) {
                 em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
                 return;
             }
+            // ENORMOUS node "translation" -> BAKE STATIC (stinson city color_beam searchlights: the GEO_ANIM node
+            // translates ~4700 UNITS, which on a small far-background beam is not a faithful entity slide — the source
+            // node-anim is a deform/pivot that the rigid 1-joint port mis-reads as a whole-mesh SLIDE, so the beam ends
+            // up flung "off place". Any per-mesh node translation this large (>1500u) is such a case: cook the mesh
+            // STATIC at its bind pose (correct placement) rather than sliding it across the sky. Cars/train/comets move
+            // far less and keep their rigid path. HSR_KEEPBIGSLIDE restores the old slide.
+            // BIG-ARC node motion (stinson city color_beam searchlights: the GEO_ANIM node has R tracks + its tip arcs
+            // ~4700u): the node's TRUE per-frame transform is faithfully replayed by the rigid 1-joint path below
+            // (clip = node world transform, invBind = identity -> device vertex = nodeWorld(t)*basePos = the OPA render
+            // EXACTLY). Neither a translate-slide nor a fitted-rotation approximation reproduces it; the rigid replay does.
+            (void)0;
             // TRAIN BODY (a node on a vehicle group that also carries a getTime flipbook STEAM): route to the SAME getTime
             // TRANSLATE clock as the steam so they stay attached (NOT useHz, whose animator clock drifts vs getTime).
             { int myNode = opa.animNodeOf(meshIdx);
