@@ -2244,14 +2244,22 @@ private:
                 if (memcmp(file.data()+i, needle, nlen) == 0) return i;
             return std::string::npos;
         };
-        // material .mat.asset path (for texture/blend resolution)
-        std::string matRef;
-        { size_t m = findStr(".mat.asset", 10, 0);
-          if (m != std::string::npos) { size_t s = m + 10; while (s > 0) { char ch = (char)file[s-1];
-              if (isalnum((unsigned char)ch) || ch=='_'||ch=='-'||ch=='.'||ch=='/') --s; else break; }
-              matRef = std::string((const char*)file.data()+s, (m+10)-s); } }
         size_t sp = findStr("SkinnedPos", 10, hdrSize);
         if (sp == std::string::npos) return false;
+        // ALL material .mat.asset refs in container order (the material table sits BEFORE the geometry) —
+        // a skin can carry MULTIPLE submeshes with DIFFERENT materials (stinson palmtree_grp_a: palmTrunk +
+        // palmFronds). The old first-match-only pairing gave EVERY submesh the FIRST material, so the palm
+        // FRONDS wore the TRUNK texture ("leaves have wrong skinned texture"). Submesh.matIndex indexes this
+        // list; single-material skins are unchanged (matRefs[0]).
+        std::vector<std::string> matRefs;
+        { size_t from = 0;
+          while (true) { size_t m = findStr(".mat.asset", 10, from);
+              if (m == std::string::npos || m > sp) break;
+              size_t s = m + 10; while (s > 0) { char ch = (char)file[s-1];
+                  if (isalnum((unsigned char)ch) || ch=='_'||ch=='-'||ch=='.'||ch=='/') --s; else break; }
+              matRefs.push_back(std::string((const char*)file.data()+s, (m+10)-s));
+              from = m + 10; } }
+        std::string matRef = matRefs.empty() ? std::string() : matRefs[0];
         Cur c; c.d = file.data(); c.n = file.size(); c.p = sp - 4;   // at the posFmt string record
         std::string posFmt = c.str();      // "SkinnedPos"
         std::string dataFmt = c.str();     // "StdData"
@@ -2281,11 +2289,14 @@ private:
         uint32_t nv = posBytes / posStride, nstd = stdBytes / 20, nidx = idxBytes / 2;
         const uint8_t* posP = c.at(posOff); const uint8_t* stdP = c.at(stdOff);
         const uint16_t* idxP = (const uint16_t*)c.at(idxOff);
-        // texture/blend from the referenced material (.mat.txt metadata)
+        // texture/blend resolver — called PER SUBMESH with its OWN material (sub.matIndex -> matRefs)
+        auto resolveMat = [&](const std::string& mref, const Tex*& tex, const MatProps*& mp) {
+            tex = nullptr; mp = nullptr;
+            std::string stem = matStem(mref); auto it = matProps.find(stem); if (it != matProps.end()) mp = &it->second;
+            if (mp) { if (!mp->diffuseBase.empty()) tex = texByBase(mp->diffuseBase);
+                      if (!tex && mp->diffuseId) { auto a = assetIdToTexBase.find(mp->diffuseId); if (a != assetIdToTexBase.end()) tex = texByBase(a->second); } } };
         const Tex* tex = nullptr; const MatProps* mp = nullptr;
-        { std::string stem = matStem(matRef); auto it = matProps.find(stem); if (it != matProps.end()) mp = &it->second;
-          if (mp) { if (!mp->diffuseBase.empty()) tex = texByBase(mp->diffuseBase);
-                    if (!tex && mp->diffuseId) { auto a = assetIdToTexBase.find(mp->diffuseId); if (a != assetIdToTexBase.end()) tex = texByBase(a->second); } } }
+        resolveMat(matRef, tex, mp);
         static int novflip = -1; if (novflip < 0) novflip = std::getenv("HSR_NOVFLIP") ? 1 : 0;
         // Skin's own joint name list (after the index data) -> map each bone index to a clip joint.
         // The skin's joints share names (and usually order) with its .anim clip. bone idx (u8x4)
@@ -2375,6 +2386,10 @@ private:
         int emitted = 0;
         for (auto& sub : subs) {
             if (sub.indexCount == 0 || sub.firstIndex + sub.indexCount > nidx) continue;
+            // per-SUBMESH material (stinson palm fronds-vs-trunk fix): matIndex indexes the container's own
+            // material table; out-of-range or single-material skins keep the first ref (old behavior).
+            if (matRefs.size() > 1 && sub.matIndex < matRefs.size())
+                resolveMat(matRefs[sub.matIndex], tex, mp);
             MeshData md; md.name = fn;
             std::unordered_map<uint32_t,uint32_t> remap; remap.reserve(sub.indexCount);
             md.indices.reserve(sub.indexCount);

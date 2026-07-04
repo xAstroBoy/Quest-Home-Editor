@@ -2103,7 +2103,10 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         bool skinnedOpaque = haveSkin && m.hzJointCount > 0 && !m.blend;
         if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' skinnedOpaque=%d blend=%d hzJoints=%d haveSkin=%d w=%d h=%d rgba=%zu\n", i, m.name.c_str(), skinnedOpaque, (int)m.blend, m.hzJointCount, (int)haveSkin, m.w, m.h, m.rgba.size());
         std::vector<uint8_t> texOpaque; const uint8_t* texSrc = m.rgba.data();
-        if (skinnedOpaque && m.rgba.size() >= (size_t)m.w * m.h * 4) {
+        if (skinnedOpaque && !m.alphaTest && m.rgba.size() >= (size_t)m.w * m.h * 4) {
+            // (MASKED skinned foliage keeps its REAL alpha — the skinned-CUTOUT shader below discards on it.
+            //  Forcing alpha=255 here rendered the stinson materialsplit trees' transparent leaf gaps SOLID
+            //  = "tree leaves in cook are all blocky".)
             texOpaque = m.rgba; for (size_t k = 3; k < texOpaque.size(); k += 4) texOpaque[k] = 255; texSrc = texOpaque.data();
         }
         else if (m.additive && m.uvScroll) {
@@ -2339,6 +2342,26 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // on the dark viewscreen (alpha-blend made them near-invisible). Non-emissive blend skinned (a real force-field
                 // glass) still uses unlitBLENDskinned (alpha).
                 AssetKey3 sk = (m.blend && !m.additive && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
+                // MASKED skinned foliage (stinson materialsplit trees: authored AlphaTest, "_masked") -> a skinned
+                // CUTOUT shader: the opaque skinned base + an alpha<0.5 discard in the forward frag (same
+                // shadergen::CUTOUT edit the static path uses — it only touches the FRAGMENT, skinning untouched).
+                // Without it the opaque skinned pipeline drew the leaf textures' transparent gaps SOLID ("blocky").
+                // The texture keeps its REAL alpha for this path (see the skinnedOpaque force-255 exemption above).
+                if (m.alphaTest && !m.blend && !shadSkin.empty()) {
+                    const char* cfn = "cooker/skincutout.surface.bin";
+                    AssetKey3 skinCutK{};
+                    auto itc0 = rotShaders.find(cfn);
+                    if (itc0 != rotShaders.end()) skinCutK = itc0->second;
+                    else {
+                        auto cb = readFileBytes(cfn);
+                        if (cb.empty()) { cb = shadergen::generate(shadSkin, shadergen::CUTOUT, 0.5f);
+                                          if (!cb.empty()) writeFileBytes(cfn, cb); }
+                        if (!cb.empty()) { char cp[168]; snprintf(cp, sizeof cp, "%s/shaders/skincutout.surface/shader", MH.c_str());
+                            skinCutK = keyForPath(cp); assets.push_back({ cp, skinCutK.tgt, cb, skinCutK }); rotShaders[cfn] = skinCutK; }
+                    }
+                    if (skinCutK.pkg || skinCutK.ing) { sk = skinCutK;
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SKINNED-CUTOUT (masked foliage, discard a<0.5)\n", i, m.name.c_str()); }
+                }
                 // ── COMBINED effect card (RIGID-HZANIM + material UV/fade) — NO EXCLUSION ──────────────────────────
                 // A fog/dust card whose node has R/S rides a RIGID-HZANIM skeleton (faithful T+R+S) AND has a UV flipbook
                 // + opacity fade. Bake the UV-matrix replay + fade into a PER-MESH SKINNED shader variant: FLIPBOOK mode
