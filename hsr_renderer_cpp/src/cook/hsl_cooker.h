@@ -2410,7 +2410,13 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // f2,f3 PRESENT) but keep the TRANSPARENT skinned MATL (matSkinB, field2=2) -> ADDITIVE blend = bright streaks
                 // on the dark viewscreen (alpha-blend made them near-invisible). Non-emissive blend skinned (a real force-field
                 // glass) still uses unlitBLENDskinned (alpha).
-                AssetKey3 sk = ((m.blend || foliageBlend) && !m.additive && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
+                // ADDITIVE skinned GLOW (stinson city color_beam searchlights, Additive:true): the OLD "opaque shader
+                // + transparent MATL" trick renders OPAQUE on device — unlitdoublesidedskinned forces alpha=1, so the
+                // alpha-blend MATL just composites the full (city-atlas) texture as a solid cyan/pink BLOB ("huge, no
+                // transparent, off place"). Use the BLEND skinned shader (unlitblendskinned, passes texture alpha)
+                // together with the luminance-alpha texture the additive branch already bakes (alpha = max(rgb)·a) →
+                // the bright beam feathers in over the sky and the dark atlas background drops out = a real glow.
+                AssetKey3 sk = ((m.blend || foliageBlend || m.additive) && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
                 // MASKED skinned foliage (stinson materialsplit trees: authored AlphaTest, "_masked") -> a skinned
                 // CUTOUT shader: the opaque skinned base + an alpha<0.5 discard in the forward frag (same
                 // shadergen::CUTOUT edit the static path uses — it only touches the FRAGMENT, skinning untouched).
