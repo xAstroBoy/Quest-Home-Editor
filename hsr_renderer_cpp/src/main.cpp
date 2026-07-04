@@ -1311,14 +1311,52 @@ int main(int argc, char** argv) {
         // unlitblend base that renders. ShellPoseAnimationComponent is a 2-keyframe ONE-SHOT (sub_14651D8) that plays
         // once then HOLDS static ("visible but not moving"), so it's opt-in only (HSR_POSEANIM). HSR_NOPULSE = off.
         else if (gltf.isNodeAnimated(meshIdx) && gltf.nodeAnimMoves(meshIdx) && !std::getenv("HSR_NOPULSE")) {   // nodeAnimMoves: skip CONSTANT tracks (no getTime shader -> static, not "breathing")
+            // COMBINED T+R node anim (cyan gears/mills/boat/shadow cards, dome comets, rifthome leaves) → 2-joint
+            // RIGID-HZANIM: the node's EXACT per-frame WORLD matrix on the device-proven skinned path. The fit chain
+            // below is rotation-ONLY or translation-ONLY — it DROPPED the other channel for meshes that animate both
+            // ("wrong animation on windmill, shadows, gears"). Pure-T / pure-R meshes return !ok() here and keep
+            // their proven getTime shaders (no regression). Gated on HSR_HZANIM like every skinned cook path.
+            if (std::getenv("HSR_HZANIM") && !std::getenv("HSR_NOGLTFRIGID")) {
+                auto rg = gltf.extractNodeRigidHzAnim(meshIdx);
+                if (rg.ok()) {
+                    em.hzJointPos=std::move(rg.jointPos); em.hzJointQuat=std::move(rg.jointQuat); em.hzJointScale=std::move(rg.jointScale);
+                    em.hzParents=std::move(rg.parents); em.hzBoneIdx=std::move(rg.boneIdx); em.hzBoneWgt=std::move(rg.boneWgt);
+                    em.hzTrsLocal=std::move(rg.trsLocal); em.hzRestPos=std::move(rg.restPos);
+                    em.hzJointCount=rg.jointCount; em.hzFrames=rg.frameCount; em.hzFps=rg.fps;
+                    em.vatOffsets.clear(); em.vatFrames=0;
+                    if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%d glTF T+R node anim -> RIGID-HZANIM (%d frames @ %.1ffps)\n", meshIdx, rg.frameCount, rg.fps);
+                    if (gltf.isNodeAnimated(meshIdx) && std::getenv("HSR_VERBOSE")) gltf.dumpNodeAnimTrack(meshIdx);
+                    return;
+                }
+            }
             // Y-ROTATION (Outer Wilds skybox/Interloper) takes precedence: a uniform node-spin -> getTime() Y-rotation
             // shader. Falls through to the wisp scale-pulse for non-rotation node anims (erebor flames have no rot channel).
             float rax[3] = {0,1,0}, rom = 0.f, rpiv[3] = {0,0,0}, ramp = 0.f, rper = 0.f; bool rosc = false;
             if (!std::getenv("HSR_NOROT") && gltf.extractNodeRotation(meshIdx, rax, rom, rpiv, rosc, ramp, rper)) {
-                em.rotAnim = true; em.rotOmega = rom; em.rotOsc = rosc; em.rotAmp = ramp; em.rotPeriod = rper;
-                em.rotAxis[0]=rax[0]; em.rotAxis[1]=rax[1]; em.rotAxis[2]=rax[2];
-                em.rotPivot[0]=rpiv[0]; em.rotPivot[1]=rpiv[1]; em.rotPivot[2]=rpiv[2];
-                em.vatOffsets.clear(); em.vatFrames = 0;   // rotation/sway -> getTime() Rodrigues shader, NOT VAT (vatBaker also ran on this node-anim mesh)
+                // FAST or LARGE "sway" -> EXACT ROTREPLAY (the OPA torch-flame fix, glTF side). The single-cosine
+                // sway fit is wrong for (a) fast keyed flicker (fireplace particles) and (b) a MONOTONIC per-loop
+                // rotation ramp (cyan gears: 63° in 8.3s, wraps on the gear symmetry) — the fit sees peak=63° and
+                // plays a one-sided rock. Replay the node's actual relative quats instead (same getTime shader as
+                // the aurora). Gentle slow ambient sways (foliage ±1-3°) keep the cheap fitted oscillate shader.
+                bool exact = rosc && !std::getenv("HSR_NOROTREPLAY")
+                           && (rper < 5.f || ramp > 0.15f || ramp < -0.15f);   // fast flicker OR >~8.6° swing
+                if (exact) {
+                    int RN = 128; if (const char* e2 = std::getenv("HSR_ROTKEYS")) { int c = atoi(e2); if (c >= 8) RN = c; }
+                    float piv[3]; std::vector<float> quats; float loopSec = 0.f;
+                    if (gltf.cookExtractRotationReplay(meshIdx, RN, piv, quats, loopSec) && (int)quats.size() == (RN+1)*4) {
+                        em.rotReplay = true; em.rotReplayN = RN; em.rotLoopSec = loopSec; em.rotQuats = std::move(quats);
+                        em.rotPivot[0]=piv[0]; em.rotPivot[1]=piv[1]; em.rotPivot[2]=piv[2];
+                        em.rotAnim = true; em.rotAxis[0]=rax[0]; em.rotAxis[1]=rax[1]; em.rotAxis[2]=rax[2];
+                        em.vatOffsets.clear(); em.vatFrames = 0;
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%d glTF SWAY(amp=%.0fdeg per=%.1fs) -> ROTREPLAY %d keys loop=%.2fs (exact shape)\n", meshIdx, ramp*57.2958f, rper, RN, loopSec);
+                    }
+                }
+                if (!em.rotReplay) {
+                    em.rotAnim = true; em.rotOmega = rom; em.rotOsc = rosc; em.rotAmp = ramp; em.rotPeriod = rper;
+                    em.rotAxis[0]=rax[0]; em.rotAxis[1]=rax[1]; em.rotAxis[2]=rax[2];
+                    em.rotPivot[0]=rpiv[0]; em.rotPivot[1]=rpiv[1]; em.rotPivot[2]=rpiv[2];
+                    em.vatOffsets.clear(); em.vatFrames = 0;   // rotation/sway -> getTime() Rodrigues shader, NOT VAT (vatBaker also ran on this node-anim mesh)
+                }
             } else if (gltf.extractNodeTranslation(meshIdx, 16, em.transFrames, em.transLoop)) {   // GENERAL node-translation replay (sliding screens) — port ANY translation, not the wrong pulse default
                 em.transAnim = true; em.transN = 16;
             } else if (!std::getenv("HSR_NOSCALE") && gltf.extractNodeScaleFrames(meshIdx, 16, em.scaleFrames, em.scaleLoop, em.scalePivot)) {
@@ -1335,14 +1373,14 @@ int main(int argc, char** argv) {
         // ~2fps → the body-undulation is massively undersampled → "moves but not the original animation". Sample at a
         // real rate (~30fps) so the wave is captured. ACL compresses the extra frames cheaply. HSR_HZFPS overrides.
         // The HZAN clip has a HARD device size limit: a ~22 KB clip (256 frames) LOADS, ~65 KB (935 frames) throws
-        // std::length_error on load (the device reads the clip block size into a SIGNED 16-bit field → >32767 goes
-        // negative → bad string/vector resize). So CAP the frame count (not a fixed 64 — that under-samples a 31 s clip
-        // to ~2 fps = "moves but not the original animation"). 256 frames is device-confirmed safe; for snakeway's 31 s
-        // dragon that's ~8 fps (4× smoother than 64). HSR_HZFPS / HSR_HZMAXFRAMES override.
+        // std::length_error on load. ⚠ That "size limit" was a MISDIAGNOSIS: the crash was the missing 5-byte
+        // trailing channel-name table (IDA @0x1617f4c, fixed in hzAclEncode — "never a malformed clip"), and the
+        // official oceanarium whale ships 240 KB / 197 KB HzAnim clips. NO CAP by default — FULL PORT, the whole
+        // clip at ~30fps (snakeway's 31.2s dragon = real 30fps, was ~8fps). HSR_HZFPS / HSR_HZMAXFRAMES opt back in.
         { float hzfps = 30.f; if (const char* e2 = std::getenv("HSR_HZFPS")) { float v = (float)atof(e2); if (v >= 1.f) hzfps = v; }
-          int cap = 256; if (const char* e3 = std::getenv("HSR_HZMAXFRAMES")) { int v = atoi(e3); if (v >= 8) cap = v; }
+          int cap = 0x7FFFFFFF; if (const char* e3 = std::getenv("HSR_HZMAXFRAMES")) { int v = atoi(e3); if (v >= 8) cap = v; }
           int nf = (gltf.animDuration > 0.f) ? (int)(gltf.animDuration * hzfps + 0.5f) : frames;
-          if (nf < 64) nf = 64; if (nf > cap) nf = cap;   // floor 64 (short clips); cap to keep the ACL clip under the device size limit
+          if (nf < 64) nf = 64; if (nf > cap) nf = cap;   // floor 64 (short clips); cap only if HSR_HZMAXFRAMES set
           frames = nf; }
         auto e = gltf.extractHzAnim(meshIdx, frames);
         if (e.ok()) { em.hzJointPos=std::move(e.jointPos); em.hzJointQuat=std::move(e.jointQuat); em.hzJointScale=std::move(e.jointScale);
@@ -1355,6 +1393,12 @@ int main(int argc, char** argv) {
     std::unordered_map<size_t, std::pair<float,float>> g_opaUv;
     std::unordered_map<size_t, OpaLoader::FlipRec> g_opaFlip;   // mat.sanim ATLAS flipbooks (waterfall/stream/fog)
     std::set<int> g_syncNodes;   // declared HERE (outlives the lambda stored in editor.hzAnimExtractor); populated below
+    // OPA VAT cook (underwater corals/seaweed/fish): bake the SOURCE VAT data (t_*_vatdata.exr.opa, played
+    // live via vatRecs) into the cooker's device-proven useVat path (RGBA16 offset tex + vatunlitbasecolor —
+    // the Erebor-wisp pipeline). Was never wired -> every VAT mesh cooked STATIC. HSR_NOVAT disables (same
+    // switch as the loader's live VAT).
+    if (isOpa && !std::getenv("HSR_NOVAT"))
+        editor.vatBaker = [&opa](int meshIdx, int frames, int& nv){ return opa.bakeVAT(meshIdx, frames, nv); };
     if (isOpa && !std::getenv("HSR_NOROT")) {
         opa.cookExtractRotations(g_opaRot);
         opa.cookExtractUVScroll(g_opaUv);   // mat.sanim water/foam UV scrolls (continuous)
@@ -1373,6 +1417,21 @@ int main(int argc, char** argv) {
                 if (md > 60.f) { int n=opa.animNodeOf((int)mi); if (n>=0){ g_syncNodes.insert(n); int p=opa.animNodeParentOf(n); if(p>=0) g_syncNodes.insert(p); } } } }
         editor.hzAnimExtractor = [&g_opaRot,&g_opaUv,&g_opaFlip,&opa,&g_syncNodes](int meshIdx, int frames, hslcook::ExportMesh& em){
             (void)frames;
+            // MaterialTint FULL-RGBA cycle (stinson fireworks flash colors / city window-light flicker) — filled
+            // FIRST, independent of the motion routing below (shader branches chain a TINTREPLAY frag stage).
+            // The baked COLOR_0 already carries the t=0 tint (animate(0) -> md.curTint folded into em.curTint), so
+            // DIVIDE it back out — the replay table carries the full curve including frame 0 (no double-apply).
+            // HSR_NOTINT disables.
+            if (!std::getenv("HSR_NOTINT")) {
+                std::vector<float> trgba; int tn = 0; float tloop = 0.f;
+                if (opa.cookExtractTintRGBA(meshIdx, 512, trgba, tn, tloop) && tn >= 2) {
+                    // undo the baked frame-0 tint exactly (em.curTint = md.curTint(frame0)·edit·light); a channel
+                    // that STARTS at 0 (firework light OFF at t=0) is unrecoverable -> neutral 1 (the replay owns it)
+                    for (int c = 0; c < 4; c++) { float f0 = trgba[c]; em.curTint[c] = (f0 > 1e-4f) ? em.curTint[c]/f0 : 1.0f; }
+                    em.tintAnim = true; em.tintFrames = std::move(trgba); em.tintN = tn; em.tintLoop = tloop;
+                    if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%d MaterialTint RGBA cycle %d frames loop=%.2fs -> TINTREPLAY\n", meshIdx, tn, tloop);
+                }
+            }
             // PURE CONTINUOUS SCROLL (waterfall / water / foam / stream: identity 2x2 + a small CONSTANT per-frame
             // translate) -> the SMOOTH getTime `uv += rate*time` scroll shader, NOT the per-frame matrix REPLAY below.
             // Replaying N discrete matrices SNAPS the UV each frame = CHOPPY, and the hard per-frame offset jump shows
@@ -1445,7 +1504,12 @@ int main(int argc, char** argv) {
                           }
                       }
                   }
-                  em.blend=true; em.flipbook=true; em.flipOffset=true; em.uvScroll=false;
+                  // KEEP the AUTHORED blend (set from md.useBlend/additive in buildExportMeshes): fog/steam are
+                  // authored Transparent:true and stay BLEND, but the storybook River waterCards are authored
+                  // OPAQUE (Transparent:false) — the old forced em.blend=true made them alpha-blend with NO depth
+                  // write, so overlapping river cards z-fought/sorted wrong and composited darker than OPA
+                  // ("not in sync, wrong placements, wrong lighting"). OPA renders them opaque with depth-write.
+                  em.flipbook=true; em.flipOffset=true; em.uvScroll=false;
                   em.flipUVMats=std::move(mats); em.flipN=mN; em.flipLoop=mLoop;
                   em.flipCols=1; em.flipRows=1; em.flipFrames=mN; em.flipFps=30.f;
                   em.rotAnim=false; em.vatOffsets.clear(); em.vatFrames=0;
@@ -1488,8 +1552,26 @@ int main(int argc, char** argv) {
                           // UV/puff mLoop made the steam race along the track and detach from the cart = the regression.
                           em.transAnim=true; em.transN=24; em.transFrames=std::move(tof); em.transLoop=tloop;
                       } else if (md > 1.f) {
-                          // AMBIENT drift (fog/dust): lock the MOVEMENT to the mat.sanim period (mLoop) so translate + UV +
-                          // fade stay synced (matches the render — one mat.sanim clock).
+                          // CONVEYOR card (storybook river waterCards: drift ~23u downstream then TELEPORT back upstream
+                          // MID-loop): the 24-sample getTime TRANSLATE smears that instant teleport across a whole sample
+                          // interval (17s/24 ≈ 0.7s) — the card visibly ZIPS back and TEARS the river ("not synced", the
+                          // black sliver through the water). RIGID-HZANIM replays the EXACT per-frame node path at native
+                          // resolution with the exclusive-endpoint wrap (instant seam — the cyberhome cars "speed backward"
+                          // fix), and the UV flipbook + fade ride the skinned material shader exactly like the fog cards.
+                          // VEHICLES (>60u) stay on the getTime TRANSLATE clock — their sibling BODY meshes sync to it.
+                          if (!std::getenv("HSR_FLIPNOHZ") && std::getenv("HSR_HZANIM")) {
+                              auto rg = opa.extractNodeRigidHzAnim((int)meshIdx);
+                              if (rg.ok()) {
+                                  em.hzJointPos=std::move(rg.jointPos); em.hzJointQuat=std::move(rg.jointQuat); em.hzJointScale=std::move(rg.jointScale);
+                                  em.hzParents=std::move(rg.parents); em.hzBoneIdx=std::move(rg.boneIdx); em.hzBoneWgt=std::move(rg.boneWgt);
+                                  em.hzTrsLocal=std::move(rg.trsLocal); em.hzRestPos=std::move(rg.restPos);
+                                  em.hzJointCount=rg.jointCount; em.hzFrames=rg.frameCount; em.hzFps=rg.fps;
+                                  em.transAnim=false;
+                                  return;
+                              }
+                          }
+                          // AMBIENT drift (fog/dust, rigid unavailable): lock the MOVEMENT to the mat.sanim period (mLoop)
+                          // so translate + UV + fade stay synced (matches the render — one mat.sanim clock).
                           std::vector<float> tof2; float tl2=0.f;
                           if (opa.cookExtractNodeTranslateFrames((int)meshIdx, 24, tof2, tl2, mLoop)) {
                               em.transAnim=true; em.transN=24; em.transFrames=std::move(tof2); em.transLoop=tl2; }
@@ -1568,10 +1650,29 @@ int main(int argc, char** argv) {
               } }
             auto it = g_opaRot.find((size_t)meshIdx);
             if (it != g_opaRot.end()) { const noderot::Result& r = it->second;
-                em.rotAnim=true; em.rotOmega=r.omega; em.rotOsc=r.isOsc; em.rotAmp=r.amp; em.rotPeriod=r.period;
-                em.rotAxis[0]=r.axis[0]; em.rotAxis[1]=r.axis[1]; em.rotAxis[2]=r.axis[2];
-                em.rotPivot[0]=r.pivot[0]; em.rotPivot[1]=r.pivot[1]; em.rotPivot[2]=r.pivot[2];
-                em.vatOffsets.clear(); em.vatFrames=0; }
+                // FAST ROCKING (torch flames: sub-5s keyed flicker) — the single-cosine SWAY fit is too crude for it:
+                // the (amp/2)(1-cos) shader swings ONE-SIDED while the source rocks both ways, and the amplitude/axis
+                // come from a probe fit of a 38-key flicker ("flame anim not correct"). REPLAY the node's EXACT
+                // per-frame relative rotation instead — the same ROTREPLAY getTime vertex shader the aurora uses:
+                // faithful rocking shape + phase, exact node-origin pivot. Slow ambient sways (foliage ~29s, ±1-3°)
+                // keep the cheap fitted oscillate shader (looked right; replay would add shaders for no visible gain).
+                bool fastOsc = r.isOsc && r.period > 1e-3f && r.period < 5.f && !std::getenv("HSR_NOROTREPLAY");
+                if (fastOsc) {
+                    int RN=128; if(const char*e=std::getenv("HSR_ROTKEYS")){int c=atoi(e);if(c>=8)RN=c;}
+                    float pivot[3]; std::vector<float> quats; float loopSec=0.f;
+                    if (opa.cookExtractRotationReplay(meshIdx,RN,pivot,quats,loopSec) && (int)quats.size()==(RN+1)*4) {
+                        em.rotReplay=true; em.rotReplayN=RN; em.rotLoopSec=loopSec; em.rotQuats=std::move(quats);
+                        em.rotPivot[0]=pivot[0]; em.rotPivot[1]=pivot[1]; em.rotPivot[2]=pivot[2];
+                        em.rotAnim=true; em.vatOffsets.clear(); em.vatFrames=0;
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] m%d FAST-SWAY -> ROTREPLAY %d keys loop=%.2fs (exact rocking, node pivot)\n", meshIdx, RN, loopSec);
+                    }
+                }
+                if (!em.rotReplay) {
+                    em.rotAnim=true; em.rotOmega=r.omega; em.rotOsc=r.isOsc; em.rotAmp=r.amp; em.rotPeriod=r.period;
+                    em.rotAxis[0]=r.axis[0]; em.rotAxis[1]=r.axis[1]; em.rotAxis[2]=r.axis[2];
+                    em.rotPivot[0]=r.pivot[0]; em.rotPivot[1]=r.pivot[1]; em.rotPivot[2]=r.pivot[2];
+                    em.vatOffsets.clear(); em.vatFrames=0; }
+                }
             auto fit = g_opaFlip.find((size_t)meshIdx);   // ATLAS flipbook (waterfall/stream/fog) -> OFFSET flipbook shader (frame-snap)
             if (fit != g_opaFlip.end()) {
                 em.flipbook=true; em.flipOffset=true; em.blend=true;

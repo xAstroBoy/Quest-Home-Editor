@@ -55,3 +55,19 @@ cooker/out/
 cooker/ow/
 cooker/realfloor/
 cooker/debug.keystore
+
+# Regenerable shader caches (deleted+rebuilt whenever shadergen changes)
+cooker/*.surface.bin
+cooker/*_shader.bin
+cooker/*_mat.bin
+cooker/*_mesh.bin
+cooker/*_tex.bin
+cooker/*_phys.bin
+cooker/*.bak
+cooker/haven_manifest.bin
+cooker/unlitblendskinned.bin
+cooker/unlitdoublesidedskinned.bin
+cooker/unlitskinneddistancefade.bin
+cooker/unlitspritesheetflipbookadditive.surface.bin
+cooker/ref_skinned_mesh.bin
+cooker/waterflipbook.*

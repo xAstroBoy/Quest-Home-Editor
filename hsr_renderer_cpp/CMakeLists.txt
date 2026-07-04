@@ -148,6 +148,7 @@ endif()
 if(MSVC)
     target_compile_options(hsr_renderer PRIVATE /Zc:__cplusplus)  # ACL checks __cplusplus for the C++ level
     target_compile_options(hsr_renderer PRIVATE /Zi)              # debug symbols (PDB) for the crash-handler stack traces
+    target_compile_options(hsr_renderer PRIVATE /bigobj)          # main.cpp TU exceeds the 64k COFF section limit (big inline cook/shadergen headers)
     target_link_options(hsr_renderer PRIVATE /DEBUG)              # emit the .pdb so segfault stacks resolve to file:line
 endif()
 if(WIN32)

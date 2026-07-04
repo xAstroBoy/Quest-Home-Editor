@@ -48,7 +48,11 @@ inline Result fit(const std::vector<const float*>& frames, size_t nv, const floa
     float orbitSpan=0.f; for(int i=0;i<=NS;i++){float d[3]={Cc[(size_t)i*3]-Cm[0],Cc[(size_t)i*3+1]-Cm[1],Cc[(size_t)i*3+2]-Cm[2]}; float s=dot(d,d); if(s>orbitSpan)orbitSpan=s;} orbitSpan=std::sqrt(orbitSpan);
     float bodySpan=0.f; for(size_t v=0;v<nv;v++){float d[3]={P0f[v*3]-Cc[0],P0f[v*3+1]-Cc[1],P0f[v*3+2]-Cc[2]}; float s=dot(d,d); if(s>bodySpan)bodySpan=s;} bodySpan=std::sqrt(bodySpan);
     float ax[3]={0,0,0};
-    bool orbit = orbitSpan > bodySpan && orbitSpan > 1e-2f;
+    // ORBIT only when the centroid's travel is MUCH larger than the body: a real orbit (King Kai planet circling
+    // a distant center) has orbitSpan >> bodySpan. A PENDULUM hinged just OUTSIDE the mesh (storybook torch flame
+    // rocking about its wick node: centroid arc ≈ body size) tripped the old `>` test -> pivot=centroid -> the
+    // cooked sway wobbled the flame about its own MIDDLE instead of the hinge ("flame anim not correct").
+    bool orbit = orbitSpan > 2.f*bodySpan && orbitSpan > 1e-2f;
     if (orbit) {
         for (int i=0;i<NS;i++){ float a[3]={Cc[(size_t)i*3]-Cm[0],Cc[(size_t)i*3+1]-Cm[1],Cc[(size_t)i*3+2]-Cm[2]}, b[3]={Cc[(size_t)(i+1)*3]-Cm[0],Cc[(size_t)(i+1)*3+1]-Cm[1],Cc[(size_t)(i+1)*3+2]-Cm[2]}, c[3]; cross(a,b,c); ax[0]+=c[0];ax[1]+=c[1];ax[2]+=c[2]; }
         for (int k=0;k<3;k++) out.pivot[k]=Cm[k];   // ORBIT: the rotation center is the centroid's orbit center, not the mesh node origin

@@ -36,12 +36,38 @@ struct MatlmatlInfo {
     // This replaces the old tgt-sentinel byte-scan, which picked the WRONG ing for USD-derived materials
     // (the real diffuse fell into the "unreferenced" texture bucket -> the mesh rendered WHITE).
     std::vector<std::pair<u32,u64>> samplerTex;  // {samplerNameHash, ing}, in file order
+    // This MATL is a clone of OUR cook's TRANSPARENT template (cooker/realdome_mat.bin = the unlitblend
+    // MATL): the cook only ever patches asset REFS into it, so bytes [0..48) (root offset + magic + vtable)
+    // are template-constant. The HSL preview uses this as the FAITHFUL blend signal — paired with an
+    // opaque-family shader it is the cook's ADDITIVE-GLOW signature (storybook godRays "full dark" fix).
+    bool isCookBlendTpl = false;
+    // This MATL is a clone of OUR cook's OPAQUE SKINNED template (cooker/skinned_mat_v2.bin, matSkin2):
+    // authoritative "render OPAQUE with depth-write". Needed because parseRendShadForward's f4-omission
+    // heuristic MISREADS skinned surfaces (skinuv/unlitdoublesidedskinned report transp=1) -> every cooked
+    // skinned mesh classified alpha-blend/no-depth-write -> the storybook river's overlapping cards
+    // z-fought and composited dark ("wrong placements / wrong lighting"). The cook contract wins.
+    bool isCookOpaqueSkinTpl = false;
 };
 
 inline bool parseMatlmatl(const std::vector<u8>& data, MatlmatlInfo& info) {
     // Need at least 68 bytes for shader ref (at offsets 48/56/64) + MATL magic at +4
     if (data.size() < 68) return false;
     if (memcmp(data.data() + 4, "MATL", 4) != 0) return false;
+    {   // fingerprint of cooker/realdome_mat.bin (unlitblend template) bytes [0..48): root+magic+vtable —
+        // constant across every MATL the cook emits from it (only refs @48+/@120+ get patched).
+        static const u8 kBlendTpl48[48] = {
+            0x1c,0x00,0x00,0x00, 0x4d,0x41,0x54,0x4c, 0x00,0x00,0x00,0x00, 0x10,0x00,0x30,0x00,
+            0x00,0x00,0x14,0x00, 0x10,0x00,0x0c,0x00, 0x08,0x00,0x04,0x00, 0x10,0x00,0x00,0x00,
+            0x2c,0x00,0x00,0x00, 0x3c,0x00,0x00,0x00, 0x68,0x00,0x00,0x00, 0x02,0x00,0x00,0x00 };
+        info.isCookBlendTpl = data.size() >= 48 && memcmp(data.data(), kBlendTpl48, 48) == 0;
+        // fingerprint of cooker/skinned_mat_v2.bin (matSkin2, the OPAQUE skinned MATL) bytes [0..48) —
+        // refs are patched at 48+/120+ so the header is template-constant (verified against a cooked m701).
+        static const u8 kOpaqueSkinTpl48[48] = {
+            0x20,0x00,0x00,0x00, 0x4d,0x41,0x54,0x4c, 0x00,0x00,0x16,0x00, 0x2c,0x00,0x2a,0x00,
+            0x00,0x00,0x00,0x00, 0x0c,0x00,0x00,0x00, 0x04,0x00,0x00,0x00, 0x10,0x00,0x08,0x00,
+            0x16,0x00,0x00,0x00, 0x28,0x00,0x00,0x00, 0x38,0x00,0x00,0x00, 0x64,0x00,0x00,0x00 };
+        info.isCookOpaqueSkinTpl = data.size() >= 48 && memcmp(data.data(), kOpaqueSkinTpl48, 48) == 0;
+    }
 
     // Shader ref = MATL root table FIELD INDEX 7 (FlatBuffer vtable), an inline AssetReference struct
     // {pkg u64 @0, ing u64 @8, tgt u32 @16}. This is how libshell's generated accessor reads it — by

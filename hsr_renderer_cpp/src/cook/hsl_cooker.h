@@ -1361,6 +1361,7 @@ struct ExportMesh {
     // GENERAL node TRANSLATION replay (Star Trek sliding screens etc.) -> shadergen::TRANSLATE getTime() shader (faithful, any track)
     bool transAnim = false; std::vector<float> transFrames; int transN = 0; float transLoop = 0.f;   // transN frames of vec3 OFFSET, loop seconds
     bool fadeAnim = false; std::vector<float> fadeFrames; int fadeN = 0; float fadeLoop = 0.f;   // mat.sanim MaterialTint ALPHA fade curve replayed in the flipbook frag; fadeLoop synced to transLoop
+    bool tintAnim = false; std::vector<float> tintFrames; int tintN = 0; float tintLoop = 0.f;   // mat.sanim MaterialTint FULL RGBA cycle (fireworks flashes / window-light flicker) -> shadergen::TINTREPLAY chained onto the mesh's shader (supersedes the alpha-only fade when set)
     // GENERAL node SCALE "breathe" replay (Erebor's 12 wisps, NON-UNIFORM per-axis) -> shadergen::SCALE getTime() shader.
     // scaleFrames = scaleN frames of per-axis FACTOR (= scale(t)/scale(0), frame0=(1,1,1)); scalePivot = node WORLD origin.
     bool scaleAnim = false; std::vector<float> scaleFrames; int scaleN = 0; float scaleLoop = 0.f; float scalePivot[3] = {0,0,0};
@@ -1483,6 +1484,7 @@ inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMe
             ExportMesh c; c.name = m.name; c.blend = m.blend; c.alphaTest = m.alphaTest; c.additive = m.additive; c.w = m.w; c.h = m.h; c.rgba = m.rgba;
             c.skybox = m.skybox;   // split parts MUST inherit the skybox mark, else a big dome (>60k verts) loses it -> far-clipped/black
             for (int k = 0; k < 4; k++) c.matTint[k] = m.matTint[k];
+            c.tintAnim = m.tintAnim; c.tintFrames = m.tintFrames; c.tintN = m.tintN; c.tintLoop = m.tintLoop;   // split parts keep the tint cycle
             std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(cap + 16);
             while (t < ntri) {
                 uint32_t tri[3] = { m.indices[t*3], m.indices[t*3+1], m.indices[t*3+2] };
@@ -2112,17 +2114,22 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             texSrc = m.rgba.data();
         }
         else if (m.additive && m.rgba.size() >= (size_t)m.w * m.h * 4) {
-            // ADDITIVE glow uses hard additive (src+dst, ignores alpha). A FULL-COLOR texture then renders as a SOLID
-            // disc (the Star Trek warp "blue tunnel") because the soft falloff lives in the ALPHA, which additive drops.
-            // PREMULTIPLY rgb*=a so additive shows color*alpha = a SOFT glow (the warp tube fades out). Bright streak
-            // pixels (alpha~1) stay bright; the empty gaps (alpha~0) stay dark -> streaks unaffected. Cache key (rh
-            // below) hashes texSrc, so the premultiplied variant dedups correctly and never collides with a straight tex.
+            // ADDITIVE glow → ALPHA conversion (the storybook godRays "still black" fix). GROUND TRUTH from the
+            // official V205 files: the additive flipbook .surface forward pass is BYTE-IDENTICAL in state to the
+            // OPAQUE one, and the official flame(additive)/mist(alpha) MATLs both carry field2=2 — so there is NO
+            // independent additive pipeline the cook can target, and the old "opaque-pass shader in transparent
+            // MATL" trick just renders UNBLENDED on device: a texture that stores its glow in RGB over BLACK with
+            // a UNIFORM alpha (godRays texA=255 everywhere; lake foam) drew its black background as a DARK SHEET
+            // over the bright scene. Port additive faithfully-visible instead: alpha := max(r,g,b) so black adds
+            // nothing (transparent) and the bright rays show, rgb UNTOUCHED (no premult double-attenuation), on
+            // the DEVICE-PROVEN unlitblend path (shader routing below). Textures that already carry a real alpha
+            // falloff (Star Trek warp: soft edge in alpha, non-uniform) keep alpha' = a·max(rgb) — same formula,
+            // their authored falloff still multiplies in. Cache key (rh below) hashes texSrc, so this variant
+            // dedups correctly and never collides with a straight tex.
             texOpaque = m.rgba;
             for (size_t k = 0; k + 3 < texOpaque.size(); k += 4) {
-                uint32_t a = texOpaque[k+3];
-                texOpaque[k+0] = (uint8_t)(texOpaque[k+0] * a / 255);
-                texOpaque[k+1] = (uint8_t)(texOpaque[k+1] * a / 255);
-                texOpaque[k+2] = (uint8_t)(texOpaque[k+2] * a / 255);
+                uint32_t lum = texOpaque[k+0]; if (texOpaque[k+1] > lum) lum = texOpaque[k+1]; if (texOpaque[k+2] > lum) lum = texOpaque[k+2];
+                texOpaque[k+3] = (uint8_t)(lum * texOpaque[k+3] / 255);   // a' = max(rgb)·a  (uniform-alpha glows -> pure luminance mask)
             }
             texSrc = texOpaque.data();
         }
@@ -2157,17 +2164,15 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // hash structs being emitted 12B/align-4 when V205.2's NEW MeshDefinition verifier requires 8B/align-8
         // (IDA @0xeba93c). Fixed in encodeRendMeshParts -> no size cap needed. HSR_HZMAXVERTS still overrides if set.
         int hzMaxVerts = std::getenv("HSR_HZMAXVERTS") ? atoi(std::getenv("HSR_HZMAXVERTS")) : 0x7FFFFFFF;
-        // The device reads the ACL clip block size into a SIGNED 16-bit field (IDA; see main.cpp HZ note): an encoded
-        // clip over ~32 KB wraps NEGATIVE -> bad std::string/vector resize -> `std::length_error` crash on load (the
-        // lakesidepeak crash; m154 = 9 joints x 400 frames = 41 KB). Pre-encode the clip HERE; if it exceeds the byte
-        // budget, SUBSAMPLE the frame count (evenly-spaced frames across the clip, DURATION preserved) and re-encode,
-        // reducing N until it fits — so the mesh still ANIMATES at the highest fps that fits, NOT dropped to static.
-        // This mirrors the glTF path (main.cpp ~1184) which caps the frame count up front. fps = (N-1)/duration keeps
-        // playback speed correct (duration = (frames-1)/fps; ACL samples inclusively over the interval -> NF-1 spans).
-        // Budget = HSR_HZMAXBYTES (default 20000; the glTF note: ~22 KB loads, ~65 KB throws length_error). Set it very
-        // high (e.g. 999999) to ship the FULL untouched clip = device-test the TRUE limit. Only when even an 8-frame
-        // clip won't fit do we fall back to STATIC (the device physically can't take it).
-        size_t hzMaxBytes = 20000;
+        // Clip byte budget: NONE by default — FULL PORT, every source frame ships untouched (user directive).
+        // ⚠ The old 20000-byte default was FEAR FROM A MISDIAGNOSIS: the lakesidepeak `std::length_error` was NEVER
+        // clip size — it was the missing 5-byte trailing channel-name table (IDA-proven @0x1617f4c, fixed in
+        // hzAclEncode; "never a malformed clip, data-dependent"). The old "signed-16 size field" theory is disproven
+        // by GROUND TRUTH: the official oceanarium whale ships 240,520-byte HzAnim clips. The 20 KB ceiling was
+        // silently DESTROYING big-rig anims: cyberhome's screens (153 joints x 578 frames) got subsampled
+        // 578 -> 17 frames = 0.83 fps = the "2D anims not ported" slideshow. HSR_HZMAXBYTES opts back into a budget
+        // (the subsample loop below then reduces the frame count, DURATION preserved, until it fits).
+        size_t hzMaxBytes = SIZE_MAX;
         if (const char* eb = std::getenv("HSR_HZMAXBYTES")) { long v = atol(eb); if (v > 0) hzMaxBytes = (size_t)v; }
         std::vector<uint8_t> hzAnimPre; bool hzClipFits = true;
         if (std::getenv("HSR_HZANIM") && haveSkin && m.hzFrames > 1 && m.hzJointCount > 0
@@ -2589,7 +2594,10 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             const char* usuf = ublend ? "_b" : "";
             long ru=(long)(m.uvRate[0]*100000), rv=(long)(m.uvRate[1]*100000);
             uint32_t h = (uint32_t)(0x9E3779B9u*(uint32_t)ru ^ 0xC2B2AE35u*(uint32_t)rv ^ (ublend?0x68bc21ebu:0u));
-            char ufn[160]; snprintf(ufn, sizeof ufn, "cooker/uvscroll_%08x%s%s.surface.bin", h, usuf, meshFar ? "_dc" : "");
+            bool utint = m.tintAnim && m.tintN >= 2 && m.tintFrames.size() >= (size_t)m.tintN*4 && m.tintLoop > 1e-4f;
+            if (utint) { h = h*16777619u ^ (uint32_t)m.tintN ^ (uint32_t)(long)(m.tintLoop*1000);   // fold the tint cycle into the cache key
+                for (float v : m.tintFrames) h = h*16777619u ^ (uint32_t)(long)(v*10000); }
+            char ufn[160]; snprintf(ufn, sizeof ufn, "cooker/uvscroll_%08x%s%s%s.surface.bin", h, usuf, utint?"t":"", meshFar ? "_dc" : "");
             AssetKey3 uvK{};
             auto it = rotShaders.find(ufn);
             if (it != rotShaders.end()) uvK = it->second;
@@ -2598,6 +2606,8 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 if (ubytes.empty()) {   // getTime() uv += rate*time shader — C++ generator
                     const std::vector<uint8_t>& gbase = meshFar ? (ublend ? shadBlendDC : shadDC) : (ublend ? shadBlend : shad);   // FAR -> remap base
                     ubytes = shadergen::generate(gbase, shadergen::UVSCROLL, m.uvRate[0], m.uvRate[1]);
+                    // MaterialTint RGBA cycle (fireworks flash / window flicker) chained onto the same forward frag
+                    if (!ubytes.empty() && utint) { auto tb = shadergen::generate(ubytes, shadergen::TINTREPLAY, m.tintLoop, 0,0,0,0, m.tintFrames, m.tintN); if (!tb.empty()) ubytes = tb; }
                     if (!ubytes.empty()) writeFileBytes(ufn, ubytes);
                 }
                 if (!ubytes.empty()) { char up[160]; snprintf(up, sizeof up, "%s/shaders/uvscroll_%08x%s%s.surface/shader", MH.c_str(), h, usuf, meshFar ? "_dc" : "");
@@ -2641,14 +2651,17 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             int fframes=m.flipFrames>0?m.flipFrames:fcols*frows; float ffps=m.flipFps>0.f?m.flipFps:5.f;
             float foff = m.flipOffset ? 1.f : 0.f;   // OFFSET flipbook (mat.sanim waterfall: uv'=inUv+cellOff, no scale) vs SCALE spritesheet
             bool useReplay = m.flipUVMats.size() >= (size_t)m.flipN*6 && m.flipN >= 2;   // EXACT per-frame source matrices present -> replay (fog/dust fix)
-            bool ffade = useReplay && m.fadeAnim && m.fadeN>=2 && m.fadeFrames.size()>=(size_t)m.fadeN && m.fadeLoop>1e-4f;   // opacity fade curve
+            bool ftint = m.tintAnim && m.tintN >= 2 && m.tintFrames.size() >= (size_t)m.tintN*4 && m.tintLoop > 1e-4f;   // FULL RGBA tint cycle (fireworks flashes)
+            bool ffade = !ftint && useReplay && m.fadeAnim && m.fadeN>=2 && m.fadeFrames.size()>=(size_t)m.fadeN && m.fadeLoop>1e-4f;   // opacity fade curve (alpha-only subset — superseded by the RGBA tint replay)
             uint32_t h;
             if (useReplay) { h = (uint32_t)(0x9E3779B9u*(uint32_t)m.flipN ^ 0x85EBCA6Bu*(uint32_t)(long)(m.flipLoop*1000));
                 for (size_t k=0;k<m.flipUVMats.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000); }
             else h=(uint32_t)(0x9E3779B9u*(uint32_t)fcols ^ 0xC2B2AE35u*(uint32_t)frows ^ 0x27D4EB2Fu*(uint32_t)fframes ^ 0x85EBCA6Bu*(uint32_t)(long)(ffps*1000) ^ (m.flipOffset?0xA1B2C3D4u:0u));
             if (ffade) { h = h*16777619u ^ (uint32_t)(long)(m.fadeLoop*1000);
                 for (size_t k=0;k<m.fadeFrames.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.fadeFrames[k]*100000); }
-            char ffn[160]; snprintf(ffn,sizeof ffn,"cooker/flipbook_%08x%s%s%s%s.surface.bin", h, useReplay?"r":"", ffade?"a":"", m.flipOffset?"o":"", meshFar?"_dc":"");
+            if (ftint) { h = h*16777619u ^ (uint32_t)m.tintN ^ (uint32_t)(long)(m.tintLoop*1000);   // fold the tint cycle into the cache key
+                for (float v : m.tintFrames) h = h*16777619u ^ (uint32_t)(long)(v*10000); }
+            char ffn[160]; snprintf(ffn,sizeof ffn,"cooker/flipbook_%08x%s%s%s%s%s.surface.bin", h, useReplay?"r":"", ffade?"a":"", ftint?"t":"", m.flipOffset?"o":"", meshFar?"_dc":"");
             AssetKey3 flipK{}; auto it=rotShaders.find(ffn);
             if (it!=rotShaders.end()) flipK=it->second;
             else {
@@ -2658,8 +2671,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     fbytes = useReplay ? shadergen::generate(gbase, shadergen::FLIPBOOK, m.flipLoop, 0.f,0.f,1.f,0.f, m.flipUVMats, m.flipN,
                                              ffade ? m.fadeFrames : noFade, ffade ? m.fadeLoop : 0.f)   // EXACT per-frame matrix replay + opacity fade (desktop data)
                                        : shadergen::generate(gbase, shadergen::FLIPBOOK, (float)fcols,(float)frows,(float)fframes,ffps,foff);    // grid
+                    // MaterialTint RGBA cycle (fireworks flash colors) chained onto the flipbook frag — replaces the
+                    // alpha-only fade (the tint table carries alpha too, so both channels replay in one pass)
+                    if (!fbytes.empty() && ftint) { auto tb = shadergen::generate(fbytes, shadergen::TINTREPLAY, m.tintLoop, 0,0,0,0, m.tintFrames, m.tintN); if (!tb.empty()) fbytes = tb; }
                     if(!fbytes.empty()) writeFileBytes(ffn,fbytes); }
-                if(!fbytes.empty()){ char fp2[176]; snprintf(fp2,sizeof fp2,"%s/shaders/flipbook_%08x%s%s%s%s.surface/shader", MH.c_str(), h, useReplay?"r":"", ffade?"a":"", m.flipOffset?"o":"", meshFar?"_dc":"");
+                if(!fbytes.empty()){ char fp2[176]; snprintf(fp2,sizeof fp2,"%s/shaders/flipbook_%08x%s%s%s%s%s.surface/shader", MH.c_str(), h, useReplay?"r":"", ffade?"a":"", ftint?"t":"", m.flipOffset?"o":"", meshFar?"_dc":"");
                     flipK=keyForPath(fp2); assets.push_back({fp2, flipK.tgt, fbytes, flipK}); rotShaders[ffn]=flipK; } }
             matl = matBlend;
             if (flipK.ing){ memcpy(matl.data()+48,&flipK.pkg,8); memcpy(matl.data()+56,&flipK.ing,8); }   // field7 -> generated flipbook shader
@@ -2718,9 +2734,41 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] m%03zu '%s' CUTOUT depth-write (blend=%d mask=%d tree=%d)\n", i, m.name.c_str(), (int)m.blend, (int)m.alphaTest, (int)isTreeCutout);
             } else if (meshFar) { AssetKey3 dck = (m.blend && haveBlend) ? shaderBlendDCK : shaderDCK;   // FAR -> remap shader (renders past the 5000 clip); near keeps unlit/unlitblend = byte-exact
                            if (dck.ing) { memcpy(matl.data()+48,&dck.pkg,8); memcpy(matl.data()+56,&dck.ing,8); } }
-            else if (m.additive && haveBlend) {   // EMISSIVE GLOW (warp/nebula/fog): transparent MATL (matBlend) + the OPAQUE-pass unlit shader (f2,f3 PRESENT) = ADDITIVE blend -> the glow ADDS light (visible) instead of faint alpha-lerp that vanishes on a dark backdrop
-                           memcpy(matl.data()+48,&shaderK.pkg,8); memcpy(matl.data()+56,&shaderK.ing,8);
-                           if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' ADDITIVE glow (opaque-pass shader in transparent MATL)\n", i, m.name.c_str()); }
+            else if (m.additive && haveBlend) {
+                // EMISSIVE GLOW (godRays/warp/nebula): unlitblend (the alpha-pass shader) + matBlend + the
+                // luminance-alpha texture (converted above). The OLD "opaque-pass unlit shader in the transparent
+                // MATL = additive" trick is DISPROVEN on device (storybook godRays / lake foam rendered their
+                // black background as a DARK SHEET over bright scenes — it draws UNBLENDED; the official additive
+                // .surface pass state is byte-identical to opaque, so f2,f3-presence never encoded a blend mode).
+                // HSR_ADDGLOW_OLD restores the trick for A/B.
+                if (std::getenv("HSR_ADDGLOW_OLD")) {
+                    memcpy(matl.data()+48,&shaderK.pkg,8); memcpy(matl.data()+56,&shaderK.ing,8);
+                    if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' ADDITIVE glow (OLD opaque-pass trick, HSR_ADDGLOW_OLD)\n", i, m.name.c_str());
+                } else if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' ADDITIVE glow -> luminance-alpha BLEND (unlitblend, device-proven path)\n", i, m.name.c_str());
+            }
+            // STATIC mesh with a MaterialTint RGBA cycle (stinson city window lights / lightsStatic / terraces:
+            // geometry static, the mat.sanim tint FLASHES the emissive texture) — generate a TINTREPLAY variant
+            // of the plain unlit/unlitblend base and point field7 at it. Without this the device showed one
+            // constant "generic" color (the renderer's animate() played the same track live, so preview was right).
+            else if (m.tintAnim && m.tintN >= 2 && m.tintFrames.size() >= (size_t)m.tintN*4 && m.tintLoop > 1e-4f) {
+                uint32_t th = (uint32_t)(0x9E3779B9u*(uint32_t)m.tintN ^ 0x85EBCA6Bu*(uint32_t)(long)(m.tintLoop*1000) ^ ((m.blend&&haveBlend)?0x68bc21ebu:0u));
+                for (float v : m.tintFrames) th = th*16777619u ^ (uint32_t)(long)(v*10000);
+                char tfn[160]; snprintf(tfn, sizeof tfn, "cooker/tint_%08x%s%s.surface.bin", th, (m.blend&&haveBlend)?"_b":"", meshFar?"_dc":"");
+                AssetKey3 tK{}; auto itT = rotShaders.find(tfn);
+                if (itT != rotShaders.end()) tK = itT->second;
+                else {
+                    auto tbytes = readFileBytes(tfn);
+                    if (tbytes.empty()) {
+                        const std::vector<uint8_t>& gbase = meshFar ? ((m.blend&&haveBlend) ? shadBlendDC : shadDC) : ((m.blend&&haveBlend) ? shadBlend : shad);
+                        tbytes = shadergen::generate(gbase, shadergen::TINTREPLAY, m.tintLoop, 0,0,0,0, m.tintFrames, m.tintN);
+                        if (!tbytes.empty()) writeFileBytes(tfn, tbytes);
+                    }
+                    if (!tbytes.empty()) { char tp[168]; snprintf(tp, sizeof tp, "%s/shaders/tint_%08x%s%s.surface/shader", MH.c_str(), th, (m.blend&&haveBlend)?"_b":"", meshFar?"_dc":"");
+                        tK = keyForPath(tp); assets.push_back({ tp, tK.tgt, tbytes, tK }); rotShaders[tfn] = tK; }
+                }
+                if (tK.ing) { memcpy(matl.data()+48,&tK.pkg,8); memcpy(matl.data()+56,&tK.ing,8); }
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' TINTREPLAY %d frames loop=%.2fs %s %s\n", i, m.name.c_str(), m.tintN, m.tintLoop, (m.blend&&haveBlend)?"BLEND":"opaque", tK.ing?"":"(MISSING -> static tint)");
+            }
             memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);
         }
         // Skinned: use the CENTERED rest positions (extractHzAnim centered mesh+skeleton+clip near origin so the
@@ -2915,13 +2963,18 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // skinned -> AnimatorPlatformComponent (a real components[] entry). pose-anim wisp -> the TOP-LEVEL "poseAnimation"
         // entity key (IDA V205 EnvironmentEntitySystem sub_1148BFC), NOT a component — the mesh keeps its unlitblend shader.
         std::string extraComp = !animatorComp.empty() ? animatorComp : std::string();
-        // ── ANIMATED COLLIDER (V205 kinematic): if this mesh is marked as a collider, ship a ColliderMesh + StaticCollision
-        //    PhysicsBody on THIS SAME entity. Because the entity also carries the animation (Animator/skeleton for skinned,
-        //    or the node transform), libshell's KinematicAddDynamicTask promotes the body and Kinematic{Pose,Shape}UpdateTask
-        //    drives the collider with the mesh's animation. Collider geometry = the mesh's OWN cooked geometry (local for
-        //    skinned so the skeleton deforms it; world for static), so it lines up 1:1 with what's drawn. ──
+        // ── ANIMATED COLLIDER: if this mesh is marked as a collider, PhysX-cook its geometry into a ColliderMesh +
+        //    StaticCollision PhysicsBody. Placement is the whole game here (japan "colliders went berserk"):
+        //    SKINNED (useHz) colliders must NOT ship hzRestPos — that's the butterfly-parity ROOT-JOINT-LOCAL space,
+        //    and a rig can carry its whole unit conversion in the root joint SCALE (japan koi: Maya cm rig, root scale
+        //    ~0.0127 — the RENDER path shrinks the 90m rest verts through the animated root joint every frame, but a
+        //    PhysX kinematic pose is RIGID: scale is DROPPED, so the shipped collider stayed a ~90m monster sweeping
+        //    the whole map). Ship the t=0 WORLD rest verts (m.positions — the fish at its real size and place, exactly
+        //    what the editor preview collides with) on a STATIC SIBLING entity instead: correct place, correct size,
+        //    device-safe. (The kinematic follow for skinned rigs was never device-validated —
+        //    project_hsr_v205_kinematic_collider is still OPEN — so a resting collider beats a berserk one.) ──
         if (m.wantCollider) {
-            const std::vector<float>& cpos = useHz ? hzMeshPos : *staticPos;
+            const std::vector<float>& cpos = useHz ? m.positions : *staticPos;
             if (cpos.size() >= 9 && m.indices.size() >= 3) {
                 auto sebd = cookNavmeshSEBD(cpos.data(), (uint32_t)(cpos.size()/3), m.indices.data(), (uint32_t)(m.indices.size()/3));
                 if (sebd.size() > 64 && sebd[0]=='S'&&sebd[1]=='E'&&sebd[2]=='B'&&sebd[3]=='D') {
@@ -2931,19 +2984,20 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                                         + "," + comp("PhysicsBodyPlatformComponent", 7, "{\"type\":\"StaticCollision\"}");
                     // ── KINEMATIC-PROMOTION TRAP (the bluehills windmill_tails "stuck at spawn" bug) ──────────────────────
                     // libshell promotes a PhysicsBody that sits on an ANIMATED entity to a KINEMATIC body and drives its
-                    // KinematicPose from the entity's pose source. SKINNED meshes (useHz → AnimatorPlatformComponent) and
-                    // entity-pose meshes (usePose → top-level "poseAnimation") DO carry such a driver, so their collider
-                    // follows the animation correctly — keep it on the SAME entity (proven). But a SHADER-ONLY animation
-                    // (useRot/useTrans/useScale/usePulse/useUvScroll/useVat: the motion lives in the material getTime()
-                    // shader while the ENTITY transform is static) has NO pose driver — libshell still promotes the body to
-                    // kinematic and, finding nothing to pose it, COLLAPSES the body AND the entity transform the visual mesh
-                    // rides on to the kinematic origin == spawn (m161 windmill_tails). FIX: emit the collider on a SEPARATE
-                    // STATIC sibling entity (no animation → never promoted) carrying the SAME transform as the mesh (the
-                    // collider SEBD is in the mesh's local/centered space, so it needs hzPos to land at the world rest; the
-                    // ±few-degree shader sway is negligible for collision). project_hsr_v205_kinematic_collider.
+                    // KinematicPose from the entity's pose source. Entity-pose meshes (usePose → top-level "poseAnimation")
+                    // DO carry such a driver, so their collider follows the animation — keep it on the SAME entity. But a
+                    // SHADER-ONLY animation (useRot/useTrans/useScale/usePulse/useUvScroll/useVat: the motion lives in the
+                    // material getTime() shader while the ENTITY transform is static) has NO pose driver — libshell still
+                    // promotes the body to kinematic and, finding nothing to pose it, COLLAPSES the body AND the entity
+                    // transform the visual mesh rides on to the kinematic origin == spawn (m161 windmill_tails). And a
+                    // SKINNED mesh (useHz) ships WORLD verts now (see cpos above), so the animated entity must not re-pose
+                    // them either. FIX: emit the collider on a SEPARATE STATIC sibling entity (no animation → never
+                    // promoted). Transform: hzPos/hzScl — identity for useHz (verts are world), poseCtr for the centered
+                    // shader-anim cases (their SEBD is in the mesh's local/centered space; the ±few-degree shader sway is
+                    // negligible for collision). project_hsr_v205_kinematic_collider.
                     bool shaderAnim = useRot || useTrans || useScale || usePulse || useUvScroll || useVat;
-                    bool poseDriven = useHz || usePose;
-                    if (shaderAnim && !poseDriven) {
+                    bool poseDriven = usePose;
+                    if ((shaderAnim || useHz) && !poseDriven) {
                         std::string cid = makeUuid(rng);
                         char ctf[256]; snprintf(ctf,sizeof ctf,
                             "{\"localPosition\":{\"x\":%g,\"y\":%g,\"z\":%g},\"localRotation\":{\"x\":0,\"y\":0,\"z\":0},\"localScale\":{\"x\":%g,\"y\":%g,\"z\":%g}}",
@@ -2951,7 +3005,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                         entities += "," + std::string("{\"id\":\"") + cid + "\",\"name\":\"" + nm + "_col\",\"components\":["
                                   + comp("TransformPlatformComponent", 1, ctf) + "," + colComp + "],\"attributes\":[]}";
                         rels += (rels.empty() ? std::string() : std::string(",")) + relChildOf(cid, rootId);
-                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' shader-anim collider -> %zuB SEBD (%zu tris) on a STATIC SIBLING entity @(%.1f,%.1f,%.1f) (no kinematic collapse)\n", i, m.name.c_str(), sebd.size(), m.indices.size()/3, hzPos[0],hzPos[1],hzPos[2]);
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' %s collider -> %zuB SEBD (%zu tris) on a STATIC SIBLING entity @(%.1f,%.1f,%.1f) (no kinematic collapse)\n", i, m.name.c_str(), useHz?"skinned (world-rest)":"shader-anim", sebd.size(), m.indices.size()/3, hzPos[0],hzPos[1],hzPos[2]);
                     } else {
                         if (!extraComp.empty()) extraComp += ",";
                         extraComp += colComp;

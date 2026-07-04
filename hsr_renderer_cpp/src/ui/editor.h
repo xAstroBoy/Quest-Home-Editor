@@ -5209,6 +5209,10 @@ struct Editor {
     void startCook() {
         if (cooking.load()) return;
         saveProject();   // AUTO-SAVE the session on cook — the user's edits (transforms/renames/hides/spawn points/colliders/skybox marks + cook config) are persisted to <env>.hsledit BEFORE cooking, so a cook never silently loses unsaved edits (they're already baked into the APK via the live state; this just keeps the on-disk session in sync).
+        // BEFORE buildExportMeshes: the anim-extractor lambda gates the fog/river RIGID-HZANIM+UV path on
+        // HSR_HZANIM — runCook's setenv came AFTER extraction, so the gate was ALWAYS false on the first cook
+        // of a session (river waterCards fell to the seam-smearing getTime TRANSLATE = the torn river).
+        setenv_("HSR_HZANIM", animSkinned ? "1" : "");
         auto ems = buildExportMeshes();
         if (ems.empty()) { setStatus("ERROR: no exportable meshes"); return; }
         if (cookThread.joinable()) cookThread.join();
@@ -5224,6 +5228,8 @@ struct Editor {
         if (std::getenv("HSR_NOHZ")) animSkinned=false;   // diag: cook with skinned anim OFF (isolate the HZANIM crash)
         if (std::getenv("HSR_NOAUDIO")) cookAudio=false;  // headless/CLI: cook a silent home (no background audio loop)
         if (std::getenv("HSR_NOINSTALL")) installAfterCook=false;   // batch/CLI: cook the APK files only, don't touch the device
+        if (std::getenv("HSR_NOAUTOFLOOR")) cookAutoFloor=false;   // headless/CLI: honor the no-generated-collision flag (runCook re-derives the env var from this)
+        setenv_("HSR_HZANIM", animSkinned ? "1" : "");   // BEFORE buildExportMeshes (same as startCook): the extractor's RIGID+UV gates read it
         auto ems = buildExportMeshes();
         std::array<float,3> spawn{ r->cam.pos[0], r->cam.pos[1], r->cam.pos[2] };
         std::vector<sitem::Item> its=items; bakeNavmeshes(its);

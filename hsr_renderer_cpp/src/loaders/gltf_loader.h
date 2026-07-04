@@ -956,6 +956,202 @@ public:
           (void)tt; float w0[16]; worldAt0(nodeIdx, w0); pivot[0]=w0[12]; pivot[1]=w0[13]; pivot[2]=w0[14]; }
         return maxDev > 1e-3f;   // actually breathes
     }
+    // ── COOK: NON-skinned node-animated glTF mesh → 2-joint RIGID HZANIM (STATIC root + MOVING child carrying the
+    //    node's EXACT per-frame composed WORLD matrix) — the OPA extractNodeRigidHzAnim port for glTF envs (cyan/
+    //    dome/rifthome). The old extractor chain fitted a node anim to rotation-ONLY (SWAY/SPIN Rodrigues) or
+    //    translation-ONLY (16-frame replay), DROPPING the other channel: cyan's gears/mills/boat/rocket/shadow
+    //    cards all animate T+R TOGETHER (verified [V79ANIM]: gearAnim_Top T range ~280u + 56° R; millAnim_02
+    //    T ±500u + 45° yaw), so the cooked motion was rotation-about-a-fitted-axis only = "wrong animation on
+    //    windmill, shadows, gears". This replays the FULL T+R+S faithfully on the device-proven skinned path:
+    //    2 JOINTS so V205's root-motion extraction can't eat the translation (root stays identity, the child
+    //    moves — the OPA train/cars fix), BIND = W0 on the mover so the device computes invBind = inv(W0) and the
+    //    ACL clip stores W(f) directly = small ACL-friendly numbers (the OPA comet ACL-clean fix):
+    //      driven:  vert = W(f)·inv(W0) · (W0·basePos) = W(f)·basePos       (exact node animation)
+    //      frozen:  vert = W0·inv(W0)   · (W0·basePos) = W0·basePos          (correct world rest when un-driven)
+    //    requireRotation (default): return !ok() unless the node BOTH translates AND rotates — pure translations
+    //    keep the lighter getTime TRANSLATE replay, pure spins the getTime Rodrigues shader (both device-proven;
+    //    no regression on Star Trek screens / OW planets / erebor wisps). HSR_NOGLTFRIGID disables the whole path.
+    HzAnimExport extractNodeRigidHzAnim(int meshIdx, bool requireRotation = true) {
+        HzAnimExport e;
+        const NodeAnimRec* rec = nullptr;
+        for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { rec = &r; break; }
+        if (!rec || rec->basePos.size() < 9) return e;
+        int node = rec->nodeIdx; if (node < 0 || (size_t)node >= gnodes.size()) return e;
+        // PER-NODE clip duration = the latest key time among channels animating this node or any ancestor (the
+        // node's own loop, matching the OPA per-node-period fix — sampling a short-period node over the global
+        // clip aliases its motion). Falls back to the global animDuration when no channel is found.
+        float clipDur = 0.f;
+        for (int n = node, g = 0; n >= 0 && (size_t)n < gnodes.size() && g < 64; n = gnodes[n].parent, ++g)
+            for (auto& ch : gchannels)
+                if (ch.node == n && ch.sampler >= 0 && (size_t)ch.sampler < gsamplers.size()) {
+                    auto& tv = gsamplers[ch.sampler].times;
+                    if (!tv.empty() && tv.back() > clipDur) clipDur = tv.back();
+                }
+        if (clipDur <= 1e-4f) clipDur = animDuration;
+        if (clipDur <= 1e-4f) return e;
+        // ~30fps native sampling, floor 64 (short clips), NO cap — FULL PORT (the old 256 "device clip size
+        // limit" was a misdiagnosis — official whale clips are 240 KB and the device loads them fine).
+        int NF = (int)(clipDur * 30.f + 0.5f); if (NF < 64) NF = 64;
+        // Full composed WORLD matrix of the node at time t (every ancestor's channels sampled) — same math as
+        // extractNodeTranslation's worldAt (world-space so parent scale/rotation are honored).
+        auto trsMat = [](const float* t, const float* r, const float* sc, float* mm){ float x=r[0],y=r[1],z=r[2],ww=r[3];
+            mm[0]=(1-2*(y*y+z*z))*sc[0]; mm[1]=(2*(x*y+ww*z))*sc[0]; mm[2]=(2*(x*z-ww*y))*sc[0]; mm[3]=0;
+            mm[4]=(2*(x*y-ww*z))*sc[1]; mm[5]=(1-2*(x*x+z*z))*sc[1]; mm[6]=(2*(y*z+ww*x))*sc[1]; mm[7]=0;
+            mm[8]=(2*(x*z+ww*y))*sc[2]; mm[9]=(2*(y*z-ww*x))*sc[2]; mm[10]=(1-2*(x*x+y*y))*sc[2]; mm[11]=0;
+            mm[12]=t[0]; mm[13]=t[1]; mm[14]=t[2]; mm[15]=1; };
+        auto mulMat = [](const float* a, const float* b, float* o){
+            for (int c=0;c<4;c++) for (int rr=0;rr<4;rr++) o[c*4+rr]=a[rr]*b[c*4]+a[4+rr]*b[c*4+1]+a[8+rr]*b[c*4+2]+a[12+rr]*b[c*4+3]; };
+        std::function<void(int,float,float*)> worldAt = [&](int n, float t, float* out){
+            float tt[3]={gnodes[n].t[0],gnodes[n].t[1],gnodes[n].t[2]}, q[4]={gnodes[n].r[0],gnodes[n].r[1],gnodes[n].r[2],gnodes[n].r[3]}, sc[3]={gnodes[n].s[0],gnodes[n].s[1],gnodes[n].s[2]};
+            for (auto& ch : gchannels) if (ch.node==n && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
+                float o4[4]; sampleSampler(gsamplers[ch.sampler], t, o4);
+                if (ch.path==0){ tt[0]=o4[0]; tt[1]=o4[1]; tt[2]=o4[2]; }
+                else if (ch.path==1){ q[0]=o4[0]; q[1]=o4[1]; q[2]=o4[2]; q[3]=o4[3]; }
+                else if (ch.path==2){ sc[0]=o4[0]; sc[1]=o4[1]; sc[2]=o4[2]; } }
+            float loc[16]; trsMat(tt,q,sc,loc);
+            if (gnodes[n].parent>=0 && (size_t)gnodes[n].parent<gnodes.size()){ float pw[16]; worldAt(gnodes[n].parent,t,pw); mulMat(pw,loc,out); }
+            else memcpy(out,loc,64); };
+        auto matTrs = [](const float* m, float* q /*xyzw*/, float* t, float* s){
+            t[0]=m[12]; t[1]=m[13]; t[2]=m[14];
+            s[0]=sqrtf(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]); s[1]=sqrtf(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]); s[2]=sqrtf(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]);
+            float ix=s[0]>1e-8f?1/s[0]:0, iy=s[1]>1e-8f?1/s[1]:0, iz=s[2]>1e-8f?1/s[2]:0;
+            float r0=m[0]*ix,r1=m[1]*ix,r2=m[2]*ix, r3=m[4]*iy,r4=m[5]*iy,r5=m[6]*iy, r6=m[8]*iz,r7=m[9]*iz,r8=m[10]*iz;
+            float tr=r0+r4+r8;
+            if (tr>0){ float S=sqrtf(tr+1)*2; q[3]=0.25f*S; q[0]=(r5-r7)/S; q[1]=(r6-r2)/S; q[2]=(r1-r3)/S; }
+            else if (r0>r4&&r0>r8){ float S=sqrtf(1+r0-r4-r8)*2; q[3]=(r5-r7)/S; q[0]=0.25f*S; q[1]=(r3+r1)/S; q[2]=(r6+r2)/S; }
+            else if (r4>r8){ float S=sqrtf(1+r4-r0-r8)*2; q[3]=(r6-r2)/S; q[0]=(r3+r1)/S; q[1]=0.25f*S; q[2]=(r7+r5)/S; }
+            else { float S=sqrtf(1+r8-r0-r4)*2; q[3]=(r1-r3)/S; q[0]=(r6+r2)/S; q[1]=(r7+r5)/S; q[2]=0.25f*S; } };
+        // INCLUSIVE endpoint [0, clipDur] — the "jumpy resets" fix (see the OPA twin): frame[NF] = the sampler's
+        // t=clipDur value (glTF samplers CLAMP at the last key), so the device LERPS the final interval instead of
+        // holding-then-teleporting a missing frame of motion every loop. count = NF+1, fps = NF/clipDur ->
+        // device duration = clipDur exact.
+        std::vector<float> mats(((size_t)NF+1)*16);
+        float o0[3]={0,0,0}, maxd=0.f, rotMaxd=0.f, sclMaxd=0.f, rs0[9]={0}, sc0[3]={1,1,1};
+        for (int f = 0; f <= NF; f++) {
+            float* w = &mats[(size_t)f*16];
+            worldAt(node, clipDur*(float)f/(float)NF, w);
+            // NORMALIZED 3x3 (scale stripped per column) — cyan's nodes carry a ~0.01 world scale, so the raw
+            // rotation*scale Frobenius read 100x too small (63° looked like 0.0148) and every gear/mill/boat
+            // failed the rotation gate. Column-normalizing measures the PURE rotation deviation; the stripped
+            // column norms give the SCALE deviation (dome's amber embers: 0.001→1.0 pop-in/out).
+            float rs[9]={w[0],w[1],w[2], w[4],w[5],w[6], w[8],w[9],w[10]}, cs[3];
+            for (int c=0;c<3;c++){ float l=sqrtf(rs[c*3]*rs[c*3]+rs[c*3+1]*rs[c*3+1]+rs[c*3+2]*rs[c*3+2]); cs[c]=l;
+                                   if (l>1e-8f){ rs[c*3]/=l; rs[c*3+1]/=l; rs[c*3+2]/=l; } }
+            if (f==0){ o0[0]=w[12];o0[1]=w[13];o0[2]=w[14]; for(int k=0;k<9;k++) rs0[k]=rs[k]; for(int c=0;c<3;c++) sc0[c]=cs[c]>1e-8f?cs[c]:1.f; }
+            else { float dx=w[12]-o0[0],dy=w[13]-o0[1],dz=w[14]-o0[2]; float d=sqrtf(dx*dx+dy*dy+dz*dz); if(d>maxd)maxd=d;
+                   float rd=0.f; for(int k=0;k<9;k++){ float e2=rs[k]-rs0[k]; rd+=e2*e2; } rd=sqrtf(rd); if(rd>rotMaxd)rotMaxd=rd;
+                   for(int c=0;c<3;c++){ float sd=cs[c]/sc0[c]-1.f; if(sd<0)sd=-sd; if(sd>sclMaxd)sclMaxd=sd; } }
+        }
+        // COMBINED T+(R or S) only (the cases the fit chain ruins — it drops the second channel): pure
+        // translation / pure rotation / pure scale keep their proven getTime shader paths.
+        if (maxd < 0.01f || (requireRotation && rotMaxd < 0.02f && sclMaxd < 0.05f)) {
+            if (std::getenv("HSR_VERBOSE"))
+                fprintf(stderr, "[GLTF-RIGID] mesh%d node%d REJECT travel=%.4f rotDev=%.4f sclDev=%.4f dur=%.2fs (needs T>=0.01 %s)\n",
+                        meshIdx, node, maxd, rotMaxd, sclMaxd, clipDur, requireRotation ? "AND (R>=0.02 or S>=0.05)" : "");
+            return e;
+        }
+        const float* W0 = &mats[0];
+        float w0q[4], w0t[3], w0s[3]; matTrs(W0, w0q, w0t, w0s);
+        float w0su = (w0s[0]+w0s[1]+w0s[2])/3.f;   // bind carries ONE uniform scale per joint (HZAN:SKEL format)
+        e.jointCount = 2; e.parents = {-1, 0};
+        e.jointPos   = {0,0,0, w0t[0],w0t[1],w0t[2]};
+        e.jointQuat  = {1,0,0,0, w0q[3],w0q[0],w0q[1],w0q[2]};   // (w,x,y,z) for HZAN:SKEL; matTrs q is (x,y,z,w)
+        e.jointScale = {1, (w0su>1e-4f||w0su<-1e-4f)?w0su:1.f};
+        e.trsLocal.resize((size_t)(NF+1)*2*10);
+        for (int f = 0; f <= NF; f++) {
+            float q[4], t[3], s[3]; matTrs(&mats[(size_t)f*16], q, t, s);   // clip-local = the node's ACTUAL world matrix W(f) (ACL-clean vs bind W0)
+            float* r = &e.trsLocal[(size_t)(f*2+0)*10]; r[0]=0;r[1]=0;r[2]=0;r[3]=1; r[4]=0;r[5]=0;r[6]=0; r[7]=1;r[8]=1;r[9]=1;   // joint0 = STATIC identity (no root motion to extract)
+            float* p = &e.trsLocal[(size_t)(f*2+1)*10]; p[0]=q[0];p[1]=q[1];p[2]=q[2];p[3]=q[3]; p[4]=t[0];p[5]=t[1];p[6]=t[2]; p[7]=s[0];p[8]=s[1];p[9]=s[2];
+        }
+        // QUATERNION HEMISPHERE CONTINUITY (the cyan "very shaky" fix): matTrs's per-frame quat sign is
+        // arbitrary; a mill/gear spin crossing 180 deg flips polarity and the decoder's neighbor-lerp takes the
+        // LONG arc for one interval = a twitch every crossing. Keep the mover's quats sign-continuous.
+        for (int f = 1; f <= NF; f++) {
+            float* q = &e.trsLocal[((size_t)f*2 + 1)*10]; const float* p = &e.trsLocal[((size_t)(f-1)*2 + 1)*10];
+            if (q[0]*p[0]+q[1]*p[1]+q[2]*p[2]+q[3]*p[3] < 0.f) { q[0]=-q[0]; q[1]=-q[1]; q[2]=-q[2]; q[3]=-q[3]; }
+        }
+        size_t nv = rec->basePos.size()/3;
+        e.restPos.resize(nv*3);   // verts WORLD-baked into the frame-0 rest (bind W0 → device invBind cancels it)
+        for (size_t v = 0; v < nv; v++) { const float* b = &rec->basePos[v*3]; float* o = &e.restPos[v*3];
+            o[0]=W0[0]*b[0]+W0[4]*b[1]+W0[8]*b[2]+W0[12];
+            o[1]=W0[1]*b[0]+W0[5]*b[1]+W0[9]*b[2]+W0[13];
+            o[2]=W0[2]*b[0]+W0[6]*b[1]+W0[10]*b[2]+W0[14]; }
+        e.boneIdx.assign(nv*4, 0); e.boneWgt.assign(nv*4, 0);
+        for (size_t v = 0; v < nv; v++) { e.boneIdx[v*4]=1; e.boneWgt[v*4]=255; }   // weight every vert to the MOVING joint
+        e.frameCount = NF+1; e.fps = (float)NF / clipDur;   // NF+1 INCLUSIVE frames over [0,clipDur] -> device duration = clipDur; last frame = the seam target
+        if (std::getenv("HSR_VERBOSE"))
+            fprintf(stderr, "[GLTF-RIGID] mesh%d node%d NF=%d dur=%.2fs travel=%.2f rotDev=%.2f sclDev=%.2f W0t=(%.1f,%.1f,%.1f)\n",
+                    meshIdx, node, NF, clipDur, maxd, rotMaxd, sclMaxd, w0t[0], w0t[1], w0t[2]);
+        return e;
+    }
+    // ── COOK: EXACT per-frame QUATERNION rotation replay for a node-animated glTF mesh — the OPA
+    //    cookExtractRotationReplay port (shadergen::ROTREPLAY, same consumer). For rotation-ONLY node anims whose
+    //    motion is NOT a clean continuous spin or gentle sway: cyan's gears ramp 63° MONOTONICALLY per 8.3s loop
+    //    (source wraps invisibly on the gear's symmetry), which the single-cosine SWAY fit turned into a one-sided
+    //    rocking = "wrong animation on gears". Replay the node's ACTUAL relative world rotation instead — faithful
+    //    shape + phase, self-looping getTime() vertex shader (no animator LOD). Returns (N+1)*4 xyzw quats rel to
+    //    frame 0 (hemisphere-continuous for the shader's nlerp), the node's world pivot, and the per-node loop.
+    bool cookExtractRotationReplay(int meshIdx, int N, float pivotOut[3], std::vector<float>& quats, float& loopSec) {
+        quats.clear(); loopSec = 0.f;
+        const NodeAnimRec* rec = nullptr;
+        for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { rec = &r; break; }
+        if (!rec || N < 2) return false;
+        int node = rec->nodeIdx; if (node < 0 || (size_t)node >= gnodes.size()) return false;
+        float clipDur = 0.f;   // per-node loop = latest key among the node's + ancestors' channels (same as the rigid path)
+        for (int n = node, g = 0; n >= 0 && (size_t)n < gnodes.size() && g < 64; n = gnodes[n].parent, ++g)
+            for (auto& ch : gchannels)
+                if (ch.node == n && ch.sampler >= 0 && (size_t)ch.sampler < gsamplers.size()) {
+                    auto& tv = gsamplers[ch.sampler].times;
+                    if (!tv.empty() && tv.back() > clipDur) clipDur = tv.back();
+                }
+        if (clipDur <= 1e-4f) clipDur = animDuration;
+        if (clipDur <= 1e-4f) return false;
+        loopSec = clipDur;
+        auto trsMat = [](const float* t, const float* r, const float* sc, float* mm){ float x=r[0],y=r[1],z=r[2],ww=r[3];
+            mm[0]=(1-2*(y*y+z*z))*sc[0]; mm[1]=(2*(x*y+ww*z))*sc[0]; mm[2]=(2*(x*z-ww*y))*sc[0]; mm[3]=0;
+            mm[4]=(2*(x*y-ww*z))*sc[1]; mm[5]=(1-2*(x*x+z*z))*sc[1]; mm[6]=(2*(y*z+ww*x))*sc[1]; mm[7]=0;
+            mm[8]=(2*(x*z+ww*y))*sc[2]; mm[9]=(2*(y*z-ww*x))*sc[2]; mm[10]=(1-2*(x*x+y*y))*sc[2]; mm[11]=0;
+            mm[12]=t[0]; mm[13]=t[1]; mm[14]=t[2]; mm[15]=1; };
+        auto mulMat = [](const float* a, const float* b, float* o){
+            for (int c=0;c<4;c++) for (int rr=0;rr<4;rr++) o[c*4+rr]=a[rr]*b[c*4]+a[4+rr]*b[c*4+1]+a[8+rr]*b[c*4+2]+a[12+rr]*b[c*4+3]; };
+        std::function<void(int,float,float*)> worldAt = [&](int n, float t, float* out){
+            float tt[3]={gnodes[n].t[0],gnodes[n].t[1],gnodes[n].t[2]}, q[4]={gnodes[n].r[0],gnodes[n].r[1],gnodes[n].r[2],gnodes[n].r[3]}, sc[3]={gnodes[n].s[0],gnodes[n].s[1],gnodes[n].s[2]};
+            for (auto& ch : gchannels) if (ch.node==n && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
+                float o4[4]; sampleSampler(gsamplers[ch.sampler], t, o4);
+                if (ch.path==0){ tt[0]=o4[0]; tt[1]=o4[1]; tt[2]=o4[2]; }
+                else if (ch.path==1){ q[0]=o4[0]; q[1]=o4[1]; q[2]=o4[2]; q[3]=o4[3]; }
+                else if (ch.path==2){ sc[0]=o4[0]; sc[1]=o4[1]; sc[2]=o4[2]; } }
+            float loc[16]; trsMat(tt,q,sc,loc);
+            if (gnodes[n].parent>=0 && (size_t)gnodes[n].parent<gnodes.size()){ float pw[16]; worldAt(gnodes[n].parent,t,pw); mulMat(pw,loc,out); }
+            else memcpy(out,loc,64); };
+        auto matQuat = [](const float* m, float* q /*xyzw*/){   // normalized 3x3 -> quat (scale stripped)
+            float sx=sqrtf(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]), sy=sqrtf(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]), sz=sqrtf(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]);
+            float ix=sx>1e-8f?1/sx:0, iy=sy>1e-8f?1/sy:0, iz=sz>1e-8f?1/sz:0;
+            float r0=m[0]*ix,r1=m[1]*ix,r2=m[2]*ix, r3=m[4]*iy,r4=m[5]*iy,r5=m[6]*iy, r6=m[8]*iz,r7=m[9]*iz,r8=m[10]*iz;
+            float tr=r0+r4+r8;
+            if (tr>0){ float S=sqrtf(tr+1)*2; q[3]=0.25f*S; q[0]=(r5-r7)/S; q[1]=(r6-r2)/S; q[2]=(r1-r3)/S; }
+            else if (r0>r4&&r0>r8){ float S=sqrtf(1+r0-r4-r8)*2; q[3]=(r5-r7)/S; q[0]=0.25f*S; q[1]=(r3+r1)/S; q[2]=(r6+r2)/S; }
+            else if (r4>r8){ float S=sqrtf(1+r4-r0-r8)*2; q[3]=(r6-r2)/S; q[0]=(r3+r1)/S; q[1]=0.25f*S; q[2]=(r7+r5)/S; }
+            else { float S=sqrtf(1+r8-r0-r4)*2; q[3]=(r1-r3)/S; q[0]=(r6+r2)/S; q[1]=(r7+r5)/S; q[2]=0.25f*S; } };
+        float W0[16]; worldAt(node, 0.f, W0);
+        pivotOut[0]=W0[12]; pivotOut[1]=W0[13]; pivotOut[2]=W0[14];
+        float q0[4]; matQuat(W0, q0); float c0[4] = {-q0[0], -q0[1], -q0[2], q0[3]};   // conj(q0)
+        quats.resize((size_t)(N+1)*4); float bestMag = 0.f;
+        for (int f = 0; f <= N; f++) {
+            float W[16]; worldAt(node, clipDur*(float)f/(float)N, W);
+            float q[4]; matQuat(W, q); float r[4];   // rel = q * conj(q0) (xyzw) — NO handedness flip (the aurora lesson)
+            r[0]= q[3]*c0[0] + q[0]*c0[3] + q[1]*c0[2] - q[2]*c0[1];
+            r[1]= q[3]*c0[1] - q[0]*c0[2] + q[1]*c0[3] + q[2]*c0[0];
+            r[2]= q[3]*c0[2] + q[0]*c0[1] - q[1]*c0[0] + q[2]*c0[3];
+            r[3]= q[3]*c0[3] - q[0]*c0[0] - q[1]*c0[1] - q[2]*c0[2];
+            if (f > 0) { float* p = &quats[(size_t)(f-1)*4];   // hemisphere continuity -> the shader nlerp takes the short arc
+                if (r[0]*p[0]+r[1]*p[1]+r[2]*p[2]+r[3]*p[3] < 0) { r[0]=-r[0]; r[1]=-r[1]; r[2]=-r[2]; r[3]=-r[3]; } }
+            float* o = &quats[(size_t)f*4]; o[0]=r[0]; o[1]=r[1]; o[2]=r[2]; o[3]=r[3];
+            float mag = sqrtf(r[0]*r[0]+r[1]*r[1]+r[2]*r[2]); if (mag > bestMag) bestMag = mag;
+        }
+        if (bestMag < 0.02f) { quats.clear(); return false; }   // node doesn't actually rotate
+        return true;
+    }
     // Extract a uniform NODE Y-ROTATION track (Outer Wilds skybox = +Y 333s; Interloper = -Y 81s). Walks the parent
     // chain so a mesh INHERITS an animated ancestor's spin — the OW planets are children of the rotating skybox node,
     // so they ORBIT origin (the skybox node's pivot), not spin in place. Returns period (one revolution, s), dir

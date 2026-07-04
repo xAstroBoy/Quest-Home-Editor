@@ -30,7 +30,11 @@ namespace shadergen {
 //   SCALE    : pos' = pivot + (inPos - pivot)*replay(N sampled per-axis SCALE FACTORS, looped) — FAITHFULLY ports ANY node
 //              SCALE "breathe" track (e.g. Erebor's 12 wisps, NON-UNIFORM per-axis amplitudes) by piecewise-linear
 //              interpolation of the sampled per-axis factor frames (frame0 = (1,1,1)); not a (1-cos) shape guess.
-enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3, TRANSLATE = 4, SCALE = 5, CUTOUT = 6, ROTREPLAY = 7 };
+enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3, TRANSLATE = 4, SCALE = 5, CUTOUT = 6, ROTREPLAY = 7, TINTREPLAY = 8 };
+// TINTREPLAY: per-frame RGBA MaterialTint replay in the forward FRAGMENT (color *= tint[frame]) — ports V79's
+//   mat.sanim MaterialTint COLOR cycling (stinson fireworks flashes / city window lights) that the cook previously
+//   dropped entirely (only the alpha FADE subset was ported, and only on the flipbook path). tframes = N*4 RGBA,
+//   tN = N, p0 = loopSec. Frame-SNAP select (flashes are steps); chainable onto any generated surface.
 // ROTREPLAY: per-frame ANGLE replay about a fixed axis+pivot (the aurora's NON-UNIFORM rotation — its w=0 flip-axis
 // sweeps unevenly, so a constant-omega ROTATE is wrong). p0=loopSec, ax/ay/az=unit axis, tframes=[px,py,pz, a0..aN]
 // (pivot then N+1 CONTINUOUS unwrapped angles, radians), tN=N segments. Vertex getTime shader interpolates the angle
@@ -799,6 +803,84 @@ inline std::vector<uint8_t> editFragAlphaFade(const uint8_t* sd, uint32_t spvLen
     return mod;
 }
 
+// TINTREPLAY in the FORWARD FRAGMENT: per-frame RGBA MaterialTint replay — color *= tint[floor(fract(time/loop)*N)].
+// The RGBA generalization of editFragAlphaFade (same phase math, same sample-splice); ports V79's mat.sanim
+// MaterialTint COLOR cycling (stinson fireworks flash colors, city window-light flicker) which the cook dropped —
+// devices showed one static "generic" color. rgba = N*4 floats. The step(i,phase) weight is computed ONCE per
+// frame and shared by all four channel accumulators.
+inline std::vector<uint8_t> editFragTintReplay(const uint8_t* sd, uint32_t spvLen, const std::vector<float>& rgba, int N, float loopSec){
+    using namespace detail;
+    if (N < 2 || (int)rgba.size() < N*4) return {};
+    size_t nw=spvLen/4; auto W=[&](size_t k){ return u32(sd,spvLen,(int64_t)k*4); };
+    uint32_t version=W(1), generator=W(2), bound=W(3);
+    std::vector<Inst> insts;
+    for (size_t i=5;i<nw;){ uint32_t ins=W(i),wc=ins>>16,op=ins&0xffff; if(!wc)break; Inst t; t.op=(int)op; for(uint32_t k=0;k<wc;++k)t.w.push_back(W(i+k)); insts.push_back(std::move(t)); i+=wc; }
+    uint32_t tFloat=0,tInt=0,tV4=0,glsl=0,gu=0; int timeIdx=-1;
+    std::map<int64_t,uint32_t> fltc; std::map<int32_t,uint32_t> intc; std::map<uint64_t,uint32_t> ptr;
+    std::map<uint32_t,std::string> names;
+    auto fround=[](float v){ return (int64_t)llround((double)v*1e6); };
+    for (auto& t:insts){ auto&w=t.w;
+        if (t.op==5) names[w[1]]=wstr(w,2);
+        else if (t.op==6){ if (wstr(w,3)=="time") timeIdx=(int)w[2]; }
+        else if (t.op==11 && wstr(w,2).find("GLSL")!=std::string::npos) glsl=w[1];
+        else if (t.op==22 && w[2]==32) tFloat=w[1];
+        else if (t.op==21 && w[2]==32) tInt=w[1]; }
+    for (auto& t:insts){ auto&w=t.w; if (t.op==23 && w[2]==tFloat && w[3]==4) tV4=w[1]; else if (t.op==32) ptr[((uint64_t)w[2]<<32)|w[3]]=w[1]; }
+    for (auto& t:insts){ auto&w=t.w; if (t.op==43 && w[1]==tInt){ int32_t iv; memcpy(&iv,&w[3],4); intc[iv]=w[2]; } else if (t.op==43 && w[1]==tFloat){ float fv; memcpy(&fv,&w[3],4); fltc[fround(fv)]=w[2]; } }
+    for (auto& kv:names) if (kv.second=="globalUniforms") gu=kv.first;
+    if (!tFloat||!tInt||!glsl||!gu||timeIdx<0) return {};
+    int sampIdx=-1; uint32_t sampRes=0;   // base-color sample = FIRST OpImageSampleImplicitLod
+    for (size_t k=0;k<insts.size();++k){ if (insts[k].op==87 && insts[k].w.size()>=5){ sampIdx=(int)k; sampRes=insts[k].w[2]; break; } }
+    if (sampIdx<0 || !sampRes) return {};
+    std::vector<Inst> newConsts,newTypes;
+    auto nid=[&](){ return bound++; };
+    auto fbits=[](float f){ uint32_t u; memcpy(&u,&f,4); return u; };
+    auto fconst=[&](float val)->uint32_t{ int64_t k=fround(val); auto it=fltc.find(k); if(it!=fltc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tFloat,id,fbits(val)}}); fltc[k]=id; return id; };
+    auto iconst=[&](int32_t val)->uint32_t{ auto it=intc.find(val); if(it!=intc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tInt,id,(uint32_t)val}}); intc[val]=id; return id; };
+    auto ptrOf=[&](uint32_t sc,uint32_t ty)->uint32_t{ uint64_t k=((uint64_t)sc<<32)|ty; auto it=ptr.find(k); if(it!=ptr.end())return it->second; uint32_t id=nid(); newTypes.push_back({32,{0,id,sc,ty}}); ptr[k]=id; return id; };
+    if (!tV4){ tV4=nid(); newTypes.push_back({23,{0,tV4,tFloat,4}}); }
+    const uint32_t GLSL_FRACT=10, GLSL_STEP=48;
+    if (loopSec<=1e-4f) loopSec=1.f;
+    uint32_t c_invloop=fconst(1.0f/loopSec), c_N=fconst((float)N), c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
+    std::vector<std::array<uint32_t,4>> fc((size_t)N);
+    for (int i=0;i<N;i++) for (int c=0;c<4;c++) fc[i][c]=fconst(rgba[(size_t)i*4+c]);
+    uint32_t pt=nid(),tt=nid(),tn=nid(),t01=nid(),fphase=nid();
+    std::vector<Inst> pre = {
+        {65,{0,pUf,pt,gu,c_time}}, {61,{0,tFloat,tt,pt}},       // time
+        {133,{0,tFloat,tn,tt,c_invloop}},                       // time/loopSec
+        {12,{0,tFloat,t01,glsl,GLSL_FRACT,tn}},                 // fract -> [0,1)
+        {133,{0,tFloat,fphase,t01,c_N}},                        // *N -> [0,N)
+    };
+    uint32_t acc[4] = { fc[0][0], fc[0][1], fc[0][2], fc[0][3] };   // frame-SNAP select per channel, SHARED step weight
+    for (int i=1;i<N;i++){ uint32_t c_i=fconst((float)i);
+        uint32_t w=nid(); pre.push_back({12,{0,tFloat,w,glsl,GLSL_STEP,c_i,fphase}});       // step(i,fphase) once
+        for (int c=0;c<4;c++){
+            uint32_t dd=nid(); pre.push_back({131,{0,tFloat,dd,fc[i][c],acc[c]}});          // tint[i]-acc
+            uint32_t s=nid(); pre.push_back({133,{0,tFloat,s,dd,w}});                       // *w
+            uint32_t n2=nid(); pre.push_back({129,{0,tFloat,n2,acc[c],s}}); acc[c]=n2;      // acc += diff*w
+        }
+    }
+    uint32_t v4=nid(), tinted=nid();
+    std::vector<Inst> out; bool addedG=false;
+    for (size_t k=0;k<insts.size();++k){
+        if (!addedG && insts[k].op==54){ for(auto&t2:newTypes)out.push_back(t2); for(auto&c:newConsts)out.push_back(c); addedG=true; }
+        if ((int)k==sampIdx){
+            for(auto&b:pre) out.push_back(b);
+            out.push_back(insts[k]);                                            // the base-color sample (result = sampRes)
+            out.push_back({0x50,{0,tV4,v4,acc[0],acc[1],acc[2],acc[3]}});       // OpCompositeConstruct vec4(r,g,b,a)
+            out.push_back({133,{0,tV4,tinted,sampRes,v4}});                     // OpFMul: sampled·tint
+            continue;
+        }
+        if ((int)k>sampIdx){ Inst t2=insts[k]; for(size_t j=1;j<t2.w.size();++j) if(t2.w[j]==sampRes) t2.w[j]=tinted; out.push_back(t2); continue; }
+        out.push_back(insts[k]);
+    }
+    if (!addedG) return {};
+    std::vector<uint32_t> words={0x07230203u,version,generator,bound,0u};
+    for(auto&t2:out){ uint32_t hdr=((uint32_t)t2.w.size()<<16)|(uint32_t)t2.op; words.push_back(hdr); for(size_t j=1;j<t2.w.size();++j)words.push_back(t2.w[j]); }
+    std::vector<uint8_t> mod(words.size()*4); memcpy(mod.data(),words.data(),mod.size());
+    return mod;
+}
+
 // ── GENERAL round-trip: compile arbitrary GLSL → SPIR-V (bundled tools/glslangValidator.exe) and swap it into a
 //    RENDSHAD .surface's forward-FRAGMENT stage. This is the "transform ANY shader" path — instead of hand-patching
 //    a fixed base with a getTime enum, the cook can emit a WHOLE target program (any fade/scroll/noise/cell/timing,
@@ -862,6 +944,19 @@ inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode,
         int64_t slot,spvOff; uint32_t spvLen;
         if (!detail::findFwdFragSpv(d,N,slot,spvOff,spvLen)) return {};
         std::vector<uint8_t> mod = editFragCutout(d+spvOff, spvLen, p0>0.f ? p0 : 0.5f);   // p0 = alpha threshold
+        if (mod.empty()) return {};
+        std::vector<uint8_t> o = src;
+        while (o.size()%4) o.push_back(0);
+        uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
+        o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
+        o.insert(o.end(),mod.begin(),mod.end());
+        uint32_t rel=nv-(uint32_t)slot; memcpy(o.data()+slot,&rel,4);   // repoint the forward-frag SPIR-V uoffset
+        return o;
+    }
+    if (mode==TINTREPLAY){   // per-frame RGBA MaterialTint replay in the forward FRAGMENT (chainable onto any surface)
+        int64_t slot,spvOff; uint32_t spvLen;
+        if (!detail::findFwdFragSpv(d,N,slot,spvOff,spvLen)) return {};
+        std::vector<uint8_t> mod = editFragTintReplay(d+spvOff, spvLen, tframes, tN, p0);   // p0 = loopSec, tframes = tN*4 RGBA
         if (mod.empty()) return {};
         std::vector<uint8_t> o = src;
         while (o.size()%4) o.push_back(0);

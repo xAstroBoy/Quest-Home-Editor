@@ -1,6 +1,0 @@
-id=quest_env_ctl
-name=Quest Env Control (HSR)
-version=v1.0.0
-versionCode=1
-author=xAstroBoy / HSR
-description=Boot-persistent root control for HSR env testing: keeps the headset "worn" (no idle menu/sleep), turns on verbose ShellHsr logging, and installs the `questctl` CLI (awake/sleep/menu/sniff/tap/key/screencap) that the Quest-Ctl MCP server drives over adb.

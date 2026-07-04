@@ -500,11 +500,19 @@ public:
         // → origin, but calming_fgpocket.hstf places it at (-13.5,..)). Empty meshes with NO real-placed
         // namesake are untouched (they keep the group-offset inheritance path — the oceanarium sand).
         {
+            // ANIMATOR-driven entities are EXEMPT: our cook ships skinned/rigid-HZANIM meshes with an
+            // INTENTIONALLY empty {} transform (whale cull parity — the device places them via the skeleton,
+            // entityJson tfData). They are NOT template duplicates, but their names are material-derived
+            // (dozens share one name), so this dedup silently dropped 502/766 of cooked storybook (all the
+            // node-animated plants/lilypads/flames' siblings) — "doesn't render in HSL as the original".
+            auto hasAnimator = [](const DrawableEntity& e){
+                for (const auto& c : e.components) if (c.shortCls.find("Animator") != std::string::npos) return true;
+                return false; };
             std::set<std::string> realNamed;
             for (auto& e : entities) if (!e.emptyTransform && e.meshRef.ing != 0) realNamed.insert(e.name);
             size_t before = entities.size();
             entities.erase(std::remove_if(entities.begin(), entities.end(), [&](const DrawableEntity& e){
-                return e.emptyTransform && e.meshRef.ing != 0 && realNamed.count(e.name) != 0; }), entities.end());
+                return e.emptyTransform && e.meshRef.ing != 0 && realNamed.count(e.name) != 0 && !hasAnimator(e); }), entities.end());
             if (entities.size() != before) log("  dropped %zu empty-transform template duplicate(s) at origin (real-placed namesake exists)", before - entities.size());
         }
         log("  Total drawable entities from HSTF hierarchy: %zu", entities.size());
@@ -810,6 +818,23 @@ public:
             // Candle FLAME / glow = ADDITIVE emissive (self-lit, brightens the scene; not opaque).
             if (sp && (sp->find("flame") != std::string::npos || sp->find("glow") != std::string::npos)) {
                 md.useBlend = true; md.additive = true;
+            }
+            // FAITHFUL (the cook's own contract, not a name rule): the MATL is a clone of OUR transparent
+            // template (realdome unlitblend — byte-fingerprinted in parseMatlmatl). That alone = alpha-blend.
+            // Paired with an OPAQUE-family shader (none of the name rules above fired) it is the cook's
+            // ADDITIVE-GLOW signature — the opaque-pass shader kept in a transparent MATL = src+dst on device
+            // (godRays/warp/nebula). HSL preview read it OPAQUE -> storybook godRays drew as a huge DARK sheet.
+            if (matInfo.isCookBlendTpl && !md.useBlend) {
+                md.useBlend = true; md.additive = true;
+                log("  [blend] '%s' cook BLEND-template MATL + opaque-pass shader = ADDITIVE glow", md.name.c_str());
+            }
+            // OPAQUE-SKINNED cook template = authoritative OPAQUE + depth-write. Overrides the f4-omission
+            // heuristic, which misreads SKINNED surface layouts (skinuv/unlitdoublesidedskinned report
+            // transp=1) and classified every cooked skinned mesh as alpha-blend/no-depth-write — the
+            // storybook river's overlapping opaque cards z-fought and composited dark vs OPA.
+            if (matInfo.isCookOpaqueSkinTpl && md.useBlend) {
+                md.useBlend = false; md.additive = false;
+                log("  [blend] '%s' cook OPAQUE-SKINNED MATL -> forced opaque/depth-write (skinned f4 misread)", md.name.c_str());
             }
 
             // Load EVERY texture the material references into its role slot, exactly as

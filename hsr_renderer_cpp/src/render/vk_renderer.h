@@ -548,7 +548,12 @@ public:
         // purple + misaligned verts). Only fall back to the generic skinned program if the mesh's own shader
         // isn't a skinned variant (false-positive hasBones, or unresolved).
         if (routePerMat && md.hasBones && !md.hasVat) {
-            bool ownIsSkinned = gm.progIdx >= 0 && programs[gm.progIdx].surface.find("skinned") != std::string::npos;
+            // "skinned" name test must ALSO match our generated skinuv_* shaders (RIGID-HZANIM + UV-replay
+            // combined, built from the SKINNED blend base): the old test overrode them with the generic
+            // unlitdoublesidedskinned program -> the river/fog cards lost their UV animation in HSL preview
+            // and sampled the WRONG atlas region ("fucked up texture" — device was fine, shader is skinned).
+            bool ownIsSkinned = gm.progIdx >= 0 && (programs[gm.progIdx].surface.find("skinned") != std::string::npos
+                                                 || programs[gm.progIdx].surface.rfind("skinuv_", 0) == 0);
             if (!ownIsSkinned) { int sp = programForSkinned(); if (sp >= 0) gm.progIdx = sp; }
         }
 
