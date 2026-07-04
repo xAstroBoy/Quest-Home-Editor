@@ -167,6 +167,9 @@ struct MeshData {
     std::vector<u8> texRGBA;
     u32 texW = 1, texH = 1;
     bool hasTexture = false;
+    // Source ASTC mip chain (blocks only) + footprint for LOSSLESS cook pass-through of an unmodified base texture
+    // (avoids the decode→re-encode double-compression that softens definition). Empty if not a plain KTX-ASTC.
+    std::vector<u8> srcAstc; u32 srcAstcBw = 0, srcAstcBh = 0, srcAstcMips = 0;
 
     // Additional per-material textures, bound to shader slots BY ROLE (libshell binds
     // each shader texture resource by name to the material's named texture param):

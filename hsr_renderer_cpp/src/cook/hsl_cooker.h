@@ -380,6 +380,26 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
     int root = b.endObject(); b.finish(root, "TXTR"); return b.output();
 }
 
+// ── LOSSLESS pass-through: package a texture's ORIGINAL ASTC mip chain (from the source KTX) verbatim into the
+//    RENDTXTR wrapper, skipping decode→re-encode. Byte-for-byte the source quality (the fix for "textures lost
+//    definition" — double ASTC compression at MEDIUM softens every re-encoded texture). Only valid for a plain
+//    single-face KTX-ASTC whose footprint the device supports (6x6/8x8/12x12 enum). ──
+inline std::vector<uint8_t> encodeRendTxtrFromAstc(const std::vector<uint8_t>& astcMips, int w, int h, int bw, int bh, int mipCount) {
+    if (astcMips.empty() || w < 1 || h < 1 || mipCount < 1) return {};
+    uint8_t blkEnum = (bw == 6 && bh == 6) ? 18 : (bw == 12 && bh == 12) ? 24 : (bw == 8 && bh == 8) ? 20 : 0;
+    if (blkEnum == 0) return {};   // unsupported footprint -> caller re-encodes
+    FB b(astcMips.size() + 512);
+    int dv = b.createByteVector(astcMips.data(), astcMips.size());
+    b.startObject(10);
+    b.addScalar<uint8_t>(2, blkEnum);
+    b.addScalar<uint16_t>(3, (uint16_t)w); b.addScalar<uint16_t>(4, (uint16_t)h);
+    b.addScalar<uint16_t>(5, 1);
+    b.addScalar<uint8_t>(6, (uint8_t)mipCount);
+    b.addScalar<uint16_t>(7, 1);
+    b.addOffset(9, dv);
+    int root = b.endObject(); b.finish(root, "TXTR"); return b.output();
+}
+
 // ── VAT (Vertex Animation Texture) offset texture: the NON-skeletal animation path (vista fish/coral). Same
 //    RENDTXTR wrapper as above but f2=5 (R16G16B16A16_SFLOAT, libshell TextureFormat 97), width=vertexCount,
 //    height=frameCount; each texel = that vertex's OFFSET (x,y,z)+w=1 for that frame. vatunlitbasecolor samples
@@ -1353,6 +1373,8 @@ struct ExportMesh {
     std::vector<uint32_t> indices;  // triangle list
     std::vector<uint8_t> rgba;      // decoded base-color RGBA8 (optional)
     uint32_t w = 0, h = 0;
+    std::vector<uint8_t> srcAstc;   // LOSSLESS pass-through: source ASTC mip chain (blocks) if the base tex is a plain KTX-ASTC and UNMODIFIED
+    uint32_t srcAstcBw = 0, srcAstcBh = 0, srcAstcMips = 0;
     std::vector<uint8_t> iblVertCol; // FAITHFUL SpecIbl diffuse-irradiance per-vertex RGBA = diffuseCube(worldN)·ambientIBLTint, baked in buildExportMeshes (the renderer's exact uploadMesh bake). Device base·vertexColor0 = env-lit lake water, NOT the dark basecolor (the "black lake" bug). Empty for non-specibl meshes.
     bool blend = false;             // alpha-blended (transparent) -> route to unlitblend.surface
     bool alphaTest = false;         // MASK/cutout (foliage, *_masked scenery): DEPTH-WRITE cutout shader (alpha-test discard) so it OCCLUDES + discards transparent texels — was routed to the no-depth-write blend pass = the lakeside 2D-scenery overlay/flash. Meta cuts depth-write too (unlitfoliage f2,f3 PRESENT).
@@ -1499,6 +1521,7 @@ inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMe
         size_t ntri = m.indices.size() / 3, t = 0;
         while (t < ntri) {
             ExportMesh c; c.name = m.name; c.blend = m.blend; c.alphaTest = m.alphaTest; c.additive = m.additive; c.w = m.w; c.h = m.h; c.rgba = m.rgba;
+            c.srcAstc = m.srcAstc; c.srcAstcBw = m.srcAstcBw; c.srcAstcBh = m.srcAstcBh; c.srcAstcMips = m.srcAstcMips;   // split parts keep the lossless source-ASTC pass-through
             c.skybox = m.skybox;   // split parts MUST inherit the skybox mark, else a big dome (>60k verts) loses it -> far-clipped/black
             for (int k = 0; k < 4; k++) c.matTint[k] = m.matTint[k];
             c.tintAnim = m.tintAnim; c.tintFrames = m.tintFrames; c.tintN = m.tintN; c.tintLoop = m.tintLoop;   // split parts keep the tint cycle
@@ -2173,10 +2196,24 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             auto cit = texCache.find(rh);
             if (cit != texCache.end()) { texK = cit->second.first; pTex = cit->second.second; }  // reuse the shared texture; leave `tex` empty so it isn't re-encoded/re-pushed
             else { texK = keyForPath(pTex);
-                  // alpha-test foliage (masked trees/leaves): alpha-weight the mip RGB (no transparent-bg bleed halo) AND
-                  // preserve alpha COVERAGE down the chain, so the leaves don't dissolve into blocky ASTC chunks at range.
-                  bool aw = m.blend || m.alphaTest; bool cov = m.alphaTest && !m.blend;
-                  tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, 8, 8, 11, aw, capCols, capRows, cov); texCache[rh] = { texK, pTex };   // m.blend/alphaTest -> alpha-weighted mips; alphaTest -> coverage-preserving; cols/rows -> per-cell mip cap
+                  // ── LOSSLESS PASS-THROUGH (fixes "textures lost definition") ──────────────────────────────────
+                  // If the base texture is UNMODIFIED (texSrc still points at the raw decoded m.rgba — NOT the
+                  // force-255 / luminance-alpha variants) and we kept its ORIGINAL ASTC mip chain, ship those blocks
+                  // VERBATIM instead of decode→re-encode (double ASTC at MEDIUM softens every texture). Byte-exact
+                  // source quality + faster (no encode) + the ORIGINAL Meta mips (authoritative). Skip for
+                  // spritesheets (need the per-cell mip cap). HSR_NOTEXPASS forces re-encode.
+                  bool unmodified = (texSrc == m.rgba.data());
+                  bool canPass = unmodified && !m.srcAstc.empty() && capCols==1 && capRows==1
+                               && !std::getenv("HSR_NOTEXPASS")
+                               && ((m.srcAstcBw==8&&m.srcAstcBh==8)||(m.srcAstcBw==6&&m.srcAstcBh==6)||(m.srcAstcBw==12&&m.srcAstcBh==12));
+                  if (canPass) tex = encodeRendTxtrFromAstc(m.srcAstc, (int)m.w, (int)m.h, (int)m.srcAstcBw, (int)m.srcAstcBh, (int)m.srcAstcMips);
+                  if (tex.empty()) {   // pass-through N/A or unsupported footprint -> re-encode
+                      // alpha-test foliage (masked trees/leaves): alpha-weight the mip RGB (no transparent-bg bleed halo) AND
+                      // preserve alpha COVERAGE down the chain, so the leaves don't dissolve into blocky ASTC chunks at range.
+                      bool aw = m.blend || m.alphaTest; bool cov = m.alphaTest && !m.blend;
+                      tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, 8, 8, 11, aw, capCols, capRows, cov);
+                  } else if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' TEX PASS-THROUGH (source ASTC %dx%d %ux mips, lossless)\n", i, m.name.c_str(), (int)m.srcAstcBw, (int)m.srcAstcBh, m.srcAstcMips);
+                  texCache[rh] = { texK, pTex };
                   if ((capCols>1||capRows>1) && std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SPRITESHEET %dx%d -> mip-capped\n", i, m.name.c_str(), capCols, capRows); }
         }
         if (tex.empty() && texK.tgt == 0) { texK = whiteK; whiteUsed = true; }     // share the white fallback (only when there was NO texture at all, not for a dedup hit)

@@ -162,7 +162,11 @@ public:
     // Decoded *.png.opa textures (OPAA container -> KTX/ASTC -> RGBA), keyed by their cooked
     // basename (filename minus ".png.opa", lowercased) so ANY home's naming resolves — not
     // just spacestation's "tx_" convention.
-    struct Tex { std::string key; std::vector<uint8_t> rgba; uint32_t w=1, h=1; bool hasAlpha=false; };
+    struct Tex { std::string key; std::vector<uint8_t> rgba; uint32_t w=1, h=1; bool hasAlpha=false;
+        // Source ASTC mip chain (blocks only, per-mip imageSize prefixes stripped) + footprint, kept for LOSSLESS
+        // pass-through: an UNMODIFIED texture cooks its ORIGINAL ASTC verbatim instead of decode→re-encode (double
+        // ASTC compression at MEDIUM = "lost definition"). Empty when the source wasn't a plain KTX-ASTC.
+        std::vector<uint8_t> srcAstc; uint32_t srcBw=0, srcBh=0, srcMips=0; };
     std::vector<Tex> textures;
 
     // Faithful material metadata, read from the cooked *.mat.txt (libshell's own material
@@ -204,19 +208,24 @@ public:
         return nullptr;
     }
 
-    // KTX1 (ASTC) base mip -> RGBA (same decode the glTF loader uses)
-    static bool decodeKtxBaseMip(const uint8_t* ktx, size_t n, std::vector<uint8_t>& rgba, uint32_t& outW, uint32_t& outH) {
+    // KTX1 (ASTC) base mip -> RGBA (same decode the glTF loader uses).
+    // If srcAstcOut != null, ALSO extract the full ASTC mip chain (blocks only, imageSize prefixes stripped) +
+    // footprint (srcBw/srcBh) + mip count — for the cook's LOSSLESS pass-through of unmodified textures.
+    static bool decodeKtxBaseMip(const uint8_t* ktx, size_t n, std::vector<uint8_t>& rgba, uint32_t& outW, uint32_t& outH,
+                                 std::vector<uint8_t>* srcAstcOut = nullptr, uint32_t* srcBwOut = nullptr,
+                                 uint32_t* srcBhOut = nullptr, uint32_t* srcMipsOut = nullptr) {
         if (n < 64) return false;
         static const uint8_t id[12] = {0xAB,'K','T','X',' ','1','1',0xBB,'\r','\n',0x1A,'\n'};
         if (memcmp(ktx, id, 12) != 0) return false;
         auto u32a = [&](size_t o){ uint32_t v; memcpy(&v, ktx+o, 4); return v; };
         uint32_t glInternalFormat = u32a(28);
         uint32_t w = u32a(36), h = u32a(40);
+        uint32_t mipCount = u32a(56); if (mipCount < 1) mipCount = 1;
         uint32_t bytesOfKeyValueData = u32a(60);
         size_t off = 64 + bytesOfKeyValueData;
         if (off + 4 > n) return false;
-        uint32_t imageSize = u32a(off); off += 4;
-        if (off + imageSize > n) imageSize = (uint32_t)(n - off);
+        uint32_t imageSize = u32a(off); size_t base0 = off + 4;
+        if (base0 + imageSize > n) imageSize = (uint32_t)(n - base0);
         // Full ASTC footprint table (linear 0x93B0..0x93BD, sRGB 0x93D0..0x93DD, same
         // order of 14 footprints) — libshell reads the footprint from glInternalFormat,
         // so every non-square one (e.g. 8x6 = 0x93B6) must map correctly; defaulting to
@@ -230,8 +239,25 @@ public:
         if (glInternalFormat >= 0x93B0 && glInternalFormat <= 0x93BD) fidx = (int)(glInternalFormat - 0x93B0);
         else if (glInternalFormat >= 0x93D0 && glInternalFormat <= 0x93DD) fidx = (int)(glInternalFormat - 0x93D0);
         if (fidx >= 0) { bw = kFootprints[fidx][0]; bh = kFootprints[fidx][1]; }
-        if (!astc::decodeASTC(ktx+off, imageSize, w, h, bw, bh, rgba)) return false;
-        outW = w; outH = h; return true;
+        if (!astc::decodeASTC(ktx+base0, imageSize, w, h, bw, bh, rgba)) return false;
+        outW = w; outH = h;
+        // Optional: walk the whole KTX mip chain [imageSize u32][blocks] per level and concatenate the BLOCKS.
+        if (srcAstcOut && fidx >= 0) {
+            srcAstcOut->clear();
+            size_t p = off; uint32_t mw = w, mh = h; bool ok = true;
+            for (uint32_t lvl = 0; lvl < mipCount; ++lvl) {
+                if (p + 4 > n) { ok = false; break; }
+                uint32_t isz = u32a(p); p += 4;
+                if (p + isz > n) { ok = false; break; }
+                size_t expect = (size_t)((mw + bw - 1) / bw) * ((mh + bh - 1) / bh) * 16;
+                if (isz != expect) { ok = false; break; }   // not a plain single-face ASTC chain -> bail (re-encode)
+                srcAstcOut->insert(srcAstcOut->end(), ktx + p, ktx + p + isz);
+                p += isz; mw = mw > 1 ? mw / 2 : 1; mh = mh > 1 ? mh / 2 : 1;
+            }
+            if (!ok) { srcAstcOut->clear(); }
+            else { if (srcBwOut) *srcBwOut = bw; if (srcBhOut) *srcBhOut = bh; if (srcMipsOut) *srcMipsOut = mipCount; }
+        }
+        return true;
     }
 
     // ── sanim node-TRS animation (the looping ui_ring / wire motion) ──────────────────
@@ -1995,7 +2021,7 @@ private:
             if (sz > 48 && memcmp(d, "OPAA", 4) == 0) {
                 uint32_t hdr; memcpy(&hdr, (uint8_t*)d + 16, 4); if (hdr < 48 || hdr >= sz) hdr = 48;
                 Tex t; t.key = key;
-                if (decodeKtxBaseMip((uint8_t*)d + hdr, sz - hdr, t.rgba, t.w, t.h) && !t.rgba.empty()) {
+                if (decodeKtxBaseMip((uint8_t*)d + hdr, sz - hdr, t.rgba, t.w, t.h, &t.srcAstc, &t.srcBw, &t.srcBh, &t.srcMips) && !t.rgba.empty()) {
                     // KEEP the real KTX alpha (we render unlit, outputting texture rgb + a). Blend
                     // mode comes from the material's .mat.txt (Transparent/Additive), not a guess;
                     // hasAlpha stays only as a fallback for materials with no .mat.txt.
@@ -2452,6 +2478,7 @@ private:
             }
             md.nVerts = (u32)(md.positions.size()/3); md.nIdx = (u32)md.indices.size();
             if (tex) { md.texW=tex->w; md.texH=tex->h; md.hasTexture=true; md.texRGBA=tex->rgba;
+                       md.srcAstc=tex->srcAstc; md.srcAstcBw=tex->srcBw; md.srcAstcBh=tex->srcBh; md.srcAstcMips=tex->srcMips;
                        md.tint[0]=md.tint[1]=md.tint[2]=1.0f; md.useBlend = mp ? (mp->transparent||mp->additive) : tex->hasAlpha;
                        md.alphaTest = mp ? mp->alphaTest : false; }
             else     { md.texW=md.texH=1; md.hasTexture=true;   // no texture -> flat diffuse UNIFORM color (not grey)
@@ -2819,6 +2846,7 @@ private:
                 if (tex) {
                     md.texW = tex->w; md.texH = tex->h; md.hasTexture = true;
                     md.texRGBA = tex->rgba;
+                    md.srcAstc = tex->srcAstc; md.srcAstcBw = tex->srcBw; md.srcAstcBh = tex->srcBh; md.srcAstcMips = tex->srcMips;
                     // CAPTURE-CONFIRMED: no runtime IBL shader exists; textured specibl = diffuse·lightmap
                     // (set below) or diffuse-only. Old IBL path is opt-in via HSR_IBL for A/B comparison.
                     md.iblLit = isSpecibl && std::getenv("HSR_IBL");

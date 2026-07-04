@@ -4795,7 +4795,8 @@ struct Editor {
             }
             else { if (vatBaker){ int bnv=0; auto off=vatBaker((int)i,64,bnv); if(!off.empty()&&bnv==(int)nv){ em.vatOffsets=std::move(off); em.vatFrames=64; } }
                    if (hzAnimExtractor) hzAnimExtractor((int)i,64,em); }
-            if (md.hasTexture && md.texRGBA.size()>=(size_t)md.texW*md.texH*4){ em.rgba=md.texRGBA; em.w=md.texW; em.h=md.texH; }
+            if (md.hasTexture && md.texRGBA.size()>=(size_t)md.texW*md.texH*4){ em.rgba=md.texRGBA; em.w=md.texW; em.h=md.texH;
+                em.srcAstc=md.srcAstc; em.srcAstcBw=md.srcAstcBw; em.srcAstcBh=md.srcAstcBh; em.srcAstcMips=md.srcAstcMips; }
             ems.push_back(std::move(em));
         }
         if(skyPreviewMesh<0) appendSkyboxMesh(ems);   // GENERAL skybox -> far sky sphere in the cook (if a live preview sphere exists it's already in sceneMeshes, so don't double-emit)
