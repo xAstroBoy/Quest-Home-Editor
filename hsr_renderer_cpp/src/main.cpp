@@ -1610,11 +1610,22 @@ int main(int argc, char** argv) {
             // up flung "off place". Any per-mesh node translation this large (>1500u) is such a case: cook the mesh
             // STATIC at its bind pose (correct placement) rather than sliding it across the sky. Cars/train/comets move
             // far less and keep their rigid path. HSR_KEEPBIGSLIDE restores the old slide.
-            // BIG-ARC node motion (stinson city color_beam searchlights: the GEO_ANIM node has R tracks + its tip arcs
-            // ~4700u): the node's TRUE per-frame transform is faithfully replayed by the rigid 1-joint path below
-            // (clip = node world transform, invBind = identity -> device vertex = nodeWorld(t)*basePos = the OPA render
-            // EXACTLY). Neither a translate-slide nor a fitted-rotation approximation reproduces it; the rigid replay does.
-            (void)0;
+            // BIG node motion -> BAKE STATIC (stinson city color_beam searchlights). The GEO_ANIM node's LOCAL
+            // translation is ~4700u, but the source's WORLD motion is SUBTLE (the beam stays inside its building) —
+            // the parent scales it down. The rigid 1-joint port replays the un-scaled 4700u = the beam swings HUGE and
+            // flies out of the building ("too huge, not fitting"). Until the world-space subtle motion is captured
+            // faithfully (VAT), bake it STATIC at the bind pose so it is CORRECTLY SIZED + placed inside the building.
+            // HSR_KEEPBIGSLIDE restores the (wrong, huge) rigid replay.
+            {
+                std::vector<float> tofc; float tlc=0.f; float maxT=0.f;
+                if (opa.cookExtractNodeTranslateFrames(meshIdx, 24, tofc, tlc)) for (float v : tofc) { float a=std::fabs(v); if (a>maxT) maxT=a; }
+                if (maxT > 1500.f && !std::getenv("HSR_KEEPBIGSLIDE")) {
+                    em.hzJointCount=0; em.hzFrames=0; em.rotAnim=false; em.transAnim=false; em.uvScroll=false;
+                    em.scaleAnim=false; em.poseAnim=false; em.vatOffsets.clear(); em.vatFrames=0;
+                    if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%d node translate=%.0fu (>1500) -> STATIC (subtle world motion, don't slide huge)\n", meshIdx, maxT);
+                    return;
+                }
+            }
             // TRAIN BODY (a node on a vehicle group that also carries a getTime flipbook STEAM): route to the SAME getTime
             // TRANSLATE clock as the steam so they stay attached (NOT useHz, whose animator clock drifts vs getTime).
             { int myNode = opa.animNodeOf(meshIdx);

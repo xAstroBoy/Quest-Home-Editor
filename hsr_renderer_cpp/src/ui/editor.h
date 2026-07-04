@@ -4801,7 +4801,7 @@ struct Editor {
             // cutout SIBLING (same skinning/geometry, distinct name so it's a separate asset; the skel+anim dedup by
             // bytes = no extra skeleton) drawn in the opaque pass so the foliage OCCLUDES correctly, with the blend
             // painting the smooth edges on top. = the device's a2c foliage look (smooth + depth), via two draws.
-            bool foliage2pass = em.alphaTest && em.hzJointCount > 0 && !em.blend && !em.additive && !std::getenv("HSR_NOFOLIAGE2PASS");
+            bool foliage2pass = em.alphaTest && em.hzJointCount > 0 && !em.blend && !em.additive && std::getenv("HSR_FOLIAGE_2PASS");
             hslcook::ExportMesh prepass; if (foliage2pass) prepass = em;   // copy BEFORE the move (keeps all skinning)
             ems.push_back(std::move(em));
             if (foliage2pass) { prepass.depthPrepass = true; prepass.name += "_depthwr"; ems.push_back(std::move(prepass)); }
