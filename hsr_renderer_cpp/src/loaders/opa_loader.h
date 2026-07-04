@@ -338,6 +338,13 @@ public:
         int jointCount=0, frameCount=0; float fps=0.f;
         bool ok() const { return jointCount>0 && frameCount>1; }
     };
+    // Does this mesh carry a CPU-skinning record (a .skin.opa submesh, device-cooked via HZANIM)? Used by the
+    // cook's tint routing: the getTime TINTREPLAY frag stage is NOT reliably driven for skinned-cutout on device,
+    // so skinned foliage tints must be baked STATICALLY into COLOR_0 (the base×COLOR0 path always works).
+    bool isSkinnedMesh(int meshIdx) const {
+        for (auto& r : skinRecs) if ((int)r.meshIdx == meshIdx) return true;
+        return false;
+    }
     OpaHzAnim extractHzAnim(int meshIdx) {
         OpaHzAnim e;
         const SkinRec* rec=nullptr; for (auto& r : skinRecs) if ((int)r.meshIdx==meshIdx) { rec=&r; break; }
@@ -485,6 +492,13 @@ public:
                 e.jointQuat[j*4]=q[3];e.jointQuat[j*4+1]=q[0];e.jointQuat[j*4+2]=q[1];e.jointQuat[j*4+3]=q[2];
                 e.jointScale[j]=(s[0]>1e-4f||s[0]<-1e-4f)?s[0]:1.f; }
             // trsLocal already = absolute parent-local clip (emitted above), unchanged.
+        }
+        if (std::getenv("HSR_HZBRANCH")) {
+            const char* br = (nj==1&&have[0]) ? "nj1" : (nj>1&&have[0]) ? "nj>1-worldRest" : "DEFAULT(basePos)";
+            // how far did reskinning move verts from the raw pre-skin basePos? (0 => restPos==basePos == default/scattered)
+            double moved=0; size_t nvv=std::min(e.restPos.size(),rec->basePos.size())/3;
+            for(size_t v=0;v<nvv;v++){ double dx=e.restPos[v*3]-rec->basePos[v*3],dy=e.restPos[v*3+1]-rec->basePos[v*3+1],dz=e.restPos[v*3+2]-rec->basePos[v*3+2]; double d=dx*dx+dy*dy+dz*dz; if(d>moved)moved=d; }
+            fprintf(stderr,"[HZBRANCH] mesh%d nj=%d have0=%d branch=%s maxVertMovedFromBase=%.3f\n", meshIdx, nj, (int)have[0], br, std::sqrt(moved));
         }
         return e;
     }

@@ -1425,11 +1425,23 @@ int main(int argc, char** argv) {
             if (!std::getenv("HSR_NOTINT")) {
                 std::vector<float> trgba; int tn = 0; float tloop = 0.f;
                 if (opa.cookExtractTintRGBA(meshIdx, 512, trgba, tn, tloop) && tn >= 2) {
-                    // undo the baked frame-0 tint exactly (em.curTint = md.curTint(frame0)·edit·light); a channel
-                    // that STARTS at 0 (firework light OFF at t=0) is unrecoverable -> neutral 1 (the replay owns it)
-                    for (int c = 0; c < 4; c++) { float f0 = trgba[c]; em.curTint[c] = (f0 > 1e-4f) ? em.curTint[c]/f0 : 1.0f; }
-                    em.tintAnim = true; em.tintFrames = std::move(trgba); em.tintN = tn; em.tintLoop = tloop;
-                    if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%d MaterialTint RGBA cycle %d frames loop=%.2fs -> TINTREPLAY\n", meshIdx, tn, tloop);
+                    // SKINNED foliage (stinson zen tree materialsplit_*): the getTime TINTREPLAY frag stage does NOT
+                    // reliably drive on the device's skinned-cutout pipeline (device showed the leaves PALE/untinted =
+                    // stark white "shattered" cards, while the source live-tints them GREEN so they read as a canopy).
+                    // Bake the tint STATICALLY into COLOR_0 instead — the base×COLOR0 unlit path always executes on
+                    // device AND shows in the preview. em.curTint already carries the frame-0 tint (the loader's tint
+                    // attach set md.curTint = the cycle's frame-0, which is the clean natural leaf GREEN — the cycle's
+                    // resting color; the green→cyan→pink loop's MEAN is a muddy khaki that reads as dead foliage). So
+                    // leave em.curTint as-is (frame-0 green) and do NOT flag tintAnim (no getTime replay for skins).
+                    if (opa.isSkinnedMesh(meshIdx)) {
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%d MaterialTint (skinned) -> STATIC COLOR_0 tint=(%.2f,%.2f,%.2f,%.2f)\n", meshIdx, em.curTint[0],em.curTint[1],em.curTint[2],em.curTint[3]);
+                    } else {
+                        // undo the baked frame-0 tint exactly (em.curTint = md.curTint(frame0)·edit·light); a channel
+                        // that STARTS at 0 (firework light OFF at t=0) is unrecoverable -> neutral 1 (the replay owns it)
+                        for (int c = 0; c < 4; c++) { float f0 = trgba[c]; em.curTint[c] = (f0 > 1e-4f) ? em.curTint[c]/f0 : 1.0f; }
+                        em.tintAnim = true; em.tintFrames = std::move(trgba); em.tintN = tn; em.tintLoop = tloop;
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%d MaterialTint RGBA cycle %d frames loop=%.2fs -> TINTREPLAY\n", meshIdx, tn, tloop);
+                    }
                 }
             }
             // PURE CONTINUOUS SCROLL (waterfall / water / foam / stream: identity 2x2 + a small CONSTANT per-frame
