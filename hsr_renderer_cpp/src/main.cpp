@@ -1610,29 +1610,9 @@ int main(int argc, char** argv) {
             // up flung "off place". Any per-mesh node translation this large (>1500u) is such a case: cook the mesh
             // STATIC at its bind pose (correct placement) rather than sliding it across the sky. Cars/train/comets move
             // far less and keep their rigid path. HSR_KEEPBIGSLIDE restores the old slide.
-            // BIG node motion (stinson city color_beam searchlights: GEO_ANIM node moves ~4700u): the rigid 1-joint
-            // replay applies clip·invBind·basePos, and any non-identity invBind AMPLIFIES the motion so the beam swings
-            // HUGE and flies out of the building ("too huge, not fitting"). Bake the EXACT per-frame WORLD motion as
-            // VAT instead (nodeWorld(t)·basePos, sampled from the renderer's own eval) -> reproduces the OPA source
-            // BYTE-FOR-BYTE, so it MOVES like the original AND fits. HSR_KEEPBIGSLIDE restores the (wrong) rigid slide.
-            {
-                std::vector<float> tofc; float tlc=0.f; float maxT=0.f;
-                if (opa.cookExtractNodeTranslateFrames(meshIdx, 24, tofc, tlc)) for (float v : tofc) { float a=std::fabs(v); if (a>maxT) maxT=a; }
-                if (maxT > 1500.f && !std::getenv("HSR_KEEPBIGSLIDE")) {
-                    int VN = 64; if (const char* e=std::getenv("HSR_VATFRAMES")){ int c=atoi(e); if (c>=2) VN=c; }
-                    int nvv=0; float vloop=0.f; auto voff = opa.bakeNodeAnimVAT(meshIdx, VN, nvv, vloop);
-                    if (!voff.empty() && nvv > 0) {
-                        em.vatOffsets = std::move(voff); em.vatFrames = VN;
-                        em.hzJointCount=0; em.hzFrames=0; em.rotAnim=false; em.transAnim=false; em.uvScroll=false; em.scaleAnim=false; em.poseAnim=false;
-                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%d node move=%.0fu -> VAT %d frames loop=%.2fs (exact OPA motion, fits)\n", meshIdx, maxT, VN, vloop);
-                        return;
-                    }
-                    // VAT bake failed -> STATIC (better than a huge amplified slide)
-                    em.hzJointCount=0; em.hzFrames=0; em.rotAnim=false; em.transAnim=false; em.uvScroll=false; em.scaleAnim=false; em.poseAnim=false; em.vatOffsets.clear(); em.vatFrames=0;
-                    if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%d node move=%.0fu -> STATIC (VAT bake failed)\n", meshIdx, maxT);
-                    return;
-                }
-            }
+            // (color_beam searchlights fall through to the rigid 1-joint node replay below — it renders the additive
+            //  GLOW visibly, unlike the VAT path whose vatunlitblend mis-samples the base texture = a solid white/
+            //  invisible beam. The rigid replay reproduces the node's world transform per frame = moves like the OPA.)
             // TRAIN BODY (a node on a vehicle group that also carries a getTime flipbook STEAM): route to the SAME getTime
             // TRANSLATE clock as the steam so they stay attached (NOT useHz, whose animator clock drifts vs getTime).
             { int myNode = opa.animNodeOf(meshIdx);
