@@ -2383,6 +2383,25 @@ private:
             }
         }
         bool canSkin = (skinClip >= 0) && !skinInvBind.empty();
+        // MaterialTint (mat.sanim) for SKINNED meshes — the track is keyed by the GEO name
+        // ('MaterialSplit_2'), the skin by its FILENAME stem ('materialsplit_2.skin.opa'): match
+        // case-insensitively. Only the static entry parse attached tints; skins never did, so the
+        // stinson zen tree (8 skinned canopy layers, a 35s green→cyan→pink staggered RGBA cycle)
+        // cooked UNTINTED = washed-out "generic colors".
+        const std::string* skinTintKey = nullptr;
+        {
+            std::string stem = fn;
+            size_t sl = stem.find_last_of('/'); if (sl != std::string::npos) stem = stem.substr(sl + 1);
+            size_t fx = stem.rfind(".fbx.");    if (fx != std::string::npos) stem = stem.substr(fx + 5);
+            size_t sk2 = stem.find(".skin");    if (sk2 != std::string::npos) stem = stem.substr(0, sk2);
+            for (auto& kv : matTintAnim) {
+                if (kv.first.size() != stem.size()) continue;
+                bool eq = true;
+                for (size_t q = 0; q < stem.size(); ++q)
+                    if (tolower((unsigned char)kv.first[q]) != tolower((unsigned char)stem[q])) { eq = false; break; }
+                if (eq) { skinTintKey = &kv.first; break; }
+            }
+        }
         int emitted = 0;
         for (auto& sub : subs) {
             if (sub.indexCount == 0 || sub.firstIndex + sub.indexCount > nidx) continue;
@@ -2430,6 +2449,16 @@ private:
                 sr.meshIdx = meshes.size(); sr.basePos = md.positions;
                 sr.boneClip = boneToClipJoint; sr.invBind = skinInvBind; sr.nJoints = (int)skinJoints.size();
                 skinRecs.push_back(std::move(sr));
+            }
+            if (skinTintKey) {   // same attach as the static entry parse (curTint streamed by animate())
+                tintRecs.push_back({ meshes.size(), *skinTintKey });
+                md.dynamicVerts = true;
+                const TintTrack& tt = matTintAnim[*skinTintKey];
+                if (tt.nFrames > 0) { md.curTint[0]=tt.rgba[0]; md.curTint[1]=tt.rgba[1];
+                                      md.curTint[2]=tt.rgba[2]; md.curTint[3]=tt.rgba[3]; }
+                float amn=1e9f, amx=-1e9f;
+                for (int f = 0; f < tt.nFrames; ++f) { float a = tt.rgba[(size_t)f*4+3]; if (a<amn)amn=a; if (a>amx)amx=a; }
+                if (tt.nFrames > 1 && amx - amn > 0.05f) md.animatedTintAlpha = true;
             }
             meshes.push_back(std::move(md)); ++emitted;
         }

@@ -2409,19 +2409,34 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // Without it the opaque skinned pipeline drew the leaf textures' transparent gaps SOLID ("blocky").
                 // The texture keeps its REAL alpha for this path (see the skinnedOpaque force-255 exemption above).
                 if (m.alphaTest && !m.blend && !shadSkin.empty()) {
-                    const char* cfn = "cooker/skincutout.surface.bin";
+                    // A masked skin may ALSO carry a mat.sanim MaterialTint RGBA cycle (stinson zen tree:
+                    // 8 skinned canopy layers pulse green→cyan→pink over 35s). Chain TINTREPLAY onto the
+                    // CUTOUT frag so the skinned leaves recolor on-device (it only edits the fragment; the
+                    // vertex SKINNING is untouched). Cache key folds the tint curve so each distinct cycle
+                    // dedups. No tint -> the shared plain skincutout (unchanged for the palm/materialsplit trees).
+                    bool sctint = m.tintAnim && m.tintN >= 2 && m.tintFrames.size() >= (size_t)m.tintN*4 && m.tintLoop > 1e-4f;
+                    char cfn[80];
+                    if (sctint) { uint32_t th = 0x811C9DC5u ^ (uint32_t)(long)(m.tintLoop*1000);
+                        for (float v : m.tintFrames) th = th*16777619u ^ (uint32_t)(long)(v*10000);
+                        snprintf(cfn, sizeof cfn, "cooker/skincutout_t%08x.surface.bin", th); }
+                    else snprintf(cfn, sizeof cfn, "cooker/skincutout.surface.bin");
                     AssetKey3 skinCutK{};
                     auto itc0 = rotShaders.find(cfn);
                     if (itc0 != rotShaders.end()) skinCutK = itc0->second;
                     else {
                         auto cb = readFileBytes(cfn);
                         if (cb.empty()) { cb = shadergen::generate(shadSkin, shadergen::CUTOUT, 0.5f);
+                                          if (!cb.empty() && sctint) { auto tb = shadergen::generate(cb, shadergen::TINTREPLAY, m.tintLoop, 0,0,0,0, m.tintFrames, m.tintN); if (!tb.empty()) cb = tb; }
                                           if (!cb.empty()) writeFileBytes(cfn, cb); }
-                        if (!cb.empty()) { char cp[168]; snprintf(cp, sizeof cp, "%s/shaders/skincutout.surface/shader", MH.c_str());
-                            skinCutK = keyForPath(cp); assets.push_back({ cp, skinCutK.tgt, cb, skinCutK }); rotShaders[cfn] = skinCutK; }
+                        if (!cb.empty()) {
+                            // asset path = the cache filename's basename (e.g. "skincutout_t1a2b3c4d.surface"),
+                            // so the tinted variant is a distinct on-device shader asset from the plain one.
+                            std::string base(cfn+7); size_t dot = base.rfind(".bin"); if (dot!=std::string::npos) base = base.substr(0,dot);
+                            char cp2[200]; snprintf(cp2, sizeof cp2, "%s/shaders/%s/shader", MH.c_str(), base.c_str());
+                            skinCutK = keyForPath(cp2); assets.push_back({ cp2, skinCutK.tgt, cb, skinCutK }); rotShaders[cfn] = skinCutK; }
                     }
                     if (skinCutK.pkg || skinCutK.ing) { sk = skinCutK;
-                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SKINNED-CUTOUT (masked foliage, discard a<0.5)\n", i, m.name.c_str()); }
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SKINNED-CUTOUT%s (masked foliage, discard a<0.5)\n", i, m.name.c_str(), sctint?"+TINTREPLAY":""); }
                 }
                 // ── COMBINED effect card (RIGID-HZANIM + material UV/fade) — NO EXCLUSION ──────────────────────────
                 // A fog/dust card whose node has R/S rides a RIGID-HZANIM skeleton (faithful T+R+S) AND has a UV flipbook
