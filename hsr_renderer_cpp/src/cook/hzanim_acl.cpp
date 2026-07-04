@@ -84,9 +84,11 @@ int hzAclSampleLocal(HzAclClip* c, float t, float* out, int maxJoints)
 }
 
 // ── ENCODE: per-joint LOCAL TRS -> ACL compressed_tracks -> HzAnim 0xA34912B6 wrapper (HZANIM port). ──
-std::vector<uint8_t> hzAclEncode(const float* trs, const int* parents, int jointCount, int frameCount, float fps)
+std::vector<uint8_t> hzAclEncode(const float* trs, const int* parents, int jointCount, int frameCount, float fps,
+                                 float shellDistance)
 {
     if (!trs || jointCount < 1 || frameCount < 1) return {};
+    if (!(shellDistance >= 1.0f)) shellDistance = 1.0f;   // never LOOSER than the old default (NaN-safe)
     ansi_allocator allocator;
     track_array_qvvf tracks(allocator, (uint32_t)jointCount);
     for (int j = 0; j < jointCount; ++j)
@@ -95,7 +97,10 @@ std::vector<uint8_t> hzAclEncode(const float* trs, const int* parents, int joint
         desc.output_index  = (uint32_t)j;
         desc.parent_index  = (parents && parents[j] >= 0) ? (uint32_t)parents[j] : k_invalid_track_index;
         desc.precision     = 0.0001f;
-        desc.shell_distance = 1.0f;
+        // Error budget applied at the REAL vertex lever, not a fixed 1.0 (the cyan "very shaky" fix):
+        // rigs with ~0.01 node scale put verts 100-500 JOINT-LOCAL units out, so quantization error that ACL
+        // considered legal at radius 1.0 was amplified 100-500x at the actual geometry = visible wobble.
+        desc.shell_distance = shellDistance;
         track_qvvf track = track_qvvf::make_reserve(desc, allocator, (uint32_t)frameCount, fps);
         for (int f = 0; f < frameCount; ++f)
         {

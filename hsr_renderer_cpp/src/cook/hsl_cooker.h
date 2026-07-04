@@ -2249,10 +2249,50 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                         m.name.c_str(), nfSrc, f0[4],f0[5],f0[6], fL[4],fL[5],fL[6], endDrift, (int)oneWay,
                         oneWay ? "TELEPORT" : (loopWrap ? "SEAM" : "none"));
             }
+            // ── ACL SHELL DISTANCE = the farthest vertex from its DOMINANT joint in JOINT-LOCAL units (the cyan
+            //    "animations very shaky" fix). ACL evaluates its rotation-error budget AT shell_distance; the old
+            //    fixed 1.0 let rigs with ~0.01 node scale (verts 100-500 joint-local units out) wobble by
+            //    centimeters at the real geometry. Compose each REAL joint's bind world from the SKEL data, take
+            //    max |inv(bindWorld[dominantBone]) · restVert| over the mesh. Anchors excluded (constant tracks).
+            float shellDist = 1.f;
+            {
+                std::vector<std::array<float,16>> bw((size_t)njReal);
+                for (int j2 = 0; j2 < njReal; ++j2) {
+                    float qw=m.hzJointQuat[j2*4], qx=m.hzJointQuat[j2*4+1], qy=m.hzJointQuat[j2*4+2], qz=m.hzJointQuat[j2*4+3];
+                    float s = m.hzJointScale[j2]; if (s < 1e-6f && s > -1e-6f) s = 1.f;
+                    float lx=m.hzJointPos[j2*3], ly=m.hzJointPos[j2*3+1], lz=m.hzJointPos[j2*3+2];
+                    float l[16] = { (1-2*(qy*qy+qz*qz))*s, (2*(qx*qy+qw*qz))*s, (2*(qx*qz-qw*qy))*s, 0,
+                                    (2*(qx*qy-qw*qz))*s, (1-2*(qx*qx+qz*qz))*s, (2*(qy*qz+qw*qx))*s, 0,
+                                    (2*(qx*qz+qw*qy))*s, (2*(qy*qz-qw*qx))*s, (1-2*(qx*qx+qy*qy))*s, 0,
+                                    lx, ly, lz, 1 };
+                    int p = m.hzParents[j2];
+                    if (p >= 0 && p < j2) { const float* a = bw[(size_t)p].data(); float* o = bw[(size_t)j2].data();
+                        for (int c2=0;c2<4;c2++) for (int r2=0;r2<4;r2++) o[c2*4+r2] = a[r2]*l[c2*4] + a[4+r2]*l[c2*4+1] + a[8+r2]*l[c2*4+2] + a[12+r2]*l[c2*4+3];
+                    } else std::memcpy(bw[(size_t)j2].data(), l, sizeof l);
+                }
+                auto invLever = [&](const float* mtx, float x, float y, float z)->float {
+                    float M00=mtx[0],M01=mtx[4],M02=mtx[8], M10=mtx[1],M11=mtx[5],M12=mtx[9], M20=mtx[2],M21=mtx[6],M22=mtx[10];
+                    float det=M00*(M11*M22-M12*M21)-M01*(M10*M22-M12*M20)+M02*(M10*M21-M11*M20);
+                    float id=(det>1e-20f||det<-1e-20f)?1.f/det:0.f;
+                    float i00=(M11*M22-M12*M21)*id, i01=(M02*M21-M01*M22)*id, i02=(M01*M12-M02*M11)*id;
+                    float i10=(M12*M20-M10*M22)*id, i11=(M00*M22-M02*M20)*id, i12=(M02*M10-M00*M12)*id;
+                    float i20=(M10*M21-M11*M20)*id, i21=(M01*M20-M00*M21)*id, i22=(M00*M11-M01*M10)*id;
+                    float tx=x-mtx[12], ty=y-mtx[13], tz=z-mtx[14];
+                    float px=i00*tx+i01*ty+i02*tz, py=i10*tx+i11*ty+i12*tz, pz=i20*tx+i21*ty+i22*tz;
+                    return std::sqrt(px*px+py*py+pz*pz); };
+                size_t nvv = m.hzRestPos.size()/3;
+                for (size_t v2 = 0; v2 < nvv; ++v2) {
+                    int b = (v2*4 < m.hzBoneIdx.size()) ? (int)m.hzBoneIdx[v2*4] : 0; if (b < 0 || b >= njReal) b = 0;
+                    float lv = invLever(bw[(size_t)b].data(), m.hzRestPos[v2*3], m.hzRestPos[v2*3+1], m.hzRestPos[v2*3+2]);
+                    if (lv > shellDist) shellDist = lv;
+                }
+                if (shellDist > 100000.f) shellDist = 100000.f;
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu ACL shellDist=%.1f (joint-local max vertex lever)\n", i, shellDist);
+            }
             int    nf   = nf0;
             float  fps  = fps0;
             std::vector<float> trsCur = trs0;               // current candidate clip (starts = full clip)
-            hzAnimPre = hzAclEncode(trsCur.data(), parentsA.data(), nj0, nf, fps);
+            hzAnimPre = hzAclEncode(trsCur.data(), parentsA.data(), nj0, nf, fps, shellDist);
             // Reduce N (~3/4 each step, floor 8) until the encoded clip fits the byte budget. trsCur[(f*nj+j)*10 .. +10)
             // = {qx,qy,qz,qw, t3, s3} — sample N evenly-spaced source frames (endpoints inclusive) into a tight buffer.
             while ((hzAnimPre.empty() || hzAnimPre.size() > hzMaxBytes) && nf > 8 && dur > 0.f) {
@@ -2268,7 +2308,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 }
                 nf  = newNf;
                 fps = (newNf > 1) ? (float)(newNf - 1) / dur : fps0;   // DURATION-preserving fps (no #3 warp-speed bug)
-                hzAnimPre = hzAclEncode(trsCur.data(), parentsA.data(), nj0, nf, fps);
+                hzAnimPre = hzAclEncode(trsCur.data(), parentsA.data(), nj0, nf, fps, shellDist);
             }
             if (hzAnimPre.empty() || hzAnimPre.size() > hzMaxBytes) hzClipFits = false;   // even 8 frames won't fit -> static
             // The subsampled fps lives INSIDE the re-encoded ACL clip (hzAclEncode's fps arg), so hzAnimPre alone carries
@@ -2744,11 +2784,18 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // trees midF=0.00, vistaCards midF=0.01 (CUTOUT) vs moonGlow 0.13 / lambert34 0.14 / ice 0.58 (BLEND).
                 bool bimodal   = (midF < 0.05f);   // hard-edged cutout mask (no soft gradient)
                 bool hasOpaque = (opF  > 0.004f);  // has real opaque content (skip near-empty cards)
-                if (bimodal && hasOpaque) {
+                // SOLID-BODIED soft-edged cards (vista's layered diorama: midBG opF=0.35, LtFg 0.49, RtFg 0.26
+                // with midF 0.07-0.14 = a solid silhouette wearing an anti-aliased EDGE) — V79 renders these via
+                // the dedicated MeshShellEnvMaskDepthWrite pass (depth-write the body, blend the edge). Cooking
+                // them plain BLEND (no depth-write) broke layer occlusion = vista "depth issues everywhere".
+                // Port = the LOW-threshold cutout: depth-writes the body, discards the transparent sky, keeps
+                // most of the soft edge (0.12 cut). Pure-soft FX (fog/glow/glass: opF~0 or midF high) stay BLEND.
+                bool solidBody = (opF > 0.25f && midF < 0.30f);
+                if ((bimodal && hasOpaque) || solidBody) {
                     cutoutOK = true;
                     isTreeCutout = true;   // LOW 0.12 discard: depth-writes + keeps any faint soft edge; for midF~0 it equals a 0.5 cut
                 }
-                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' blendcard opF=%.2f midF=%.2f -> %s\n", i, m.name.c_str(), opF, midF, cutoutOK?"CUTOUT(bimodal)":"blend");
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' blendcard opF=%.2f midF=%.2f -> %s\n", i, m.name.c_str(), opF, midF, cutoutOK?(bimodal?"CUTOUT(bimodal)":"CUTOUT(solid-body)"):"blend");
             }
             matl = (m.blend && haveBlend && !cutoutOK) ? matBlend : matTpl;
             if (cutoutOK) {   // CUTOUT = opaque MATL + alpha-test DISCARD shader -> DEPTH-WRITE: authored MASK scenery OCCLUDES (fixes back-overlays-front); discard cuts the hard mask. Double-sided handled by the cook's reversed-tri append.

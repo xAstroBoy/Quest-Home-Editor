@@ -702,7 +702,16 @@ public:
         if (s.step) { for(int c=0;c<s.comps;++c) out[c]=v0[c]; return; }   // hold prev keyframe (flipbook)
         float t0=s.times[i], t1=s.times[i+1];
         float a = (t1>t0) ? (t-t0)/(t1-t0) : 0.f;
-        for (int c=0;c<s.comps;++c) out[c]=v0[c]+(v1[c]-v0[c])*a;
+        // SHORTEST-ARC quaternion nlerp (the cyan windmill "glitchy and shaking" fix): exporters store some
+        // neighbouring rotation keys with FLIPPED sign (q and -q are the same rotation — cyan node8 has
+        // antipodal pairs at t=2.708/5.292/5.583, node34/36 too). A raw componentwise lerp between antipodal
+        // keys passes near |q|=0, and the normalize turns that interval into a wild long-arc sweep + holds —
+        // which the 30fps clip resample then BAKES into the cooked animation (decoded clip showed 9x-speed
+        // spikes and frozen frames at exactly those key times, while the source keys are a uniform 2.02deg/key).
+        // Negating v1 when dot<0 lerps the short arc, matching what every real engine's nlerp does.
+        float sgn = 1.f;
+        if (s.comps==4 && (v0[0]*v1[0]+v0[1]*v1[1]+v0[2]*v1[2]+v0[3]*v1[3]) < 0.f) sgn = -1.f;
+        for (int c=0;c<s.comps;++c) out[c]=v0[c]+(v1[c]*sgn-v0[c])*a;
         if (s.comps==4) { // normalize quaternion
             float l=sqrtf(out[0]*out[0]+out[1]*out[1]+out[2]*out[2]+out[3]*out[3]);
             if (l>1e-8f) for(int c=0;c<4;c++) out[c]/=l;
@@ -1021,13 +1030,12 @@ public:
             else if (r0>r4&&r0>r8){ float S=sqrtf(1+r0-r4-r8)*2; q[3]=(r5-r7)/S; q[0]=0.25f*S; q[1]=(r3+r1)/S; q[2]=(r6+r2)/S; }
             else if (r4>r8){ float S=sqrtf(1+r4-r0-r8)*2; q[3]=(r6-r2)/S; q[0]=(r3+r1)/S; q[1]=0.25f*S; q[2]=(r7+r5)/S; }
             else { float S=sqrtf(1+r8-r0-r4)*2; q[3]=(r1-r3)/S; q[0]=(r6+r2)/S; q[1]=(r7+r5)/S; q[2]=0.25f*S; } };
-        // INCLUSIVE endpoint [0, clipDur] — the "jumpy resets" fix (see the OPA twin): frame[NF] = the sampler's
-        // t=clipDur value (glTF samplers CLAMP at the last key), so the device LERPS the final interval instead of
-        // holding-then-teleporting a missing frame of motion every loop. count = NF+1, fps = NF/clipDur ->
-        // device duration = clipDur exact.
-        std::vector<float> mats(((size_t)NF+1)*16);
+        // EXCLUSIVE endpoint [0, clipDur): the cooker's loopWrap already appends the seam frame (frame0 copy)
+        // for cyclic clips — adding an inclusive endpoint HERE doubled it (two identical end frames = a 33ms
+        // hold every loop, visible on the fast windmill). Open paths keep the intentional teleport wrap.
+        std::vector<float> mats((size_t)NF*16);
         float o0[3]={0,0,0}, maxd=0.f, rotMaxd=0.f, sclMaxd=0.f, rs0[9]={0}, sc0[3]={1,1,1};
-        for (int f = 0; f <= NF; f++) {
+        for (int f = 0; f < NF; f++) {
             float* w = &mats[(size_t)f*16];
             worldAt(node, clipDur*(float)f/(float)NF, w);
             // NORMALIZED 3x3 (scale stripped per column) — cyan's nodes carry a ~0.01 world scale, so the raw
@@ -1042,9 +1050,21 @@ public:
                    float rd=0.f; for(int k=0;k<9;k++){ float e2=rs[k]-rs0[k]; rd+=e2*e2; } rd=sqrtf(rd); if(rd>rotMaxd)rotMaxd=rd;
                    for(int c=0;c<3;c++){ float sd=cs[c]/sc0[c]-1.f; if(sd<0)sd=-sd; if(sd>sclMaxd)sclMaxd=sd; } }
         }
-        // COMBINED T+(R or S) only (the cases the fit chain ruins — it drops the second channel): pure
-        // translation / pure rotation / pure scale keep their proven getTime shader paths.
-        if (maxd < 0.01f || (requireRotation && rotMaxd < 0.02f && sclMaxd < 0.05f)) {
+        // COMBINED T+(R or S), plus SMALL pure-rotation meshes (the gear-shadow CLOCK-DESYNC fix): a pure-R
+        // mesh whose siblings are RIGID (animator clock) must NOT ride the getTime ROTREPLAY shader clock —
+        // the two clocks share no phase, so cyan's gear SHADOW drifted against its gear. Small meshes (world
+        // span < 50m) join the rigid/animator clock family; only BIG pure-rotation domes (OW skybox class)
+        // keep the shader replay, where the animator's LOD judder is the greater evil.
+        bool pureRotOk = false;
+        if (maxd < 0.01f && (rotMaxd >= 0.02f || sclMaxd >= 0.05f)) {
+            float lever = 0.f;
+            for (size_t v = 0; v + 2 < rec->basePos.size(); v += 3) {
+                float lx=rec->basePos[v], ly=rec->basePos[v+1], lz=rec->basePos[v+2];
+                float l = sqrtf(lx*lx+ly*ly+lz*lz); if (l > lever) lever = l; }
+            float ws = sqrtf(mats[0]*mats[0]+mats[1]*mats[1]+mats[2]*mats[2]);   // W0 column-0 scale ~ node world scale
+            pureRotOk = lever * (ws > 1e-8f ? ws : 1.f) < 50.f;
+        }
+        if ((maxd < 0.01f && !pureRotOk) || (requireRotation && rotMaxd < 0.02f && sclMaxd < 0.05f)) {
             if (std::getenv("HSR_VERBOSE"))
                 fprintf(stderr, "[GLTF-RIGID] mesh%d node%d REJECT travel=%.4f rotDev=%.4f sclDev=%.4f dur=%.2fs (needs T>=0.01 %s)\n",
                         meshIdx, node, maxd, rotMaxd, sclMaxd, clipDur, requireRotation ? "AND (R>=0.02 or S>=0.05)" : "");
@@ -1057,8 +1077,8 @@ public:
         e.jointPos   = {0,0,0, w0t[0],w0t[1],w0t[2]};
         e.jointQuat  = {1,0,0,0, w0q[3],w0q[0],w0q[1],w0q[2]};   // (w,x,y,z) for HZAN:SKEL; matTrs q is (x,y,z,w)
         e.jointScale = {1, (w0su>1e-4f||w0su<-1e-4f)?w0su:1.f};
-        e.trsLocal.resize((size_t)(NF+1)*2*10);
-        for (int f = 0; f <= NF; f++) {
+        e.trsLocal.resize((size_t)NF*2*10);
+        for (int f = 0; f < NF; f++) {
             float q[4], t[3], s[3]; matTrs(&mats[(size_t)f*16], q, t, s);   // clip-local = the node's ACTUAL world matrix W(f) (ACL-clean vs bind W0)
             float* r = &e.trsLocal[(size_t)(f*2+0)*10]; r[0]=0;r[1]=0;r[2]=0;r[3]=1; r[4]=0;r[5]=0;r[6]=0; r[7]=1;r[8]=1;r[9]=1;   // joint0 = STATIC identity (no root motion to extract)
             float* p = &e.trsLocal[(size_t)(f*2+1)*10]; p[0]=q[0];p[1]=q[1];p[2]=q[2];p[3]=q[3]; p[4]=t[0];p[5]=t[1];p[6]=t[2]; p[7]=s[0];p[8]=s[1];p[9]=s[2];
@@ -1066,7 +1086,7 @@ public:
         // QUATERNION HEMISPHERE CONTINUITY (the cyan "very shaky" fix): matTrs's per-frame quat sign is
         // arbitrary; a mill/gear spin crossing 180 deg flips polarity and the decoder's neighbor-lerp takes the
         // LONG arc for one interval = a twitch every crossing. Keep the mover's quats sign-continuous.
-        for (int f = 1; f <= NF; f++) {
+        for (int f = 1; f < NF; f++) {
             float* q = &e.trsLocal[((size_t)f*2 + 1)*10]; const float* p = &e.trsLocal[((size_t)(f-1)*2 + 1)*10];
             if (q[0]*p[0]+q[1]*p[1]+q[2]*p[2]+q[3]*p[3] < 0.f) { q[0]=-q[0]; q[1]=-q[1]; q[2]=-q[2]; q[3]=-q[3]; }
         }
@@ -1078,7 +1098,7 @@ public:
             o[2]=W0[2]*b[0]+W0[6]*b[1]+W0[10]*b[2]+W0[14]; }
         e.boneIdx.assign(nv*4, 0); e.boneWgt.assign(nv*4, 0);
         for (size_t v = 0; v < nv; v++) { e.boneIdx[v*4]=1; e.boneWgt[v*4]=255; }   // weight every vert to the MOVING joint
-        e.frameCount = NF+1; e.fps = (float)NF / clipDur;   // NF+1 INCLUSIVE frames over [0,clipDur] -> device duration = clipDur; last frame = the seam target
+        e.frameCount = NF; e.fps = (float)NF / clipDur;   // NF frames over [0,clipDur); the cooker's loopWrap appends the seam frame for cyclic clips
         if (std::getenv("HSR_VERBOSE"))
             fprintf(stderr, "[GLTF-RIGID] mesh%d node%d NF=%d dur=%.2fs travel=%.2f rotDev=%.2f sclDev=%.2f W0t=(%.1f,%.1f,%.1f)\n",
                     meshIdx, node, NF, clipDur, maxd, rotMaxd, sclMaxd, w0t[0], w0t[1], w0t[2]);
