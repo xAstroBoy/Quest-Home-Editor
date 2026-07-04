@@ -531,17 +531,11 @@ public:
             else if(r0>r4&&r0>r8){float S=std::sqrt(1+r0-r4-r8)*2;q[3]=(r5-r7)/S;q[0]=0.25f*S;q[1]=(r3+r1)/S;q[2]=(r6+r2)/S;}
             else if(r4>r8){float S=std::sqrt(1+r4-r0-r8)*2;q[3]=(r6-r2)/S;q[0]=(r3+r1)/S;q[1]=0.25f*S;q[2]=(r7+r5)/S;}
             else{float S=std::sqrt(1+r8-r0-r4)*2;q[3]=(r1-r3)/S;q[0]=(r6+r2)/S;q[1]=(r7+r5)/S;q[2]=0.25f*S;} };
-        // INCLUSIVE endpoint — the "jumpy resets" fix. The renderer's sampleTrack WRAP-LERPS the loop seam
-        // (i1 wraps to frame 0: last->first interpolated over ONE source frame = the V79 look). The old
-        // EXCLUSIVE sampling [0,clipDur) left the device to fract-teleport frame[NF-1]->frame[0] — a missing
-        // frame of motion EVERY loop = a visible hitch on anything fast (river cards / cars / comets). Emitting
-        // frame[NF] = eval(clipDur) — which sampleTrack fmods back to FRAME 0 — makes the device LERP the final
-        // interval exactly like the renderer's seam. (The old "speed backward" bug was NOT inclusive sampling
-        // itself: it was sampling >1 period (global duration) so a wrap landed INSIDE the clip. With the
-        // per-node period = exactly one loop, inclusive is correct.) count = NF+1, fps = NF/clipDur ->
-        // device duration = (count-1)/fps = clipDur EXACT.
-        std::vector<Mat4> mats((size_t)NF + 1); float o0[3]={0,0,0}, maxd=0.f, rotMaxd=0.f; float rs0[9]={0}; Mat4 W0 = identity();
-        for (int f=0; f<=NF; f++) { evalAnimNodes(clipDur * (float)f / (float)NF);
+        // EXCLUSIVE endpoint [0, clipDur): the cooker's loopWrap appends the seam frame (frame0 copy) for
+        // cyclic clips — an extractor-side inclusive endpoint DOUBLED it (a held frame every loop). Open
+        // paths keep the intentional teleport wrap (cars crossing tile seams).
+        std::vector<Mat4> mats((size_t)NF); float o0[3]={0,0,0}, maxd=0.f, rotMaxd=0.f; float rs0[9]={0}; Mat4 W0 = identity();
+        for (int f=0; f<NF; f++) { evalAnimNodes(clipDur * (float)f / (float)NF);
             Mat4 w = (node < nodeWorldAnim.size()) ? nodeWorldAnim[node] : identity();
             mats[f]=w; float tx=w.m[12],ty=w.m[13],tz=w.m[14];
             float rs[9]={w.m[0],w.m[1],w.m[2], w.m[4],w.m[5],w.m[6], w.m[8],w.m[9],w.m[10]};   // upper 3x3 (rotation*scale)
@@ -589,7 +583,7 @@ public:
         // motion on a CHILD joint (root stays identity) means there is NO root motion to extract → the child bone skins
         // the verts along the full faithful path. HSR_RIGID1JOINT restores the old 1-joint clip.
         bool oneJoint = std::getenv("HSR_RIGID1JOINT") != nullptr;
-        e.frameCount=NF+1; e.fps = (float)NF / clipDur;   // NF+1 INCLUSIVE frames over [0,clipDur] -> device duration = (count-1)/fps = clipDur; last frame = the seam-lerp target (frame 0)
+        e.frameCount=NF; e.fps = (float)NF / clipDur;   // NF frames over [0,clipDur); the cooker's loopWrap appends the seam frame for cyclic clips
         // BIND = IDENTITY (both joints at origin), clip = RELATIVE to frame-0 (W(t)·inv(W0)) on the MOVING joint, verts
         // WORLD-baked into W0. invBind = inverse(bind) = identity, rest = W0·basePos, motion joint world = W(t)·inv(W0):
         //   driven:           vert = W(t)·inv(W0) · (W0·basePos) = W(t)·basePos     (correct full-path anim)
@@ -618,8 +612,8 @@ public:
         else                 { e.jointCount=2; e.parents={-1,0}; e.jointPos={0,0,0, 0,0,0}; e.jointQuat={1,0,0,0, 1,0,0,0}; e.jointScale={1,1}; }
         const int nj = e.jointCount;                       // 1 (root only) or 2 (static root + moving child)
         const int mj = nj - 1;                             // the MOVING joint index (child if 2-joint, else the root)
-        std::vector<float> trsv((size_t)(NF+1)*nj*10);
-        for (int f=0; f<=NF; f++) {
+        std::vector<float> trsv((size_t)NF*nj*10);
+        for (int f=0; f<NF; f++) {
             float q[4],t[3],s[3];
             if (cleanBind) { matTrs(mats[f].m, q, t, s); }                       // clip-local = the node's ACTUAL world matrix W(f) (ACL-clean)
             else { float rel[16]; mat4mul(mats[f].m, invW0, rel); matTrs(rel, q, t, s); }   // legacy rel = W(f)·inv(W0)
@@ -630,7 +624,7 @@ public:
         // frame; a spin crossing 180 deg flips polarity mid-clip and the decoder's neighbor-lerp takes the LONG
         // arc for one interval = a visible twitch every crossing. Keep each joint's quat in the same hemisphere
         // as its previous frame (q and -q are the same rotation; lerp then always takes the short arc).
-        for (int j = 0; j < nj; j++) for (int f = 1; f <= NF; f++) {
+        for (int j = 0; j < nj; j++) for (int f = 1; f < NF; f++) {
             float* q = &trsv[((size_t)f*nj + j)*10]; const float* p = &trsv[((size_t)(f-1)*nj + j)*10];
             if (q[0]*p[0]+q[1]*p[1]+q[2]*p[2]+q[3]*p[3] < 0.f) { q[0]=-q[0]; q[1]=-q[1]; q[2]=-q[2]; q[3]=-q[3]; }
         }
@@ -1198,8 +1192,14 @@ public:
         int i0 = (int)f; float frac = f - (float)i0;
         if (i0 >= tr.nFrames) { i0 = tr.nFrames - 1; frac = 0.0f; }
         int i1 = (i0 + 1 < tr.nFrames) ? i0 + 1 : 0;               // wrap to frame 0 -> smooth loop seam
+        // SHORTEST-ARC quaternion lerp (see gltf sampleSampler): antipodal neighbour keys (q vs -q) lerped
+        // componentwise pass near |q|=0 = a wild long-arc sweep for that interval, baked into cooked clips.
+        float sgn = 1.f;
+        if (comps == 4) { float d = 0.f;
+            for (int c = 0; c < 4; ++c) d += tr.v[(size_t)i0*comps + c] * tr.v[(size_t)i1*comps + c];
+            if (d < 0.f) sgn = -1.f; }
         for (int c = 0; c < comps; ++c)
-            out[c] = tr.v[(size_t)i0*comps + c] * (1.0f - frac) + tr.v[(size_t)i1*comps + c] * frac;
+            out[c] = tr.v[(size_t)i0*comps + c] * (1.0f - frac) + tr.v[(size_t)i1*comps + c] * sgn * frac;
     }
     // Sample each animated node at looped time t and rewrite its mesh's world positions.
     void animate(float t) {

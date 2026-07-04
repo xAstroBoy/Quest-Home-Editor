@@ -14,7 +14,12 @@ struct HzAclClip;  // opaque
 // ENCODE (HZANIM port): per-joint LOCAL TRS animation -> a V203 HzAnim clip (ACL compressed_tracks wrapped in the
 // 0xA34912B6 container). trsLocal[(frame*jointCount + joint)*10] = quat(x,y,z,w), translation(x,y,z), scale(x,y,z);
 // parents[joint] = parent index (-1 = root). Returns the full HZAN:ANIM asset bytes (empty on failure).
-std::vector<uint8_t> hzAclEncode(const float* trsLocal, const int* parents, int jointCount, int frameCount, float fps);
+// shellDistance = the FARTHEST vertex from its joint in JOINT-LOCAL units — ACL evaluates its rotation-error
+// tolerance AT this radius. The old fixed 1.0 let cyan's rigs (node scale ~0.01 -> verts 100-500 local units out)
+// wobble by centimeters at the real geometry ("animations very shaky"): quantization error legal at 1.0 is
+// amplified 100-500x at the actual lever. Pass the real lever so the error budget applies where the verts are.
+std::vector<uint8_t> hzAclEncode(const float* trsLocal, const int* parents, int jointCount, int frameCount, float fps,
+                                 float shellDistance = 1.0f);
 
 // Parse the HzAnim wrapper, validate the inner ACL compressed_tracks, build a decompression context.
 // Copies the bytes it needs, so `file` need not outlive the call. Returns nullptr if not a valid clip.

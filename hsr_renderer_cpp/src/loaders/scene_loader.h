@@ -158,9 +158,22 @@ public:
         return false;
     }
     void animate(float t) {
+        static int animdbg = -1; if (animdbg < 0) animdbg = std::getenv("HSR_ANIMDBG") ? 1 : 0;
+        static int dbgShots = 0;   // print the first few calls + one around t=15 (to catch hold-then-move clips)
+        bool dbg = animdbg && (dbgShots < 3 || (t > 15.f && dbgShots < 6));
+        if (dbg) ++dbgShots;
+        int gi = -1;
         for (auto& g : animGroups) {
-            if (!(g.skel.ok() && g.clip.ok() && !g.skinRecs.empty())) continue;
+            ++gi;
+            if (!(g.skel.ok() && g.clip.ok() && !g.skinRecs.empty())) { if (dbg) fprintf(stderr, "[ANIMDBG] t=%.2f g%d SKIPPED (skel=%d clip=%d recs=%zu)\n", t, gi, (int)g.skel.ok(), (int)g.clip.ok(), g.skinRecs.size()); continue; }
             std::vector<float> skin; sampleRendClip(g.skel, g.clip, t, skin);   // device: quat->mat3*scale+T per joint
+            if (dbg) { float tx=skin.size()>=32?skin[28]:0, ty=skin.size()>=32?skin[29]:0, tz=skin.size()>=32?skin[30]:0;
+                std::string ms; for (auto& r : g.skinRecs) { ms += std::to_string(r.meshIdx) + ","; }
+                fprintf(stderr, "[ANIMDBG] t=%.2f g%d meshes=[%s] j1skinT=(%.2f,%.2f,%.2f)\n", t, gi, ms.c_str(), tx, ty, tz);
+                for (auto& r : g.skinRecs) if (r.meshIdx == 5 && r.basePos.size() >= 3 && r.bIdx.size() >= 4) {
+                    fprintf(stderr, "[ANIMDBG]   mesh5 base0=(%.2f,%.2f,%.2f) bIdx=[%d,%d,%d,%d] bWgt=[%d,%d,%d,%d] nj=%d\n",
+                        r.basePos[0], r.basePos[1], r.basePos[2], r.bIdx[0], r.bIdx[1], r.bIdx[2], r.bIdx[3],
+                        r.bWgt[0], r.bWgt[1], r.bWgt[2], r.bWgt[3], (int)skin.size()/16); } }
             int nj = (int)skin.size()/16;
             for (auto& r : g.skinRecs) {
                 auto& md = meshes[r.meshIdx];
@@ -183,6 +196,8 @@ public:
                     else { float inv=1.0f/wsum; ox*=inv; oy*=inv; oz*=inv; }   // normalize (weights may not sum to 1)
                     md.positions[v*3]=ox; md.positions[v*3+1]=oy; md.positions[v*3+2]=oz;
                 }
+                if (dbg && r.meshIdx == 5 && md.positions.size() >= 3)
+                    fprintf(stderr, "[ANIMDBG]   mesh5 SKINNED v0=(%.2f,%.2f,%.2f)\n", md.positions[0], md.positions[1], md.positions[2]);
             }
         }
     }
