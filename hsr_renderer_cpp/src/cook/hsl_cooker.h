@@ -2387,11 +2387,19 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         bool useVat = !useHz && !useRot && !useTrans && !useScale && !useUvScroll && !usePulse && !m.vatOffsets.empty() && m.vatFrames > 1 && haveVat && m.vatOffsets.size() >= (size_t)vc * m.vatFrames * 3;
         std::vector<uint8_t> vatTex; AssetKey3 vatTexK;
         if (useVat) { vatTex = encodeVatTexture(m.vatOffsets, vc, m.vatFrames); if (vatTex.empty()) useVat = false; }
+        // MASKED FOLIAGE → ALPHA-BLEND (device anti-aliasing): a hard alpha-test `discard` has NO edge AA on the
+        // Quest (MSAA smooths geometry edges, not per-fragment discard — you'd need alpha-to-coverage, which the
+        // shadergen CUTOUT shader doesn't set), so every cutout leaf/flower renders JAGGED/BLOCKY on device while
+        // the DESKTOP preview looks fine because it resolves with AA (this hid the bug through many "fixed in
+        // preview" iterations). The stinson zen tree + bougainvillea + palms are all masked skinned foliage → route
+        // them to the BLEND skinned pipeline (unlitblendskinned + transparent MATL) so the leaf-mask alpha feathers
+        // the edges smoothly on device. HSR_FOLIAGE_CUTOUT restores the old hard-discard path.
+        bool foliageBlend = useHz && m.alphaTest && !m.blend && !m.additive && !std::getenv("HSR_FOLIAGE_CUTOUT");
         std::vector<uint8_t> matl; std::string animatorComp;
         if (useHz) {   // HZANIM: CURRENT-format skinned MATL (field7=shader) + HZAN:SKEL + ACL HZAN:ANIM + AnimatorPlatformComponent
             // BLEND skinned (the SHIELD) -> the transparent-flagged material (field2=2) so it alpha-blends in the
             // transparent pass; OPAQUE skinned (body) -> the plain butterflies template.
-            matl = std::getenv("HSR_HZMATTPL") ? matTpl : (m.blend && matSkinB.size() >= 176 ? matSkinB : matSkin2);
+            matl = std::getenv("HSR_HZMATTPL") ? matTpl : ((m.blend || foliageBlend) && matSkinB.size() >= 176 ? matSkinB : matSkin2);
             // (Moving/skinned transparent cards e.g. the TRAIN stay ALPHA-BLEND — a hard alpha-cutoff cutout here
             //  destroyed the train's soft transparency. Depth-write for MOVING cards is intentionally NOT forced.)
             if (!std::getenv("HSR_HZMATTPL") && matl.size() >= 140) {
@@ -2402,13 +2410,13 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // f2,f3 PRESENT) but keep the TRANSPARENT skinned MATL (matSkinB, field2=2) -> ADDITIVE blend = bright streaks
                 // on the dark viewscreen (alpha-blend made them near-invisible). Non-emissive blend skinned (a real force-field
                 // glass) still uses unlitBLENDskinned (alpha).
-                AssetKey3 sk = (m.blend && !m.additive && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
+                AssetKey3 sk = ((m.blend || foliageBlend) && !m.additive && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
                 // MASKED skinned foliage (stinson materialsplit trees: authored AlphaTest, "_masked") -> a skinned
                 // CUTOUT shader: the opaque skinned base + an alpha<0.5 discard in the forward frag (same
                 // shadergen::CUTOUT edit the static path uses — it only touches the FRAGMENT, skinning untouched).
                 // Without it the opaque skinned pipeline drew the leaf textures' transparent gaps SOLID ("blocky").
                 // The texture keeps its REAL alpha for this path (see the skinnedOpaque force-255 exemption above).
-                if (m.alphaTest && !m.blend && !shadSkin.empty()) {
+                if (m.alphaTest && !m.blend && !foliageBlend && !shadSkin.empty()) {
                     // A masked skin may ALSO carry a mat.sanim MaterialTint RGBA cycle (stinson zen tree:
                     // 8 skinned canopy layers pulse green→cyan→pink over 35s). Chain TINTREPLAY onto the
                     // CUTOUT frag so the skinned leaves recolor on-device (it only edits the fragment; the
@@ -2827,7 +2835,16 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // Port = the LOW-threshold cutout: depth-writes the body, discards the transparent sky, keeps
                 // most of the soft edge (0.12 cut). Pure-soft FX (fog/glow/glass: opF~0 or midF high) stay BLEND.
                 bool solidBody = (opF > 0.25f && midF < 0.30f);
-                if ((bimodal && hasOpaque) || solidBody) {
+                // FLAT HORIZONTAL DECAL guard (property, not name): a pond shadow / water-colour overlay lies IN the
+                // floor plane (Y is its SMALLEST extent) and paints translucently ONTO the coplanar floor — it must
+                // NOT depth-write or it z-fights the floor ("texture fighting" on pond_color_sh over platformCenter).
+                // A vista scenery card is VERTICAL (large Y extent) and must occlude, so it still depth-writes. Only
+                // the solidBody branch is gated (a genuinely bimodal mask decal keeps its cutout).
+                float pmn[3]={1e30f,1e30f,1e30f}, pmx[3]={-1e30f,-1e30f,-1e30f};
+                for (size_t q=0; q+2<m.positions.size(); q+=3) for(int a=0;a<3;a++){ float p=m.positions[q+a]; if(p<pmn[a])pmn[a]=p; if(p>pmx[a])pmx[a]=p; }
+                float exX=pmx[0]-pmn[0], exY=pmx[1]-pmn[1], exZ=pmx[2]-pmn[2];
+                bool flatHorizontalDecal = (exY < 0.15f*exX && exY < 0.15f*exZ);   // near-planar in Y = ground/pond decal
+                if (!flatHorizontalDecal && ((bimodal && hasOpaque) || solidBody)) {   // flat floor decals stay BLEND (no depth-write = no z-fight with the coplanar floor)
                     cutoutOK = true;
                     isTreeCutout = true;   // LOW 0.12 discard: depth-writes + keeps any faint soft edge; for midF~0 it equals a 0.5 cut
                 }
