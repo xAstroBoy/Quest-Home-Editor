@@ -26,7 +26,31 @@
   #include <ws2tcpip.h>
   #include <windows.h>
   #include <shobjidl.h>            // IFileOpenDialog — the full Explorer folder picker for the Blender export path
+#else
+  // POSIX sockets for the Quest-bridge mirror (same BSD API; alias the few Winsock-isms we use)
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <arpa/inet.h>
+  #include <unistd.h>
+  #include <sys/time.h>
+  typedef int SOCKET;
+  #ifndef INVALID_SOCKET
+  #define INVALID_SOCKET (-1)
+  #endif
+  #define closesocket ::close
 #endif
+// Socket recv/send timeout in ms — Winsock takes a DWORD, POSIX a struct timeval.
+static inline void hsrSockTimeoutMs(SOCKET s, int ms) {
+#ifdef _WIN32
+    DWORD to = (DWORD)ms;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&to, sizeof to);
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&to, sizeof to);
+#else
+    struct timeval tv{ ms / 1000, (ms % 1000) * 1000 };
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&tv, sizeof tv);
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof tv);
+#endif
+}
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -68,22 +92,19 @@ struct Editor {
     // Fire-and-forget a bridge command to 127.0.0.1:27042 (adb forward). Detached so the UI never stalls.
     void sendQuestCmd(std::string cmd) {
         std::thread([cmd]{
-#ifdef _WIN32
             SOCKET s = socket(AF_INET, SOCK_STREAM, 0); if (s == INVALID_SOCKET) return;
-            DWORD to = 250; setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&to, sizeof to); setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&to, sizeof to);
+            hsrSockTimeoutMs(s, 250);
             sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(27042); a.sin_addr.s_addr = inet_addr("127.0.0.1");
             if (connect(s, (sockaddr*)&a, sizeof a) == 0) { std::string c = cmd + "\n"; send(s, c.c_str(), (int)c.size(), 0); char rb[64]; recv(s, rb, sizeof rb, 0); }
             closesocket(s);
-#endif
         }).detach();
     }
     // Poll the device's LIVE clock so the timeline can show "desktop t  vs  Quest t" side-by-side (verify sync).
     // Detached (300ms timeout); parses `gtime` reply "time(buf+596)=<sec>" into questTimeNow.
     void pollQuestTime() {
         std::thread([this]{
-#ifdef _WIN32
             SOCKET s = socket(AF_INET, SOCK_STREAM, 0); if (s == INVALID_SOCKET) return;
-            DWORD to = 300; setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (char*)&to, sizeof to); setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&to, sizeof to);
+            hsrSockTimeoutMs(s, 300);
             sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(27042); a.sin_addr.s_addr = inet_addr("127.0.0.1");
             if (connect(s, (sockaddr*)&a, sizeof a) == 0) {
                 const char* c = "gtime\n"; send(s, c, 6, 0);
@@ -91,7 +112,6 @@ struct Editor {
                 if (n > 0) { rb[n] = 0; const char* p = strstr(rb, "buf+596)="); if (p) questTimeNow = (float)atof(p + 9); }
             }
             closesocket(s);
-#endif
         }).detach();
     }
     double nowMs() { return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -3185,7 +3205,11 @@ struct Editor {
             syncQuest = !syncQuest;
             if (syncQuest) {
 #ifdef _WIN32
+#ifdef _WIN32
                 system("adb forward tcp:27042 tcp:27042 >nul 2>&1");   // ensure the bridge port is reachable
+#else
+                system("adb forward tcp:27042 tcp:27042 >/dev/null 2>&1");
+#endif
 #endif
                 if (animPlaying) qPlay(); else qPin();
             } else sendQuestCmd("world off");
@@ -4165,10 +4189,18 @@ struct Editor {
               std::string safe = "saved/"; for (char c : gm.name) safe += (c=='/'||c=='\\'||c==':')?'_':c; safe += "_tex.png";
               if (stbi_write_png(safe.c_str(), md->texW, md->texH, 4, md->texRGBA.data(), md->texW*4)) {
                   std::string abs = std::filesystem::absolute(safe, ec).string();
+#ifdef _WIN32
                   for (char& c : abs) if (c=='/') c='\\';
                   setStatus("Exported texture -> "+abs+"  (opening Explorer)");
-#ifdef _WIN32
                   system(("explorer /select,\""+abs+"\"").c_str());   // SHOW the user exactly where it landed
+#else
+                  setStatus("Exported texture -> "+abs+"  (opening folder)");
+                  std::string dir = abs; size_t sl2 = dir.find_last_of('/'); if (sl2 != std::string::npos) dir = dir.substr(0, sl2);
+  #ifdef __APPLE__
+                  system(("open \""+dir+"\" >/dev/null 2>&1 &").c_str());
+  #else
+                  system(("xdg-open \""+dir+"\" >/dev/null 2>&1 &").c_str());
+  #endif
 #endif
               } else setStatus("Texture export FAILED (disk full / path?): "+safe);
           }
@@ -4225,10 +4257,16 @@ struct Editor {
 #ifdef _WIN32
         std::string gv = AppConfig::s_exeDir + "\\..\\tools\\glslangValidator.exe";
         if (FILE* t=fopen(gv.c_str(),"rb")) fclose(t); else gv = "tools/glslangValidator.exe";
+        const std::string shPfx = "cmd /C ";   // Windows system() = cmd /c <str>, which strips ONE outer quote pair — wrap explicitly
+#else
+        std::string gv = AppConfig::exeRel("../tools/glslangValidator");
+        if (FILE* t=fopen(gv.c_str(),"rb")) fclose(t); else if (FILE* t2=fopen("tools/glslangValidator","rb")) { fclose(t2); gv="tools/glslangValidator"; } else gv = "glslangValidator";   // PATH
+        const std::string shPfx = "";
+#endif
         std::string vs="saved/shaders/"+safe+".vert.edit.spv", fs="saved/shaders/"+safe+".frag.edit.spv", lg="saved/shaders/_compile.log";
         std::error_code ec; std::filesystem::remove(vs,ec); std::filesystem::remove(fs,ec);
-        system(("cmd /C \""+gv+"\" -V -S vert \""+vg+"\" -o \""+vs+"\" > \""+lg+"\" 2>&1").c_str());
-        system(("cmd /C \""+gv+"\" -V -S frag \""+fg+"\" -o \""+fs+"\" >> \""+lg+"\" 2>&1").c_str());
+        system((shPfx+"\""+gv+"\" -V -S vert \""+vg+"\" -o \""+vs+"\" > \""+lg+"\" 2>&1").c_str());
+        system((shPfx+"\""+gv+"\" -V -S frag \""+fg+"\" -o \""+fs+"\" >> \""+lg+"\" 2>&1").c_str());
         auto rd=[&](const std::string& p, std::vector<u32>& out)->bool{ FILE* f=fopen(p.c_str(),"rb"); if(!f) return false;
             fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
             if (n<20 || (n&3)){ fclose(f); return false; } out.resize((size_t)n/4); fread(out.data(),4,out.size(),f); fclose(f); return true; };
@@ -4243,7 +4281,6 @@ struct Editor {
         bool ok = r->reloadShaderFor(mi, vspv, fspv);
         setStatus(ok ? ("Shader '"+sn+"' compiled + HOT-RELOADED - the change is LIVE in the viewport")
                      : "Shader compiled but pipeline rebuild FAILED (kept old shader) - check bindings match");
-#endif
     }
     // Dump the mesh's ACTIVE shader program (per-material or global) to saved/shaders/ as .spv, then
     // run the vendored tools/spirv-cross.exe to emit readable GLSL beside it and open the folder.
@@ -4271,6 +4308,18 @@ struct Editor {
         // open both GLSL files for editing right away (default editor), + the folder for context
         system(("cmd /C start \"\" notepad \"saved\\shaders\\"+safe+".vert.glsl\" >NUL 2>&1").c_str());
         system(("cmd /C start \"\" notepad \"saved\\shaders\\"+safe+".frag.glsl\" >NUL 2>&1").c_str());
+#else
+        std::string sc = AppConfig::exeRel("../tools/spirv-cross");
+        if (FILE* t=fopen(sc.c_str(),"rb")) fclose(t); else if (FILE* t2=fopen("tools/spirv-cross","rb")) { fclose(t2); sc="tools/spirv-cross"; } else sc = "spirv-cross";   // PATH
+        system(("\""+sc+"\" --version 450 \""+vp+"\" --output \"saved/shaders/"+safe+".vert.glsl\" >/dev/null 2>&1"
+                " ; \""+sc+"\" --version 450 \""+fp+"\" --output \"saved/shaders/"+safe+".frag.glsl\" >/dev/null 2>&1").c_str());
+#ifdef __APPLE__
+        const char* opener = "open";
+#else
+        const char* opener = "xdg-open";
+#endif
+        system((std::string(opener)+" \"saved/shaders/"+safe+".vert.glsl\" >/dev/null 2>&1 &").c_str());
+        system((std::string(opener)+" \"saved/shaders/"+safe+".frag.glsl\" >/dev/null 2>&1 &").c_str());
 #endif
         setStatus("Shader '"+sn+"' -> saved/shaders/"+safe+".{vert,frag}.glsl OPENED - edit, then 'Compile + APPLY' hot-reloads it live");
     }
@@ -5147,9 +5196,8 @@ struct Editor {
         //    cooked result (skinned + car HZANIM animation, max far-clip, materials) is validated FIRST-HAND IN THE
         //    RENDERER's V205 path — no device, no manual reload. The new window IS the HSL-mode preview. ──
         if (std::getenv("HSR_COOK_PREVIEW")) {
-            char exe[MAX_PATH]={0}; GetModuleFileNameA(NULL, exe, MAX_PATH);
-            if (exe[0]) { std::string c = std::string("start \"HSL preview\" \"") + exe + "\" \"" + out + "\"";
-                          system(c.c_str()); setStatus("Cooked + launched HSL preview: " + out); }
+            std::string exe = AppConfig::exePath();   // portable (Win32/macOS/Linux)
+            if (!exe.empty() && AppConfig::launchDetached(exe, out)) setStatus("Cooked + launched HSL preview: " + out);
         }
         std::string finalSystem, finalSpoof, msg = "Cooked "+std::to_string(ems.size())+" meshes ("+std::to_string(apk.size()/1024)+"KB)";
         // ── own-package APK (sign -> <env>_Rooted-System.apk; drop the unsigned intermediate on success) ──
@@ -5212,7 +5260,13 @@ struct Editor {
         return "adb";   // on PATH
     }
     int runAdb(const std::string& adb, const std::string& sel, const std::string& tail) {
-        char cmd[1600]; snprintf(cmd, sizeof cmd, "\"\"%s\"%s %s\"", adb.c_str(), sel.c_str(), tail.c_str()); return system(cmd);
+        char cmd[1600];
+#ifdef _WIN32
+        snprintf(cmd, sizeof cmd, "\"\"%s\"%s %s\"", adb.c_str(), sel.c_str(), tail.c_str());   // cmd.exe strips ONE outer quote pair
+#else
+        snprintf(cmd, sizeof cmd, "\"%s\"%s %s", adb.c_str(), sel.c_str(), tail.c_str());
+#endif
+        return system(cmd);
     }
     // Run an adb command and CAPTURE its stdout+stderr (needed for getprop / id / pm path probing).
     static std::string adbCapture(const std::string& adb, const std::string& sel, const std::string& tail) {
@@ -5762,7 +5816,15 @@ struct Editor {
         int W=28, n=(int)(f*W); char bar[64]; for(int i=0;i<W;i++) bar[i]=i<n?'#':' '; bar[W]=0;
         fprintf(stderr, "\r[%s] %3d%%  %-22s", bar, (int)(f*100), s); fflush(stderr);
     }
-    static void setenv_(const char* k, const char* v){ std::string s=std::string(k)+"="+v; _putenv(s.c_str()); }
+    static void setenv_(const char* k, const char* v){
+#ifdef _WIN32
+        std::string s=std::string(k)+"="+v; _putenv(s.c_str());   // "K=" removes the var on Windows
+#else
+        // POSIX setenv(k,"",1) stores an EMPTY string which getenv() returns NON-NULL — every
+        // `if (getenv("HSR_X"))` gate would read as ON. Empty value must UNSET, matching Windows.
+        if (!v || !*v) unsetenv(k); else setenv(k, v, 1);
+#endif
+    }
     static bool writeFile(const std::string& p, const std::vector<uint8_t>& b){ FILE* f=fopen(p.c_str(),"wb"); if(!f) return false; fwrite(b.data(),1,b.size(),f); fclose(f); return true; }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════

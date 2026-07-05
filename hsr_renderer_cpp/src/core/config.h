@@ -11,6 +11,20 @@
 #include <cstdlib>
 #include <algorithm>
 #include <filesystem>
+#ifdef _WIN32
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>
+#elif defined(__APPLE__)
+  #include <mach-o/dyld.h>     // _NSGetExecutablePath
+  #include <unistd.h>
+#else
+  #include <unistd.h>          // readlink(/proc/self/exe)
+#endif
 
 struct AppConfig {
     // ── cook / sign ──
@@ -32,6 +46,37 @@ struct AppConfig {
     // tools dropped beside the exe — no env vars, no SDK install. exeRel() resolves a path relative to it.
     static inline std::string s_exeDir;
     static std::string exeRel(const std::string& rel) { return s_exeDir.empty() ? rel : (s_exeDir + "/" + rel); }
+
+    // Full path of the running executable — portable (Win32 / macOS / Linux). "" if the OS can't say.
+    static std::string exePath() {
+#ifdef _WIN32
+        char buf[1024] = {0}; DWORD n = GetModuleFileNameA(NULL, buf, sizeof buf);
+        return (n > 0 && n < sizeof buf) ? std::string(buf, n) : std::string();
+#elif defined(__APPLE__)
+        char buf[1024] = {0}; uint32_t n = sizeof buf;
+        if (_NSGetExecutablePath(buf, &n) != 0) return "";
+        std::error_code ec; auto canon = std::filesystem::canonical(buf, ec);
+        return ec ? std::string(buf) : canon.string();
+#else
+        char buf[1024] = {0}; ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+        return n > 0 ? std::string(buf, (size_t)n) : std::string();
+#endif
+    }
+    // Launch a program DETACHED with one argument (the editor uses it to spawn a fresh instance on an
+    // APK/glTF). Win32: CreateProcess (inherits env). POSIX: shell background spawn (env inherits too).
+    static bool launchDetached(const std::string& exe, const std::string& arg) {
+        if (exe.empty()) return false;
+#ifdef _WIN32
+        std::string cmd = "\"" + exe + "\" \"" + arg + "\"";
+        std::vector<char> cmdv(cmd.begin(), cmd.end()); cmdv.push_back(0);
+        STARTUPINFOA si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
+        if (!CreateProcessA(exe.c_str(), cmdv.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) return false;
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread); return true;
+#else
+        std::string cmd = "\"" + exe + "\" \"" + arg + "\" >/dev/null 2>&1 &";
+        return std::system(cmd.c_str()) == 0;
+#endif
+    }
 
     // Scan the usual Android SDK locations for the NEWEST build-tools dir that has apksigner.
     static std::string detectBuildTools() {

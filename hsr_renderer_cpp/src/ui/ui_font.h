@@ -4,6 +4,7 @@
 // it for text (white·coverage·tint). Mirrors how stb_image / stb_vorbis are vendored (impl in a separate TU).
 #pragma once
 #include "stb_truetype.h"
+#include "core/config.h"   // AppConfig::s_exeDir — exe-relative bundled-font probing (cwd-independent)
 #include <vector>
 #include <string>
 #include <cstdint>
@@ -66,23 +67,59 @@ inline bool readFile(const char* path, std::vector<uint8_t>& out) {
     out.resize(r); return r > 0;
 }
 
-// Load the UI font at `px`, trying the bundled TTFs under several path prefixes (cwd may be the source tree or
-// build/), then guaranteed Windows system fonts. `mono` picks Consolas (numeric fields) over Inter.
+// Load the UI font at `px`, trying the bundled TTFs under several path prefixes (cwd may be the source tree,
+// build/, or ANYWHERE — so EXE-RELATIVE paths are probed too), then per-OS system fonts. On macOS the old list
+// had ONLY Windows system fallbacks: launched outside the repo no font loaded, the glyph atlas stayed empty and
+// the editor UI rendered NOTHING while the 3D env drew fine (GitHub issue #2 "menus dont show up on mac os").
+// `mono` picks Consolas (numeric fields) over Inter.
 inline bool loadUIFont(Font& f, float px, bool mono = false) {
     static const char* sans[] = {
         "third_party/fonts/InterVariable.ttf", "../third_party/fonts/InterVariable.ttf",
         "hsr_renderer_cpp/third_party/fonts/InterVariable.ttf",
-        "third_party/fonts/SegoeUI.ttf", "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf" };
+        "third_party/fonts/SegoeUI.ttf",
+#ifdef _WIN32
+        "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc", "/System/Library/Fonts/SFNS.ttf",
+#else
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+#endif
+    };
     static const char* monos[] = {
         "third_party/fonts/Consola.ttf", "../third_party/fonts/Consola.ttf",
         "hsr_renderer_cpp/third_party/fonts/Consola.ttf",
-        "C:/Windows/Fonts/consola.ttf", "C:/Windows/Fonts/cour.ttf" };
+#ifdef _WIN32
+        "C:/Windows/Fonts/consola.ttf", "C:/Windows/Fonts/cour.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Monaco.ttf", "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Supplemental/Courier New.ttf",
+#else
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+#endif
+    };
     const char* const* list = mono ? monos : sans;
     int count = mono ? (int)(sizeof(monos)/sizeof(monos[0])) : (int)(sizeof(sans)/sizeof(sans[0]));
     std::vector<uint8_t> ttf;
+    // EXE-RELATIVE first: works no matter what the cwd is (Finder launch, AppImage, PATH). The packaged
+    // builds ship the fonts beside the binary (fonts/ or third_party/fonts/) and macOS in Resources/.
+    if (!AppConfig::s_exeDir.empty()) {
+        const char* rel[] = { "fonts/", "third_party/fonts/", "../third_party/fonts/", "../Resources/fonts/" };
+        const char* fn = mono ? "Consola.ttf" : "InterVariable.ttf";
+        for (const char* r : rel) {
+            std::string p = AppConfig::s_exeDir + "/" + r + fn;
+            if (readFile(p.c_str(), ttf) && f.loadBytes(ttf, px)) return true;
+        }
+    }
     for (int i = 0; i < count; ++i) {
         if (readFile(list[i], ttf) && f.loadBytes(ttf, px)) return true;
     }
+    fprintf(stderr, "[UI] FATAL-ish: no UI font found (bundled fonts missing AND no system fallback) — the editor UI cannot draw text\n");
     return false;
 }
 
