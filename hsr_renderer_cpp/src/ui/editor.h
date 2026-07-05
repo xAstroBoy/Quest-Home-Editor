@@ -3750,7 +3750,16 @@ struct Editor {
                                break; }
           case sitem::BOXCOL: { vecRowF("Half size", it.half, 3, 0.01f, x, y, w); cx.label(x,y,w,rh,"(invisible wall / path blocker)",th.textDim); y+=rh; break; }
           case sitem::WALLPLACE: { cx.label(x,y,78*uiScale,rh,"Max W",th.textDim); cx.dragFloat(ui::hashId("wpw"),x+80*uiScale,y,w-80*uiScale,rh,it.propW,0.01f); y+=rh+2*uiScale;
-                                   cx.label(x,y,78*uiScale,rh,"Max H",th.textDim); cx.dragFloat(ui::hashId("wph"),x+80*uiScale,y,w-80*uiScale,rh,it.propH,0.01f); y+=rh; break; }
+                                   cx.label(x,y,78*uiScale,rh,"Max H",th.textDim); cx.dragFloat(ui::hashId("wph"),x+80*uiScale,y,w-80*uiScale,rh,it.propH,0.01f); y+=rh+2*uiScale;
+                                   // FACING: the props hang on the side the viewport arrow points at (the entity's forward).
+                                   // The auto-fit guesses that side from where the camera stood at creation — when it guesses
+                                   // wrong ("loads on the wrong side") this flips it without hand-editing rotation numbers.
+                                   if (cx.button(ui::hashId("wpflip"), x, y, w, rh, "Flip facing (props on the OTHER side)")) {
+                                       pushItemUndo(items);
+                                       it.rot[1] += 180.f; while (it.rot[1] > 180.f) it.rot[1] -= 360.f; while (it.rot[1] < -180.f) it.rot[1] += 360.f;
+                                       setStatus("Wall placement flipped - the viewport arrow shows the props side");
+                                   } y+=rh;
+                                   cx.label(x,y,w,rh,"(arrow in the viewport = props side)",th.textDim); y+=rh; break; }
           case sitem::NAVMESH: {
                 cx.label(x,y,w,rh,"Build mode",th.textDim); y+=rh;
                 const char* modes[3]={"Flat","Smart","Selection"}; float bw=(w-4*uiScale)/3;
@@ -4788,7 +4797,9 @@ struct Editor {
                 if (worldToScreen(ep,es[0],es[1])){ float hs=(seld?5:3)*uiScale; dl.rect(es[0]-hs,es[1]-hs,hs*2,hs*2,col); dl.border(es[0]-hs,es[1]-hs,hs*2,hs*2,ui::rgba(20,20,20),1);
                     if (on) dl.line(s[0],s[1],es[0],es[1],ui::withA(col,130),1.f);
                     if (seld){ exitHVis=true; exitHS[0]=es[0]; exitHS[1]=es[1]; cx.textAligned(es[0]+8*uiScale,es[1]-8*uiScale,80*uiScale,16*uiScale,"exit",col,0); } } break; }
-              case sitem::WALLPLACE: { float h[3]={it.propW*0.5f,it.propH*0.5f,0.02f}; drawBox(it.pos,h,q,col,th,seld); break; }
+              case sitem::WALLPLACE: { float h[3]={it.propW*0.5f,it.propH*0.5f,0.02f}; drawBox(it.pos,h,q,col,th,seld);
+                    drawFacingArrow(it.pos,q,col,th,0.6f);   // props hang on THIS side ("loads on the wrong side" fix: see it + Flip button)
+                    if (seld) cx.textAligned(s[0]+10*uiScale,s[1]-8*uiScale,150*uiScale,16*uiScale,"front",col,0); break; }
               case sitem::HOTSPOT: { if (on){ float rr=16*uiScale; for (int a=0;a<16;a++){ float a0=a/16.f*6.2831853f,a1=(a+1)/16.f*6.2831853f; dl.line(s[0]+cosf(a0)*rr,s[1]+sinf(a0)*rr, s[0]+cosf(a1)*rr,s[1]+sinf(a1)*rr, col,th); } drawFacingArrow(it.pos,q,col,th,0.6f); } break; }
               case sitem::NAVMESH: { drawNavWire(it, ui::withA(col, seld?210:120)); float mp[3]; itemMarkerPos(it,mp); float ms[2]; if (worldToScreen(mp,ms[0],ms[1])) { dl.rect(ms[0]-3*uiScale,ms[1]-3*uiScale,6*uiScale,6*uiScale,col); cx.textAligned(ms[0]+8*uiScale,ms[1]-8*uiScale,180*uiScale,16*uiScale,it.name.c_str(),col,0); } break; }
               case sitem::BOUNDARY: {   // kill-floor plane: a grid at it.pos + a normal arrow along the UnitAxis direction
