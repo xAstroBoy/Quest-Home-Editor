@@ -393,7 +393,13 @@ public:
         auto matTrs=[](const float* m,float* q,float* t,float* s){
             t[0]=m[12];t[1]=m[13];t[2]=m[14];
             s[0]=std::sqrt(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]); s[1]=std::sqrt(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]); s[2]=std::sqrt(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]);
-            float ix=s[0]>1e-8f?1/s[0]:0, iy=s[1]>1e-8f?1/s[1]:0, iz=s[2]>1e-8f?1/s[2]:0;
+            // det<0 = MIRRORED node (negative scale — e.g. the *_inside_* searchlight twins): all-positive sqrt
+            // scales force the rotation part to absorb the reflection = an IMPROPER matrix whose quaternion is
+            // GARBAGE → the mesh cooks rotated/positioned wrong ("out of place"). Negate ONE scale axis (x) so
+            // R = M·S⁻¹ is a proper rotation again.
+            float det = m[0]*(m[5]*m[10]-m[6]*m[9]) - m[4]*(m[1]*m[10]-m[2]*m[9]) + m[8]*(m[1]*m[6]-m[2]*m[5]);
+            if (det < 0.f) s[0] = -s[0];
+            float ix=std::fabs(s[0])>1e-8f?1/s[0]:0, iy=s[1]>1e-8f?1/s[1]:0, iz=s[2]>1e-8f?1/s[2]:0;
             float r0=m[0]*ix,r1=m[1]*ix,r2=m[2]*ix, r3=m[4]*iy,r4=m[5]*iy,r5=m[6]*iy, r6=m[8]*iz,r7=m[9]*iz,r8=m[10]*iz;
             float tr=r0+r4+r8;
             if(tr>0){float S=std::sqrt(tr+1)*2;q[3]=0.25f*S;q[0]=(r5-r7)/S;q[1]=(r6-r2)/S;q[2]=(r1-r3)/S;}
@@ -564,7 +570,13 @@ public:
         auto matTrs=[](const float* m,float* q,float* t,float* s){
             t[0]=m[12];t[1]=m[13];t[2]=m[14];
             s[0]=std::sqrt(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]); s[1]=std::sqrt(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]); s[2]=std::sqrt(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]);
-            float ix=s[0]>1e-8f?1/s[0]:0, iy=s[1]>1e-8f?1/s[1]:0, iz=s[2]>1e-8f?1/s[2]:0;
+            // det<0 = MIRRORED node (negative scale — e.g. the *_inside_* searchlight twins): all-positive sqrt
+            // scales force the rotation part to absorb the reflection = an IMPROPER matrix whose quaternion is
+            // GARBAGE → the mesh cooks rotated/positioned wrong ("out of place"). Negate ONE scale axis (x) so
+            // R = M·S⁻¹ is a proper rotation again.
+            float det = m[0]*(m[5]*m[10]-m[6]*m[9]) - m[4]*(m[1]*m[10]-m[2]*m[9]) + m[8]*(m[1]*m[6]-m[2]*m[5]);
+            if (det < 0.f) s[0] = -s[0];
+            float ix=std::fabs(s[0])>1e-8f?1/s[0]:0, iy=s[1]>1e-8f?1/s[1]:0, iz=s[2]>1e-8f?1/s[2]:0;
             float r0=m[0]*ix,r1=m[1]*ix,r2=m[2]*ix, r3=m[4]*iy,r4=m[5]*iy,r5=m[6]*iy, r6=m[8]*iz,r7=m[9]*iz,r8=m[10]*iz;
             float tr=r0+r4+r8;
             if(tr>0){float S=std::sqrt(tr+1)*2;q[3]=0.25f*S;q[0]=(r5-r7)/S;q[1]=(r6-r2)/S;q[2]=(r1-r3)/S;}
@@ -642,20 +654,40 @@ public:
         // Un-driven fallback stays correct too: skinMatrix = bindWorld·invBind = W0·inv(W0) = I → vert = W0·basePos = world rest.
         // HSR_RIGIDRELBIND restores the old identity-bind / rel-clip encoding.
         float w0q[4], w0t[3], w0s[3]; matTrs(W0.m, w0q, w0t, w0s);
+        if (std::getenv("HSR_VERBOSE")) {   // PROOF data for the bind: signed frame-0 scale + per-axis scale range over the loop
+            float smn[3]={1e30f,1e30f,1e30f}, smx[3]={-1e30f,-1e30f,-1e30f};
+            for (int f=0; f<NF; f++){ float q[4],t[3],s[3]; matTrs(mats[f].m,q,t,s);
+                for(int c=0;c<3;c++){ if(s[c]<smn[c])smn[c]=s[c]; if(s[c]>smx[c])smx[c]=s[c]; } }
+            fprintf(stderr,"[RIGIDBIND] mesh%d w0t=(%.1f,%.1f,%.1f) w0q=(%.3f,%.3f,%.3f,%.3f) w0s=(%.4f,%.4f,%.4f)%s sRange x[%.4f,%.4f] y[%.4f,%.4f] z[%.4f,%.4f]\n",
+                meshIdx, w0t[0],w0t[1],w0t[2], w0q[3],w0q[0],w0q[1],w0q[2], w0s[0],w0s[1],w0s[2],
+                (w0s[0]<0.f?" MIRRORED":""), smn[0],smx[0], smn[1],smx[1], smn[2],smx[2]);
+        }
         const bool cleanBind = !oneJoint && !std::getenv("HSR_RIGIDRELBIND");
-        const float w0su = (w0s[0]+w0s[1]+w0s[2]) / 3.f;   // bind uses one uniform scale per joint (billboard nodes are ~unit/uniform)
+        // BIND SCALE = 1 (the "beams out of place" fix). The device reconstructs invBind from the DECOMPOSED bind
+        // TRS with ONE UNIFORM scale per joint, and the ACL clip likewise carries ONE scale channel per joint. The
+        // old code baked rest/clip with the EXACT W0 (full per-axis scale) but bound with the uniform average w0su:
+        // for a node with NON-UNIFORM or NEGATIVE frame-0 scale (the color_beam stretch/mirror rigs) inv(bind)·W0≠I,
+        // and that constant error times the ~2400u node→verts lever = the beam rendered hundreds of units off.
+        // FIX: bind with UNIT scale (exactly representable) + store the clip's scale as the per-frame RATIO to the
+        // frame-0 scale (below) — constant-scale rigs then have ratio 1 everywhere: nothing for the device's single
+        // uniform channel to get wrong, and vert(f) = W(f)·inv(T0·R0)·(W0·basePos) = W(f)·basePos EXACTLY.
         if (oneJoint)        { e.jointCount=1; e.parents={-1}; e.jointPos={0,0,0}; e.jointQuat={1,0,0,0}; e.jointScale={1}; }
         else if (cleanBind)  { e.jointCount=2; e.parents={-1,0};
                                e.jointPos={0,0,0, w0t[0],w0t[1],w0t[2]};
                                e.jointQuat={1,0,0,0, w0q[3],w0q[0],w0q[1],w0q[2]};   // hzJointQuat is (w,x,y,z); matTrs q is (x,y,z,w)
-                               e.jointScale={1, w0su}; }
+                               e.jointScale={1, 1}; }
         else                 { e.jointCount=2; e.parents={-1,0}; e.jointPos={0,0,0, 0,0,0}; e.jointQuat={1,0,0,0, 1,0,0,0}; e.jointScale={1,1}; }
         const int nj = e.jointCount;                       // 1 (root only) or 2 (static root + moving child)
         const int mj = nj - 1;                             // the MOVING joint index (child if 2-joint, else the root)
         std::vector<float> trsv((size_t)NF*nj*10);
         for (int f=0; f<NF; f++) {
             float q[4],t[3],s[3];
-            if (cleanBind) { matTrs(mats[f].m, q, t, s); }                       // clip-local = the node's ACTUAL world matrix W(f) (ACL-clean)
+            if (cleanBind) { matTrs(mats[f].m, q, t, s);
+                             // scale as the RATIO to frame-0: the frame-0 per-axis (possibly negative/non-uniform)
+                             // scale is already IN the world-baked rest verts (rest = W0·basePos), so the clip only
+                             // carries the VARIATION. Constant-scale rigs => ratio 1 on every axis => the device's
+                             // single uniform scale channel is exact. vert(f) = T(f)R(f)·(s(f)/s0)·s0·basePos = W(f)·basePos.
+                             for (int c=0;c<3;c++) s[c] = (std::fabs(w0s[c])>1e-8f) ? s[c]/w0s[c] : 1.f; }
             else { float rel[16]; mat4mul(mats[f].m, invW0, rel); matTrs(rel, q, t, s); }   // legacy rel = W(f)·inv(W0)
             if (nj==2) { float* r=trsv.data()+(size_t)(f*nj+0)*10; r[0]=0;r[1]=0;r[2]=0;r[3]=1; r[4]=0;r[5]=0;r[6]=0; r[7]=1;r[8]=1;r[9]=1; }  // joint0 = STATIC identity (no root motion)
             float* p=trsv.data()+(size_t)(f*nj+mj)*10; p[0]=q[0];p[1]=q[1];p[2]=q[2];p[3]=q[3]; p[4]=t[0];p[5]=t[1];p[6]=t[2]; p[7]=s[0];p[8]=s[1];p[9]=s[2];

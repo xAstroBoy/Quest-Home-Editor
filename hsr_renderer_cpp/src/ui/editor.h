@@ -1424,6 +1424,200 @@ struct Editor {
     }
     void rotateMesh180(int mi){ rotateMeshGeom(mi, 1, 180); }
 
+    // ── DOME PATTERN ANALYSIS: characterize an existing dome's tessellation (so we can EXTEND its own
+    //    triangle pattern instead of replacing it). Reports: sphere center/radius, ring latitudes + per-ring
+    //    segment counts, azimuth coverage, edge-length stats, and open boundary loops. Data-only (no edits).
+    std::string analyzeDomePattern(int mi){
+        std::string o;
+        char b[256];
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size()) return "pattern: bad mesh index\n";
+        const MeshData& md=(*sceneMeshes)[(size_t)mi];
+        size_t nv=md.positions.size()/3; size_t ntri=md.indices.size()/3;
+        snprintf(b,sizeof b,"=== PATTERN mesh[%d] '%s'  nVerts=%zu nTris=%zu ===\n", mi, md.name.c_str(), nv, ntri); o+=b;
+        if (nv<3||md.indices.size()<3) return o+"  (no geometry)\n";
+        // center = bbox center; radius = mean dist
+        double c[3]={0,0,0}; float mn[3]={1e30f,1e30f,1e30f},mx[3]={-1e30f,-1e30f,-1e30f};
+        for(size_t v=0;v<nv;v++)for(int k=0;k<3;k++){ float p=md.positions[v*3+k]; mn[k]=std::min(mn[k],p); mx[k]=std::max(mx[k],p);}
+        for(int k=0;k<3;k++) c[k]=(mn[k]+mx[k])*0.5;
+        double rsum=0,rmin=1e30,rmax=0;
+        std::vector<double> vt(nv),vph(nv);
+        for(size_t v=0;v<nv;v++){ double dx=md.positions[v*3]-c[0],dy=md.positions[v*3+1]-c[1],dz=md.positions[v*3+2]-c[2];
+            double l=std::sqrt(dx*dx+dy*dy+dz*dz); rsum+=l; rmin=std::min(rmin,l); rmax=std::max(rmax,l);
+            double ll=l<1e-6?1:l; vt[v]=std::acos(std::clamp(dy/ll,-1.0,1.0)); vph[v]=std::atan2(dz,dx); }
+        double rmean=rsum/nv;
+        snprintf(b,sizeof b,"  bboxCenter=(%.2f,%.2f,%.2f)  radius mean=%.2f min=%.2f max=%.2f (spread=%.1f%%)\n",
+                 c[0],c[1],c[2], rmean,rmin,rmax, (rmax-rmin)/std::max(1e-6,rmean)*100.0); o+=b;
+        // LEAST-SQUARES SPHERE FIT (the TRUE sphere the cap lies on) + residual spread from THAT center
+        { double A[4][4]={{0}}, B4[4]={0};
+          for(size_t v=0;v<nv;v++){ double px=md.positions[v*3],py=md.positions[v*3+1],pz=md.positions[v*3+2];
+              double row[4]={2*px,2*py,2*pz,1.0}, rhs=px*px+py*py+pz*pz;
+              for(int i=0;i<4;i++){ for(int j=0;j<4;j++)A[i][j]+=row[i]*row[j]; B4[i]+=row[i]*rhs; } }
+          double M2[4][5]; for(int i=0;i<4;i++){for(int j=0;j<4;j++)M2[i][j]=A[i][j]; M2[i][4]=B4[i];}
+          bool ok=true; for(int cc=0;cc<4;cc++){ int piv=cc; for(int rr=cc+1;rr<4;rr++) if(std::fabs(M2[rr][cc])>std::fabs(M2[piv][cc]))piv=rr;
+              if(std::fabs(M2[piv][cc])<1e-12){ok=false;break;} for(int j=0;j<5;j++)std::swap(M2[cc][j],M2[piv][j]);
+              for(int rr=0;rr<4;rr++){ if(rr==cc)continue; double f=M2[rr][cc]/M2[cc][cc]; for(int j=cc;j<5;j++)M2[rr][j]-=f*M2[cc][j]; } }
+          if(ok){ double s[4]; for(int i=0;i<4;i++)s[i]=M2[i][4]/M2[i][i];
+              double Rf=std::sqrt(std::max(0.0,s[3]+s[0]*s[0]+s[1]*s[1]+s[2]*s[2]));
+              double fmn=1e30,fmx=0,frms=0; for(size_t v=0;v<nv;v++){ double dx=md.positions[v*3]-s[0],dy=md.positions[v*3+1]-s[1],dz=md.positions[v*3+2]-s[2];
+                  double l=std::sqrt(dx*dx+dy*dy+dz*dz); fmn=std::min(fmn,l); fmx=std::max(fmx,l); frms+=(l-Rf)*(l-Rf); } frms=std::sqrt(frms/nv);
+              snprintf(b,sizeof b,"  LS-FIT sphere center=(%.2f,%.2f,%.2f) R=%.2f  |v-C|:[%.1f..%.1f]  RMS residual=%.2f (%.1f%% of R)\n",
+                       s[0],s[1],s[2],Rf, fmn,fmx, frms, frms/std::max(1e-6,Rf)*100.0); o+=b; }
+          else o+="  LS-FIT sphere: FAILED (degenerate)\n"; }
+        // RINGS: sort polar angles, split into clusters where the gap exceeds a threshold
+        std::vector<double> ts=vt; std::sort(ts.begin(),ts.end());
+        double span=ts.back()-ts.front(); double thr=std::max(0.02, span/200.0);
+        std::vector<std::pair<double,int>> rings;  // (mean latitude, count)
+        { double acc=ts[0]; int cnt=1;
+          for(size_t i=1;i<ts.size();++i){ if(ts[i]-ts[i-1]>thr){ rings.push_back({acc/cnt, cnt}); acc=0; cnt=0; } acc+=ts[i]; cnt++; }
+          rings.push_back({acc/cnt,cnt}); }
+        snprintf(b,sizeof b,"  polar t range=[%.1f°..%.1f°]  detected %zu rings (gap thr=%.3f rad):\n",
+                 ts.front()*57.2958, ts.back()*57.2958, rings.size(), thr); o+=b;
+        // per-ring azimuth coverage: assign each vert to nearest ring, measure azimuth span + typical step
+        for(size_t ri=0; ri<rings.size() && ri<40; ++ri){ double rt=rings[ri].first;
+            std::vector<double> az;
+            for(size_t v=0;v<nv;v++) if(std::fabs(vt[v]-rt) <= thr) az.push_back(vph[v]);
+            std::sort(az.begin(),az.end());
+            double aspan = az.empty()?0 : (az.back()-az.front());
+            // median azimuth gap
+            double medstep=0; if(az.size()>1){ std::vector<double> g; for(size_t i=1;i<az.size();++i)g.push_back(az[i]-az[i-1]); std::sort(g.begin(),g.end()); medstep=g[g.size()/2]; }
+            int segFull = medstep>1e-4 ? (int)std::llround(2*3.14159265/medstep) : 0;
+            snprintf(b,sizeof b,"    ring %2zu  t=%6.1f°  verts=%3zu  azSpan=%6.1f°  medStep=%5.2f°  ->fullSegs~%d\n",
+                     ri, rt*57.2958, az.size(), aspan*57.2958, medstep*57.2958, segFull); o+=b;
+        }
+        // EDGE lengths (welded) + BOUNDARY loops
+        std::vector<std::vector<uint32_t>> loops; collectBoundaryLoops(md, loops);
+        snprintf(b,sizeof b,"  boundary loops (holes/rims): %zu\n", loops.size()); o+=b;
+        for(size_t li=0; li<loops.size() && li<12; ++li){ snprintf(b,sizeof b,"    loop %2zu: %zu edges\n", li, loops[li].size()); o+=b; }
+        return o;
+    }
+
+    // ── COMPLETE DOME: regenerate the sky dome as ONE UNIFORM sphere. The partial mesh (e.g.
+    //    bluehillsgoldmine VE_WESTERN sky_MTL, a perfect sphere CAP) is fitted to its sphere, then the WHOLE
+    //    thing is rebuilt as an ICOSPHERE — geodesic, uniform near-equilateral triangles EVERYWHERE, no pole
+    //    slivers, top identical to bottom. Its texture is re-baked into a standard equirect map (real imagery
+    //    rasterized to its true direction, empty parts push-pull inpainted) and the icosphere gets equirect
+    //    UVs, so it stays textured. Non-destructive (original soft-deleted; Ctrl+Z reverts).
+    void completeDome(int mi, bool fullSphere=false){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
+        MeshData md = (*sceneMeshes)[(size_t)mi];
+        size_t nv = md.positions.size()/3;
+        if (nv < 8 || md.indices.size() < 3) { setStatus("dome: mesh has no editable geometry"); return; }
+        const double PI = 3.14159265358979323846;
+        bool hasUV = md.uvs.size() >= nv*2;
+
+        // ── 1. least-squares SPHERE fit → centre C, radius R (V79 sky domes fit at 0.0% residual) ──
+        double C[3]={0,0,0}, R=0;
+        { double A[4][4]={{0}}, B4[4]={0};
+          for(size_t v=0;v<nv;v++){ double px=md.positions[v*3],py=md.positions[v*3+1],pz=md.positions[v*3+2];
+              double row[4]={2*px,2*py,2*pz,1.0}, rhs=px*px+py*py+pz*pz;
+              for(int i=0;i<4;i++){ for(int j=0;j<4;j++)A[i][j]+=row[i]*row[j]; B4[i]+=row[i]*rhs; } }
+          double M2[4][5]; for(int i=0;i<4;i++){for(int j=0;j<4;j++)M2[i][j]=A[i][j]; M2[i][4]=B4[i];}
+          bool ok=true; for(int cc=0;cc<4;cc++){ int piv=cc; for(int rr=cc+1;rr<4;rr++) if(std::fabs(M2[rr][cc])>std::fabs(M2[piv][cc]))piv=rr;
+              if(std::fabs(M2[piv][cc])<1e-12){ok=false;break;} for(int j=0;j<5;j++)std::swap(M2[cc][j],M2[piv][j]);
+              for(int rr=0;rr<4;rr++){ if(rr==cc)continue; double f=M2[rr][cc]/M2[cc][cc]; for(int j=cc;j<5;j++)M2[rr][j]-=f*M2[cc][j]; } }
+          if(!ok){ setStatus("dome: sphere fit failed"); return; }
+          double s[4]; for(int i=0;i<4;i++)s[i]=M2[i][4]/M2[i][i];
+          C[0]=s[0]; C[1]=s[1]; C[2]=s[2]; R=std::sqrt(std::max(0.0,s[3]+s[0]*s[0]+s[1]*s[1]+s[2]*s[2])); }
+        if (!(R>1e-3)) { setStatus("dome: degenerate sphere"); return; }
+
+        // ── 2. bake the original texture into a STANDARD equirect map (u=azimuth/2π, v=polar/π) ──
+        bool bakeTex = hasUV && md.hasTexture && !md.texRGBA.empty() && md.texW>0 && md.texH>0
+                       && md.texRGBA.size() >= (size_t)md.texW*md.texH*4;
+        std::vector<u8> canvas; const int TW=2048, TH=1024;
+        if (bakeTex) {
+            std::vector<double> vt(nv), vph(nv);
+            for (size_t v=0; v<nv; ++v){ double dx=md.positions[v*3]-C[0],dy=md.positions[v*3+1]-C[1],dz=md.positions[v*3+2]-C[2];
+                double l=std::sqrt(dx*dx+dy*dy+dz*dz); if(l<1e-6)l=1; vt[v]=std::acos(std::clamp(dy/l,-1.0,1.0)); vph[v]=std::atan2(dz,dx); }
+            int SW=(int)md.texW, SH=(int)md.texH; const std::vector<u8>& src=md.texRGBA;
+            auto sampleSrc=[&](double u,double vv,u8 out[3]){ u-=std::floor(u); vv-=std::floor(vv); double fx=u*SW-0.5,fy=vv*SH-0.5;
+                int x0=(int)std::floor(fx),y0=(int)std::floor(fy); double tx=fx-x0,ty=fy-y0;
+                auto S=[&](int x,int y,int c)->double{ x=std::clamp(x,0,SW-1); y=std::clamp(y,0,SH-1); return (double)src[((size_t)y*SW+x)*4+c]; };
+                for(int c=0;c<3;++c){ double a=S(x0,y0,c)*(1-tx)+S(x0+1,y0,c)*tx,b=S(x0,y0+1,c)*(1-tx)+S(x0+1,y0+1,c)*tx; out[c]=(u8)std::clamp(a*(1-ty)+b*ty,0.0,255.0); } };
+            canvas.assign((size_t)TW*TH*3,0); std::vector<u8> mask((size_t)TW*TH,0);
+            auto edge=[](double ax,double ay,double bx,double by,double px,double py){ return (bx-ax)*(py-ay)-(by-ay)*(px-ax); };
+            for (size_t k=0;k+2<md.indices.size();k+=3){ uint32_t id[3]={md.indices[k],md.indices[k+1],md.indices[k+2]};
+                if(id[0]>=nv||id[1]>=nv||id[2]>=nv) continue;
+                double eu[3],ev[3],ou[3],ov[3];
+                for(int c=0;c<3;c++){ eu[c]=(vph[id[c]]+PI)/(2*PI); ev[c]=std::clamp(vt[id[c]]/PI,0.0,1.0); ou[c]=md.uvs[id[c]*2]; ov[c]=md.uvs[id[c]*2+1]; }
+                double mnu=std::min({eu[0],eu[1],eu[2]}), mxu=std::max({eu[0],eu[1],eu[2]}); if(mxu-mnu>0.5) for(int c=0;c<3;c++) if(eu[c]<0.5)eu[c]+=1.0;
+                double px[3],py[3]; for(int c=0;c<3;c++){ px[c]=eu[c]*TW; py[c]=ev[c]*TH; }
+                double area=edge(px[0],py[0],px[1],py[1],px[2],py[2]); if(std::fabs(area)<1e-9)continue;
+                int x0=(int)std::floor(std::min({px[0],px[1],px[2]})),x1=(int)std::ceil(std::max({px[0],px[1],px[2]}));
+                int y0=std::clamp((int)std::floor(std::min({py[0],py[1],py[2]})),0,TH-1),y1=std::clamp((int)std::ceil(std::max({py[0],py[1],py[2]})),0,TH-1);
+                for(int y=y0;y<=y1;y++)for(int x=x0;x<=x1;x++){ double sx=x+0.5,sy=y+0.5;
+                    double w0=edge(px[1],py[1],px[2],py[2],sx,sy)/area,w1=edge(px[2],py[2],px[0],py[0],sx,sy)/area,w2=1.0-w0-w1;
+                    if(w0<-1e-4||w1<-1e-4||w2<-1e-4)continue;
+                    double ux=w0*ou[0]+w1*ou[1]+w2*ou[2],vx=w0*ov[0]+w1*ov[1]+w2*ov[2];
+                    int xx=((x%TW)+TW)%TW; size_t pi=(size_t)y*TW+xx; sampleSrc(ux,vx,&canvas[pi*3]); mask[pi]=1; } }
+            // push-pull inpaint the uncovered region so it's never blank
+            std::vector<std::vector<float>> LC,LW2; std::vector<int> LWd,LHt;
+            { std::vector<float> c((size_t)TW*TH*3,0),w((size_t)TW*TH,0);
+              for(size_t i=0;i<(size_t)TW*TH;i++) if(mask[i]){ c[i*3]=canvas[i*3]/255.f;c[i*3+1]=canvas[i*3+1]/255.f;c[i*3+2]=canvas[i*3+2]/255.f;w[i]=1.f; }
+              LC.push_back(std::move(c)); LW2.push_back(std::move(w)); LWd.push_back(TW); LHt.push_back(TH); }
+            while(LWd.back()>1||LHt.back()>1){ int cw=LWd.back(),ch=LHt.back(),pw=std::max(1,cw/2),ph=std::max(1,ch/2);
+                const auto& cc=LC.back(); const auto& cw2=LW2.back(); std::vector<float> c((size_t)pw*ph*3,0),w((size_t)pw*ph,0);
+                for(int y=0;y<ph;y++)for(int x=0;x<pw;x++){ float sw=0,sc[3]={0,0,0};
+                    for(int dy=0;dy<2;dy++)for(int dx=0;dx<2;dx++){ int sx=std::min(x*2+dx,cw-1),sy=std::min(y*2+dy,ch-1); size_t si=(size_t)sy*cw+sx; float ww=cw2[si]; sw+=ww; for(int t=0;t<3;t++)sc[t]+=cc[si*3+t]*ww; }
+                    size_t pi=(size_t)y*pw+x; if(sw>0)for(int t=0;t<3;t++)c[pi*3+t]=sc[t]/sw; w[pi]=std::min(1.f,sw*0.25f); }
+                LC.push_back(std::move(c)); LW2.push_back(std::move(w)); LWd.push_back(pw); LHt.push_back(ph); }
+            for(int l=(int)LC.size()-2;l>=0;l--){ int cw=LWd[l],ch=LHt[l],pw=LWd[l+1]; auto& cc=LC[l]; auto& cw2=LW2[l]; const auto& pc=LC[l+1]; const auto& pw2=LW2[l+1];
+                for(int y=0;y<ch;y++)for(int x=0;x<cw;x++){ size_t ci=(size_t)y*cw+x; float ownW=cw2[ci]; if(ownW>=0.999f)continue;
+                    int qx=std::min(x/2,pw-1),qy=std::min(y/2,LHt[l+1]-1); size_t pi=(size_t)qy*pw+qx; if(pw2[pi]<=0)continue;
+                    for(int t=0;t<3;t++)cc[ci*3+t]=cc[ci*3+t]*ownW+pc[pi*3+t]*(1.f-ownW); cw2[ci]=1.f; } }
+            const auto& c0=LC[0]; for(size_t i=0;i<(size_t)TW*TH;i++) if(!mask[i]) for(int t=0;t<3;t++) canvas[i*3+t]=(u8)std::clamp(c0[i*3+t]*255.f,0.f,255.f);
+        }
+
+        // ── 3. build a UNIFORM ICOSPHERE (subdivided icosahedron) → the new, consistent geometry ──
+        const double gt=(1.0+std::sqrt(5.0))/2.0;
+        std::vector<std::array<double,3>> P = {
+            {-1,gt,0},{1,gt,0},{-1,-gt,0},{1,-gt,0}, {0,-1,gt},{0,1,gt},{0,-1,-gt},{0,1,-gt}, {gt,0,-1},{gt,0,1},{-gt,0,-1},{-gt,0,1} };
+        for (auto& p : P){ double l=std::sqrt(p[0]*p[0]+p[1]*p[1]+p[2]*p[2]); p[0]/=l;p[1]/=l;p[2]/=l; }
+        std::vector<std::array<uint32_t,3>> F = {
+            {0,11,5},{0,5,1},{0,1,7},{0,7,10},{0,10,11}, {1,5,9},{5,11,4},{11,10,2},{10,7,6},{7,1,8},
+            {3,9,4},{3,4,2},{3,2,6},{3,6,8},{3,8,9}, {4,9,5},{2,4,11},{6,2,10},{8,6,7},{9,8,1} };
+        const int SUB = 5;   // 20*4^5 = 20480 tris (matches the game's own full dome density)
+        std::map<uint64_t,uint32_t> midCache;
+        auto midpoint=[&](uint32_t a, uint32_t b)->uint32_t{
+            uint64_t key = a<b ? ((uint64_t)a<<32|b) : ((uint64_t)b<<32|a);
+            auto it=midCache.find(key); if(it!=midCache.end()) return it->second;
+            std::array<double,3> m={ (P[a][0]+P[b][0])*0.5,(P[a][1]+P[b][1])*0.5,(P[a][2]+P[b][2])*0.5 };
+            double l=std::sqrt(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]); m[0]/=l;m[1]/=l;m[2]/=l;
+            uint32_t idx=(uint32_t)P.size(); P.push_back(m); midCache[key]=idx; return idx; };
+        for (int s=0;s<SUB;++s){ std::vector<std::array<uint32_t,3>> F2; F2.reserve(F.size()*4);
+            for (auto& f : F){ uint32_t a=midpoint(f[0],f[1]), b=midpoint(f[1],f[2]), c=midpoint(f[2],f[0]);
+                F2.push_back({f[0],a,c}); F2.push_back({f[1],b,a}); F2.push_back({f[2],c,b}); F2.push_back({a,b,c}); }
+            F.swap(F2); }
+
+        // ── 4. write the icosphere into md: positions on the fitted sphere, equirect UVs, seam-split ──
+        md.positions.clear(); md.uvs.clear(); md.indices.clear();
+        md.colors.clear(); md.uvs2.clear(); md.uvs3.clear(); md.uvs4.clear();
+        md.positions.reserve(P.size()*3); md.uvs.reserve(P.size()*2);
+        std::vector<double> U(P.size());
+        for (size_t i=0;i<P.size();++i){ const auto& d=P[i];
+            md.positions.push_back((float)(C[0]+R*d[0])); md.positions.push_back((float)(C[1]+R*d[1])); md.positions.push_back((float)(C[2]+R*d[2]));
+            double u=(std::atan2(d[2],d[0])+PI)/(2*PI), v=std::acos(std::clamp(d[1],-1.0,1.0))/PI;
+            U[i]=u; md.uvs.push_back((float)u); md.uvs.push_back((float)v); }
+        // seam fix: a triangle spanning the u=0/1 wrap gets its low-u corners duplicated at u+1 (no smear)
+        std::map<uint32_t,uint32_t> seamDup;
+        auto seamVert=[&](uint32_t v)->uint32_t{ auto it=seamDup.find(v); if(it!=seamDup.end())return it->second;
+            uint32_t idx=(uint32_t)(md.positions.size()/3);
+            md.positions.push_back(md.positions[v*3]); md.positions.push_back(md.positions[v*3+1]); md.positions.push_back(md.positions[v*3+2]);
+            md.uvs.push_back((float)(U[v]+1.0)); md.uvs.push_back(md.uvs[v*2+1]); seamDup[v]=idx; return idx; };
+        for (auto& f : F){ uint32_t a=f[0],b=f[1],c=f[2];
+            double mn=std::min({U[a],U[b],U[c]}), mx=std::max({U[a],U[b],U[c]});
+            if (mx-mn>0.5){ if(U[a]<0.5)a=seamVert(a); if(U[b]<0.5)b=seamVert(b); if(U[c]<0.5)c=seamVert(c); }
+            md.indices.push_back(a); md.indices.push_back(b); md.indices.push_back(c); }
+        md.doubleSided = true;   // sky dome viewed from inside
+        if (bakeTex){ std::vector<u8> rgba((size_t)TW*TH*4,255);
+            for(size_t i=0;i<(size_t)TW*TH;i++){ rgba[i*4]=canvas[i*3]; rgba[i*4+1]=canvas[i*3+1]; rgba[i*4+2]=canvas[i*3+2]; }
+            md.texRGBA.swap(rgba); md.texW=TW; md.texH=TH; md.hasTexture=true; md.srcAstc.clear(); md.srcAstcBw=md.srcAstcBh=md.srcAstcMips=0; }
+
+        size_t tris=F.size();
+        if (commitGeomEdit(mi, std::move(md), fullSphere?"completeSphere":"completeDome"))
+            setStatus("Regenerated a UNIFORM icosphere ("+std::to_string(tris)+" even tris, no poles)"
+                      +std::string(bakeTex?" + equirect sky map":"")+" - Ctrl+Z reverts");
+    }
+
     // ── FUSE the multi-selection into ONE mesh: every source's CURRENT world transform is baked into
     //    the vertices, geometry concatenated, and EVERY SOURCE KEEPS ITS OWN TEXTURE — the textures are
     //    packed into ONE ATLAS (identical textures share a cell) and each source's UVs are remapped into
@@ -3077,6 +3271,8 @@ struct Editor {
             {"Mirror X",24,-1},{"Mirror Y",25,-1},{"Mirror Z",26,-1},
             {"Rotate Y +90 (repeat to stack)",28,-1},{"Rotate Y 180",29,-1},
             {"Rotate X +90",30,-1},{"Rotate Z +90",31,-1},
+            {std::string("Complete DOME (partial sky -> full 360°)")+suf,46,-1},
+            {std::string("Complete SPHERE (360° enclosed, closes bottom)")+suf,47,-1},
             {std::string("Fuse selection into ONE mesh")+suf,32,-1},
             {std::string("Fuse + REBUILD surface")+suf+" (clean retri)",42,-1},
             {std::string("Re-UV flat (texture spans ONCE)")+suf,39,-1} };
@@ -3126,7 +3322,7 @@ struct Editor {
                 else if (a==8) { if (!inSel(ctxMesh)) selectOne(ctxMesh); duplicateSelected(); }   // clone selection (independent copy, cooks too)
                 else if (a==9) { if (!inSel(ctxMesh)) selectOne(ctxMesh); toggleDeleteSelected(); }  // drop from render + cook (Ctrl+Z restores)
                 else if (a==18) { if (!inSel(ctxMesh)) selectOne(ctxMesh); gizmoOp=2; tab=TAB_OBJECT;   // STRETCH: per-axis Scale gizmo + the Object tab's Scale fields
-                                  setStatus("Scale gizmo ON - drag a box handle to stretch per-axis (or type in Object > Scale)"); }
+                                  setStatus("Scale gizmo ON - drag a box handle to stretch per-axis, or the CENTER square for uniform (all 3 axes) - or type in Object > Scale"); }
                 // GEOMETRY ops apply to the WHOLE multi-selection (each source -> its own result, all re-selected)
                 else if (a==19) forEachSelMesh([&](int m){ extendMeshBoundary(m, extendDist, 0); });   // grow DOWN off open edges
                 else if (a==20) forEachSelMesh([&](int m){ extendMeshBoundary(m, extendDist, 1); });   // grow OUTWARD (radial)
@@ -3152,6 +3348,8 @@ struct Editor {
                 else if (a==37) forEachSelMesh([&](int m){ sliceMesh(m, 2); });
                 else if (a==44) startSliceGizmo(ctxHitValid?ctxHitP:nullptr);
                 else if (a==45) startKnife();
+                else if (a==46) forEachSelMesh([&](int m){ completeDome(m, false); });  // partial sky dome -> full 360° dome (to the rim)
+                else if (a==47) forEachSelMesh([&](int m){ completeDome(m, true);  });  // -> fully enclosed 360° sphere (closes the bottom)
                 else if (a==38) { patchMode=!patchMode; patchPts.clear(); patchCols.clear();
                                   if (patchMode) setStatus("PATCH: click the gap's corner points in the viewport (3+), Enter builds, Esc cancels"); }
                 else if (a==39) forEachSelMesh([&](int m){ reUVFlat(m); });
@@ -4565,6 +4763,9 @@ struct Editor {
                 for (int s=0;s<32;s++){ float d=distToSeg(mx,my, gzRing[k][s][0],gzRing[k][s][1], gzRing[k][s+1][0],gzRing[k][s+1][1]); if (d<bestD){bestD=d;best=k;} } }
             return best;
         }
+        // SCALE: the center square = UNIFORM scale (all 3 axes at once). Test it FIRST with a tight radius —
+        // every axis handle STARTS at the origin, so without priority the axes would always win at the center.
+        if (gizmoOp==2 && std::hypot(mx-gzOrigin[0], my-gzOrigin[1]) < 8*uiScale) return 3;
         float bestD=14*uiScale;
         for (int k=0;k<3;k++){ if (lockAxis[k]) continue; float d=distToSeg(mx,my, gzOrigin[0],gzOrigin[1], gzTip[k][0],gzTip[k][1]); if (d<bestD){bestD=d;best=k;} }
         return best;
@@ -4648,14 +4849,29 @@ struct Editor {
                 cx.textAligned(ts[0]+hs+1, ts[1]-8*uiScale, 14*uiScale, 16*uiScale, axn[k], c, 0);
             }
         }
-        dl.rect(os[0]-4*uiScale, os[1]-4*uiScale, 8*uiScale, 8*uiScale, ui::rgba(240,240,240));        // center pivot square
+        // center pivot square — in SCALE mode it's a HANDLE (uniform scale of all 3 axes); light it up when hot
+        bool uniHot = gizmoOp==2 && (gizmoHitTest((float)cx.in.mx,(float)cx.in.my)==3 || (gizmoDrag&&gizmoAxis==3));
+        float cps = uniHot ? 6*uiScale : 4*uiScale;
+        dl.rect(os[0]-cps, os[1]-cps, cps*2, cps*2, uniHot?ui::rgba(255,235,80):ui::rgba(240,240,240));
         gzVisible = true;
         dl.popClip();
         // apply an in-progress drag (uses this frame's accumulated mouse delta) to the WHOLE selection
         if (gizmoDrag && gizmoAxis>=0 && cx.in.down[0] && (cx.in.dmx!=0||cx.in.dmy!=0)) applyGizmoDrag(len);
     }
     void applyGizmoDrag(float len) {
-        int k=gizmoAxis; float* A=gzAxisW[k];
+        int k=gizmoAxis;
+        if (gizmoOp==2 && k==3 && !sliceGizmoOn) {   // ── UNIFORM SCALE: the center square drags all 3 axes together ──
+            float f = 1.f + (cx.in.dmx - cx.in.dmy)*0.005f;   // move right / up = grow
+            if (selItem>=0 && selItem<(int)items.size()) {
+                auto& it=items[selItem];
+                if (!(editExit && it.type==sitem::CHAIR)) for (int a2=0;a2<3;a2++) it.scale[a2]=std::max(0.01f, it.scale[a2]*f);
+                return;
+            }
+            for (int m : sel){ if(m<0||m>=(int)r->gpuMeshes.size())continue; VkGpuMesh& gm=r->gpuMeshes[m];
+                for (int a2=0;a2<3;a2++) gm.editS[a2]=std::max(0.001f, gm.editS[a2]*f); recomputeModel(gm); }
+            return;
+        }
+        float* A=gzAxisW[k];
         if (lockAxis[k]) return;   // axis locked mid-drag (Shift+X/Y/Z during a grab) -> freeze it
         if (sliceGizmoOn && selItem<0) {   // the gizmo drives the SLICE PLANE, not the meshes
             if (gizmoOp==1) { float ang = cx.in.dmx * 0.0075f * (gzAxisFace[k]>0?-1.f:1.f);
@@ -4797,14 +5013,23 @@ struct Editor {
                    if (hzAnimExtractor) hzAnimExtractor((int)i,64,em); }
             if (md.hasTexture && md.texRGBA.size()>=(size_t)md.texW*md.texH*4){ em.rgba=md.texRGBA; em.w=md.texW; em.h=md.texH;
                 em.srcAstc=md.srcAstc; em.srcAstcBw=md.srcAstcBw; em.srcAstcBh=md.srcAstcBh; em.srcAstcMips=md.srcAstcMips; }
-            // TWO-PASS foliage: skinned masked foliage renders as smooth BLEND (no depth-write). Emit a DEPTH-WRITE
-            // cutout SIBLING (same skinning/geometry, distinct name so it's a separate asset; the skel+anim dedup by
-            // bytes = no extra skeleton) drawn in the opaque pass so the foliage OCCLUDES correctly, with the blend
-            // painting the smooth edges on top. = the device's a2c foliage look (smooth + depth), via two draws.
+            // TWO-PASS foliage: FUNDAMENTALLY BROKEN and disabled by default (opt-in HSR_FOLIAGE_2PASS). The opaque
+            // depth-write cutout SIBLING is drawn behind the transparent blend, but the blend is see-through so the
+            // BLOCKY cutout edges show THROUGH it -> "leaves back to being blocky". Shrinking the cutout doesn't help
+            // (it's still visible through the transparent leaf). The only real smooth+depth path is alpha-to-coverage.
             bool foliage2pass = em.alphaTest && em.hzJointCount > 0 && !em.blend && !em.additive && std::getenv("HSR_FOLIAGE_2PASS");
             hslcook::ExportMesh prepass; if (foliage2pass) prepass = em;   // copy BEFORE the move (keeps all skinning)
             ems.push_back(std::move(em));
-            if (foliage2pass) { prepass.depthPrepass = true; prepass.name += "_depthwr"; ems.push_back(std::move(prepass)); }
+            if (foliage2pass) {
+                prepass.depthPrepass = true; prepass.name += "_depthwr";
+                // shrink toward centroid (~1.5%) so the cutout is just behind the blend surface (blend wins the depth test)
+                auto shrink = [](std::vector<float>& p){ if (p.size()<9) return; double c[3]={0,0,0}; size_t n=p.size()/3;
+                    for (size_t v=0; v<n; v++){ c[0]+=p[v*3]; c[1]+=p[v*3+1]; c[2]+=p[v*3+2]; } c[0]/=n; c[1]/=n; c[2]/=n;
+                    const float s = 0.985f;   // 1.5% inward
+                    for (size_t v=0; v<n; v++){ p[v*3]=(float)(c[0]+(p[v*3]-c[0])*s); p[v*3+1]=(float)(c[1]+(p[v*3+1]-c[1])*s); p[v*3+2]=(float)(c[2]+(p[v*3+2]-c[2])*s); } };
+                shrink(prepass.positions); shrink(prepass.hzRestPos);
+                ems.push_back(std::move(prepass));
+            }
         }
         if(skyPreviewMesh<0) appendSkyboxMesh(ems);   // GENERAL skybox -> far sky sphere in the cook (if a live preview sphere exists it's already in sceneMeshes, so don't double-emit)
         return ems;
@@ -5284,6 +5509,11 @@ struct Editor {
         // surface (haven2025's = ~272 tris), NOT the raw render geometry: a 10k-tri road SEBD TIMES OUT the device
         // loader (18s) -> abort -> fallback to nuxd. We rasterize the walkable (up-facing) faces into ~5m cells and
         // emit one quad per occupied cell at its surface height -> a few hundred tris that load instantly + are walkable.
+        // A MESH COLLIDER (added via "Add Mesh Collider" -> "Collider (...)") is an EXACT solid obstacle, not a
+        // walkable navmesh: keep EVERY triangle at ANY orientation. Without this the slope filter dropped
+        // down-/side-facing faces — so a PATCH sheet (whose winding can point away from +Y) contributed NO
+        // collision ("patch not counted"). Exact colliders respect the mesh's own geometry/plane verbatim.
+        bool exactCollider = isMeshColliderItem(si);
         struct TB { float ax,ay,az, bx,by,bz, cx,cy,cz; };   // a walkable triangle (full verts, for height interpolation)
         std::vector<TB> tb; float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f};
         for (int m:ms){ if(m<0||m>=(int)r->gpuMeshes.size())continue; auto& gm=r->gpuMeshes[m];
@@ -5299,6 +5529,7 @@ struct Editor {
                 // made roof/air junk. navMode 2 = 0.05, navMode 1 = 0.15. HSR_NAVSLOPE overrides for diag.
                 float slopeMin = (si.navMode==2) ? 0.05f : 0.15f;
                 if (solidCollision) slopeMin = 0.0f;   // include the vertical walls (the trimesh handles them cleanly; boxes didn't)
+                if (exactCollider)  slopeMin = -2.0f;  // exact solid obstacle: keep ALL faces (unit ny/nl >= -1 > -2 always) incl. patches
                 if(const char* e=std::getenv("HSR_NAVSLOPE")){ float s=(float)atof(e); if(s>=0.0f) slopeMin=s; }
                 float nl=std::sqrt(nx*nx+ny*ny+nz*nz); if(nl<1e-9f || ny/nl < slopeMin) continue;   // signed -> floor + walls, drop ceilings
                 tb.push_back(TB{wa[0],wa[1],wa[2], wb[0],wb[1],wb[2], wc[0],wc[1],wc[2]});
