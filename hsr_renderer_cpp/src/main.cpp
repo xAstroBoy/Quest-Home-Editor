@@ -70,14 +70,44 @@ static LONG WINAPI hsrCrashHandler(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;  // terminate after reporting
 }
 
-// ── HSR_LIVE HTTP control server ───────────────────────────────────────────────────────────────
+#else
+// POSIX crash reporter — same _crash.txt contract as the Win32 handler (raw backtrace; feed the
+// addresses to addr2line/atos against the same binary for file:line).
+#include <csignal>
+#include <execinfo.h>
+static void hsrPosixCrash(int sig) {
+    void* frames[48]; int n = backtrace(frames, 48);
+    fprintf(stderr, "\n[CRASH] signal %d\n", sig);
+    if (FILE* cf = fopen("_crash.txt", "w")) {
+        fprintf(cf, "[CRASH] signal %d\n", sig);
+        backtrace_symbols_fd(frames, n, fileno(cf));
+        fclose(cf);
+    }
+    backtrace_symbols_fd(frames, n, 2);
+    signal(sig, SIG_DFL); raise(sig);   // rethrow with the default action (core dump etc.)
+}
+#endif
+
+// ── HSR_LIVE HTTP control server (all platforms — Winsock or BSD sockets) ─────────────────────
 // A tiny localhost HTTP server so the renderer loads ONCE and is driven live (no relaunch, no files).
 // POST the command block (newline-separated, same syntax as the comments in the render loop) in the
 // request body; the response body carries the result (farscan/listmesh dumps, or "ok"/"shot <path>").
 // The socket thread only enqueues raw text under a mutex; ALL renderer/Vulkan state is touched solely
 // by the main thread, which drains the queue each frame — so this never races the GPU.
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+typedef int SOCKET;
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET (-1)
+#endif
+#define closesocket ::close
+#endif
 #include <thread>
 #include <mutex>
 #include <deque>
@@ -87,13 +117,15 @@ static std::mutex          g_liveMx;
 static std::deque<LiveCmd*> g_liveQ;
 std::atomic<bool>          g_audioMuted{false};   // PC preview-audio mute: the editor's "Play preview audio" toggle binds here; audio.h's data callback reads it (defined non-static so editor.h/audio.h externs resolve)
 static void hsrHttpServer(int port) {
+#ifdef _WIN32
     WSADATA w; if (WSAStartup(MAKEWORD(2,2), &w) != 0) { fprintf(stderr, "[HTTP] WSAStartup failed\n"); return; }
+#endif
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     int yes = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (char*)&yes, sizeof yes);
-    sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons((u_short)port);
+    sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons((unsigned short)port);
     inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
     if (bind(ls, (sockaddr*)&a, sizeof a) != 0 || listen(ls, 8) != 0) {
-        fprintf(stderr, "[HTTP] bind/listen failed on port %d (err %d)\n", port, WSAGetLastError()); return;
+        fprintf(stderr, "[HTTP] bind/listen failed on port %d\n", port); return;
     }
     fprintf(stderr, "[HTTP] live control on http://127.0.0.1:%d  (POST commands in body)\n", port);
     for (;;) {
@@ -115,7 +147,7 @@ static void hsrHttpServer(int port) {
         if (hp != std::string::npos && hp + 4 < req.size()) cmds = req.substr(hp + 4);
         LiveCmd lc; lc.text = cmds;
         { std::lock_guard<std::mutex> g(g_liveMx); g_liveQ.push_back(&lc); }
-        while (!lc.done.load(std::memory_order_acquire)) Sleep(1);
+        while (!lc.done.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
         std::string body = lc.result.empty() ? "ok\n" : lc.result;
         char hdr[160]; int hl = snprintf(hdr, sizeof hdr,
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", body.size());
@@ -123,7 +155,6 @@ static void hsrHttpServer(int port) {
         closesocket(c);
     }
 }
-#endif
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -279,18 +310,11 @@ static void paintLoadSplash(HWND hwnd, const char* envName, bool waitingForDrop)
 }
 #endif
 
-#ifdef _WIN32
+// Spawn a fresh editor instance on `apk` (drag-drop reload path). Portable: Win32 CreateProcess /
+// POSIX background shell spawn — both inherit our environment (all HSR_* params carry over).
 static void relaunchSelf(const std::string& apk) {
-    char exe[MAX_PATH]; GetModuleFileNameA(NULL, exe, MAX_PATH);
-    std::string cmd = std::string("\"") + exe + "\" \"" + apk + "\"";
-    std::vector<char> cmdv(cmd.begin(), cmd.end()); cmdv.push_back(0);
-    STARTUPINFOA si{}; si.cb = sizeof(si); PROCESS_INFORMATION pi{};
-    // lpEnvironment = NULL -> inherit our environment (all HSR_* params carry over)
-    if (CreateProcessA(exe, cmdv.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    }
+    AppConfig::launchDetached(AppConfig::exePath(), apk);
 }
-#endif
 
 static void updateMeshSelection(int idx) {
     if (!g_renderer || g_renderer->gpuMeshes.empty()) return;
@@ -385,6 +409,9 @@ int main(int argc, char** argv) {
     // in a normal session. Previously WSAStartup only ran inside hsrHttpServer() (HSR_LIVE mode), so in the plain
     // editor every socket() returned INVALID_SOCKET -> "Quest: ON" pause/scrub silently sent NOTHING to the bridge.
     { WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa); }
+#else
+    for (int sig : { SIGSEGV, SIGABRT, SIGILL, SIGFPE, SIGBUS })
+        signal(sig, hsrPosixCrash);                 // crash → backtrace in stderr + _crash.txt (POSIX parity)
 #endif
     // Record the exe's own directory so APK signing can find/auto-create the Android build-tools + debug keystore
     // right beside the exe (a machine with no Android SDK just needs the tools dropped next to the exe).
@@ -1199,16 +1226,12 @@ int main(int argc, char** argv) {
     const char* liveEnv  = std::getenv("HSR_LIVE");
     bool        liveMode = liveEnv != nullptr;
     std::string pendingShot, pendingShotOut;
-#ifdef _WIN32
     LiveCmd*    pendingShotCmd = nullptr;   // the command whose shot completes after the next render
-#endif
     if (liveMode) {
         shotQuit = false; shotPath = nullptr;   // never auto-quit / one-shot in live mode
-#ifdef _WIN32
         int port = atoi(liveEnv); if (port <= 1) port = 8777;
         std::thread(hsrHttpServer, port).detach();
         fprintf(stderr, "[LIVE] ready - HTTP control on :%d (curl --data 'cam=..\\nshot=path' 127.0.0.1:%d)\n", port, port);
-#endif
     }
     auto animStart = std::chrono::high_resolution_clock::now();
     // HSR_ANIMTIME=<sec> forces a fixed animation pose (deterministic capture / debugging).
@@ -1775,7 +1798,6 @@ int main(int argc, char** argv) {
         //   geometry flung far away that tears holes) | matinfo=i (shader/VAT/bones/blend flags)
         //   dump=i (FULL data-extract for ONE mesh: coordinates/shader/material/matParams/textures/
         //          animation/skeleton/components — the cooker ground-truth reference) | quit
-#ifdef _WIN32
         if (liveMode && uploadNext >= uploadEnd) {   // DEFER live commands until the scene finished streaming in (a shot/listmesh mid-upload would see a partial scene)
             std::vector<LiveCmd*> batch;
             { std::lock_guard<std::mutex> g(g_liveMx); while (!g_liveQ.empty()) { batch.push_back(g_liveQ.front()); g_liveQ.pop_front(); } }
@@ -2081,7 +2103,6 @@ int main(int argc, char** argv) {
                 else { pendingShot = shotThis; pendingShotOut = out; pendingShotCmd = lc; }  // finished after render (below)
             }
         }
-#endif
 
         // V79 glTF skeletal animation: sample the clip and stream skinned positions into
         // each dynamic mesh's persistently-mapped VBO (vertex position is at offset 0).
@@ -2244,9 +2265,7 @@ int main(int argc, char** argv) {
                 g_doReload = false; g_dropPath.clear();
             }
             else if (interactive) { nextEnv = g_dropPath; g_doReload = false; g_dropPath.clear(); break; }
-#ifdef _WIN32
             relaunchSelf(g_dropPath);
-#endif
             break;
         }
         // Editor-driven swap (Cook panel: "Preview cooked (HSL)" / "Back to source") - same in-place reload.
@@ -2268,13 +2287,11 @@ int main(int argc, char** argv) {
         if (liveMode && !pendingShot.empty()) {
             vkRenderer.screenshot(pendingShot.c_str());
             fprintf(stderr, "[LIVE] shot -> %s\n", pendingShot.c_str());
-#ifdef _WIN32
             if (pendingShotCmd) {
                 pendingShotCmd->result = pendingShotOut + "shot " + pendingShot + "\n";
                 pendingShotCmd->done.store(true, std::memory_order_release);
                 pendingShotCmd = nullptr;
             }
-#endif
             pendingShot.clear(); pendingShotOut.clear();
         }
 

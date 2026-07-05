@@ -30,19 +30,33 @@ add_library(miniz
 )
 target_include_directories(miniz PUBLIC "${MINIZ_DIR}")
 
-# ── astcenc (ARM ASTC — AVX2) — FULL encoder+decoder so the cooker can ENCODE textures (RGBA8->ASTC)
-#    as well as the renderer DECODE them. (DECOMPRESSOR OFF = full build; target = astcenc-avx2-static.) ──
+# ── astcenc (ARM ASTC) — FULL encoder+decoder so the cooker can ENCODE textures (RGBA8->ASTC)
+#    as well as the renderer DECODE them. (DECOMPRESSOR OFF = full build.)
+#    ISA: the old hardcoded AVX2 build crashed with 0xc000001d (illegal instruction) on any CPU
+#    without AVX2 (pre-2013 Intel, e.g. a 3rd-gen i5 — GitHub issue #1). Default is the broadly
+#    compatible ISA per arch (SSE4.1 on x86-64 = every 64-bit CPU since ~2008; NEON on arm64);
+#    -DHSR_AVX2=ON opts back into the ~1.3x faster AVX2 encoder for your own machine. ──
+option(HSR_AVX2 "Build astcenc with AVX2 (faster cooks; needs a 2013+ CPU — crashes older ones)" OFF)
 include(FetchContent)
 FetchContent_Declare(astcenc
     GIT_REPOSITORY https://github.com/ARM-software/astc-encoder.git
     GIT_TAG 4.8.0
     GIT_SHALLOW TRUE
 )
-set(ASTCENC_ISA_AVX2    ON  CACHE BOOL "" FORCE)
 set(ASTCENC_DECOMPRESSOR OFF CACHE BOOL "" FORCE)
-set(ASTCENC_CLI         OFF CACHE BOOL "" FORCE)
+set(ASTCENC_CLI          OFF CACHE BOOL "" FORCE)
+set(ASTCENC_UNIVERSAL_BUILD OFF CACHE BOOL "" FORCE)   # macOS: pick the ISA explicitly per arch below
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(ASTCENC_ISA_NEON ON CACHE BOOL "" FORCE)
+    set(ASTCENC_LIB astcenc-neon-static)
+elseif(HSR_AVX2)
+    set(ASTCENC_ISA_AVX2 ON CACHE BOOL "" FORCE)
+    set(ASTCENC_LIB astcenc-avx2-static)
+else()
+    set(ASTCENC_ISA_SSE41 ON CACHE BOOL "" FORCE)
+    set(ASTCENC_LIB astcenc-sse4.1-static)
+endif()
 FetchContent_MakeAvailable(astcenc)
-set(ASTCENC_LIB astcenc-avx2-static)
 
 # ── libopus (xiph) — DECODER for Ogg-Opus env audio. Half the official V79 envs (storybook,
 #    polarvillage, underwater, ...) ship their background loop as Ogg-OPUS, which stb_vorbis can't

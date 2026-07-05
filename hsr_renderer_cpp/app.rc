@@ -1,0 +1,2 @@
+// Win32 resource — gives hsr_renderer.exe its file icon (shown in Explorer / taskbar).
+1 ICON "app.ico"
