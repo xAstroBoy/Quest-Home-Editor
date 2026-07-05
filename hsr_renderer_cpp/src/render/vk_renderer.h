@@ -2043,8 +2043,28 @@ private:
         if (enableValidation) extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         const char* validationLayers[] = {"VK_LAYER_KHRONOS_validation"};
 
+        // MoltenVK (macOS): Vulkan loaders >= 1.3.216 HIDE non-conformant "portability" drivers unless
+        // the app opts in via VK_KHR_portability_enumeration + the ENUMERATE_PORTABILITY flag. Without
+        // the opt-in, vkCreateInstance fails with VK_ERROR_INCOMPATIBLE_DRIVER (-9) even though MoltenVK
+        // is installed (issue #4 - "worked last time" = before a Vulkan SDK/loader update). Only added
+        // when the loader actually advertises it, so Windows/Linux and pre-1.3.216 loaders are untouched.
+        VkInstanceCreateFlags instFlags = 0;
+        {
+            u32 na = 0; vkEnumerateInstanceExtensionProperties(nullptr, &na, nullptr);
+            std::vector<VkExtensionProperties> avail(na);
+            if (na) vkEnumerateInstanceExtensionProperties(nullptr, &na, avail.data());
+            for (auto& e : avail)
+                if (!strcmp(e.extensionName, "VK_KHR_portability_enumeration")) {
+                    extensions.push_back("VK_KHR_portability_enumeration");
+                    instFlags |= 0x00000001;   // VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+                    log("  Portability (MoltenVK) instance enumeration enabled");
+                    break;
+                }
+        }
+
         VkInstanceCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        createInfo.flags = instFlags;
         createInfo.pApplicationInfo = &appInfo;
         createInfo.enabledExtensionCount = (u32)extensions.size();
         createInfo.ppEnabledExtensionNames = extensions.data();
@@ -2139,6 +2159,19 @@ private:
 
         std::vector<const char*> deviceExts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME,
                                                VK_KHR_MULTIVIEW_EXTENSION_NAME};
+        // MoltenVK: when a device advertises VK_KHR_portability_subset the spec REQUIRES enabling it
+        // (the device is a portability implementation); harmless no-op everywhere else.
+        {
+            u32 na = 0; vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &na, nullptr);
+            std::vector<VkExtensionProperties> avail(na);
+            if (na) vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &na, avail.data());
+            for (auto& e : avail)
+                if (!strcmp(e.extensionName, "VK_KHR_portability_subset")) {
+                    deviceExts.push_back("VK_KHR_portability_subset");
+                    log("  VK_KHR_portability_subset enabled (MoltenVK device)");
+                    break;
+                }
+        }
 
         // Enable the multiview feature — the skinned shader (unlitblendskinned)
         // requires the MultiView SPIR-V capability; without it the skinned pipeline
