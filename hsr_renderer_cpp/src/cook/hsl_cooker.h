@@ -400,6 +400,64 @@ inline std::vector<uint8_t> encodeRendTxtrFromAstc(const std::vector<uint8_t>& a
     int root = b.endObject(); b.finish(root, "TXTR"); return b.output();
 }
 
+// ── HYBRID mip extension for the lossless pass-through: some source KTXs ship only 1 (or few) mips
+//    (stinson front/city/fog 4096²+2048² cards with "1x mips"). Shipping those verbatim leaves the device
+//    minifying mip0 with no chain = shimmer/aliasing at distance ("low quality texture"). Keep the source
+//    ASTC levels BYTE-EXACT (lossless where it counts) and synthesize ONLY the missing coarser levels by
+//    box-filtering the decoded mip0 and encoding each level (they're tiny; softness is invisible there).
+//    Returns the combined chain + writes the new mip count; empty on failure (caller keeps the source chain). ──
+inline std::vector<uint8_t> extendAstcMipChain(const std::vector<uint8_t>& srcAstc, const uint8_t* rgba,
+                                               int w, int h, int bw, int bh, int srcMips, int& mipsOut) {
+    mipsOut = srcMips;
+    if (srcAstc.empty() || !rgba || w < 1 || h < 1 || srcMips < 1) return {};
+    int fullMips = 1; { int d0 = w>h?w:h; while (d0 > 1){ fullMips++; d0/=2; } }
+    if (srcMips >= fullMips) return {};                        // chain already complete
+    // dims of the first MISSING level
+    int cw = w, ch = h; for (int l=0; l<srcMips; l++){ cw = cw>1?cw/2:1; ch = ch>1?ch/2:1; }
+    // box-filter the decoded mip0 down to that level
+    std::vector<uint8_t> cur(rgba, rgba + (size_t)w*h*4); int dw = w, dh = h;
+    while (dw > cw || dh > ch) {
+        int nw = dw>1?dw/2:1, nh = dh>1?dh/2:1;
+        std::vector<uint8_t> nx((size_t)nw*nh*4);
+        for (int y=0;y<nh;y++) for (int x=0;x<nw;x++) for (int c=0;c<4;c++){
+            int sx=x*2, sy=y*2, sx1=sx+1<dw?sx+1:sx, sy1=sy+1<dh?sy+1:sy;
+            nx[((size_t)y*nw+x)*4+c] = (uint8_t)((cur[((size_t)sy*dw+sx)*4+c]+cur[((size_t)sy*dw+sx1)*4+c]
+                                                 +cur[((size_t)sy1*dw+sx)*4+c]+cur[((size_t)sy1*dw+sx1)*4+c]+2)/4); }
+        cur.swap(nx); dw=nw; dh=nh;
+    }
+    astcenc_config cfg{};
+    if (astcenc_config_init(ASTCENC_PRF_LDR, (unsigned)bw, (unsigned)bh, 1, ASTCENC_PRE_MEDIUM, 0, &cfg) != ASTCENC_SUCCESS) return {};
+    const astcenc_swizzle swz = { ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
+    unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());
+    astcenc_context* ctx = nullptr; if (astcenc_context_alloc(&cfg, nthreads, &ctx) != ASTCENC_SUCCESS) return {};
+    std::vector<uint8_t> out = srcAstc; int mips = srcMips; bool fail = false;
+    while (true) {
+        int cols=(dw+bw-1)/bw, rows=(dh+bh-1)/bh;
+        std::vector<uint8_t> blocks((size_t)cols*rows*16);
+        void* slice = cur.data();
+        astcenc_image img{}; img.dim_x=(unsigned)dw; img.dim_y=(unsigned)dh; img.dim_z=1; img.data_type=ASTCENC_TYPE_U8; img.data=&slice;
+        std::vector<std::thread> pool;
+        for (unsigned t=1;t<nthreads;t++) pool.emplace_back([&,t]{ astcenc_compress_image(ctx,&img,&swz,blocks.data(),blocks.size(),t); });
+        astcenc_error e = astcenc_compress_image(ctx,&img,&swz,blocks.data(),blocks.size(),0);
+        for (auto& th:pool) th.join();
+        if (e != ASTCENC_SUCCESS){ fail=true; break; }
+        out.insert(out.end(), blocks.begin(), blocks.end()); mips++;
+        if (dw==1 && dh==1) break;
+        astcenc_compress_reset(ctx);
+        int nw=dw>1?dw/2:1, nh=dh>1?dh/2:1;
+        std::vector<uint8_t> nx((size_t)nw*nh*4);
+        for (int y=0;y<nh;y++) for (int x=0;x<nw;x++) for (int c=0;c<4;c++){
+            int sx=x*2, sy=y*2, sx1=sx+1<dw?sx+1:sx, sy1=sy+1<dh?sy+1:sy;
+            nx[((size_t)y*nw+x)*4+c] = (uint8_t)((cur[((size_t)sy*dw+sx)*4+c]+cur[((size_t)sy*dw+sx1)*4+c]
+                                                 +cur[((size_t)sy1*dw+sx)*4+c]+cur[((size_t)sy1*dw+sx1)*4+c]+2)/4); }
+        cur.swap(nx); dw=nw; dh=nh;
+    }
+    astcenc_context_free(ctx);
+    if (fail) return {};
+    mipsOut = mips;
+    return out;
+}
+
 // ── VAT (Vertex Animation Texture) offset texture: the NON-skeletal animation path (vista fish/coral). Same
 //    RENDTXTR wrapper as above but f2=5 (R16G16B16A16_SFLOAT, libshell TextureFormat 97), width=vertexCount,
 //    height=frameCount; each texel = that vertex's OFFSET (x,y,z)+w=1 for that frame. vatunlitbasecolor samples
@@ -2208,13 +2266,24 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                   bool canPass = unmodified && !m.srcAstc.empty() && capCols==1 && capRows==1
                                && !std::getenv("HSR_NOTEXPASS")
                                && ((m.srcAstcBw==8&&m.srcAstcBh==8)||(m.srcAstcBw==6&&m.srcAstcBh==6)||(m.srcAstcBw==12&&m.srcAstcBh==12));
-                  if (canPass) tex = encodeRendTxtrFromAstc(m.srcAstc, (int)m.w, (int)m.h, (int)m.srcAstcBw, (int)m.srcAstcBh, (int)m.srcAstcMips);
+                  int passMips = (int)m.srcAstcMips;
+                  if (canPass) {
+                      // INCOMPLETE source chain (front/city/fog: 4096²+2048² cards shipping "1x mips"): verbatim
+                      // pass-through leaves the device minifying mip0 with no chain = shimmer/aliasing at distance
+                      // ("low quality texture"). Keep the source levels byte-exact and SYNTHESIZE only the missing
+                      // coarser levels from the decoded mip0 (tiny; encode softness invisible there).
+                      int extMips = 0;
+                      auto ext = extendAstcMipChain(m.srcAstc, m.rgba.data(), (int)m.w, (int)m.h,
+                                                    (int)m.srcAstcBw, (int)m.srcAstcBh, (int)m.srcAstcMips, extMips);
+                      if (!ext.empty()) { tex = encodeRendTxtrFromAstc(ext, (int)m.w, (int)m.h, (int)m.srcAstcBw, (int)m.srcAstcBh, extMips); passMips = extMips; }
+                      else               tex = encodeRendTxtrFromAstc(m.srcAstc, (int)m.w, (int)m.h, (int)m.srcAstcBw, (int)m.srcAstcBh, (int)m.srcAstcMips);
+                  }
                   if (tex.empty()) {   // pass-through N/A or unsupported footprint -> re-encode
                       // alpha-test foliage (masked trees/leaves): alpha-weight the mip RGB (no transparent-bg bleed halo) AND
                       // preserve alpha COVERAGE down the chain, so the leaves don't dissolve into blocky ASTC chunks at range.
                       bool aw = m.blend || m.alphaTest; bool cov = m.alphaTest && !m.blend;
                       tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, 8, 8, 11, aw, capCols, capRows, cov);
-                  } else if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' TEX PASS-THROUGH (source ASTC %dx%d %ux mips, lossless)\n", i, m.name.c_str(), (int)m.srcAstcBw, (int)m.srcAstcBh, m.srcAstcMips);
+                  } else if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' TEX PASS-THROUGH (source ASTC %dx%d %ux->%dx mips, lossless base)\n", i, m.name.c_str(), (int)m.srcAstcBw, (int)m.srcAstcBh, m.srcAstcMips, passMips);
                   texCache[rh] = { texK, pTex };
                   if ((capCols>1||capRows>1) && std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SPRITESHEET %dx%d -> mip-capped\n", i, m.name.c_str(), capCols, capRows); }
         }
@@ -2436,7 +2505,13 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // TWO-PASS foliage: the depthPrepass SIBLING renders as a DEPTH-WRITE cutout (opaque pass) so it occludes;
         // the primary copy renders as smooth BLEND on top. Together = smooth edges AND correct depth (the a2c the
         // device foliage uses natively, approximated with two draws). The sibling forces cutout (foliageBlend off).
-        bool foliageBlend = useHz && m.alphaTest && !m.blend && !m.additive && !m.depthPrepass && !std::getenv("HSR_FOLIAGE_CUTOUT");
+        // DEFAULT = CUTOUT (as authored). The blend rerouting is now OPT-IN (HSR_FOLIAGE_BLEND): device evidence
+        // showed it breaking MORE than it smoothed — the balloons' authored-AlphaTest texture (median alpha 98/255,
+        // sprite-sheet transparent bg) rendered as a PALE GHOST via blend ("broken texture"), and the tree canopy
+        // lost depth-writes ("still fuckin depth issues"). Cutout = faithful authored alpha-test: depth-writes,
+        // vivid, and the coverage-preserving alpha mips keep leaf silhouettes from going blocky at range. The
+        // skinned-CUTOUT path also chains TINTREPLAY (the zen tree's authentic green→cyan→pink canopy cycle).
+        bool foliageBlend = useHz && m.alphaTest && !m.blend && !m.additive && !m.depthPrepass && std::getenv("HSR_FOLIAGE_BLEND");
         std::vector<uint8_t> matl; std::string animatorComp;
         if (useHz) {   // HZANIM: CURRENT-format skinned MATL (field7=shader) + HZAN:SKEL + ACL HZAN:ANIM + AnimatorPlatformComponent
             // BLEND skinned (the SHIELD) -> the transparent-flagged material (field2=2) so it alpha-blends in the
@@ -2459,6 +2534,29 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // together with the luminance-alpha texture the additive branch already bakes (alpha = max(rgb)·a) →
                 // the bright beam feathers in over the sky and the dark atlas background drops out = a real glow.
                 AssetKey3 sk = ((m.blend || foliageBlend || m.additive) && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
+                // SKINNED BLEND + MaterialTint RGBA cycle (stinson zen tree canopy: the SOURCE SHADER cycles the
+                // tint green→cyan→pink — NOT a static green): chain TINTREPLAY onto the skinned BLEND frag, same
+                // fragment-only edit the static/cutout paths use (vertex skinning untouched). Per-curve cache.
+                if ((m.blend || foliageBlend) && !m.additive && !shadSkinB.empty()
+                    && m.tintAnim && m.tintN >= 2 && m.tintFrames.size() >= (size_t)m.tintN*4 && m.tintLoop > 1e-4f) {
+                    uint32_t th = 0x811C9DC5u ^ (uint32_t)(long)(m.tintLoop*1000);
+                    for (float v : m.tintFrames) th = th*16777619u ^ (uint32_t)(long)(v*10000);
+                    char bfn[80]; snprintf(bfn, sizeof bfn, "cooker/skinblend_t%08x.surface.bin", th);
+                    AssetKey3 skinTintK{};
+                    auto itb0 = rotShaders.find(bfn);
+                    if (itb0 != rotShaders.end()) skinTintK = itb0->second;
+                    else {
+                        auto bb = readFileBytes(bfn);
+                        if (bb.empty()) { bb = shadergen::generate(shadSkinB, shadergen::TINTREPLAY, m.tintLoop, 0,0,0,0, m.tintFrames, m.tintN);
+                                          if (!bb.empty()) writeFileBytes(bfn, bb); }
+                        if (!bb.empty()) {
+                            std::string base(bfn+7); size_t dot = base.rfind(".bin"); if (dot!=std::string::npos) base = base.substr(0,dot);
+                            char bp2[200]; snprintf(bp2, sizeof bp2, "%s/shaders/%s/shader", MH.c_str(), base.c_str());
+                            skinTintK = keyForPath(bp2); assets.push_back({ bp2, skinTintK.tgt, bb, skinTintK }); rotShaders[bfn] = skinTintK; }
+                    }
+                    if (skinTintK.pkg || skinTintK.ing) { sk = skinTintK;
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SKINNED-BLEND+TINTREPLAY (%d frames loop=%.2fs)\n", i, m.name.c_str(), m.tintN, m.tintLoop); }
+                }
                 // MASKED skinned foliage (stinson materialsplit trees: authored AlphaTest, "_masked") -> a skinned
                 // CUTOUT shader: the opaque skinned base + an alpha<0.5 discard in the forward frag (same
                 // shadergen::CUTOUT edit the static path uses — it only touches the FRAGMENT, skinning untouched).
@@ -2492,7 +2590,18 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                             skinCutK = keyForPath(cp2); assets.push_back({ cp2, skinCutK.tgt, cb, skinCutK }); rotShaders[cfn] = skinCutK; }
                     }
                     if (skinCutK.pkg || skinCutK.ing) { sk = skinCutK;
-                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SKINNED-CUTOUT%s (masked foliage, discard a<0.5)\n", i, m.name.c_str(), sctint?"+TINTREPLAY":""); }
+                        // OFFICIAL masked-foliage PIPELINE FLAGS (ground truth = Meta's own cooked haven2025
+                        // m_pottedplantaleaves_*_masked MATL, byte-diffed against our butterflies template —
+                        // IDENTICAL struct layout): field0 struct u16 flags @76 = 0x7C (ours shipped 0x10) and
+                        // f32 alphaCutoff @80 = 0.30 (ours shipped 1.0). These are the bits the device pipeline
+                        // builder consumes for MASKED cutout foliage — the native alpha-tested/alpha-to-coverage
+                        // path that is smooth AND depth-writes (what blend/two-pass kept failing to fake).
+                        // HSR_NOFOLIA2C reverts to the plain template bits.
+                        if (matl.size() >= 84 && !std::getenv("HSR_NOFOLIA2C")) {
+                            uint16_t fl = 0x7C; std::memcpy(matl.data()+76, &fl, 2);
+                            float cut = 0.30f;  std::memcpy(matl.data()+80, &cut, 4);
+                        }
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SKINNED-CUTOUT%s (masked foliage, official masked flags 0x7C cutoff 0.30)\n", i, m.name.c_str(), sctint?"+TINTREPLAY":""); }
                 }
                 // ── COMBINED effect card (RIGID-HZANIM + material UV/fade) — NO EXCLUSION ──────────────────────────
                 // A fog/dust card whose node has R/S rides a RIGID-HZANIM skeleton (faithful T+R+S) AND has a UV flipbook
@@ -2882,7 +2991,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // them plain BLEND (no depth-write) broke layer occlusion = vista "depth issues everywhere".
                 // Port = the LOW-threshold cutout: depth-writes the body, discards the transparent sky, keeps
                 // most of the soft edge (0.12 cut). Pure-soft FX (fog/glow/glass: opF~0 or midF high) stay BLEND.
-                bool solidBody = (opF > 0.25f && midF < 0.30f);
+                // midF cap 0.18 (was 0.30): the measured split is vista solid cards midF 0.07-0.14 vs VOLUMETRIC FOG
+                // midF 0.28 (stinson fogB opF=0.30 midF=0.28). The lax 0.30 cap routed the fog to CUTOUT(solid-body):
+                // an alpha-test on a card whose alpha is ~all soft 0.3s discards nearly EVERY pixel = "i dont see the
+                // fog". Fog/haze keeps a real mid-alpha gradient everywhere -> stays BLEND.
+                bool solidBody = (opF > 0.25f && midF < 0.18f);
                 // FLAT HORIZONTAL DECAL guard (property, not name): a pond shadow / water-colour overlay lies IN the
                 // floor plane (Y is its SMALLEST extent) and paints translucently ONTO the coplanar floor — it must
                 // NOT depth-write or it z-fights the floor ("texture fighting" on pond_color_sh over platformCenter).
@@ -3041,19 +3154,53 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             bool needCol = hasLm || fr!=1.f||fg!=1.f||fb!=1.f||fa!=1.f;
             if (needCol && nvc>0) {
                 vertCol.resize(nvc*4);
-                bool vflip = !std::getenv("HSR_LMNOVFLIP");
+                // NO V-flip by default: A/B-proven on the stinson terrazzo (V79 OPA lightmap) — the flipped
+                // sample read the WRONG lightmap region and painted huge BLACK WEDGES across the platform
+                // (avg lum 0.46 flipped vs 0.71 unflipped, black min=0.00 vs 0.02; wedges gone in the shot).
+                // HSR_LMVFLIP opts the flip back in for sources whose V axis is actually inverted.
+                bool vflip = std::getenv("HSR_LMVFLIP") != nullptr;
                 auto c8=[](float x){ int i=(int)(x*255.f+0.5f); return (uint8_t)(i<0?0:i>255?255:i); };
+                int lmDark=0; float lmMin=1.f, lmMax=0.f, lmSum=0.f;
                 for (size_t v=0; v<nvc; v++) {
                     float lr=1.f,lg=1.f,lb=1.f;
                     if (hasLm) {
                         float u=m.uvs2[v*2], w=m.uvs2[v*2+1]; u-=std::floor(u); w-=std::floor(w); if(vflip) w=1.f-w;
-                        int px=(int)(u*(float)(m.lmW-1)+0.5f), py=(int)(w*(float)(m.lmH-1)+0.5f);
-                        px=px<0?0:(px>=(int)m.lmW?(int)m.lmW-1:px); py=py<0?0:(py>=(int)m.lmH?(int)m.lmH-1:py);
-                        const uint8_t* tx=&m.lmRGBA[((size_t)py*m.lmW+px)*4];
-                        lr=tx[0]/255.f*m.lightmapPower[0]; lg=tx[1]/255.f*m.lightmapPower[1]; lb=tx[2]/255.f*m.lightmapPower[2];
+                        // BILINEAR + GUTTER REJECTION (the terrazzo "black shadow" fix): the old nearest-texel point
+                        // sample could land a vertex exactly on the BLACK GUTTER between lightmap UV islands (or a
+                        // 1-texel shadow edge), and COLOR_0 interpolation smears that pure-black vertex across its
+                        // whole triangle fan = a big fake black blotch the OPA (per-pixel Modmap) never shows. A flat
+                        // few-hundred-vert floor can't represent sub-triangle shadows anyway, so an isolated dark
+                        // texel is NOISE, not signal: sample bilinear, and if the result is far darker than the
+                        // brightest texel in a 5x5 window (gutter/edge hit) use the average of the window's BRIGHT
+                        // (valid island) texels instead.
+                        float fx=u*(float)(m.lmW-1), fy=w*(float)(m.lmH-1);
+                        int x0=(int)fx, y0=(int)fy; float tx2=fx-x0, ty2=fy-y0;
+                        auto tex=[&](int x,int y,int c)->float{ x=x<0?0:(x>=(int)m.lmW?(int)m.lmW-1:x); y=y<0?0:(y>=(int)m.lmH?(int)m.lmH-1:y);
+                            return m.lmRGBA[((size_t)y*m.lmW+x)*4+c]/255.f; };
+                        float c3[3];
+                        for (int c=0;c<3;c++){ float a=tex(x0,y0,c)*(1-tx2)+tex(x0+1,y0,c)*tx2, b=tex(x0,y0+1,c)*(1-tx2)+tex(x0+1,y0+1,c)*tx2;
+                                               c3[c]=a*(1-ty2)+b*ty2; }
+                        float lum = 0.299f*c3[0]+0.587f*c3[1]+0.114f*c3[2];
+                        float wMax=0.f;
+                        for (int dy=-2;dy<=2;dy++) for (int dx=-2;dx<=2;dx++){
+                            float l2=0.299f*tex(x0+dx,y0+dy,0)+0.587f*tex(x0+dx,y0+dy,1)+0.114f*tex(x0+dx,y0+dy,2); if(l2>wMax)wMax=l2; }
+                        if (lum < 0.4f*wMax) {   // gutter/edge hit: replace with the window's valid-island average
+                            float acc[3]={0,0,0}; int n2=0;
+                            for (int dy=-2;dy<=2;dy++) for (int dx=-2;dx<=2;dx++){
+                                float t0=tex(x0+dx,y0+dy,0),t1=tex(x0+dx,y0+dy,1),t2v=tex(x0+dx,y0+dy,2);
+                                float l2=0.299f*t0+0.587f*t1+0.114f*t2v;
+                                if (l2 >= 0.6f*wMax){ acc[0]+=t0; acc[1]+=t1; acc[2]+=t2v; n2++; } }
+                            if (n2>0){ c3[0]=acc[0]/n2; c3[1]=acc[1]/n2; c3[2]=acc[2]/n2; }
+                            lmDark++;
+                        }
+                        lr=c3[0]*m.lightmapPower[0]; lg=c3[1]*m.lightmapPower[1]; lb=c3[2]*m.lightmapPower[2];
+                        float lf=0.299f*lr+0.587f*lg+0.114f*lb; if(lf<lmMin)lmMin=lf; if(lf>lmMax)lmMax=lf; lmSum+=lf;
                     }
                     vertCol[v*4]=c8(fr*lr); vertCol[v*4+1]=c8(fg*lg); vertCol[v*4+2]=c8(fb*lb); vertCol[v*4+3]=c8(fa);
                 }
+                if (hasLm && std::getenv("HSR_VERBOSE"))
+                    fprintf(stderr, "[LMBAKE] m%03zu '%s' verts=%zu lum min=%.2f max=%.2f avg=%.2f gutterFixed=%d power=(%.2f,%.2f,%.2f)\n",
+                            i, m.name.c_str(), nvc, lmMin, lmMax, nvc?lmSum/(float)nvc:0.f, lmDark, m.lightmapPower[0],m.lightmapPower[1],m.lightmapPower[2]);
             }
         }
         // SKYBOX meshes (camera-locked pass) need two cook-time fixes, else the dome is invisible:

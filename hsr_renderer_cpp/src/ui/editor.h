@@ -1263,15 +1263,31 @@ struct Editor {
         if (nl<1e-6f) { setStatus("knife: degenerate line"); return; }
         n[0]/=nl; n[1]/=nl; n[2]/=nl;
         float pd = n[0]*r->cam.pos[0]+n[1]*r->cam.pos[1]+n[2]*r->cam.pos[2];
-        // cut ONLY the mesh(es) actually UNDER the drawn line - sample the stroke and pick what it crosses
+        // Cut targets: with a SELECTION the knife cuts ONLY the selected mesh(es) — never bystanders the
+        // stroke happens to cross. With NO selection it cuts just the mesh under the stroke (what you see,
+        // not everything hidden along the ray path).
         std::set<int> targets;
-        for (int i2=0;i2<=8;++i2){ float t=(float)i2/8.f;
-            int hit = pickIndex(ax+(bx-ax)*t, ay+(by-ay)*t);
-            if (hit>=0) targets.insert(hit); }
-        if (targets.empty()) { setStatus("knife: the line didn't cross any mesh"); return; }
+        if (!sel.empty()) {
+            std::set<int> under;   // meshes the stroke actually crosses on screen
+            for (int i2=0;i2<=8;++i2){ float t=(float)i2/8.f;
+                int hit = pickIndex(ax+(bx-ax)*t, ay+(by-ay)*t);
+                if (hit>=0) under.insert(hit); }
+            for (int s2 : sel) if (under.count(s2)) targets.insert(s2);
+            if (targets.empty()) { setStatus("knife: the line didn't cross the SELECTED mesh (deselect to cut whatever is under the line)"); return; }
+        } else {
+            // no selection: cut the ONE mesh the stroke is mostly over (most stroke samples), not every
+            // neighbor the ends of the line graze
+            std::map<int,int> hits;
+            for (int i2=0;i2<=8;++i2){ float t=(float)i2/8.f;
+                int hit = pickIndex(ax+(bx-ax)*t, ay+(by-ay)*t);
+                if (hit>=0) hits[hit]++; }
+            if (hits.empty()) { setStatus("knife: the line didn't cross any mesh"); return; }
+            int best=-1, bestN=0; for (auto& kv : hits) if (kv.second>bestN){ best=kv.first; bestN=kv.second; }
+            targets.insert(best);
+        }
         int done=0;
         for (int m : targets) { sliceMeshByPlane(m, n, pd); ++done; }   // EXACT triangle-splitting cut
-        setStatus("Knife cut "+std::to_string(done)+" mesh(es) exactly under the line - Ctrl+Z un-cuts");
+        setStatus("Knife cut "+std::to_string(done)+" mesh(es) "+(sel.empty()?"under the line":"(selection only)")+" - Ctrl+Z un-cuts");
     }
     void drawKnifeOverlay(){
         if (!knifeOn) return;
