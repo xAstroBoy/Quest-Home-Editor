@@ -451,6 +451,7 @@ struct Editor {
     //    the broken triangulation at all. Undoable (Ctrl+Z removes), persists via the .geom sidecar.
     bool patchMode = false;
     bool pinIsCut  = false;                       // pins define a CUT REGION instead of a patch (same click-the-corners UX)
+    bool pinIsKnife= false;                       // pins define a KNIFE PATH: split ALONG the clicked polyline (nothing deleted)
     std::vector<std::array<float,3>> patchPts;
     std::vector<std::array<u8,4>>    patchCols;   // color sampled from the CLICKED surface at each pin (auto-matching texture)
     // ── CUT REGION by pins: drop every triangle of the SELECTION whose centroid falls inside the
@@ -481,7 +482,14 @@ struct Editor {
             nx+=(a[1]-b[1])*(a[2]+b[2]); ny+=(a[2]-b[2])*(a[0]+b[0]); nz+=(a[0]-b[0])*(a[1]+b[1]); }
         int dom = std::fabs(nx)>std::fabs(ny) ? (std::fabs(nx)>std::fabs(nz)?0:2) : (std::fabs(ny)>std::fabs(nz)?1:2);
         int ua=(dom+1)%3, va=(dom+2)%3;
-        float planeDom=0; for (auto& p : patchPts) planeDom+=p[dom]; planeDom/=(float)n;
+        // ── 3D depth window: distance measured along the pins' TRUE best-fit plane normal (a slanted
+        //    click on a dune/wall gets a slanted cut volume, not a world-axis slab), and the depth is
+        //    the Cut depth setting (0 = auto: 3m + however much the pins themselves spread off-plane).
+        float nrm[3]={nx,ny,nz}; float nl2=std::sqrt(nx*nx+ny*ny+nz*nz);
+        if (nl2>1e-9f){ nrm[0]/=nl2; nrm[1]/=nl2; nrm[2]/=nl2; } else { nrm[0]=nrm[1]=nrm[2]=0; nrm[dom]=1.f; }
+        float planeD=0; for (auto& p : patchPts) planeD += nrm[0]*p[0]+nrm[1]*p[1]+nrm[2]*p[2]; planeD/=(float)n;
+        float spread=0; for (auto& p : patchPts) spread=std::max(spread, std::fabs(nrm[0]*p[0]+nrm[1]*p[1]+nrm[2]*p[2]-planeD));
+        float depthWin = knifeCutDepth>0.001f ? knifeCutDepth : (3.f+spread);
         std::vector<std::array<float,2>> poly(n);
         for (size_t i2=0;i2<n;++i2) poly[i2]={patchPts[i2][ua], patchPts[i2][va]};
         auto inPoly=[&](float u0,float v0)->bool{ bool in=false;
@@ -501,7 +509,7 @@ struct Editor {
                 for (int e=0;e<3;e++){ const float* p=&md.positions[md.indices[k+e]*3];
                     c[0]+=M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12]; c[1]+=M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13]; c[2]+=M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14]; }
                 c[0]/=3; c[1]/=3; c[2]/=3;
-                if (std::fabs(c[dom]-planeDom)<3.f && inPoly(c[ua],c[va])) { ++cut; continue; }
+                if (std::fabs(nrm[0]*c[0]+nrm[1]*c[1]+nrm[2]*c[2]-planeD)<=depthWin && inPoly(c[ua],c[va])) { ++cut; continue; }
                 keep.push_back(md.indices[k]); keep.push_back(md.indices[k+1]); keep.push_back(md.indices[k+2]);
             }
             if (!cut) return;
@@ -509,8 +517,8 @@ struct Editor {
             commitGeomEdit(mi, std::move(md), "cutRegion");
         });
         patchPts.clear(); patchCols.clear(); patchMode=false; pinIsCut=false;
-        setStatus(totalCut ? ("Cut "+std::to_string(totalCut)+" tris inside the clicked region (texture untouched) - Ctrl+Z reverts")
-                           : "cut region: nothing inside the polygon on the selected mesh(es)");
+        setStatus(totalCut ? ("Cut "+std::to_string(totalCut)+" tris inside the clicked region, depth "+std::to_string(depthWin).substr(0,4)+"m (texture untouched) - Ctrl+Z reverts")
+                           : "cut region: nothing inside the polygon on the selected mesh(es) - raise Cut depth if the target sits deeper");
     }
     // Raycast a screen point against ONE mesh and return hit point + the SURFACE COLOR there
     // (barycentric-interpolated UV -> bilinear sample of that mesh's texture).
@@ -559,9 +567,13 @@ struct Editor {
         if (!patchMode) return;
         dl.pushClip((float)rcViewport.offset.x,(float)rcViewport.offset.y,(float)rcViewport.extent.width,(float)rcViewport.extent.height);
         cx.textAligned((float)rcViewport.offset.x, (float)rcViewport.offset.y+26*uiScale, (float)rcViewport.extent.width, 18*uiScale,
-                       pinIsBend ? "BEND/STRETCH - click the grab point, set radius+offset in Geometry, ENTER applies"
+                       pinIsKnife ? "KNIFE PATH - click points ALONG the cut line (corners allowed), ENTER cuts, ESC cancels"
+                                  : pinIsBend ? "BEND/STRETCH - click the grab point, set radius+offset in Geometry, ENTER applies"
                                  : pinIsCut ? "CUT REGION - 2 pins = SPLIT along the line, 3+ = cut the polygon out; ENTER applies"
                                 : "PATCH TOOL - click the gap's corners in order (3+), ENTER builds, ESC cancels", ui::rgba(120,230,140), 1);
+        if (!sel.empty())
+            cx.textAligned((float)rcViewport.offset.x, (float)rcViewport.offset.y+44*uiScale, (float)rcViewport.extent.width, 16*uiScale,
+                           "pins locked to the SELECTED mesh(es) - clicks on other meshes are ignored", ui::rgba(160,255,180,200), 1);
         float prev[2]; bool prevOk=false;
         for (size_t i2=0;i2<patchPts.size();++i2){
             float w[3]={patchPts[i2][0],patchPts[i2][1],patchPts[i2][2]}; float sx,sy;
@@ -573,19 +585,36 @@ struct Editor {
                 prev[0]=sx; prev[1]=sy; prevOk=true;
             }
         }
-        if (patchPts.size()>2){ float w0[3]={patchPts[0][0],patchPts[0][1],patchPts[0][2]}; float sx,sy;
+        if (!pinIsKnife && patchPts.size()>2){ float w0[3]={patchPts[0][0],patchPts[0][1],patchPts[0][2]}; float sx,sy;   // knife path = OPEN line, no closing edge
             if (prevOk && worldToScreen(w0,sx,sy)) dl.line(prev[0],prev[1],sx,sy, ui::rgba(120,230,140,140), 1.5f); }
         dl.popClip();
     }
-    // A patch click: raycast the cursor against ALL meshes, drop a pin at the hit AND remember the
-    // SURFACE COLOR under the click (the patch texture is auto-generated from these samples).
+    // A patch click: raycast the cursor, drop a pin at the hit AND remember the SURFACE COLOR under
+    // the click (the patch texture is auto-generated from these samples). With a SELECTION the ray
+    // tests ONLY the selected mesh(es) — nearest hit among them wins — so pins land on the TARGETED
+    // mesh even when bystanders sit in front or a backdrop shows through the gap being patched
+    // (clicking a gap corner used to pin the sky dome 500m behind it). No selection = any mesh.
     bool patchClick(double mx, double my){
-        int hit = pickIndex(mx,my); if (hit<0) return false;
         float p[3]; u8 col[4];
-        if (!screenRayHitColor(mx,my,hit,p,col)) return false;
+        if (!sel.empty()){
+            float bestD=1e30f, bp[3]={0,0,0}; u8 bc[4]={0,0,0,0}; bool got=false;
+            for (int m : sel){
+                if (m<0 || !r || m>=(int)r->gpuMeshes.size() || r->isDeleted((size_t)m) || r->isHidden((size_t)m)) continue;
+                float q[3]; u8 c2[4];
+                if (!screenRayHitColor(mx,my,m,q,c2)) continue;
+                float dx=q[0]-r->cam.pos[0], dy=q[1]-r->cam.pos[1], dz=q[2]-r->cam.pos[2];
+                float d=dx*dx+dy*dy+dz*dz;
+                if (d<bestD){ bestD=d; memcpy(bp,q,12); memcpy(bc,c2,4); got=true; }
+            }
+            if (!got){ setStatus("pin: click ON the selected mesh(es) - pins are locked to the selection (deselect to pin on anything)"); return false; }
+            memcpy(p,bp,12); memcpy(col,bc,4);
+        } else {
+            int hit = pickIndex(mx,my); if (hit<0) return false;
+            if (!screenRayHitColor(mx,my,hit,p,col)) return false;
+        }
         patchPts.push_back({p[0],p[1],p[2]});
         patchCols.push_back({col[0],col[1],col[2],col[3]});
-        setStatus("patch: point "+std::to_string(patchPts.size())+" set (Enter builds with 3+, Esc cancels)");
+        setStatus("patch: point "+std::to_string(patchPts.size())+(sel.empty()?"":" (on selection)")+" set (Enter builds with 3+, Esc cancels)");
         return true;
     }
     void buildPatch(){
@@ -616,19 +645,24 @@ struct Editor {
         const int TS = 512;
         md.texRGBA.assign((size_t)TS*TS*4, 255); md.texW=TS; md.texH=TS; md.hasTexture=true;
         float patchDom=0; for (auto& p : patchPts) patchDom += p[dom]; patchDom/=(float)n;
+        float pinDmn=1e30f, pinDmx=-1e30f; for (auto& p : patchPts){ pinDmn=std::min(pinDmn,p[dom]); pinDmx=std::max(pinDmx,p[dom]); }
+        float domPad = std::max(3.f, 0.75f*(pinDmx-pinDmn));   // curved rims (dune/dome sides) need a TALLER sampling window than flat gaps
         // gather candidate triangles: any visible mesh whose bounds overlap the patch region (in the
-        // plane) and sit within +-3m of the patch along the dominant axis; bucket them on a 2D grid.
-        struct CTri { int mesh; uint32_t a,b,c; float au,av,bu,bv,cu,cv; float domAvg; };
+        // plane) and sit inside the pins' height window along the dominant axis; bucket on a 2D grid.
+        // With a SELECTION only the TARGETED meshes are sampled (focus: a tree standing in the region
+        // must not bend the patch or leak into its texture).
+        struct CTri { int mesh; uint32_t a,b,c; float au,av,bu,bv,cu,cv; float domAvg; float ad,bd,cd; };
         std::vector<CTri> ctris;
         std::map<std::pair<int,int>, std::vector<int>> cgrid;   // 1/32-of-patch cells
         float cellU = su/32.f, cellV = sv/32.f;
         for (int mi2=0; mi2<(int)r->gpuMeshes.size(); ++mi2){
             if (r->isHidden(mi2) || r->isDeleted(mi2)) continue;
+            if (!sel.empty() && std::find(sel.begin(),sel.end(),mi2)==sel.end()) continue;   // locked to the selection
             const auto& gm2=r->gpuMeshes[mi2]; const MeshData& m2=(*sceneMeshes)[(size_t)mi2];
             if (gm2.isSkinned || gm2.dynamicVerts) continue;
             float mn3[3],mx3[3]; worldAabb(const_cast<VkGpuMesh&>(gm2),mn3,mx3);
             if (mx3[ua]<mnu||mn3[ua]>mxu||mx3[va]<mnv||mn3[va]>mxv) continue;
-            if (mx3[dom]<patchDom-3.f||mn3[dom]>patchDom+3.f) continue;
+            if (mx3[dom]<pinDmn-domPad||mn3[dom]>pinDmx+domPad) continue;
             size_t nvm=m2.positions.size()/3; if (m2.uvs.size()<nvm*2 || m2.texRGBA.empty()) continue;
             const auto& P2=gm2.pickPos; const auto& I2=gm2.pickIdx; if (P2.size()<9||I2.size()<3) continue;
             for (size_t k=0;k+2<I2.size();k+=3){ uint32_t a=I2[k],b=I2[k+1],c=I2[k+2];
@@ -636,8 +670,8 @@ struct Editor {
                 if (a>=nvm||b>=nvm||c>=nvm) continue;
                 float wa[3],wb[3],wc[3]; xformPoint(gm2.model,&P2[a*3],wa); xformPoint(gm2.model,&P2[b*3],wb); xformPoint(gm2.model,&P2[c*3],wc);
                 float dAvg=(wa[dom]+wb[dom]+wc[dom])/3.f;
-                if (std::fabs(dAvg-patchDom)>3.f) continue;
-                CTri ct{mi2,a,b,c, wa[ua],wa[va], wb[ua],wb[va], wc[ua],wc[va], dAvg};
+                if (dAvg<pinDmn-domPad||dAvg>pinDmx+domPad) continue;
+                CTri ct{mi2,a,b,c, wa[ua],wa[va], wb[ua],wb[va], wc[ua],wc[va], dAvg, wa[dom],wb[dom],wc[dom]};
                 float tmnu=std::min({ct.au,ct.bu,ct.cu}), tmxu=std::max({ct.au,ct.bu,ct.cu});
                 float tmnv=std::min({ct.av,ct.bv,ct.cv}), tmxv=std::max({ct.av,ct.bv,ct.cv});
                 if (tmxu<mnu||tmnu>mxu||tmxv<mnv||tmnv>mxv) continue;
@@ -696,14 +730,65 @@ struct Editor {
             px[3]=255;
         }
         fprintf(stderr,"[EDIT] patch bake: %zu/%d texels sampled from surrounding geometry, rest = gap blend\n", baked, TS*TS);
+        // ── CURVED GEOMETRY (v2): the old single-center FAN was always a FLAT plate — patching a dune
+        //    side / dome / anything with height+depth sliced straight through the terrain. The patch is
+        //    now a SUBDIVIDED disk (rim edges split, rings marching to the centroid) and EVERY generated
+        //    vertex is PROJECTED onto the surrounding geometry along the dominant axis — the exact same
+        //    triangles the texture bake samples, so the sheet follows the actual triangle directions:
+        //    curvature, slope, height. Points over the true gap blend the pin heights (IDW). Pins stay
+        //    EXACTLY where they were clicked.
         float cen[3]={0,0,0}; for (auto& p : patchPts){ cen[0]+=p[0]; cen[1]+=p[1]; cen[2]+=p[2]; }
         cen[0]/=n; cen[1]/=n; cen[2]/=n;
+        auto pinDomIDW=[&](float wu, float wv)->float{                        // gap fallback: blend of the pins' heights
+            float wsum=0, acc=0;
+            for (size_t i2=0;i2<n;++i2){ float du=wu-patchPts[i2][ua], dv=wv-patchPts[i2][va];
+                float w2=1.f/(du*du+dv*dv+1e-6f); wsum+=w2; acc+=w2*patchPts[i2][dom]; }
+            return acc/wsum; };
+        auto surfDomAt=[&](float wu, float wv, float est, float& outD)->bool{ // surviving-surface height at a plane point
+            auto itc=cgrid.find({(int)std::floor((wu-mnu)/cellU),(int)std::floor((wv-mnv)/cellV)});
+            if (itc==cgrid.end()) return false;
+            bool got=false; float best=1e30f;
+            for (int ti2 : itc->second){ const CTri& T=ctris[ti2];
+                float den=(T.bv-T.cv)*(T.au-T.cu)+(T.cu-T.bu)*(T.av-T.cv);
+                if (std::fabs(den)<1e-12f) continue;
+                float l0=((T.bv-T.cv)*(wu-T.cu)+(T.cu-T.bu)*(wv-T.cv))/den;
+                float l1=((T.cv-T.av)*(wu-T.cu)+(T.au-T.cu)*(wv-T.cv))/den;
+                float l2=1.f-l0-l1;
+                if (l0<-1e-4f||l1<-1e-4f||l2<-1e-4f) continue;                // not inside this triangle
+                float d2=l0*T.ad+l1*T.bd+l2*T.cd;                             // interpolated surface height
+                float dd=std::fabs(d2-est);
+                if (dd<best){ best=dd; outD=d2; got=true; }                   // the sheet CLOSEST to the estimate wins
+            }
+            return got && best<=domPad; };
+        auto solveDom=[&](float q[3], bool exactPin){
+            if (exactPin) return;                                             // clicked pins = ground truth
+            float est=pinDomIDW(q[ua],q[va]); float d2;
+            q[dom] = surfDomAt(q[ua],q[va],est,d2) ? d2 : est; };
         auto pushV=[&](const float p[3]){ md.positions.push_back(p[0]); md.positions.push_back(p[1]); md.positions.push_back(p[2]);
             md.uvs.push_back((p[ua]-mnu)/su); md.uvs.push_back((p[va]-mnv)/sv); };
-        for (auto& p : patchPts){ float q[3]={p[0],p[1],p[2]}; pushV(q); }
-        pushV(cen);
-        uint32_t ci=(uint32_t)n;
-        for (size_t i2=0;i2<n;++i2){ md.indices.push_back((u32)i2); md.indices.push_back((u32)((i2+1)%n)); md.indices.push_back(ci); }
+        const int SB = std::max(1,(int)std::ceil(24.f/(float)n));             // rim segments per clicked edge (~24 rim verts)
+        const int MR = (int)n*SB;                                             // rim vertex count
+        const int RG = 6;                                                     // rings rim -> center
+        for (int r2=0; r2<RG; ++r2){
+            float fr=(float)r2/(float)RG;
+            for (int j=0;j<MR;++j){
+                int pi2=j/SB, ps=j%SB; float ft=(float)ps/(float)SB;
+                const auto& A=patchPts[(size_t)pi2]; const auto& B=patchPts[(size_t)((pi2+1)%n)];
+                float rq[3]={A[0]+(B[0]-A[0])*ft, A[1]+(B[1]-A[1])*ft, A[2]+(B[2]-A[2])*ft};
+                float q[3]={rq[0]+(cen[0]-rq[0])*fr, rq[1]+(cen[1]-rq[1])*fr, rq[2]+(cen[2]-rq[2])*fr};
+                solveDom(q, r2==0 && ps==0);
+                pushV(q);
+            }
+        }
+        float cq[3]={cen[0],cen[1],cen[2]}; solveDom(cq,false); pushV(cq);
+        uint32_t ci=(uint32_t)((size_t)MR*RG);
+        for (int r2=0; r2<RG-1; ++r2) for (int j=0;j<MR;++j){ int j1=(j+1)%MR;
+            uint32_t a0=(uint32_t)(r2*MR+j), b0=(uint32_t)(r2*MR+j1), a1=(uint32_t)((r2+1)*MR+j), b1=(uint32_t)((r2+1)*MR+j1);
+            md.indices.push_back(a0); md.indices.push_back(b0); md.indices.push_back(a1);
+            md.indices.push_back(b0); md.indices.push_back(b1); md.indices.push_back(a1);
+        }
+        for (int j=0;j<MR;++j){ int j1=(j+1)%MR;
+            md.indices.push_back((uint32_t)((RG-1)*MR+j)); md.indices.push_back((uint32_t)((RG-1)*MR+j1)); md.indices.push_back(ci); }
         md.nVerts=(u32)(md.positions.size()/3); md.nIdx=(u32)md.indices.size();
         sceneMeshes->push_back(std::move(md));
         size_t ni=r->gpuMeshes.size();
@@ -715,7 +800,7 @@ struct Editor {
         geomDirty=true; holesMesh=-1;
         selectOne((int)ni); scrollToSel=true;
         patchPts.clear(); patchCols.clear(); patchMode=false;
-        setStatus("Patch built - texture auto-blended from the clicked surfaces (flat 0..1 UVs: Export PNG -> AI -> Set texture for a fancy fill)");
+        setStatus("Patch built - follows the surrounding surface curvature; texture auto-blended (Export PNG copies a ready ChatGPT inpaint prompt -> Set texture)");
     }
 
     // ── BEND / STRETCH ("grab" deform): click a point on the mesh (1 pin in bend mode), set radius +
@@ -1157,11 +1242,29 @@ struct Editor {
     //    the texture/UVs; original goes to history (one Ctrl+Z un-slices). Used by the axis buttons
     //    AND the 2-pin cut line ("draw a line -> split in two").
     void sliceMeshByPlane(int mi, const float pn[3], float pd){
+        // plane -> MODEL-space per-vertex signed distance -> the shared fence splitter below
         if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
         const MeshData& src=(*sceneMeshes)[(size_t)mi];
         const float* M=r->gpuMeshes[(size_t)mi].model;
         size_t nv=src.positions.size()/3;
         if (nv<3 || src.indices.size()<6) return;
+        float A2 = pn[0]*M[0] + pn[1]*M[1]  + pn[2]*M[2];
+        float B2 = pn[0]*M[4] + pn[1]*M[5]  + pn[2]*M[6];
+        float C2 = pn[0]*M[8] + pn[1]*M[9]  + pn[2]*M[10];
+        float E2 = pn[0]*M[12]+ pn[1]*M[13] + pn[2]*M[14] - pd;
+        std::vector<float> sdv(nv);
+        for (size_t v2=0;v2<nv;++v2){ const float* p=&src.positions[v2*3]; sdv[v2]=A2*p[0]+B2*p[1]+C2*p[2]+E2; }
+        sliceMeshBySD(mi, sdv, "slice");
+    }
+    // ── generalized splitter: split a mesh in two along the ZERO SET of a per-vertex signed distance
+    //    field — a single plane (line knife / slice gizmo) or the KNIFE PATH's piecewise polyline fence.
+    //    Crossing triangles are clipped EXACTLY at the sd=0 crossings (positions + UVs lerped), both
+    //    halves become their own meshes, the original goes to history.
+    bool sliceMeshBySD(int mi, const std::vector<float>& sdv, const char* what){
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return false;
+        const MeshData& src=(*sceneMeshes)[(size_t)mi];
+        size_t nv=src.positions.size()/3;
+        if (nv<3 || src.indices.size()<6 || sdv.size()<nv) return false;
         MeshData half[2]; std::map<uint32_t,uint32_t> rm[2];
         bool hasUV=src.uvs.size()>=nv*2, hasUV2=src.uvs2.size()>=nv*2, hasCol=src.colors.size()>=nv*4;
         for (int h2=0;h2<2;++h2){ half[h2]=src;
@@ -1172,12 +1275,7 @@ struct Editor {
         //    New vertices land EXACTLY on the cut (positions + UVs lerped by the crossing fraction),
         //    so the edge is a perfectly straight line and the texture is continuous across it.
         (void)hasCol;   // per-vertex colors are dropped by the halves (can't survive re-indexing cleanly)
-        // plane in MODEL space: f(p) = A*x + B*y + C*z + E  ==  world signed distance n.p_w - d
-        float A2 = pn[0]*M[0] + pn[1]*M[1]  + pn[2]*M[2];
-        float B2 = pn[0]*M[4] + pn[1]*M[5]  + pn[2]*M[6];
-        float C2 = pn[0]*M[8] + pn[1]*M[9]  + pn[2]*M[10];
-        float E2 = pn[0]*M[12]+ pn[1]*M[13] + pn[2]*M[14] - pd;
-        auto SD=[&](uint32_t v2)->float{ const float* p=&src.positions[v2*3]; return A2*p[0]+B2*p[1]+C2*p[2]+E2; };
+        auto SD=[&](uint32_t v2)->float{ return sdv[v2]; };
         std::map<std::pair<uint32_t,uint32_t>,uint32_t> cutRm[2];   // shared cut-verts per half (edge-keyed - watertight cut line)
         auto origV=[&](int h2, uint32_t v2)->uint32_t{
             auto& pt=half[h2]; auto& rmm=rm[h2];
@@ -1224,7 +1322,7 @@ struct Editor {
                 for (int e=2;e<pn2;++e){ pt.indices.push_back(poly[0]); pt.indices.push_back(poly[e-1]); pt.indices.push_back(poly[e]); }
             }
         }
-        if (half[0].indices.empty() || half[1].indices.empty()) { setStatus("slice: everything landed on one side (already flat here?)"); return; }
+        if (half[0].indices.empty() || half[1].indices.empty()) { setStatus(std::string(what)+": the cut didn't cross this mesh (everything on one side)"); return false; }
         const VkGpuMesh og = r->gpuMeshes[(size_t)mi];
         std::vector<int> hist{mi}; std::vector<uint8_t> histA{1};
         int made=0;
@@ -1238,13 +1336,14 @@ struct Editor {
             memcpy(ng.editT,og.editT,sizeof ng.editT); memcpy(ng.editR,og.editR,sizeof ng.editR); memcpy(ng.editS,og.editS,sizeof ng.editS);
             memcpy(ng.editTint,og.editTint,sizeof ng.editTint); recomputeModel(ng);
             hist.push_back((int)ni); histA.push_back(0);
-            meshEditLog[(int)ni] = (meshEditLog.count(mi)?meshEditLog[mi]+"+":std::string()) + "slice";
+            meshEditLog[(int)ni] = (meshEditLog.count(mi)?meshEditLog[mi]+"+":std::string()) + what;
             ++made;
         }
         r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
         r->setDeleted((size_t)mi, true); pushDeleteUndo(hist, histA);
         deselectAll(); holesMesh=-1; geomDirty = true;
-        setStatus("Sliced in two ("+std::to_string(made)+" parts, texture kept) - move/delete each; Ctrl+Z un-slices");
+        setStatus("Cut in two ("+std::to_string(made)+" parts, texture kept) - move/delete each; Ctrl+Z un-cuts");
+        return made>0;
     }
     // axis slice = plane through the mesh's world center, normal along the axis
     void sliceMesh(int mi, int axis){
@@ -1258,12 +1357,23 @@ struct Editor {
     //    (the cutting plane goes through the camera and the drawn line, so the cut lands EXACTLY
     //    under the line you see). No 3D widget, no gizmo - just drag a line over the mesh.
     bool  knifeOn = false, knifeDrag = false;
+    bool  knifeBox = false;        // KNIFE BOX sub-mode: drag a RECTANGLE = 3D cut (frustum + optional depth)
+    float knifeCutDepth = 0.f;     // box-cut depth from the FIRST surface hit; 0 = cut THROUGH everything
     float knifeA[2] = {0,0};
     void startKnife(){
-        // no selection needed - the knife cuts whatever mesh the line is DRAWN OVER
-        patchMode=false; pinIsCut=false; pinIsBend=false; sliceGizmoOn=false; patchPts.clear(); patchCols.clear();
-        knifeOn=true; knifeDrag=false;
-        setStatus("KNIFE: drag a straight line ACROSS a mesh - release cuts that mesh exactly under the line (Esc cancels)");
+        // no selection needed - the knife cuts whatever mesh the line is DRAWN OVER; with a selection
+        // it cuts the SELECTED mesh(es) the plane crosses (occluders in front can't steal the cut)
+        patchMode=false; pinIsCut=false; pinIsBend=false; pinIsKnife=false; sliceGizmoOn=false; patchPts.clear(); patchCols.clear();
+        knifeOn=true; knifeDrag=false; knifeBox=false;
+        setStatus(sel.empty() ? "KNIFE: drag a straight line ACROSS a mesh - release cuts that mesh exactly under the line (Esc cancels)"
+                              : "KNIFE: drag a line - release cuts the SELECTED mesh(es) along it, even behind occluders (Esc cancels)");
+    }
+    void startKnifeBox(){
+        patchMode=false; pinIsCut=false; pinIsBend=false; pinIsKnife=false; sliceGizmoOn=false; patchPts.clear(); patchCols.clear();
+        knifeOn=true; knifeDrag=false; knifeBox=true;
+        char b2[160]; snprintf(b2,sizeof b2, "KNIFE BOX: drag a RECTANGLE - release splits the %s into INSIDE + OUTSIDE pieces (depth %.2f%s; Esc cancels)",
+                               sel.empty()?"mesh under it":"SELECTED mesh(es)", knifeCutDepth, knifeCutDepth>0.001f?"m from the first surface":" = through");
+        setStatus(b2);
     }
     void applyKnife(float ax, float ay, float bx, float by){
         knifeOn=false; knifeDrag=false;
@@ -1283,22 +1393,28 @@ struct Editor {
         if (nl<1e-6f) { setStatus("knife: degenerate line"); return; }
         n[0]/=nl; n[1]/=nl; n[2]/=nl;
         float pd = n[0]*r->cam.pos[0]+n[1]*r->cam.pos[1]+n[2]*r->cam.pos[2];
-        // Cut targets: with a SELECTION the knife cuts ONLY the selected mesh(es) — never bystanders the
-        // stroke happens to cross. With NO selection it cuts just the mesh under the stroke (what you see,
-        // not everything hidden along the ray path).
+        // Cut targets: with a SELECTION the stroke only defines the CUTTING PLANE — every selected mesh
+        // the plane actually crosses gets cut, even when it sits partially BEHIND other meshes (the old
+        // screen-pick gate let occluders steal the hit = "the line didn't cross the SELECTED mesh" on a
+        // mesh plainly under the stroke). With NO selection it cuts just the one mesh the stroke is
+        // mostly drawn over (what you see, not everything hidden along the ray path).
         std::set<int> targets;
         if (!sel.empty()) {
-            std::set<int> under;   // meshes the stroke actually crosses on screen
-            for (int i2=0;i2<=8;++i2){ float t=(float)i2/8.f;
-                int hit = pickIndex(ax+(bx-ax)*t, ay+(by-ay)*t);
-                if (hit>=0) under.insert(hit); }
-            for (int s2 : sel) if (under.count(s2)) targets.insert(s2);
-            if (targets.empty()) { setStatus("knife: the line didn't cross the SELECTED mesh (deselect to cut whatever is under the line)"); return; }
+            for (int s2 : sel) {
+                if (s2<0 || s2>=(int)r->gpuMeshes.size() || r->isDeleted((size_t)s2)) continue;
+                float mn3[3],mx3[3]; worldAabb(r->gpuMeshes[(size_t)s2],mn3,mx3);
+                float c[3]={(mn3[0]+mx3[0])*0.5f,(mn3[1]+mx3[1])*0.5f,(mn3[2]+mx3[2])*0.5f};
+                float e[3]={(mx3[0]-mn3[0])*0.5f,(mx3[1]-mn3[1])*0.5f,(mx3[2]-mn3[2])*0.5f};
+                float dist=n[0]*c[0]+n[1]*c[1]+n[2]*c[2]-pd;                                  // center to plane
+                float rad =std::fabs(n[0])*e[0]+std::fabs(n[1])*e[1]+std::fabs(n[2])*e[2];    // AABB extent along the normal
+                if (std::fabs(dist)<=rad) targets.insert(s2);   // the plane crosses this mesh -> cut it
+            }
+            if (targets.empty()) { setStatus("knife: the cut plane misses the SELECTED mesh(es) - draw the line ACROSS them"); return; }
         } else {
             // no selection: cut the ONE mesh the stroke is mostly over (most stroke samples), not every
-            // neighbor the ends of the line graze
+            // neighbor the ends of the line graze; 24 samples so thin/narrow meshes register too
             std::map<int,int> hits;
-            for (int i2=0;i2<=8;++i2){ float t=(float)i2/8.f;
+            for (int i2=0;i2<=24;++i2){ float t=(float)i2/24.f;
                 int hit = pickIndex(ax+(bx-ax)*t, ay+(by-ay)*t);
                 if (hit>=0) hits[hit]++; }
             if (hits.empty()) { setStatus("knife: the line didn't cross any mesh"); return; }
@@ -1307,19 +1423,272 @@ struct Editor {
         }
         int done=0;
         for (int m : targets) { sliceMeshByPlane(m, n, pd); ++done; }   // EXACT triangle-splitting cut
-        setStatus("Knife cut "+std::to_string(done)+" mesh(es) "+(sel.empty()?"under the line":"(selection only)")+" - Ctrl+Z un-cuts");
+        setStatus("Knife cut "+std::to_string(done)+" mesh(es) "+(sel.empty()?"under the line":"(the selection)")+" - Ctrl+Z un-cuts");
+    }
+    // ── 3D BOX CUT core: partition ONE mesh into the part INSIDE a convex volume (4 frustum planes
+    //    from the dragged rectangle + optional near/far depth planes) and the part OUTSIDE. Triangles
+    //    crossing the boundary are clipped EXACTLY (positions + UVs lerped at the crossing), so the cut
+    //    walls are perfectly straight and the texture continuous. Both parts become their own meshes
+    //    (same material/texture, edit transform carried); the original goes to history (Ctrl+Z).
+    //    Planes are WORLD space {nx,ny,nz,d}, normal pointing INTO the volume: inside = n.p - d >= 0.
+    bool boxCutMesh(int mi, const float (*planes)[4], int nPlanes, int& insideIdx){
+        insideIdx=-1;
+        if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return false;
+        const MeshData& src=(*sceneMeshes)[(size_t)mi];
+        const VkGpuMesh& gm=r->gpuMeshes[(size_t)mi];
+        if (gm.isSkinned || gm.dynamicVerts) { setStatus("box cut: skinned/animated meshes can't be cut"); return false; }
+        const float* M=gm.model;
+        size_t nv=src.positions.size()/3;
+        if (nv<3 || src.indices.size()<3) return false;
+        bool hasUV=src.uvs.size()>=nv*2, hasUV2=src.uvs2.size()>=nv*2;
+        // planes -> MODEL space: f(p) = A*x+B*y+C*z+E == n.p_world - d
+        std::vector<std::array<float,4>> lp((size_t)nPlanes);
+        for (int i=0;i<nPlanes;++i){ const float* P=planes[i];
+            lp[(size_t)i][0]=P[0]*M[0] +P[1]*M[1] +P[2]*M[2];
+            lp[(size_t)i][1]=P[0]*M[4] +P[1]*M[5] +P[2]*M[6];
+            lp[(size_t)i][2]=P[0]*M[8] +P[1]*M[9] +P[2]*M[10];
+            lp[(size_t)i][3]=P[0]*M[12]+P[1]*M[13]+P[2]*M[14]-P[3]; }
+        struct CV { float p[3], uv[2], uv2[2]; };
+        auto sdOf=[&](const CV& v, const std::array<float,4>& q){ return q[0]*v.p[0]+q[1]*v.p[1]+q[2]*v.p[2]+q[3]; };
+        auto lerpCV=[&](const CV& a, const CV& b, float t){ CV o;
+            for (int c2=0;c2<3;++c2) o.p[c2]=a.p[c2]+(b.p[c2]-a.p[c2])*t;
+            for (int c2=0;c2<2;++c2){ o.uv[c2]=a.uv[c2]+(b.uv[c2]-a.uv[c2])*t; o.uv2[c2]=a.uv2[c2]+(b.uv2[c2]-a.uv2[c2])*t; }
+            return o; };
+        const float EPS=1e-5f;
+        auto clip=[&](const std::vector<CV>& in2, const std::array<float,4>& q, float sign, std::vector<CV>& out2){
+            out2.clear(); size_t m=in2.size();
+            for (size_t e=0;e<m;++e){ const CV& a=in2[e]; const CV& b=in2[(e+1)%m];
+                float da=sdOf(a,q)*sign, db=sdOf(b,q)*sign;
+                if (da>=-EPS) out2.push_back(a);
+                if ((da>EPS&&db<-EPS)||(da<-EPS&&db>EPS)) out2.push_back(lerpCV(a,b,da/(da-db))); } };
+        MeshData piece[2];   // [0]=OUTSIDE  [1]=INSIDE
+        for (int h2=0;h2<2;++h2){ piece[h2]=src;
+            piece[h2].positions.clear(); piece[h2].uvs.clear(); piece[h2].uvs2.clear(); piece[h2].indices.clear();
+            piece[h2].colors.clear(); piece[h2].uvs3.clear(); piece[h2].uvs4.clear();
+            piece[h2].boneIndices.clear(); piece[h2].boneWeights.clear(); piece[h2].hasBones=false; }
+        std::map<std::tuple<int,int,int,int,int>,uint32_t> vmap[2];   // bit-exact weld so the cut stays watertight
+        auto emitPoly=[&](int h2, const std::vector<CV>& poly){
+            if (poly.size()<3) return;
+            auto& pt=piece[h2]; auto& vm=vmap[h2];
+            auto vidx=[&](const CV& v)->uint32_t{
+                auto bi=[&](float f){ int i2; memcpy(&i2,&f,4); return i2; };
+                auto key=std::make_tuple(bi(v.p[0]),bi(v.p[1]),bi(v.p[2]),bi(v.uv[0]),bi(v.uv[1]));
+                auto it=vm.find(key); if (it!=vm.end()) return it->second;
+                uint32_t nvi=(uint32_t)(pt.positions.size()/3);
+                pt.positions.push_back(v.p[0]); pt.positions.push_back(v.p[1]); pt.positions.push_back(v.p[2]);
+                if (hasUV) { pt.uvs.push_back(v.uv[0]);  pt.uvs.push_back(v.uv[1]); }
+                if (hasUV2){ pt.uvs2.push_back(v.uv2[0]); pt.uvs2.push_back(v.uv2[1]); }
+                vm.emplace(key,nvi); return nvi; };
+            uint32_t v0=vidx(poly[0]);
+            for (size_t e=2;e<poly.size();++e){ pt.indices.push_back(v0); pt.indices.push_back(vidx(poly[e-1])); pt.indices.push_back(vidx(poly[e])); } };
+        std::vector<CV> cur, nxt, outPart;
+        for (size_t k=0;k+2<src.indices.size();k+=3){
+            cur.clear();
+            for (int e=0;e<3;++e){ uint32_t v2=src.indices[k+e]; CV c{};
+                memcpy(c.p,&src.positions[v2*3],12);
+                if (hasUV) { c.uv[0]=src.uvs[v2*2];   c.uv[1]=src.uvs[v2*2+1]; }
+                if (hasUV2){ c.uv2[0]=src.uvs2[v2*2]; c.uv2[1]=src.uvs2[v2*2+1]; }
+                cur.push_back(c); }
+            bool alive=true;
+            for (int i=0;i<nPlanes && alive;++i){
+                clip(cur, lp[(size_t)i], -1.f, outPart);   // slab OUTSIDE plane i (still inside planes 0..i-1)
+                emitPoly(0, outPart);
+                clip(cur, lp[(size_t)i], +1.f, nxt);       // continue clipping with the inside remainder
+                cur.swap(nxt);
+                alive = cur.size()>=3;
+            }
+            if (alive) emitPoly(1, cur);
+        }
+        if (piece[1].indices.empty()){ setStatus("box cut: the box missed the mesh"); return false; }
+        if (piece[0].indices.empty()){ setStatus("box cut: the WHOLE mesh is inside the box - nothing to cut"); return false; }
+        const VkGpuMesh og=gm;   // copy - gpuMeshes reallocates as pieces upload
+        std::vector<int> hist{mi}; std::vector<uint8_t> histA{1};
+        int made=0;
+        for (int h2=0;h2<2;++h2){
+            piece[h2].nVerts=(u32)(piece[h2].positions.size()/3); piece[h2].nIdx=(u32)piece[h2].indices.size();
+            sceneMeshes->push_back(std::move(piece[h2]));
+            size_t ni=r->gpuMeshes.size();
+            r->uploadMesh(sceneMeshes->back());
+            if (r->gpuMeshes.size()!=ni+1){ sceneMeshes->pop_back(); continue; }
+            VkGpuMesh& ng=r->gpuMeshes[ni];
+            memcpy(ng.editT,og.editT,sizeof ng.editT); memcpy(ng.editR,og.editR,sizeof ng.editR); memcpy(ng.editS,og.editS,sizeof ng.editS);
+            memcpy(ng.editTint,og.editTint,sizeof ng.editTint); recomputeModel(ng);
+            hist.push_back((int)ni); histA.push_back(0);
+            meshEditLog[(int)ni] = (meshEditLog.count(mi)?meshEditLog[mi]+"+":std::string()) + (h2?"boxcut-in":"boxcut-out");
+            if (h2) insideIdx=(int)ni;
+            ++made;
+        }
+        r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
+        r->setDeleted((size_t)mi, true); pushDeleteUndo(hist, histA);
+        holesMesh=-1; geomDirty=true;
+        return made==2;
+    }
+    // ── KNIFE PATH apply ("a free 3D knife set by LINES"): the clicked pins form a POLYLINE; each
+    //    segment + the camera eye defines a cutting plane, so the cut lands exactly under the drawn
+    //    path - but unlike the straight line knife the path can have corners and hug what you traced.
+    //    Every mesh vertex takes the signed distance of the polyline segment NEAREST to it (3D), and
+    //    the generalized splitter cuts along that piecewise fence. Targets = the SELECTION (pins are
+    //    already selection-locked); with no selection, the mesh(es) the pins actually sit on. Nothing
+    //    is deleted - the targets split in two along the line (Ctrl+Z per mesh un-cuts).
+    void applyKnifePath(){
+        if (!r || patchPts.size()<2){ setStatus("knife path: click at least 2 points along the cut line first (Enter cuts)"); return; }
+        float O[3]={r->cam.pos[0],r->cam.pos[1],r->cam.pos[2]};
+        struct Seg { float n[3], d; float a[3], b[3]; };
+        std::vector<Seg> segs;
+        for (size_t i2=0;i2+1<patchPts.size();++i2){
+            const auto& A=patchPts[i2]; const auto& B=patchPts[i2+1];
+            float u[3]={A[0]-O[0],A[1]-O[1],A[2]-O[2]}, v[3]={B[0]-O[0],B[1]-O[1],B[2]-O[2]};
+            float n2[3]={u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0]};
+            float l=std::sqrt(n2[0]*n2[0]+n2[1]*n2[1]+n2[2]*n2[2]); if (l<1e-9f) continue;
+            n2[0]/=l; n2[1]/=l; n2[2]/=l;
+            if (!segs.empty()){ const Seg& pr=segs.back();          // consistent LEFT/RIGHT along the whole path
+                if (n2[0]*pr.n[0]+n2[1]*pr.n[1]+n2[2]*pr.n[2] < 0){ n2[0]=-n2[0]; n2[1]=-n2[1]; n2[2]=-n2[2]; } }
+            Seg s; memcpy(s.n,n2,12); s.d=n2[0]*O[0]+n2[1]*O[1]+n2[2]*O[2];
+            memcpy(s.a,A.data(),12); memcpy(s.b,B.data(),12);
+            segs.push_back(s);
+        }
+        if (segs.empty()){ setStatus("knife path: the clicked points are on top of each other"); return; }
+        std::vector<int> targets;
+        if (!sel.empty()) targets=sel;
+        else { std::set<int> t2;                                    // no selection: the meshes the pins sit on
+               for (auto& p : patchPts){ float w2[3]={p[0],p[1],p[2]}; float sx,sy;
+                   if (worldToScreen(w2,sx,sy)){ int hit=pickIndex(sx,sy); if (hit>=0) t2.insert(hit); } }
+               targets.assign(t2.begin(),t2.end()); }
+        if (targets.empty()){ setStatus("knife path: no target - select the mesh(es) or pin ON a mesh"); return; }
+        auto segDist2=[&](const Seg& s, const float p[3])->float{   // squared point-to-SEGMENT distance (3D)
+            float ab[3]={s.b[0]-s.a[0],s.b[1]-s.a[1],s.b[2]-s.a[2]};
+            float ap[3]={p[0]-s.a[0],p[1]-s.a[1],p[2]-s.a[2]};
+            float ll=ab[0]*ab[0]+ab[1]*ab[1]+ab[2]*ab[2];
+            float t=ll>1e-12f? std::clamp((ap[0]*ab[0]+ap[1]*ab[1]+ap[2]*ab[2])/ll,0.f,1.f) : 0.f;
+            float q[3]={s.a[0]+ab[0]*t-p[0], s.a[1]+ab[1]*t-p[1], s.a[2]+ab[2]*t-p[2]};
+            return q[0]*q[0]+q[1]*q[1]+q[2]*q[2]; };
+        int done=0;
+        for (int m : targets){
+            if (m<0||m>=(int)sceneMeshes->size()||m>=(int)r->gpuMeshes.size()||r->isDeleted((size_t)m)) continue;
+            if (r->gpuMeshes[(size_t)m].isSkinned || r->gpuMeshes[(size_t)m].dynamicVerts) continue;
+            const MeshData& md=(*sceneMeshes)[(size_t)m]; const float* M=r->gpuMeshes[(size_t)m].model;
+            size_t nv=md.positions.size()/3; if (nv<3) continue;
+            std::vector<float> sdv(nv);
+            for (size_t v2=0;v2<nv;++v2){
+                const float* p=&md.positions[v2*3];
+                float wp[3]={M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12],
+                             M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13],
+                             M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14]};
+                size_t best=0; float bestD=1e30f;
+                for (size_t s2=0;s2<segs.size();++s2){ float d2=segDist2(segs[s2],wp); if (d2<bestD){ bestD=d2; best=s2; } }
+                const Seg& S=segs[best];
+                sdv[v2]=S.n[0]*wp[0]+S.n[1]*wp[1]+S.n[2]*wp[2]-S.d;
+            }
+            if (sliceMeshBySD(m, sdv, "knifepath")) ++done;
+        }
+        patchPts.clear(); patchCols.clear(); patchMode=false; pinIsKnife=false;
+        setStatus(done ? ("KNIFE PATH cut "+std::to_string(done)+" mesh(es) along the "+std::to_string(segs.size())+"-segment line - Ctrl+Z un-cuts")
+                       : "knife path: the line didn't cross the target mesh(es)");
+    }
+    // ── KNIFE BOX apply: the dragged rectangle -> 4 inward frustum planes through the camera (+ near/far
+    //    depth planes when Cut depth > 0, measured from the FIRST surface the rectangle's rays hit). The
+    //    cut is fully 3D-bounded: width and height by the rectangle, depth by the depth value. Targets =
+    //    the SELECTED mesh(es) the volume touches; with no selection, the one mesh under the rectangle.
+    void applyKnifeBox(float ax, float ay, float bx, float by){
+        knifeOn=false; knifeDrag=false; knifeBox=false;
+        float x0=std::min(ax,bx), x1=std::max(ax,bx), y0=std::min(ay,by), y1=std::max(ay,by);
+        if (x1-x0<8.f || y1-y0<8.f){ setStatus("box cut: rectangle too small - drag a bigger box"); return; }
+        float W=(float)rcViewport.extent.width, H=(float)rcViewport.extent.height; if (W<=0||H<=0) return;
+        float vp[16]; mat4mul(r->cam.proj, r->cam.view, vp); float inv[16]; if (!invertMat4(vp, inv)) return;
+        auto ray=[&](float sx, float sy, float d[3]){
+            float ndcx=2.f*(sx-rcViewport.offset.x)/W-1.f, ndcy=2.f*(sy-rcViewport.offset.y)/H-1.f;
+            float O2[3],F2[3]; unproject(inv,ndcx,ndcy,1.f,O2); unproject(inv,ndcx,ndcy,0.f,F2);
+            d[0]=F2[0]-O2[0]; d[1]=F2[1]-O2[1]; d[2]=F2[2]-O2[2];
+            float l=std::sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]); if (l>1e-6f){ d[0]/=l; d[1]/=l; d[2]/=l; } };
+        float dTL[3],dTR[3],dBR[3],dBL[3],dC[3];
+        ray(x0,y0,dTL); ray(x1,y0,dTR); ray(x1,y1,dBR); ray(x0,y1,dBL);
+        ray((x0+x1)*0.5f,(y0+y1)*0.5f,dC);
+        float eye[3]={r->cam.pos[0],r->cam.pos[1],r->cam.pos[2]};
+        float planes[6][4]; int np=0;
+        auto side=[&](const float* dA, const float* dB){
+            float n2[3]={dA[1]*dB[2]-dA[2]*dB[1], dA[2]*dB[0]-dA[0]*dB[2], dA[0]*dB[1]-dA[1]*dB[0]};
+            float l=std::sqrt(n2[0]*n2[0]+n2[1]*n2[1]+n2[2]*n2[2]); if (l<1e-9f) return;
+            n2[0]/=l; n2[1]/=l; n2[2]/=l;
+            if (n2[0]*dC[0]+n2[1]*dC[1]+n2[2]*dC[2] < 0){ n2[0]=-n2[0]; n2[1]=-n2[1]; n2[2]=-n2[2]; }   // point INWARD
+            planes[np][0]=n2[0]; planes[np][1]=n2[1]; planes[np][2]=n2[2];
+            planes[np][3]=n2[0]*eye[0]+n2[1]*eye[1]+n2[2]*eye[2]; ++np; };
+        side(dTL,dTR); side(dTR,dBR); side(dBR,dBL); side(dBL,dTL);
+        if (np<4){ setStatus("box cut: degenerate rectangle"); return; }
+        // targets: SELECTION first (never the rest of the world); no selection = mesh under the rectangle
+        std::set<int> targets;
+        if (!sel.empty()){
+            for (int s2 : sel){
+                if (s2<0 || s2>=(int)r->gpuMeshes.size() || r->isDeleted((size_t)s2)) continue;
+                float mn3[3],mx3[3]; worldAabb(r->gpuMeshes[(size_t)s2],mn3,mx3);
+                bool outAny=false;
+                for (int i=0;i<np && !outAny;++i){ const float* P=planes[i];
+                    float px=P[0]>0?mx3[0]:mn3[0], py=P[1]>0?mx3[1]:mn3[1], pz=P[2]>0?mx3[2]:mn3[2];   // most-inside corner
+                    if (P[0]*px+P[1]*py+P[2]*pz < P[3]) outAny=true; }
+                if (!outAny) targets.insert(s2);
+            }
+            if (targets.empty()){ setStatus("box cut: the rectangle misses the SELECTED mesh(es)"); return; }
+        } else {
+            std::map<int,int> hits;
+            for (int gy=0;gy<5;++gy) for (int gx=0;gx<5;++gx){
+                int hit=pickIndex(x0+(x1-x0)*((float)gx+0.5f)/5.f, y0+(y1-y0)*((float)gy+0.5f)/5.f);
+                if (hit>=0) hits[hit]++; }
+            if (hits.empty()){ setStatus("box cut: no mesh under the rectangle"); return; }
+            int best=-1,bestN=0; for (auto& kv:hits) if (kv.second>bestN){ best=kv.first; bestN=kv.second; }
+            targets.insert(best);
+        }
+        // depth limit: near/far planes measured from the FIRST surface the rectangle's rays hit ON THE
+        // TARGETS (so an occluder can't set the depth origin). 0 = cut through everything.
+        if (knifeCutDepth>0.001f){
+            float tNear=1e30f; float p[3]; u8 col[4];
+            for (int gy=0;gy<5;++gy) for (int gx=0;gx<5;++gx){
+                double sx=x0+(x1-x0)*((double)gx+0.5)/5.0, sy=y0+(y1-y0)*((double)gy+0.5)/5.0;
+                for (int m : targets)
+                    if (screenRayHitColor(sx,sy,m,p,col)){
+                        float s=dC[0]*(p[0]-eye[0])+dC[1]*(p[1]-eye[1])+dC[2]*(p[2]-eye[2]);
+                        if (s>0.f) tNear=std::min(tNear,s); }
+            }
+            if (tNear>=1e29f){ setStatus("box cut: no target surface under the rectangle to measure depth from"); return; }
+            float e0=dC[0]*eye[0]+dC[1]*eye[1]+dC[2]*eye[2];
+            planes[np][0]= dC[0]; planes[np][1]= dC[1]; planes[np][2]= dC[2];
+            planes[np][3]= e0 + std::max(0.f, tNear-0.01f); ++np;                        // near: just before the first surface
+            planes[np][0]=-dC[0]; planes[np][1]=-dC[1]; planes[np][2]=-dC[2];
+            planes[np][3]=-(e0 + tNear + knifeCutDepth); ++np;                           // far: first surface + depth
+        }
+        int done=0; std::vector<int> insides;
+        for (int m : targets){ int in2=-1; if (boxCutMesh(m, planes, np, in2)){ ++done; if (in2>=0) insides.push_back(in2); } }
+        if (!done) return;                                        // per-mesh status already set
+        selectOne(insides.empty()?-1:insides[0]);
+        for (size_t i2=1;i2<insides.size();++i2) toggleSel(insides[(size_t)i2]);
+        scrollToSel=true;
+        char b2[200]; snprintf(b2,sizeof b2,"3D BOX CUT: %d mesh(es) split into INSIDE + OUTSIDE pieces (depth %s) - inside piece selected: Del removes it, Ctrl+Z un-cuts",
+                               done, knifeCutDepth>0.001f?(std::to_string(knifeCutDepth).substr(0,4)+"m from the surface").c_str():"THROUGH");
+        setStatus(b2);
     }
     void drawKnifeOverlay(){
         if (!knifeOn) return;
         dl.pushClip((float)rcViewport.offset.x,(float)rcViewport.offset.y,(float)rcViewport.extent.width,(float)rcViewport.extent.height);
+        char hint[180];
+        if (knifeBox) snprintf(hint,sizeof hint,"KNIFE BOX (3D) - drag a RECTANGLE over the %s, release = cut INSIDE piece out (depth %s; Esc cancels)",
+                               sel.empty()?"mesh":"SELECTED mesh(es)", knifeCutDepth>0.001f?(std::to_string(knifeCutDepth).substr(0,4)+"m").c_str():"through");
+        else snprintf(hint,sizeof hint,"%s", sel.empty() ? "KNIFE - drag a line across the mesh, release = cut (Esc cancels)"
+                                                         : "KNIFE - drag a line, release = cut the SELECTED mesh(es) along it (Esc cancels)");
         cx.textAligned((float)rcViewport.offset.x, (float)rcViewport.offset.y+26*uiScale, (float)rcViewport.extent.width, 18*uiScale,
-                       "KNIFE - drag a line across the mesh, release = cut (Esc cancels)", ui::rgba(255,240,90), 1);
+                       hint, ui::rgba(255,240,90), 1);
         if (knifeDrag){
-            dl.line(knifeA[0],knifeA[1], cx.in.mx,cx.in.my, ui::rgba(0,0,0,180), 5.f);          // outline for contrast
-            dl.line(knifeA[0],knifeA[1], cx.in.mx,cx.in.my, ui::rgba(255,240,90), 2.5f);        // THE line
-            float hs2=5*uiScale;
-            dl.rect(knifeA[0]-hs2,knifeA[1]-hs2,hs2*2,hs2*2, ui::rgba(255,240,90));
-            dl.rect(cx.in.mx-hs2,cx.in.my-hs2,hs2*2,hs2*2, ui::rgba(255,240,90));
+            if (knifeBox){   // rectangle preview: 4 edges, black outline + yellow line
+                float rx0=std::min(knifeA[0],cx.in.mx), rx1=std::max(knifeA[0],cx.in.mx);
+                float ry0=std::min(knifeA[1],cx.in.my), ry1=std::max(knifeA[1],cx.in.my);
+                auto edge=[&](float a0,float b0,float a1,float b1){
+                    dl.line(a0,b0,a1,b1, ui::rgba(0,0,0,180), 5.f);
+                    dl.line(a0,b0,a1,b1, ui::rgba(255,240,90), 2.5f); };
+                edge(rx0,ry0,rx1,ry0); edge(rx1,ry0,rx1,ry1); edge(rx1,ry1,rx0,ry1); edge(rx0,ry1,rx0,ry0);
+            } else {
+                dl.line(knifeA[0],knifeA[1], cx.in.mx,cx.in.my, ui::rgba(0,0,0,180), 5.f);      // outline for contrast
+                dl.line(knifeA[0],knifeA[1], cx.in.mx,cx.in.my, ui::rgba(255,240,90), 2.5f);    // THE line
+                float hs2=5*uiScale;
+                dl.rect(knifeA[0]-hs2,knifeA[1]-hs2,hs2*2,hs2*2, ui::rgba(255,240,90));
+                dl.rect(cx.in.mx-hs2,cx.in.my-hs2,hs2*2,hs2*2, ui::rgba(255,240,90));
+            }
         }
         dl.popClip();
     }
@@ -1333,7 +1702,7 @@ struct Editor {
     void sliceNormal(float n[3]) const { float x[3]={1,0,0}; const_cast<Editor*>(this)->quatRotVec(sliceQuat, x, n); }
     void startSliceGizmo(const float* atWorld /*nullable*/){
         if (selected<0 || !r || selected>=(int)r->gpuMeshes.size()) { setStatus("slice gizmo: select the mesh(es) to cut first"); return; }
-        patchMode=false; pinIsCut=false; pinIsBend=false; patchPts.clear(); patchCols.clear();
+        patchMode=false; pinIsCut=false; pinIsBend=false; pinIsKnife=false; patchPts.clear(); patchCols.clear();
         sliceGizmoOn = true;
         sliceQuat[0]=sliceQuat[1]=sliceQuat[2]=0; sliceQuat[3]=1;
         if (atWorld){ memcpy(slicePos, atWorld, 12); }
@@ -1659,6 +2028,10 @@ struct Editor {
     //    packed into ONE ATLAS (identical textures share a cell) and each source's UVs are remapped into
     //    its cell. Sources go to history (ONE Ctrl+Z un-fuses). Skinned/animated sources are skipped.
     //    Caveat: TILED UVs (outside 0..1) are wrapped into the cell — heavy tiling shows seams.
+    // Fuse keeps the sources' ORIGINAL triangle pattern by default (nothing re-guessed); this opt-in
+    // additionally drops later-source triangles fully covered by an earlier coplanar sheet (z-fight
+    // cleanup for stacked flat floors — leave OFF for curved/bent geometry and patches).
+    bool fuseDropCovered = false;
     void fuseSelectedMeshes(){
         if (!r || !sceneMeshes || sel.size()<2) { setStatus("fuse: select 2+ meshes first (Ctrl+click)"); return; }
         std::vector<int> src; int skippedAnim=0;
@@ -1749,11 +2122,13 @@ struct Editor {
             triOrd.resize(out.indices.size()/3, (int)i2);   // tag every tri with its source ordinal (earlier selection wins overlaps)
         }
         // ── Z-FIGHT ELIMINATION ────────────────────────────────────────────────────────────────────
-        // Pass A: weld by position, drop degenerate + EXACT duplicate triangles.
-        // Pass B: COPLANAR COVERAGE ("make it happen"): a triangle from a LATER-selected source that
-        // lies in (within ~8mm of) an EARLIER source's plane AND whose surface is fully covered by
-        // that source's triangles is REDUNDANT SHEET - dropped. First-selected sheet wins. This kills
-        // the stacked floorGroup01/02/03 shimmer without full CSG (partial overlaps keep both).
+        // Pass A: weld by position, drop degenerate + exact SAME-WINDING duplicate triangles (reversed
+        // duplicates = intentional double-siding, always kept). The fused mesh otherwise keeps the
+        // sources' ORIGINAL triangle pattern verbatim.
+        // Pass B (OPT-IN via fuseDropCovered): COPLANAR COVERAGE — a triangle from a LATER-selected
+        // source that lies in (within ~8mm of) an EARLIER source's plane AND whose surface is fully
+        // covered by that source's triangles is REDUNDANT SHEET - dropped. First-selected sheet wins.
+        // Kills stacked floorGroup01/02/03 shimmer without full CSG (partial overlaps keep both).
         {
             size_t fnv = out.positions.size()/3;
             std::vector<uint32_t> weld(fnv);
@@ -1765,7 +2140,10 @@ struct Editor {
                   auto it=wgrid.find(k);
                   if (it==wgrid.end()) { wgrid.emplace(k,(uint32_t)v2); weld[v2]=(uint32_t)v2; } else weld[v2]=it->second;
               } }
-            // Pass A
+            // Pass A — duplicate key preserves WINDING (rotation-canonical, smallest index first).
+            // Sorting the indices treated a REVERSED-winding copy as "the same triangle" and dropped
+            // it — but these envs emulate double-siding with reversed duplicates, so fusing punched
+            // back-face holes into perfectly good meshes.
             std::set<std::tuple<uint32_t,uint32_t,uint32_t>> seen;
             std::vector<u32> keep; keep.reserve(out.indices.size());
             std::vector<int> keepOrd;
@@ -1773,17 +2151,24 @@ struct Editor {
             for (size_t k=0;k+2<out.indices.size();k+=3){
                 uint32_t a=weld[out.indices[k]], b=weld[out.indices[k+1]], c=weld[out.indices[k+2]];
                 if (a==b||b==c||c==a) { ++dropped; continue; }                     // degenerate
-                uint32_t s0=a,s1=b,s2=c; if(s0>s1)std::swap(s0,s1); if(s1>s2)std::swap(s1,s2); if(s0>s1)std::swap(s0,s1);
-                if (!seen.insert(std::make_tuple(s0,s1,s2)).second) { ++dropped; continue; }   // exact duplicate
+                uint32_t s0=a,s1=b,s2=c;                                           // rotate so the smallest LEADS, order kept
+                if (b<=a&&b<=c){ s0=b;s1=c;s2=a; } else if (c<=a&&c<=b){ s0=c;s1=a;s2=b; }
+                if (!seen.insert(std::make_tuple(s0,s1,s2)).second) { ++dropped; continue; }   // exact SAME-winding duplicate
                 keep.push_back(out.indices[k]); keep.push_back(out.indices[k+1]); keep.push_back(out.indices[k+2]);
                 keepOrd.push_back(k/3 < triOrd.size() ? triOrd[k/3] : 0);
             }
-            // Pass B: coplanar-coverage removal (later source loses where an earlier one already has surface)
+            // Pass B: coplanar-coverage removal (later source loses where an earlier one already has
+            // surface). OPT-IN (fuseDropCovered, Geometry-panel toggle): by default fuse keeps the
+            // ORIGINAL triangle pattern verbatim — the coverage guess ate bent/curved sheets bucketed
+            // as "coplanar" and re-opened patched holes ("fuse generates more holes"). Turn it ON only
+            // for genuinely stacked flat sheets (floorGroup z-fight).
             size_t nT = keep.size()/3, coplDropped=0;
+            std::vector<char> triDead(nT, 0);
+            auto V=[&](size_t t,int e)->const float*{ return &out.positions[keep[t*3+e]*3]; };
+            if (fuseDropCovered) {
             struct TriP { float n[3]; float d; int dom; float mn[2], mx[2]; };
             std::vector<TriP> tp(nT);
             std::map<std::tuple<int,int,int>, std::vector<int>> planeBuckets;      // quantized canonical normal -> tris
-            auto V=[&](size_t t,int e)->const float*{ return &out.positions[keep[t*3+e]*3]; };
             auto uvOf=[&](const TriP& P, const float* p, float& u, float& v){     // project onto the plane's dominant 2D
                 int a2=(P.dom+1)%3, b2=(P.dom+2)%3; u=p[a2]; v=p[b2]; };
             for (size_t t=0;t<nT;++t){
@@ -1800,7 +2185,12 @@ struct Editor {
                 for (int e=1;e<3;++e){ uvOf(P,V(t,e),u,v); P.mn[0]=std::min(P.mn[0],u); P.mx[0]=std::max(P.mx[0],u); P.mn[1]=std::min(P.mn[1],v); P.mx[1]=std::max(P.mx[1],v); }
                 planeBuckets[std::make_tuple((int)std::lround(n[0]*24.f),(int)std::lround(n[1]*24.f),(int)std::lround(n[2]*24.f))].push_back((int)t);
             }
-            std::vector<char> triDead(nT, 0);
+            // editor-built PATCH sources are NEVER dropped as "redundant sheet": the user built them
+            // specifically to FILL a hole — the old coverage test (4 samples only) kept declaring
+            // rim-straddling patch triangles fully covered and fusing re-opened the very hole.
+            std::vector<char> ordIsPatch(src.size(), 0);
+            for (size_t o2=0;o2<src.size();++o2){ const std::string& nm=(*sceneMeshes)[(size_t)src[o2]].name;
+                if (nm=="patch"||nm.rfind("patch",0)==0) ordIsPatch[o2]=1; }
             const float PLANE_EPS = 0.008f;                                        // 8mm sheet-offset tolerance
             for (auto& kb : planeBuckets) {
                 auto& tris = kb.second;
@@ -1814,14 +2204,18 @@ struct Editor {
                             cell[{cu,cv}].push_back(t); }
                 for (int t : tris) {
                     if (tp[t].dom<0 || keepOrd[t]==0) continue;                    // the FIRST source never loses
-                    // sample points: centroid + verts shrunk 8% toward centroid
+                    if (keepOrd[t]<(int)ordIsPatch.size() && ordIsPatch[keepOrd[t]]) continue;   // patches never lose
+                    // sample points: centroid + verts shrunk 8% toward centroid + edge midpoints shrunk
+                    // 8% (7 samples - 4 missed partial overlaps and dropped hole-spanning triangles)
                     const float* A=V(t,0); const float* B=V(t,1); const float* C=V(t,2);
                     float cen[3]={(A[0]+B[0]+C[0])/3,(A[1]+B[1]+C[1])/3,(A[2]+B[2]+C[2])/3};
-                    float smp[4][3]; memcpy(smp[0],cen,12);
+                    float smp[7][3]; memcpy(smp[0],cen,12);
                     for (int e=0;e<3;++e){ const float* P0=V(t,e);
                         for (int ax2=0;ax2<3;++ax2) smp[e+1][ax2]=P0[ax2]+(cen[ax2]-P0[ax2])*0.08f; }
+                    for (int e=0;e<3;++e){ const float* P0=V(t,e); const float* P1=V(t,(e+1)%3);
+                        for (int ax2=0;ax2<3;++ax2){ float m2=(P0[ax2]+P1[ax2])*0.5f; smp[e+4][ax2]=m2+(cen[ax2]-m2)*0.08f; } }
                     bool allCovered=true;
-                    for (int si2=0; si2<4 && allCovered; ++si2) {
+                    for (int si2=0; si2<7 && allCovered; ++si2) {
                         float su,sv; uvOf(tp[t], smp[si2], su, sv);
                         auto itc = cell.find(cellOf2(su,sv));
                         bool cov=false;
@@ -1840,6 +2234,7 @@ struct Editor {
                     if (allCovered) { triDead[t]=1; ++coplDropped; }
                 }
             }
+            }   // fuseDropCovered
             std::vector<u32> fin; fin.reserve(keep.size());
             for (size_t t=0;t<nT;++t){ if (triDead[t]) continue; fin.push_back(keep[t*3]); fin.push_back(keep[t*3+1]); fin.push_back(keep[t*3+2]); }
             if (dropped||coplDropped) fprintf(stderr,"[EDIT] fuse: dropped %zu duplicate/degenerate + %zu COPLANAR-COVERED tris (z-fight elimination)\n", dropped, coplDropped);
@@ -2088,22 +2483,44 @@ struct Editor {
             setStatus("Cut "+std::to_string(cut)+" tris (r="+std::to_string(radius)+"m) - re-bake/collision follows; original in history (Ctrl+Z)");
     }
 
-    // ── mesh SPLIT: separate into CONNECTED PIECES (verts shared by triangles = same piece). Each piece
-    //    becomes its own mesh (same texture/material) so parts can be moved/deleted/collision-excluded
-    //    independently. Original goes to history.
+    // ── mesh SPLIT: separate into CONNECTED PIECES. Connectivity is by vertex POSITION (quantized
+    //    weld), NOT raw index sharing: meshes that duplicate vertices per triangle / per UV seam
+    //    (most fused or game-ripped geometry) used to explode into "every triangle its own piece"
+    //    (max-256 bail) or split along texture seams instead of the real islands. Degenerate
+    //    (zero-area) triangles never glue two islands together (triangle-strip stitches did — many
+    //    visually separate items came back as "ONE connected piece"). Each piece becomes its own
+    //    mesh (same texture/material) so parts move/delete/collision-exclude independently.
     void splitMeshParts(int mi){
         if (!r || !sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size() || mi>=(int)r->gpuMeshes.size()) return;
         const MeshData& src = (*sceneMeshes)[(size_t)mi];
         size_t nv = src.positions.size()/3;
         if (nv<3 || src.indices.size()<3) return;
+        // 1) weld vertices by quantized position (epsilon scales with the mesh so huge terrains and
+        //    tiny props both weld correctly) — duplicated seam/soup verts land on one weld node
+        float wmn[3]={1e30f,1e30f,1e30f}, wmx[3]={-1e30f,-1e30f,-1e30f};
+        for (size_t v2=0; v2<nv; ++v2) for (int a2=0;a2<3;++a2){ float p=src.positions[v2*3+a2]; wmn[a2]=std::min(wmn[a2],p); wmx[a2]=std::max(wmx[a2],p); }
+        float wdiag=std::sqrt((wmx[0]-wmn[0])*(wmx[0]-wmn[0])+(wmx[1]-wmn[1])*(wmx[1]-wmn[1])+(wmx[2]-wmn[2])*(wmx[2]-wmn[2]));
+        double weps=std::max(wdiag*1e-5f, 1e-6f);
+        std::vector<uint32_t> weld(nv);
+        { std::map<std::tuple<long long,long long,long long>,uint32_t> wcell;
+          for (size_t v2=0; v2<nv; ++v2){
+              auto key=std::make_tuple((long long)std::llround(src.positions[v2*3]  /weps),
+                                       (long long)std::llround(src.positions[v2*3+1]/weps),
+                                       (long long)std::llround(src.positions[v2*3+2]/weps));
+              auto it=wcell.find(key);
+              if (it!=wcell.end()) weld[v2]=it->second; else { weld[v2]=(uint32_t)v2; wcell.emplace(key,(uint32_t)v2); }
+          } }
+        // 2) union-find over the WELDED ids; degenerate tris (repeated welded vert = zero area) are
+        //    skipped so strip stitches can't bridge islands
         std::vector<uint32_t> parent(nv); for (size_t i2=0;i2<nv;++i2) parent[i2]=(uint32_t)i2;
         std::function<uint32_t(uint32_t)> find = [&](uint32_t v2)->uint32_t{ while (parent[v2]!=v2){ parent[v2]=parent[parent[v2]]; v2=parent[v2]; } return v2; };
-        for (size_t k=0;k+2<src.indices.size();k+=3){ uint32_t a=find(src.indices[k]),b=find(src.indices[k+1]),c=find(src.indices[k+2]);
+        for (size_t k=0;k+2<src.indices.size();k+=3){ uint32_t a=find(weld[src.indices[k]]),b=find(weld[src.indices[k+1]]),c=find(weld[src.indices[k+2]]);
+            if (a==b||b==c||c==a) continue;   // degenerate/stitch: keep the tri, never glue through it
             parent[b]=a; parent[c]=a; }
         std::map<uint32_t,int> compOf; int nComp=0;
-        for (size_t k=0;k<src.indices.size();k+=3){ uint32_t rt=find(src.indices[k]); if(!compOf.count(rt)) compOf[rt]=nComp++; }
-        if (nComp<=1) { setStatus("split: mesh is ONE connected piece already"); return; }
-        if (nComp>256){ setStatus("split: "+std::to_string(nComp)+" pieces is too many (max 256)"); return; }
+        for (size_t k=0;k<src.indices.size();k+=3){ uint32_t rt=find(weld[src.indices[k]]); if(!compOf.count(rt)) compOf[rt]=nComp++; }
+        if (nComp<=1) { setStatus("split: mesh is ONE connected piece (by position) - use Cut region / Knife to divide it manually"); return; }
+        if (nComp>256){ setStatus("split: "+std::to_string(nComp)+" pieces is too many (max 256) - Cut region a chunk out first"); return; }
         bool hasUV=src.uvs.size()>=nv*2, hasUV2=src.uvs2.size()>=nv*2, hasCol=src.colors.size()>=nv*4;
         std::vector<MeshData> parts((size_t)nComp);
         std::vector<std::map<uint32_t,uint32_t>> remap((size_t)nComp);
@@ -2113,7 +2530,7 @@ struct Editor {
             parts[c2].boneIndices.clear(); parts[c2].boneWeights.clear(); parts[c2].hasBones=false;
             /* parts KEEP the original name (the [idx] suffix in the outliner disambiguates) */ }
         for (size_t k=0;k+2<src.indices.size();k+=3){
-            int c2 = compOf[find(src.indices[k])]; auto& pt=parts[c2]; auto& rm=remap[c2];
+            int c2 = compOf[find(weld[src.indices[k]])]; auto& pt=parts[c2]; auto& rm=remap[c2];
             for (int e=0;e<3;e++){ uint32_t v2=src.indices[k+e];
                 auto it=rm.find(v2); uint32_t nvi;
                 if (it!=rm.end()) nvi=it->second;
@@ -2167,12 +2584,56 @@ struct Editor {
                      : ("Texture set on CPU (will cook) but preview re-upload failed: "+path));
         return true;
     }
+    // ── AI texture prompt: every exported PNG comes with a ready-to-paste ChatGPT prompt (copied to
+    //    the CLIPBOARD + written as <png>_PROMPT.txt beside the file). The guardrails keep the AI's
+    //    result mappable straight back onto the mesh via Set texture: exact size, nothing moved or
+    //    re-framed, palette kept, edges still tile, alpha preserved. Patch meshes get an INPAINT
+    //    prompt instead (the smooth pin-color blend region IS the hole to repaint).
+    std::string aiTexturePrompt(const MeshData& md) const {
+        bool isPatch = md.name.rfind("patch",0)==0;
+        char head[176]; snprintf(head,sizeof head,
+            "I'm attaching a %dx%d PNG texture from a 3D game environment%s.\n\n",
+            (int)md.texW,(int)md.texH, isPatch?" (an inpainting template)":"");
+        std::string p(head);
+        if (isPatch)
+            p += "It was auto-baked around a HOLE in the scene: the detailed imagery is real surrounding "
+                 "surface sampled from the 3D scene, and the smooth/blurry gradient region is a placeholder "
+                 "covering the actual gap.\n"
+                 "TASK: repaint ONLY the smooth gradient region with plausible detail that seamlessly "
+                 "continues the surrounding imagery - match its colors, texture grain, lighting direction "
+                 "and scale. Leave every already-detailed pixel exactly as it is.\n\n";
+        else
+            p += "TASK: improve this texture - increase detail and sharpness, remove compression artifacts, "
+                 "noise and blur, and make surfaces read cleanly, while keeping the SAME look so it still "
+                 "matches the rest of the scene.\n\n";
+        p += "HARD RULES (the image is UV-mapped onto a 3D mesh, so pixel POSITIONS matter):\n"
+             "1. Same resolution and aspect ratio as the original (an exact 2x upscale is also fine).\n"
+             "2. Do NOT move, crop, rotate, mirror, re-center or re-frame anything; no added borders, "
+             "margins, vignettes, watermarks or text.\n"
+             "3. Keep the original color palette and overall brightness - no artistic re-grade.\n"
+             "4. If the texture tiles, keep the edges wrap-compatible: the left edge must still continue "
+             "into the right edge, and the top into the bottom.\n"
+             "5. Preserve transparency exactly: fully transparent areas stay fully transparent, hard "
+             "alpha cut-out edges stay hard.\n"
+             "6. If you see separate islands (a texture ATLAS), improve each island in place - never "
+             "paint across island boundaries.\n"
+             "7. Return the result as a downloadable PNG (no JPEG re-compression).\n";
+        return p;
+    }
+    void writeAiPromptSidecar(const MeshData& md, const std::string& pngPath){
+        std::string ptxt = aiTexturePrompt(md);
+        size_t dot = pngPath.find_last_of('.');
+        std::string pp = (dot==std::string::npos ? pngPath : pngPath.substr(0,dot)) + "_PROMPT.txt";
+        if (FILE* pf=fopen(pp.c_str(),"wb")){ fwrite(ptxt.data(),1,ptxt.size(),pf); fclose(pf); }
+        if (win) glfwSetClipboardString(win, ptxt.c_str());
+    }
     bool exportMeshTexture(int mi, const std::string& path){
         if(!sceneMeshes || mi<0 || mi>=(int)sceneMeshes->size()){ setStatus("export texture: bad mesh "+std::to_string(mi)); return false; }
         const MeshData& md=(*sceneMeshes)[mi];
         if(!md.hasTexture || md.texRGBA.size()<(size_t)md.texW*md.texH*4 || md.texW<1||md.texH<1){ setStatus("export texture: mesh "+std::to_string(mi)+" has none"); return false; }
         int ok=stbi_write_png(path.c_str(), md.texW, md.texH, 4, md.texRGBA.data(), md.texW*4);
-        setStatus(ok ? ("Exported texture ["+std::to_string(mi)+"] "+std::to_string(md.texW)+"x"+std::to_string(md.texH)+" -> "+path)
+        if (ok) writeAiPromptSidecar(md, path);
+        setStatus(ok ? ("Exported texture ["+std::to_string(mi)+"] "+std::to_string(md.texW)+"x"+std::to_string(md.texH)+" -> "+path+"  |  ChatGPT prompt copied to clipboard (+_PROMPT.txt)")
                      : ("texture export FAILED: "+path));
         return ok!=0;
     }
@@ -2906,9 +3367,10 @@ struct Editor {
                 else { std::vector<Xform> after; for (int m:gizmoSel) after.push_back(captureX(r->gpuMeshes[m])); pushUndo(gizmoSel, gizmoBeforeV, after); }
                 gizmoDrag=false; gizmoAxis=-1; }
             else if (b == 0 && popupAtePress) { popupAtePress = false; }   // the press went to a MENU: its release must NOT pick a mesh behind the popup
-            else if (b == 0 && knifeOn && knifeDrag) {   // KNIFE: release = cut under the drawn line
+            else if (b == 0 && knifeOn && knifeDrag) {   // KNIFE: release = cut (line = plane, box = 3D volume)
                 knifeDrag=false;
-                applyKnife(knifeA[0], knifeA[1], (float)cx.in.mx, (float)cx.in.my);
+                if (knifeBox) applyKnifeBox(knifeA[0], knifeA[1], (float)cx.in.mx, (float)cx.in.my);
+                else          applyKnife(knifeA[0], knifeA[1], (float)cx.in.mx, (float)cx.in.my);
             }
             else if (b == 0 && in3D && patchMode) {   // PATCH TOOL: clicks drop pins, never select/deselect
                 float dx=cx.in.mx-(float)cx.in.pressX[0], dy=cx.in.my-(float)cx.in.pressY[0];
@@ -2980,15 +3442,15 @@ struct Editor {
             if (!sel.empty()) { selected=sel.back(); r->selectedMesh=selected; duplicateSelected(); }
         }
         if (key==GLFW_KEY_F1) showKeybinds = !showKeybinds;   // all-shortcuts overlay
-        if (patchMode) {   // PIN TOOLS (patch / cut region / bend): Enter = apply, Esc = cancel
-            if (key==GLFW_KEY_ENTER) { if (pinIsBend) bendAtPin(); else if (pinIsCut) cutRegionByPins(); else buildPatch(); }
-            if (key==GLFW_KEY_ESCAPE) { patchMode=false; pinIsCut=false; pinIsBend=false; patchPts.clear(); patchCols.clear(); setStatus("pin tool cancelled"); }
+        if (patchMode) {   // PIN TOOLS (patch / cut region / bend / knife path): Enter = apply, Esc = cancel
+            if (key==GLFW_KEY_ENTER) { if (pinIsKnife) applyKnifePath(); else if (pinIsBend) bendAtPin(); else if (pinIsCut) cutRegionByPins(); else buildPatch(); }
+            if (key==GLFW_KEY_ESCAPE) { patchMode=false; pinIsCut=false; pinIsBend=false; pinIsKnife=false; patchPts.clear(); patchCols.clear(); setStatus("pin tool cancelled"); }
         }
         if (sliceGizmoOn) {   // SLICE GIZMO: Enter = cut along the placed plane, Esc = cancel
             if (key==GLFW_KEY_ENTER) applySliceGizmo();
             if (key==GLFW_KEY_ESCAPE) { sliceGizmoOn=false; setStatus("slice gizmo cancelled"); }
         }
-        if (knifeOn && key==GLFW_KEY_ESCAPE) { knifeOn=false; knifeDrag=false; setStatus("knife cancelled"); }
+        if (knifeOn && key==GLFW_KEY_ESCAPE) { knifeOn=false; knifeDrag=false; knifeBox=false; setStatus("knife cancelled"); }
         if (key==GLFW_KEY_SPACE && !playSim) {   // SPACE = toggle visibility of the selection (meshes or scene items)
             if (!selItems.empty()) { bool anyVis=false; for (int i:selItems) if (i>=0&&i<(int)items.size()&&!items[i].hidden) anyVis=true;
                                      for (int i:selItems) if (i>=0&&i<(int)items.size()) items[i].hidden = anyVis; }
@@ -3390,12 +3852,12 @@ struct Editor {
                 else if (a==45) startKnife();
                 else if (a==46) forEachSelMesh([&](int m){ completeDome(m, false); });  // partial sky dome -> full 360° dome (to the rim)
                 else if (a==47) forEachSelMesh([&](int m){ completeDome(m, true);  });  // -> fully enclosed 360° sphere (closes the bottom)
-                else if (a==38) { patchMode=!patchMode; patchPts.clear(); patchCols.clear();
+                else if (a==38) { patchMode=!patchMode; pinIsCut=false; pinIsBend=false; pinIsKnife=false; patchPts.clear(); patchCols.clear();
                                   if (patchMode) setStatus("PATCH: click the gap's corner points in the viewport (3+), Enter builds, Esc cancels"); }
                 else if (a==39) forEachSelMesh([&](int m){ reUVFlat(m); });
-                else if (a==40) { patchMode=true; pinIsCut=true; pinIsBend=false; patchPts.clear(); patchCols.clear();
+                else if (a==40) { patchMode=true; pinIsCut=true; pinIsBend=false; pinIsKnife=false; patchPts.clear(); patchCols.clear();
                                   setStatus("CUT: 2 pins = SPLIT along the line, 3+ pins = cut the polygon out; Enter applies"); }
-                else if (a==41) { patchMode=true; pinIsBend=true; pinIsCut=false; patchPts.clear(); patchCols.clear();
+                else if (a==41) { patchMode=true; pinIsBend=true; pinIsCut=false; pinIsKnife=false; patchPts.clear(); patchCols.clear();
                                   setStatus("BEND: click the grab point, set Radius + Offset (Object > Geometry), Enter deforms"); }
                 else if (a==27) { bool exc = !noColMeshes.count(ctxMesh);      // collision walk-through toggle (whole selection)
                                   for (int t2:tg) { if (exc) noColMeshes.insert(t2); else noColMeshes.erase(t2); }
@@ -4024,7 +4486,7 @@ struct Editor {
           y += th.rowH+3*uiScale; }
         { float bw2=(w-6*uiScale)/2;    // PATCH TOOL: paint EXACTLY where geometry goes (gap corners -> Enter)
           char pb2[48]; snprintf(pb2,sizeof pb2, patchMode?"Patching: %d pts (Enter)":"Patch tool (click corners)",(int)patchPts.size());
-          if (cx.button(ui::hashId("patchtg"), x, y, bw2, th.rowH, pb2, patchMode&&!pinIsCut)) { patchMode=!(patchMode&&!pinIsCut&&!pinIsBend); pinIsCut=false; pinIsBend=false; patchPts.clear(); patchCols.clear();
+          if (cx.button(ui::hashId("patchtg"), x, y, bw2, th.rowH, pb2, patchMode&&!pinIsCut)) { patchMode=!(patchMode&&!pinIsCut&&!pinIsBend&&!pinIsKnife); pinIsCut=false; pinIsBend=false; pinIsKnife=false; patchPts.clear(); patchCols.clear();
               if (patchMode) setStatus("PATCH: click the gap's corner points in the viewport (3+), Enter builds, Esc cancels"); }
           if (cx.button(ui::hashId("patchgo"), x+bw2+6*uiScale, y, bw2, th.rowH, "Build patch (Enter)", false) && patchMode) buildPatch();
           y += th.rowH+3*uiScale; }
@@ -4032,13 +4494,13 @@ struct Editor {
         y += th.rowH+3*uiScale;
         { char cb2[52]; snprintf(cb2,sizeof cb2, (patchMode&&pinIsCut)?"Cutting: %d pts (Enter)":"Cut region tool (click corners)",(int)patchPts.size());
           if (cx.button(ui::hashId("cutreg"), x, y, w, th.rowH, cb2, patchMode&&pinIsCut)) {
-              patchMode=!(patchMode&&pinIsCut); pinIsCut=patchMode; pinIsBend=false; patchPts.clear(); patchCols.clear();
+              patchMode=!(patchMode&&pinIsCut); pinIsCut=patchMode; pinIsBend=false; pinIsKnife=false; patchPts.clear(); patchCols.clear();
               if (patchMode) setStatus("CUT: 2 pins = SPLIT along the line, 3+ pins = cut the polygon out of the SELECTION; Enter applies"); }
           y += th.rowH+3*uiScale; }
         // BEND/STRETCH: grab-deform with falloff (click a point, set radius + offset, Apply)
         { char bb2[52]; snprintf(bb2,sizeof bb2, (patchMode&&pinIsBend)?"Bending: pin set (Enter)":"Bend/stretch tool (click grab point)");
           if (cx.button(ui::hashId("bendtg"), x, y, w, th.rowH, bb2, patchMode&&pinIsBend)) {
-              patchMode=!(patchMode&&pinIsBend); pinIsBend=patchMode; pinIsCut=false; patchPts.clear(); patchCols.clear();
+              patchMode=!(patchMode&&pinIsBend); pinIsBend=patchMode; pinIsCut=false; pinIsKnife=false; patchPts.clear(); patchCols.clear();
               if (patchMode) setStatus("BEND: click the grab point on the mesh, set Radius + Offset below, Enter (or Apply) deforms"); }
           y += th.rowH+3*uiScale;
           if (patchMode && pinIsBend) {
@@ -4052,8 +4514,23 @@ struct Editor {
               if (cx.button(ui::hashId("bendgo"), x, y, w, th.rowH, "Apply bend (Enter)")) bendAtPin();
               y+=th.rowH+3*uiScale;
           } }
-        { char kb2[52]; snprintf(kb2,sizeof kb2, knifeOn?"KNIFE active - drag a line over the mesh":"KNIFE: cut by drawing a LINE");
-          if (cx.button(ui::hashId("knife"), x, y, w, th.rowH, kb2, knifeOn)) { if (knifeOn){ knifeOn=false; knifeDrag=false; } else startKnife(); }
+        { char kb2[52]; snprintf(kb2,sizeof kb2, (knifeOn&&!knifeBox)?"KNIFE active - drag a line over the mesh":"KNIFE: cut by drawing a LINE");
+          if (cx.button(ui::hashId("knife"), x, y, w, th.rowH, kb2, knifeOn&&!knifeBox)) { if (knifeOn&&!knifeBox){ knifeOn=false; knifeDrag=false; } else startKnife(); }
+          y += th.rowH+3*uiScale; }
+        { char kp2[64]; snprintf(kp2,sizeof kp2, (patchMode&&pinIsKnife)?"KNIFE PATH: %d pts (Enter cuts)":"KNIFE PATH: cut along clicked points",(int)patchPts.size());
+          if (cx.button(ui::hashId("knifepath"), x, y, w, th.rowH, kp2, patchMode&&pinIsKnife)) {
+              bool on = !(patchMode&&pinIsKnife);
+              patchMode=on; pinIsKnife=on; pinIsCut=false; pinIsBend=false; patchPts.clear(); patchCols.clear();
+              knifeOn=false; knifeBox=false; knifeDrag=false; sliceGizmoOn=false;
+              if (on) setStatus("KNIFE PATH: click 2+ points along the cut line (corners allowed, pins lock to the SELECTION), ENTER cuts, ESC cancels"); }
+          y += th.rowH+3*uiScale; }
+        { char kb3[64]; snprintf(kb3,sizeof kb3, (knifeOn&&knifeBox)?"KNIFE BOX active - drag a rectangle":"KNIFE BOX: 3D cut (drag a RECTANGLE)");
+          if (cx.button(ui::hashId("knifebox"), x, y, w, th.rowH, kb3, knifeOn&&knifeBox)) { if (knifeOn&&knifeBox){ knifeOn=false; knifeBox=false; knifeDrag=false; } else startKnifeBox(); }
+          y += th.rowH+2*uiScale;
+          cx.label(x,y,80*uiScale,th.rowH,"Cut depth",th.textDim);
+          cx.dragFloat(ui::hashId("kboxdep"), x+82*uiScale, y, 70*uiScale, th.rowH, knifeCutDepth, 0.01f, "%.2f");
+          cx.label(x+156*uiScale,y,w-156*uiScale,th.rowH,"m from surface (0 = through)",th.textDim);
+          if (knifeCutDepth<0.f) knifeCutDepth=0.f;
           y += th.rowH+3*uiScale; }
         { char sb2[52]; snprintf(sb2,sizeof sb2, sliceGizmoOn?"SLICE GIZMO active (Enter cuts)":"Slice GIZMO (place the cut visually)");
           if (cx.button(ui::hashId("slcgiz"), x, y, w, th.rowH, sb2, sliceGizmoOn)) { if (sliceGizmoOn) sliceGizmoOn=false; else startSliceGizmo(nullptr); }
@@ -4080,6 +4557,14 @@ struct Editor {
           if (cx.button(ui::hashId("splitp"), x, y, bw2, th.rowH, "Split pieces")) forEachSelMesh([&](int m){ splitMeshParts(m); });
           char fb2[40]; snprintf(fb2,sizeof fb2,"Fuse selection (%d)",(int)sel.size());
           if (cx.button(ui::hashId("fusesel"), x+bw2+6*uiScale, y, bw2, th.rowH, fb2, sel.size()>1)) fuseSelectedMeshes();
+          y+=th.rowH+3*uiScale;
+          if (cx.button(ui::hashId("fusezf"), x, y, w, th.rowH,
+                        fuseDropCovered ? "Fuse cleanup: drop overlapped coplanar tris (ON)"
+                                        : "Fuse: keep EVERY original triangle (cleanup OFF)", fuseDropCovered)) {
+              fuseDropCovered=!fuseDropCovered;
+              setStatus(fuseDropCovered ? "Fuse will drop later-source triangles fully covered by an earlier coplanar sheet (stacked-floor z-fight cleanup)"
+                                        : "Fuse keeps the sources' original triangle pattern verbatim (safest for curved/bent geometry + patches)");
+          }
           y+=th.rowH+3*uiScale;
           char rb2[52]; snprintf(rb2,sizeof rb2,"Fuse + REBUILD surface (%d) - clean retriangulate",(int)sel.size());
           if (cx.button(ui::hashId("rebuilds"), x, y, w, th.rowH, rb2, !sel.empty())) rebuildSurface();
@@ -4197,13 +4682,14 @@ struct Editor {
               std::error_code ec; std::filesystem::create_directories("saved", ec);   // export failed silently when saved/ didn't exist
               std::string safe = "saved/"; for (char c : gm.name) safe += (c=='/'||c=='\\'||c==':')?'_':c; safe += "_tex.png";
               if (stbi_write_png(safe.c_str(), md->texW, md->texH, 4, md->texRGBA.data(), md->texW*4)) {
+                  writeAiPromptSidecar(*md, safe);   // ChatGPT prompt -> clipboard + _PROMPT.txt beside the PNG
                   std::string abs = std::filesystem::absolute(safe, ec).string();
 #ifdef _WIN32
                   for (char& c : abs) if (c=='/') c='\\';
-                  setStatus("Exported texture -> "+abs+"  (opening Explorer)");
+                  setStatus("Exported texture -> "+abs+"  |  ChatGPT prompt COPIED to clipboard (paste it with the image; also saved as _PROMPT.txt)");
                   system(("explorer /select,\""+abs+"\"").c_str());   // SHOW the user exactly where it landed
 #else
-                  setStatus("Exported texture -> "+abs+"  (opening folder)");
+                  setStatus("Exported texture -> "+abs+"  |  ChatGPT prompt COPIED to clipboard (paste it with the image; also saved as _PROMPT.txt)");
                   std::string dir = abs; size_t sl2 = dir.find_last_of('/'); if (sl2 != std::string::npos) dir = dir.substr(0, sl2);
   #ifdef __APPLE__
                   system(("open \""+dir+"\" >/dev/null 2>&1 &").c_str());
