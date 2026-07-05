@@ -2590,18 +2590,16 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                             skinCutK = keyForPath(cp2); assets.push_back({ cp2, skinCutK.tgt, cb, skinCutK }); rotShaders[cfn] = skinCutK; }
                     }
                     if (skinCutK.pkg || skinCutK.ing) { sk = skinCutK;
-                        // OFFICIAL masked-foliage PIPELINE FLAGS (ground truth = Meta's own cooked haven2025
-                        // m_pottedplantaleaves_*_masked MATL, byte-diffed against our butterflies template —
-                        // IDENTICAL struct layout): field0 struct u16 flags @76 = 0x7C (ours shipped 0x10) and
-                        // f32 alphaCutoff @80 = 0.30 (ours shipped 1.0). These are the bits the device pipeline
-                        // builder consumes for MASKED cutout foliage — the native alpha-tested/alpha-to-coverage
-                        // path that is smooth AND depth-writes (what blend/two-pass kept failing to fake).
-                        // HSR_NOFOLIA2C reverts to the plain template bits.
-                        if (matl.size() >= 84 && !std::getenv("HSR_NOFOLIA2C")) {
+                        // ⛔ REVERTED experiment (opt-in HSR_FOLIA2C): copying haven2025's masked-leaf MATL field0
+                        // bits (flags 0x7C @76 + alphaCutoff 0.30 @80) onto OUR skinned MATL rendered the zen tree
+                        // as a "GOOPY MESS with leaves texture" on device — those bits pair with Meta's OWN
+                        // pbrlightmap_masked technique, not our custom skinned pipeline; on ours they melt the
+                        // alpha edges. Plain 0.5-discard skincutout is the working masked look.
+                        if (matl.size() >= 84 && std::getenv("HSR_FOLIA2C")) {
                             uint16_t fl = 0x7C; std::memcpy(matl.data()+76, &fl, 2);
                             float cut = 0.30f;  std::memcpy(matl.data()+80, &cut, 4);
                         }
-                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SKINNED-CUTOUT%s (masked foliage, official masked flags 0x7C cutoff 0.30)\n", i, m.name.c_str(), sctint?"+TINTREPLAY":""); }
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SKINNED-CUTOUT%s (masked foliage, discard a<0.5)\n", i, m.name.c_str(), sctint?"+TINTREPLAY":""); }
                 }
                 // ── COMBINED effect card (RIGID-HZANIM + material UV/fade) — NO EXCLUSION ──────────────────────────
                 // A fog/dust card whose node has R/S rides a RIGID-HZANIM skeleton (faithful T+R+S) AND has a UV flipbook
@@ -3145,7 +3143,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SpecIbl irradiance vertexcolor baked (%zu verts)\n", i, m.name.c_str(), m.iblVertCol.size()/4);
         } else {
             size_t nvc = m.positions.size()/3;
-            bool hasLm = m.hasLightmap && !m.lmRGBA.empty() && m.lmW>0 && m.lmH>0 && m.uvs2.size() >= nvc*2;
+            // bakeLightmapVtx gate = WYSIWYG with the preview (the OPA ground truth): the preview applies the
+            // lightmap ONLY for bakeLightmapVtx ShellEnv shells; a *_specIbl mesh (stinson platformCenter
+            // terrazzo) takes the IBL-irradiance branch and shows NO lightmap shading. The cook baking the
+            // lightmap anyway painted shadows the source never renders ("UNWANTED SHADOW" on the floor).
+            bool hasLm = m.bakeLightmapVtx && m.hasLightmap && !m.lmRGBA.empty() && m.lmW>0 && m.lmH>0 && m.uvs2.size() >= nvc*2;
             // FADED effect cards (fog/dust): the getTime flipbook shader REPLAYS the mat.sanim tint-alpha curve, so the
             // per-vertex COLOR_0 alpha must be NEUTRAL 1.0 (else static curTint[3] — 0 at cook phase 0 — ×  shaderFade = 0
             // = invisible, the "only one fog visible" bug). The shader owns the opacity for these.
