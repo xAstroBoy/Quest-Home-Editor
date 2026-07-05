@@ -200,9 +200,44 @@ struct Editor {
         if (live.empty()) { deselectAll(); return; }
         for (int m:live) r->setDeleted((size_t)m, true);
         pushDeleteUndo(live, true);     // the edit HISTORY: Ctrl+Z is the ONLY way back
+        // Deleting a CREATED mesh (cut/fuse/patch result, idx >= baseMeshCount) must re-write the .geom
+        // sidecar: the autosave gates the sidecar on geomDirty, and a STALE sidecar still holds the mesh
+        // ALIVE while its session DELETED line is ignored on load (geomAuth) -> "deleted cut mesh shows
+        // back up on reload" (bluehillgoldmine zombie).
+        if (baseMeshCount>=0) for (int m:live) if (m>=baseMeshCount) { geomDirty=true; break; }
+        bakeNavmeshes(items);           // colliders/navmeshes sourcing these meshes drop them immediately
         size_t n = live.size();
         deselectAll();                  // deleted = GONE (no list row, no pick, no gizmo)
         setStatus("Deleted "+std::to_string(n)+" mesh(es) - gone from render + list + cook (only Ctrl+Z restores)");
+    }
+    // ── ANIMATED-mesh EYE (Ctrl+H / View checkbox): one click hides EVERYTHING that animates —
+    //    skinned rigs, node anims, UV-scroll/flipbook cards, tint-flicker particles, VAT creatures
+    //    (every mat.sanim path sets dynamicVerts, so the coverage is total) — so static geometry can
+    //    be edited without the moving stuff in the way. Remembers exactly which meshes IT hid and
+    //    restores only those on toggle-off (manual hides untouched).
+    std::vector<int> animEyeHidden; bool animEyeOn=false;
+    bool meshIsAnimated(int i) const {
+        if (!r || i<0 || i>=(int)r->gpuMeshes.size()) return false;
+        const VkGpuMesh& gm=r->gpuMeshes[(size_t)i];
+        if (gm.isSkinned || gm.dynamicVerts) return true;
+        if (sceneMeshes && i<(int)sceneMeshes->size()){
+            const MeshData& md=(*sceneMeshes)[(size_t)i];
+            if (md.hasVat || md.dynamicVerts || md.hasBones || md.animatedTintAlpha) return true; }
+        return false;
+    }
+    void toggleAnimatedEye(){
+        if (!r) return;
+        if (!animEyeOn){
+            animEyeHidden.clear();
+            for (int i=0;i<(int)r->gpuMeshes.size();++i)
+                if (meshIsAnimated(i) && !r->isDeleted((size_t)i) && !r->isHidden((size_t)i)){ r->setHidden((size_t)i,true); animEyeHidden.push_back(i); }
+            animEyeOn=true;
+            setStatus("Hid "+std::to_string(animEyeHidden.size())+" ANIMATED mesh(es) - skinned/flipbooks/UV-scroll/particles/VAT (Ctrl+H shows them again)");
+        } else {
+            for (int i : animEyeHidden) if (i>=0 && i<(int)r->gpuMeshes.size()) r->setHidden((size_t)i,false);
+            setStatus("Restored "+std::to_string(animEyeHidden.size())+" animated mesh(es)");
+            animEyeHidden.clear(); animEyeOn=false;
+        }
     }
     // ── mesh DUPLICATE (Ctrl+D) — clone the selected mesh(es) into a fresh GPU mesh (its own buffers) offset in place,
     //    so the copy can be moved/edited/cooked independently WITHOUT re-authoring geometry. Appends to sceneMeshes +
@@ -1341,6 +1376,7 @@ struct Editor {
         }
         r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
         r->setDeleted((size_t)mi, true); pushDeleteUndo(hist, histA);
+        remapMeshComponents(mi, std::vector<int>(hist.begin()+1, hist.end()));   // colliders follow the halves
         deselectAll(); holesMesh=-1; geomDirty = true;
         setStatus("Cut in two ("+std::to_string(made)+" parts, texture kept) - move/delete each; Ctrl+Z un-cuts");
         return made>0;
@@ -1520,6 +1556,7 @@ struct Editor {
         }
         r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
         r->setDeleted((size_t)mi, true); pushDeleteUndo(hist, histA);
+        remapMeshComponents(mi, std::vector<int>(hist.begin()+1, hist.end()));   // colliders follow inside+outside pieces
         holesMesh=-1; geomDirty=true;
         return made==2;
     }
@@ -2250,6 +2287,7 @@ struct Editor {
         for (int s : src) r->setDeleted((size_t)s, true);
         hist.push_back((int)ni); histA.push_back(0);
         pushDeleteUndo(hist, histA);                          // ONE Ctrl+Z un-fuses (sources back, fused gone)
+        for (int s : src) remapMeshComponents(s, {(int)ni});  // colliders on any source follow the fused mesh
         meshEditLog[(int)ni] = "fuse(" + std::to_string(src.size()) + ")";
         geomDirty = true; holesMesh = -1;
         selectOne((int)ni); scrollToSel=true;
@@ -2440,6 +2478,7 @@ struct Editor {
         r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
         r->setDeleted((size_t)mi, true);
         pushDeleteUndo({mi,(int)ni}, std::vector<uint8_t>{1,0});   // ONE history entry: Ctrl+Z restores the original AND removes the result
+        remapMeshComponents(mi, {(int)ni});                        // colliders/navmeshes on this mesh follow the edit
         { auto it=meshEditLog.find(mi); std::string prev = it!=meshEditLog.end()? it->second+"+" : std::string();
           meshEditLog[(int)ni] = prev + what; }
         selectOne((int)ni);
@@ -2559,6 +2598,7 @@ struct Editor {
         }
         r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
         r->setDeleted((size_t)mi, true); pushDeleteUndo(hist, histA);
+        remapMeshComponents(mi, std::vector<int>(hist.begin()+1, hist.end()));   // colliders follow every piece
         deselectAll(); geomDirty = true; holesMesh = -1;
         setStatus("Split into "+std::to_string(made)+" pieces - move/delete/collision-exclude them independently (Ctrl+Z reverts)");
     }
@@ -3441,6 +3481,20 @@ struct Editor {
             sel.clear(); for (int m : meshClipboard) if (m>=0 && m<(int)r->gpuMeshes.size()) sel.push_back(m);
             if (!sel.empty()) { selected=sel.back(); r->selectedMesh=selected; duplicateSelected(); }
         }
+        if ((mods&GLFW_MOD_CONTROL) && key=='A') {   // Ctrl+A = select ALL: scene ITEMS when an item is active, else all meshes
+            if (selItem>=0 || !selItems.empty()) {
+                selItems.clear();
+                for (int i2=0;i2<(int)items.size();++i2) selItems.push_back(i2);
+                selItem = selItems.empty()?-1:selItems.back(); deselectAll();
+                setStatus("Selected ALL "+std::to_string(selItems.size())+" scene items (Del removes, Space hides)");
+            } else if (r) {
+                sel.clear();
+                for (int i2=0;i2<(int)r->gpuMeshes.size();++i2) if (!r->isDeleted((size_t)i2) && !r->isHidden((size_t)i2)) sel.push_back(i2);
+                selected = sel.empty()?-1:sel.back(); r->selectedMesh=selected; selItems.clear(); selItem=-1;
+                setStatus("Selected ALL "+std::to_string(sel.size())+" meshes (click a scene item first to Ctrl+A the items instead)");
+            }
+        }
+        if ((mods&GLFW_MOD_CONTROL) && key=='H') toggleAnimatedEye();   // Ctrl+H = hide/show EVERYTHING animated (cards/flipbooks/particles/skinned/VAT)
         if (key==GLFW_KEY_F1) showKeybinds = !showKeybinds;   // all-shortcuts overlay
         if (patchMode) {   // PIN TOOLS (patch / cut region / bend / knife path): Enter = apply, Esc = cancel
             if (key==GLFW_KEY_ENTER) { if (pinIsKnife) applyKnifePath(); else if (pinIsBend) bendAtPin(); else if (pinIsCut) cutRegionByPins(); else buildPatch(); }
@@ -3781,6 +3835,7 @@ struct Editor {
         std::vector<MRow> subCmp = {
             {colLbl,5,-1},
             {"Mesh Collider (static, exact tris)",16,-1},
+            {std::string("REMOVE mesh collider")+suf+" ("+std::to_string(boundMeshColliders(tg))+" bound)",48,-1},
             {"Navmesh (walkable scene)",17,-1},
             {"Box Collider (wrap mesh)",10,-1},
             {"Wall (faces camera)",11,-1},
@@ -3872,6 +3927,9 @@ struct Editor {
                 else if (a==14) for(int t:tg) addItemFromMesh(sitem::HOTSPOT, t);
                 else if (a==15) for(int t:tg) addItemFromMesh(sitem::BOUNDARY, t);
                 else if (a==16) for(int t:tg) addMeshCollider(t, true);   // STATIC mesh collider (exact tris) on EACH selected mesh
+                else if (a==48) { int nrm=removeMeshColliders(tg);        // take the collider component OFF the mesh(es)
+                                  setStatus(nrm ? ("Removed "+std::to_string(nrm)+" mesh collider component(s) - Ctrl+Z restores")
+                                                : "no mesh collider is bound to this mesh"); }
                 else if (a==17) addNavmesh(1);                            // generate the walkable scene navmesh (smart)
                 ctxOpen=false; ctxSub=-1;
         };
@@ -4334,7 +4392,11 @@ struct Editor {
         cx.checkbox(ui::hashId("gzCol"),  x, y, "Colliders / walls", r->showCollision); y+=rh;
         cx.checkbox(ui::hashId("gzSpn"),  x, y, "Spawn markers", r->showSpawn); y+=rh;
         cx.checkbox(ui::hashId("gzFar"),  x, y, "Far-clip dome (device 5000m)", showFarClip); y+=rh;
-        cx.checkbox(ui::hashId("gzMCol"), x, y, "Mesh collision (exact tris)", showMeshCol); y+=rh+6*uiScale;
+        cx.checkbox(ui::hashId("gzMCol"), x, y, "Mesh collision (exact tris)", showMeshCol); y+=rh;
+        { bool ae=animEyeOn;
+          cx.checkbox(ui::hashId("gzAnim"), x, y, "Hide ANIMATED meshes (Ctrl+H)", ae);
+          if (ae!=animEyeOn) toggleAnimatedEye(); }
+        y+=rh+6*uiScale;
         dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
         // ── LIGHTING — global light manipulation (multiplies every draw's color; live, persisted, ships in session) ──
         cx.label(x,y,w,rh,"Lighting  (global, live)",th.text); y+=rh+2*uiScale;
@@ -4350,18 +4412,33 @@ struct Editor {
         dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
         dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
         cx.label(x,y,w,rh,"Meta Components",th.text); y+=rh;
-        cx.label(x,y,w,rh*0.9f,"eye = show markers     + Add = spawn one",th.textDim); y+=rh+4*uiScale;
+        cx.label(x,y,w,rh*0.9f,"eye = show markers     Clear = remove all of a type     + Add = spawn one",th.textDim); y+=rh+4*uiScale;
         int types[]={sitem::SPAWN,sitem::CHAIR,sitem::BOXCOL,sitem::NAVMESH,sitem::WALLPLACE,sitem::HOTSPOT,sitem::BOUNDARY};
         for (int t : types){
             int cnt=0; for (auto& it:items) if (it.type==t) cnt++;
             dl.rect(x, y+3*uiScale, 10*uiScale, rh-6*uiScale, typeColor(t,true));               // colour key
             eyeToggle(x+26*uiScale, y+rh*0.5f, showType[t]);                                    // EYE visibility toggle
             char lbl[80]; snprintf(lbl,sizeof lbl,"%s  (%d)", sitem::typeName(t), cnt);
-            cx.label(x+40*uiScale, y, w-98*uiScale, rh, lbl, th.text);
+            cx.label(x+40*uiScale, y, w-158*uiScale, rh, lbl, th.text);
+            if (cnt>0 && cx.button(ui::hashId(7200u+t, 9u), x+w-110*uiScale, y+1*uiScale, 52*uiScale, rh-2*uiScale, "Clear", false)){
+                pushItemUndo(items);                                                            // one Ctrl+Z restores the whole type
+                for (int i2=(int)items.size()-1;i2>=0;--i2) if (items[(size_t)i2].type==t) items.erase(items.begin()+i2);
+                selItem=-1; selItems.clear();
+                setStatus(std::string("Cleared ")+std::to_string(cnt)+" "+sitem::typeName(t)+" item(s) - Ctrl+Z restores");
+            }
             if (cx.button(ui::hashId(7100u+t, 7u), x+w-54*uiScale, y+1*uiScale, 52*uiScale, rh-2*uiScale, "+ Add", true)) addItem(t);
             y+=rh+1*uiScale;
             cx.textAligned(x+40*uiScale, y, w-44*uiScale, rh*0.85f, sitem::metaName(t), th.textDim, 0, mono.ok?&mono:&font); y+=rh*0.85f+6*uiScale;
         }
+        // ── one-click NUKE: wipe every component/scene item in the env (undoable) ──
+        { int total=(int)items.size();
+          char cb3[48]; snprintf(cb3,sizeof cb3,"CLEAR ALL scene items (%d)",total);
+          if (cx.button(ui::hashId("clearitems"), x, y, w, rh, cb3, false) && total>0){
+              pushItemUndo(items);
+              items.clear(); selItem=-1; selItems.clear();
+              setStatus("Cleared ALL "+std::to_string(total)+" scene item(s)/component(s) - ONE Ctrl+Z restores everything");
+          }
+          y+=rh+4*uiScale; }
         // ── SKYBOX / BACKGROUND — the UI for the (long-existing) skybox backend: solid color, equirect image,
         //    or any mesh's texture. Previews live (clearRGB / sky sphere) AND cooks as the SkyboxPlatformComponent. ──
         y+=6*uiScale; dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
@@ -4576,6 +4653,15 @@ struct Editor {
               if (sel.empty() && selected>=0) { if (nowExc) noColMeshes.insert(selected); else noColMeshes.erase(selected); }
               bakeNavmeshes(items);
           }
+          y+=th.rowH+3*uiScale;
+          { std::vector<int> tgc = sel.empty() ? (selected>=0?std::vector<int>{selected}:std::vector<int>{}) : sel;
+            int nb = boundMeshColliders(tgc);
+            char rb3[64]; snprintf(rb3,sizeof rb3,"Remove mesh collider (%d bound)",nb);
+            if (cx.button(ui::hashId("rmcol"), x, y, w, th.rowH, rb3, false) && nb>0) {
+                int nrm=removeMeshColliders(tgc);
+                setStatus(nrm ? ("Removed "+std::to_string(nrm)+" mesh collider component(s) - Ctrl+Z restores")
+                              : "no mesh collider is bound to the selection");
+            } }
           y+=th.rowH+8*uiScale; }
         // hidden edit log (names never change; this is the only place edits show)
         { auto it=meshEditLog.find(selected);
@@ -6190,6 +6276,59 @@ struct Editor {
     bool isAnimCollider(int m) const { return std::find(animColliders.begin(),animColliders.end(),m)!=animColliders.end(); }
     // A NAVMESH editor item is a MESH COLLIDER (added via "Add Mesh Collider") vs a walkable navmesh, by its name.
     bool isMeshColliderItem(const sitem::Item& it) const { return it.type==sitem::NAVMESH && it.name.rfind("Collider",0)==0; }
+    // How many mesh-collider components are bound to any of these meshes (button/menu labels).
+    int boundMeshColliders(const std::vector<int>& meshes) const {
+        int n2=0;
+        for (const auto& it : items){
+            if (!isMeshColliderItem(it)) continue;
+            bool hit=false;
+            for (int m : it.srcMeshes){ for (int s2 : meshes) if (s2==m){ hit=true; break; } if (hit) break; }
+            if (hit) ++n2;
+        }
+        return n2;
+    }
+    // "Remove component": delete the mesh-collider item(s) bound to these meshes — the reverse of
+    // addMeshCollider (once added there was NO way to take the collider off an element again; its
+    // marker is hidden by default so the item was near-impossible to select). Undoable (Ctrl+Z).
+    int removeMeshColliders(const std::vector<int>& meshes){
+        std::vector<int> kill;
+        for (int i2=0;i2<(int)items.size();++i2){
+            const auto& it=items[(size_t)i2];
+            if (!isMeshColliderItem(it)) continue;
+            bool bound=false;
+            for (int m : it.srcMeshes){ for (int s2 : meshes) if (s2==m){ bound=true; break; } if (bound) break; }
+            if (bound) kill.push_back(i2);
+        }
+        if (kill.empty()) return 0;
+        pushItemUndo(items);
+        for (auto i2=kill.rbegin(); i2!=kill.rend(); ++i2) items.erase(items.begin()+*i2);
+        if (selItem>=(int)items.size()) selItem=-1;
+        selItems.clear();
+        return (int)kill.size();
+    }
+    // ── COMPONENTS FOLLOW GEOMETRY EDITS: mesh colliders / selection-navmeshes reference meshes BY
+    //    INDEX (srcMeshes); every geometry op (cut/knife/slice/split/fuse/bend/seal...) soft-deletes
+    //    the original and appends the edited result, so those components kept pointing at the DELETED
+    //    original and the generated collision ignored the edit ("collider still blocks the doorway I
+    //    just cut"). The result indices are APPENDED to srcMeshes and the old index is KEPT: deleted
+    //    meshes are filtered at bake time, so Ctrl+Z (which revives the original and deletes the
+    //    results) stays correct with no reverse remap. Collision-exclusion follows the same way, and
+    //    every touched component re-bakes immediately so preview + cook see the edited geometry.
+    void remapMeshComponents(int oldMi, const std::vector<int>& results){
+        if (results.empty()) return;
+        if (noColMeshes.count(oldMi)) for (int n2 : results) noColMeshes.insert(n2);
+        int touched=0;
+        for (auto& it : items){
+            if (it.type!=sitem::NAVMESH || it.srcMeshes.empty()) continue;
+            bool has=false; for (int m : it.srcMeshes) if (m==oldMi){ has=true; break; }
+            if (!has) continue;
+            for (int n2 : results){ bool dup=false; for (int m : it.srcMeshes) if (m==n2){ dup=true; break; }
+                if (!dup) it.srcMeshes.push_back(n2); }
+            bakeNavGeometry(it); ++touched;
+        }
+        if (touched) fprintf(stderr,"[EDIT] %d collider/navmesh component(s) followed the geometry edit (mesh %d -> %d result(s))\n",
+                             touched, oldMi, (int)results.size());
+    }
     // Whether a scene item's marker + GIZMO are shown. Mesh colliders get their OWN dedicated viewport toggle
     // (showMeshCol) on top of the Meta-Components eye — that's the quick "hide the collider so I can edit meshes"
     // control. When hidden, drawGizmo/pickItem skip it so the gizmo stops intercepting clicks.
@@ -6505,13 +6644,19 @@ struct Editor {
     void pushUndo(int mesh, const Xform& b, const Xform& a){ pushUndo(std::vector<int>{mesh}, std::vector<Xform>{b}, std::vector<Xform>{a}); }
     void endEdit(const VkGpuMesh& gm){ if (!editing) return; pushUndo(editMesh, editBefore, captureX(gm)); editing=false; }
     void restoreOp(const UndoOp& op, bool redo){ for (size_t i=0;i<op.m.size();++i) if (op.m[i]>=0&&op.m[i]<(int)r->gpuMeshes.size()) applyX(r->gpuMeshes[op.m[i]], redo?op.a[i]:op.b[i]); sel=op.m; selected=op.m.empty()?-1:op.m.back(); r->selectedMesh=selected; }
+    // a delete-op touching a CREATED mesh (>= baseMeshCount) invalidates the .geom sidecar (see toggleDeleteSelected)
+    void markGeomIfCreated(const std::vector<int>& ms){ if (baseMeshCount<0) return; for (int m:ms) if (m>=baseMeshCount){ geomDirty=true; return; } }
     void doUndo(){ if (undoStack.empty()) return; UndoOp op=undoStack.back(); undoStack.pop_back();
         if (op.isItems){ std::swap(op.itemsState, items); selItem=-1; }
-        else if (op.isDelete){ for (size_t i=0;i<op.delM.size();++i) r->setDeleted((size_t)op.delM[i], i<op.delA.size() ? !op.delA[i] : false); }   // undo = INVERT each state (restores originals, removes created clones)
+        else if (op.isDelete){ for (size_t i=0;i<op.delM.size();++i) r->setDeleted((size_t)op.delM[i], i<op.delA.size() ? !op.delA[i] : false);
+                               markGeomIfCreated(op.delM);
+                               bakeNavmeshes(items); }   // undo = INVERT each state (restores originals, removes created clones); colliders re-bake off the revived geometry
         else restoreOp(op,false); redoStack.push_back(std::move(op)); }
     void doRedo(){ if (redoStack.empty()) return; UndoOp op=redoStack.back(); redoStack.pop_back();
         if (op.isItems){ std::swap(op.itemsState, items); selItem=-1; }
-        else if (op.isDelete){ for (size_t i=0;i<op.delM.size();++i) r->setDeleted((size_t)op.delM[i], i<op.delA.size() ? op.delA[i]!=0 : true); }
+        else if (op.isDelete){ for (size_t i=0;i<op.delM.size();++i) r->setDeleted((size_t)op.delM[i], i<op.delA.size() ? op.delA[i]!=0 : true);
+                               markGeomIfCreated(op.delM);
+                               bakeNavmeshes(items); }   // redo flips back to the edited geometry - colliders follow again
         else restoreOp(op,true); undoStack.push_back(std::move(op)); }
     // ── focus ──
     void focusOn(float cx_,float cy,float cz){ Camera& c=r->cam; float ex=cx_,ey=cy+1.2f,ez=cz+3.5f; c.pos[0]=ex;c.pos[1]=ey;c.pos[2]=ez; float dx=cx_-ex,dy=cy-ey,dz=cz-ez,L=std::sqrt(dx*dx+dy*dy+dz*dz); if (L<1e-4f) L=1.f; c.yaw=std::atan2(dx,-dz); c.pitch=std::asin(dy/L); }
