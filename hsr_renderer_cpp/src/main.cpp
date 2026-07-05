@@ -502,8 +502,10 @@ int main(int argc, char** argv) {
         if (std::getenv("HSR_FLOATING")) glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
         g_window = glfwCreateWindow(g_winW, g_winH, "HSR Renderer - Quest Home Editor", nullptr, nullptr);
         if (!g_window) { fprintf(stderr, "Window creation failed\n"); glfwTerminate(); return 1; }
+#ifndef __APPLE__   // macOS windows have no icons - glfwSetWindowIcon just logs Cocoa error 65548 there
         { GLFWimage icons[2]; std::vector<unsigned char> p48, p32; genEditorIcon(48,p48); genEditorIcon(32,p32);
           icons[0]={48,48,p48.data()}; icons[1]={32,32,p32.data()}; glfwSetWindowIcon(g_window, 2, icons); }
+#endif
         glfwSetDropCallback(g_window, dropCb);
         if (apkPath.empty()) {
             // Launched bare: the main window IS the drop zone. Wait here until an .apk lands on it.
@@ -1014,8 +1016,10 @@ int main(int argc, char** argv) {
         else if (std::getenv("HSR_SHOT") || std::getenv("HSR_LIVE") || std::getenv("HSR_FLOATING")) glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
         g_window = glfwCreateWindow(g_winW, g_winH, g_title.c_str(), nullptr, nullptr);
         if (!g_window) { fprintf(stderr, "Window creation failed\n"); glfwTerminate(); return 1; }
+#ifndef __APPLE__   // macOS windows have no icons - glfwSetWindowIcon just logs Cocoa error 65548 there
         { GLFWimage icons[2]; std::vector<unsigned char> p48, p32; genEditorIcon(48,p48); genEditorIcon(32,p32);  // window/taskbar icon
           icons[0]={48,48,p48.data()}; icons[1]={32,32,p32.data()}; glfwSetWindowIcon(g_window, 2, icons); }
+#endif
     } else {
         glfwSetWindowTitle(g_window, g_title.c_str());
     }
