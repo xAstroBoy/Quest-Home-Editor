@@ -30,7 +30,7 @@ namespace shadergen {
 //   SCALE    : pos' = pivot + (inPos - pivot)*replay(N sampled per-axis SCALE FACTORS, looped) — FAITHFULLY ports ANY node
 //              SCALE "breathe" track (e.g. Erebor's 12 wisps, NON-UNIFORM per-axis amplitudes) by piecewise-linear
 //              interpolation of the sampled per-axis factor frames (frame0 = (1,1,1)); not a (1-cos) shape guess.
-enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3, TRANSLATE = 4, SCALE = 5, CUTOUT = 6, ROTREPLAY = 7, TINTREPLAY = 8 };
+enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3, TRANSLATE = 4, SCALE = 5, CUTOUT = 6, ROTREPLAY = 7, TINTREPLAY = 8, FOLIAGE = 9, TINTREPLAY_VERT = 10 };
 // TINTREPLAY: per-frame RGBA MaterialTint replay in the forward FRAGMENT (color *= tint[frame]) — ports V79's
 //   mat.sanim MaterialTint COLOR cycling (stinson fireworks flashes / city window lights) that the cook previously
 //   dropped entirely (only the alpha FADE subset was ported, and only on the flipbook path). tframes = N*4 RGBA,
@@ -79,9 +79,17 @@ inline bool findFwdVertSpv(const uint8_t* d, size_t N, int64_t& slot, int64_t& s
         for (int ef=0, m=std::min(vt_nf(d,N,e0),4); ef<m; ++ef){
             if (str_at(d,N,vt_field(d,N,e0,ef)).rfind("forward",0)==0){
                 nPasses=cnt;
+                // Prefer the "forwardSkinned" pass when present (SKINNED bases carry FOUR passes —
+                // forwardSkinned, forward, +_debug twins — and skinned meshes DRAW forwardSkinned).
+                // Editing plain "forward" put the cutout/tint into a pass the mesh never runs = the
+                // edit silently invisible on device AND preview (the zen-tree uncut-canopy saga).
+                int fwdPlain=-1, fwdSkin=-1;
                 for (uint32_t pi=0; pi<cnt; ++pi){ int64_t pt=base+pi*4+u32(d,N,base+pi*4);
-                    for (int pf=0, mm=std::min(vt_nf(d,N,pt),4); pf<mm; ++pf)
-                        if (str_at(d,N,vt_field(d,N,pt,pf))=="forward") fwdIdx=(int)pi; }
+                    for (int pf=0, mm=std::min(vt_nf(d,N,pt),4); pf<mm; ++pf){
+                        std::string pn = str_at(d,N,vt_field(d,N,pt,pf));
+                        if (pn=="forward") fwdPlain=(int)pi;
+                        else if (pn=="forwardSkinned") fwdSkin=(int)pi; } }
+                fwdIdx = (fwdSkin>=0) ? fwdSkin : fwdPlain;
             }
         }
         for (int ef=0, m=std::min(vt_nf(d,N,e0),4); ef<m; ++ef){
@@ -123,9 +131,17 @@ inline bool findFwdFragSpv(const uint8_t* d, size_t N, int64_t& slot, int64_t& s
         for (int ef=0, m=std::min(vt_nf(d,N,e0),4); ef<m; ++ef){
             if (str_at(d,N,vt_field(d,N,e0,ef)).rfind("forward",0)==0){
                 nPasses=cnt;
+                // Prefer the "forwardSkinned" pass when present (SKINNED bases carry FOUR passes —
+                // forwardSkinned, forward, +_debug twins — and skinned meshes DRAW forwardSkinned).
+                // Editing plain "forward" put the cutout/tint into a pass the mesh never runs = the
+                // edit silently invisible on device AND preview (the zen-tree uncut-canopy saga).
+                int fwdPlain=-1, fwdSkin=-1;
                 for (uint32_t pi=0; pi<cnt; ++pi){ int64_t pt=base+pi*4+u32(d,N,base+pi*4);
-                    for (int pf=0, mm=std::min(vt_nf(d,N,pt),4); pf<mm; ++pf)
-                        if (str_at(d,N,vt_field(d,N,pt,pf))=="forward") fwdIdx=(int)pi; }
+                    for (int pf=0, mm=std::min(vt_nf(d,N,pt),4); pf<mm; ++pf){
+                        std::string pn = str_at(d,N,vt_field(d,N,pt,pf));
+                        if (pn=="forward") fwdPlain=(int)pi;
+                        else if (pn=="forwardSkinned") fwdSkin=(int)pi; } }
+                fwdIdx = (fwdSkin>=0) ? fwdSkin : fwdPlain;
             }
         }
         for (int ef=0, m=std::min(vt_nf(d,N,e0),4); ef<m; ++ef){
@@ -149,6 +165,19 @@ inline bool findFwdFragSpv(const uint8_t* d, size_t N, int64_t& slot, int64_t& s
         }
     }
     return false;
+}
+// REPOINT ALL references to the module at vvOld (its length-prefix position) to the appended module at nv.
+// THE "renderer draws the UN-EDITED frag" fix: a RENDSHAD's multiple forward passes (forward /
+// forward_dynamic / forward_receiveshadow / *_debug) SHARE one physical SPIR-V module through SEPARATE
+// stage-table fields. Repointing only the ONE field findFwdFragSpv returned left every OTHER pass entry
+// pointing at the ORIGINAL module — and which entry the renderer/device reads is table-order dependent,
+// so cutout/tint edits landed for some shaders and silently VANISHED for others (the zen tree drew a
+// no-discard frag while its skincutout .surface contained the edit = uncut solid-quad canopy).
+inline void repointAll(std::vector<uint8_t>& o, size_t oldSize, int64_t vvOld, uint32_t nv){
+    for (size_t sp = 0; sp + 4 <= oldSize; sp += 4){
+        uint32_t v; memcpy(&v, o.data()+sp, 4);
+        if ((int64_t)sp + v == vvOld){ uint32_t rel = nv - (uint32_t)sp; memcpy(o.data()+sp, &rel, 4); }
+    }
 }
 } // namespace detail
 
@@ -518,6 +547,68 @@ inline std::vector<uint8_t> editFragCutout(const uint8_t* sd, uint32_t spvLen, f
     return mod;
 }
 
+// FOLIAGE SHARPEN-ALPHA (Meta's unlitfoliage recipe, for the a2c/masked pipeline): right after the basecolor
+// sample, rewrite alpha to `clamp((a - cutoff) / max(fwidth(a), eps) + 0.5, 0, 1)` and discard only when the
+// RAW alpha is ~0 (kill fully-empty texels so depth doesn't block behind holes). With the MATL masked/a2c flags
+// the MSAA hardware converts that crisp 1-texel-transition alpha into coverage = SMOOTH edges AND depth-write —
+// the native V205 foliage look. (A raw-alpha a2c without the sharpen = the "goopy mess": mip-blurred soft alpha
+// dithers whole leaves translucent.) All downstream uses of the sample see the sharpened vector.
+inline std::vector<uint8_t> editFragFoliageSharpen(const uint8_t* sd, uint32_t spvLen, float cutoff){
+    using namespace detail;
+    size_t nw = spvLen/4;
+    auto W=[&](size_t k){ return u32(sd,spvLen,(int64_t)k*4); };
+    uint32_t version=W(1), generator=W(2), bound=W(3);
+    std::vector<Inst> insts;
+    for (size_t i=5;i<nw;){ uint32_t ins=W(i),wc=ins>>16,op=ins&0xffff; if(!wc)break; Inst t; t.op=(int)op; for(uint32_t k=0;k<wc;++k)t.w.push_back(W(i+k)); insts.push_back(std::move(t)); i+=wc; }
+    auto fbits=[](float f){ uint32_t u; memcpy(&u,&f,4); return u; };
+    uint32_t tFloat=0, tBool=0, glslExt=0, sampleRes=0, tVec4=0; int sampleIdx=-1;
+    for (auto& t:insts){ auto&w=t.w;
+        if (t.op==22 && w.size()>=3 && w[2]==32) tFloat=w[1];               // OpTypeFloat 32
+        else if (t.op==20 && w.size()>=2) tBool=w[1];                       // OpTypeBool
+        else if (t.op==11 && w.size()>=3) glslExt=w[1];                     // OpExtInstImport (GLSL.std.450)
+    }
+    for (size_t k=0;k<insts.size();++k){ if (insts[k].op==87 && insts[k].w.size()>=3){ tVec4=insts[k].w[1]; sampleRes=insts[k].w[2]; sampleIdx=(int)k; break; } } // 1st OpImageSampleImplicitLod
+    if (!tFloat || sampleIdx<0 || !glslExt) return {};
+    uint32_t nidNext=bound; auto nid=[&](){ return nidNext++; };
+    std::vector<Inst> newGlobals;
+    if (!tBool) { tBool=nid(); newGlobals.push_back({20,{0,tBool}}); }
+    uint32_t cCut=nid(); newGlobals.push_back({43,{0,tFloat,cCut,fbits(cutoff)}});
+    uint32_t cEps=nid(); newGlobals.push_back({43,{0,tFloat,cEps,fbits(1e-4f)}});
+    uint32_t cHalf=nid();newGlobals.push_back({43,{0,tFloat,cHalf,fbits(0.5f)}});
+    uint32_t c0=nid();   newGlobals.push_back({43,{0,tFloat,c0,fbits(0.0f)}});
+    uint32_t c1=nid();   newGlobals.push_back({43,{0,tFloat,c1,fbits(1.0f)}});
+    uint32_t cKill=nid();newGlobals.push_back({43,{0,tFloat,cKill,fbits(0.02f)}});
+    uint32_t aId=nid(), fwId=nid(), fwMax=nid(), sub=nid(), div=nid(), add=nid(), clm=nid(), newVec=nid(), chk=nid(), killL=nid(), mrgL=nid();
+    std::vector<Inst> body = {
+        {81,{0,tFloat,aId,sampleRes,3}},                 // a  = base.w                (OpCompositeExtract)
+        {209,{0,tFloat,fwId,aId}},                       // fw = OpFwidth(a)
+        {12,{0,tFloat,fwMax,glslExt,40,fwId,cEps}},      // fw'= FMax(fw, eps)         (GLSL.std.450 FMax=40)
+        {131,{0,tFloat,sub,aId,cCut}},                   // s  = a - cutoff            (OpFSub)
+        {136,{0,tFloat,div,sub,fwMax}},                  // s /= fw'                   (OpFDiv)
+        {129,{0,tFloat,add,div,cHalf}},                  // s += 0.5                   (OpFAdd)
+        {12,{0,tFloat,clm,glslExt,43,add,c0,c1}},        // s  = FClamp(s,0,1)         (FClamp=43)
+        {172,{0,tVec4,newVec,clm,sampleRes,3}},          // base' = insert s at .w     (OpCompositeInsert: [type,res,Object,Composite,idx])
+        {184,{0,tBool,chk,aId,cKill}},                   // chk = a < 0.02             (OpFOrdLessThan)
+        {247,{0,mrgL,0}},                                // OpSelectionMerge
+        {250,{0,chk,killL,mrgL}},                        // OpBranchConditional
+        {248,{0,killL}}, {252,{0}},                      // kill: OpLabel ; OpKill
+        {248,{0,mrgL}},                                  // merge
+    };
+    std::vector<Inst> out; bool addedG=false;
+    for (size_t k=0;k<insts.size();++k){
+        if (!addedG && insts[k].op==54){ for(auto&g:newGlobals) out.push_back(g); addedG=true; }
+        Inst t = insts[k];
+        if ((int)k>sampleIdx)                             // downstream uses see the SHARPENED vector
+            for (size_t j=1;j<t.w.size();++j) if (t.w[j]==sampleRes && !(t.op==87)) t.w[j]=newVec;
+        out.push_back(t);
+        if ((int)k==sampleIdx){ for(auto&b:body) out.push_back(b); }
+    }
+    std::vector<uint32_t> words={0x07230203u,version,generator,nidNext,0u};
+    for(auto&t:out){ uint32_t hdr=((uint32_t)t.w.size()<<16)|(uint32_t)t.op; words.push_back(hdr); for(size_t j=1;j<t.w.size();++j)words.push_back(t.w[j]); }
+    std::vector<uint8_t> mod(words.size()*4); memcpy(mod.data(),words.data(),mod.size());
+    return mod;
+}
+
 // FLIPBOOK in the FORWARD FRAGMENT: step the base-color texture-sample UV through spritesheet cells from
 // globalUniforms.time, right before the OpImageSampleImplicitLod. THE device fix: the vertex-stage UV edit
 // (editVertModule FLIPBOOK) did NOT animate on device (the transparent pass's UV varying never advanced → smoke/fog/
@@ -647,7 +738,12 @@ inline std::vector<uint8_t> editFragUvScroll(const uint8_t* sd, uint32_t spvLen,
 // desktop's animate() plays). frame = floor(fract(time/loopSec)*N) (frame-SNAP, like the desktop); the base-color
 // sample UV becomes (a·u+b·v+c, d·u+e·v+f). Uses ALL frames (no cell-skipping subsample = no flashing) and the FULL
 // matrix (so a scroll, a sprite-cell atlas AND a 2x2 SCALE/dust all replay exactly as the source authored them).
-inline std::vector<uint8_t> editFragUvMatrixReplay(const uint8_t* sd, uint32_t spvLen, const std::vector<float>& mats, int N, float loopSec){
+// cellClamp (optional, 6 floats {umin,vmin,umax,vmax,padU,padV}) = SPRITESHEET close-up seam fix: clamp the sampled
+// UV to the CURRENT frame's cell (the base-UV span pushed through the same frame matrix) inset by pad — the bilinear/
+// ASTC-block footprint can never pull the neighbour cell in. Replaces the old cook-side 8-texel UV RESCALE, which
+// squeezed the whole frame (25% content loss on a 63px-wide knife cell = "u fucked 2 things"); a clamp pins only
+// edge-touching samples and leaves the frame interior pixel-exact.
+inline std::vector<uint8_t> editFragUvMatrixReplay(const uint8_t* sd, uint32_t spvLen, const std::vector<float>& mats, int N, float loopSec, const float* cellClamp=nullptr){
     using namespace detail;
     if (N < 2 || (int)mats.size() < N*6) return {};
     size_t nw=spvLen/4; auto W=[&](size_t k){ return u32(sd,spvLen,(int64_t)k*4); };
@@ -707,6 +803,28 @@ inline std::vector<uint8_t> editFragUvMatrixReplay(const uint8_t* sd, uint32_t s
     uint32_t uvw=nid(); body.push_back({80,{0,tV3,uvw,coord,c_one}});   // vec3(coord.x, coord.y, 1.0)  (OpCompositeConstruct vec2+scalar)
     uint32_t ux=nid(); body.push_back({148,{0,tFloat,ux,acc0,uvw}});    // dot(row0, uvw) = a·u+b·v+c
     uint32_t uy=nid(); body.push_back({148,{0,tFloat,uy,acc1,uvw}});    // dot(row1, uvw) = d·u+e·v+f
+    if (cellClamp){   // clamp to the CURRENT frame's cell (base-UV corners through the SAME frame matrix) minus pad
+        const uint32_t GLSL_FMIN=37, GLSL_FMAX=40, GLSL_FCLAMP=43;
+        uint32_t iu0=fconst(cellClamp[0]), iv0=fconst(cellClamp[1]), iu1=fconst(cellClamp[2]), iv1=fconst(cellClamp[3]);
+        uint32_t ipu=fconst(cellClamp[4]), ipv=fconst(cellClamp[5]);
+        uint32_t cA=nid(); newConsts.push_back({0x2c,{0,tV3,cA,iu0,iv0,c_one}});   // vec3(umin,vmin,1)
+        uint32_t cB=nid(); newConsts.push_back({0x2c,{0,tV3,cB,iu1,iv1,c_one}});   // vec3(umax,vmax,1)
+        uint32_t c1x=nid(); body.push_back({148,{0,tFloat,c1x,acc0,cA}});          // cell corner 1 = M·(umin,vmin)
+        uint32_t c1y=nid(); body.push_back({148,{0,tFloat,c1y,acc1,cA}});
+        uint32_t c2x=nid(); body.push_back({148,{0,tFloat,c2x,acc0,cB}});          // cell corner 2 = M·(umax,vmax)
+        uint32_t c2y=nid(); body.push_back({148,{0,tFloat,c2y,acc1,cB}});
+        uint32_t lox=nid(); body.push_back({12,{0,tFloat,lox,glsl,GLSL_FMIN,c1x,c2x}});   // min/max = flip-safe (negative scale)
+        uint32_t hix=nid(); body.push_back({12,{0,tFloat,hix,glsl,GLSL_FMAX,c1x,c2x}});
+        uint32_t loy=nid(); body.push_back({12,{0,tFloat,loy,glsl,GLSL_FMIN,c1y,c2y}});
+        uint32_t hiy=nid(); body.push_back({12,{0,tFloat,hiy,glsl,GLSL_FMAX,c1y,c2y}});
+        uint32_t loxp=nid(); body.push_back({129,{0,tFloat,loxp,lox,ipu}});        // lo+pad
+        uint32_t hixm=nid(); body.push_back({131,{0,tFloat,hixm,hix,ipu}});        // hi-pad
+        uint32_t loyp=nid(); body.push_back({129,{0,tFloat,loyp,loy,ipv}});
+        uint32_t hiym=nid(); body.push_back({131,{0,tFloat,hiym,hiy,ipv}});
+        uint32_t ux2=nid(); body.push_back({12,{0,tFloat,ux2,glsl,GLSL_FCLAMP,ux,loxp,hixm}});
+        uint32_t uy2=nid(); body.push_back({12,{0,tFloat,uy2,glsl,GLSL_FCLAMP,uy,loyp,hiym}});
+        ux=ux2; uy=uy2;
+    }
     // WRAP the scrolled UV with fract() to match the desktop's REPEAT sampler. A SCROLL (dust c=0.729,
     // fog c=5.8) pushes U past [0,1]; if the device sampler is CLAMP it lands OFF the (faint) sprite ->
     // invisible + looks static. fract() = seamless wrap regardless of sampler mode. No-op for sprite-cell
@@ -748,7 +866,7 @@ inline std::vector<uint8_t> editFragAlphaFade(const uint8_t* sd, uint32_t spvLen
         else if (t.op==6){ if (wstr(w,3)=="time") timeIdx=(int)w[2]; }
         else if (t.op==11 && wstr(w,2).find("GLSL")!=std::string::npos) glsl=w[1];
         else if (t.op==22 && w[2]==32) tFloat=w[1];
-        else if (t.op==21 && w[2]==32) tInt=w[1]; }
+        else if (t.op==21 && w[2]==32 && (w.size()<4 || w[3]==1)) tInt=w[1]; }   // SIGNED int32 only (OpConvertFToS/SClamp require it)
     for (auto& t:insts){ auto&w=t.w; if (t.op==23 && w[2]==tFloat && w[3]==4) tV4=w[1]; else if (t.op==32) ptr[((uint64_t)w[2]<<32)|w[3]]=w[1]; }
     for (auto& t:insts){ auto&w=t.w; if (t.op==43 && w[1]==tInt){ int32_t iv; memcpy(&iv,&w[3],4); intc[iv]=w[2]; } else if (t.op==43 && w[1]==tFloat){ float fv; memcpy(&fv,&w[3],4); fltc[fround(fv)]=w[2]; } }
     for (auto& kv:names) if (kv.second=="globalUniforms") gu=kv.first;
@@ -824,7 +942,7 @@ inline std::vector<uint8_t> editFragTintReplay(const uint8_t* sd, uint32_t spvLe
         else if (t.op==6){ if (wstr(w,3)=="time") timeIdx=(int)w[2]; }
         else if (t.op==11 && wstr(w,2).find("GLSL")!=std::string::npos) glsl=w[1];
         else if (t.op==22 && w[2]==32) tFloat=w[1];
-        else if (t.op==21 && w[2]==32) tInt=w[1]; }
+        else if (t.op==21 && w[2]==32 && (w.size()<4 || w[3]==1)) tInt=w[1]; }   // SIGNED int32 only (OpConvertFToS/SClamp require it)
     for (auto& t:insts){ auto&w=t.w; if (t.op==23 && w[2]==tFloat && w[3]==4) tV4=w[1]; else if (t.op==32) ptr[((uint64_t)w[2]<<32)|w[3]]=w[1]; }
     for (auto& t:insts){ auto&w=t.w; if (t.op==43 && w[1]==tInt){ int32_t iv; memcpy(&iv,&w[3],4); intc[iv]=w[2]; } else if (t.op==43 && w[1]==tFloat){ float fv; memcpy(&fv,&w[3],4); fltc[fround(fv)]=w[2]; } }
     for (auto& kv:names) if (kv.second=="globalUniforms") gu=kv.first;
@@ -832,46 +950,160 @@ inline std::vector<uint8_t> editFragTintReplay(const uint8_t* sd, uint32_t spvLe
     int sampIdx=-1; uint32_t sampRes=0;   // base-color sample = FIRST OpImageSampleImplicitLod
     for (size_t k=0;k<insts.size();++k){ if (insts[k].op==87 && insts[k].w.size()>=5){ sampIdx=(int)k; sampRes=insts[k].w[2]; break; } }
     if (sampIdx<0 || !sampRes) return {};
-    std::vector<Inst> newConsts,newTypes;
+    // CONSTANT-ARRAY curve (the device "sticks" fix — user-proven: the tint chain broke the mobile
+    // driver, and the CURVE ENCODING was the problem, NOT the keys): the old emitter UNROLLED N steps
+    // into ~16N ALU instructions per fragment (~42K words for the zen tree's 512-key cycle) which
+    // desktop GPUs ran but the Quest driver executed as garbage stripes. Emit the SAME N keys VERBATIM
+    // as an OpConstantComposite vec4 ARRAY in a Private variable and do ONE dynamically-indexed load —
+    // exactly how a GLSL `const vec4 curve[N]` compiles. Frame-snap semantics identical; every key
+    // byte-exact; module grows by ~4N data words instead of ~16N code words.
+    std::vector<Inst> newGlobals;   // ONE ordered stream (types/consts/private vars) — each def before use
     auto nid=[&](){ return bound++; };
     auto fbits=[](float f){ uint32_t u; memcpy(&u,&f,4); return u; };
-    auto fconst=[&](float val)->uint32_t{ int64_t k=fround(val); auto it=fltc.find(k); if(it!=fltc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tFloat,id,fbits(val)}}); fltc[k]=id; return id; };
-    auto iconst=[&](int32_t val)->uint32_t{ auto it=intc.find(val); if(it!=intc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tInt,id,(uint32_t)val}}); intc[val]=id; return id; };
-    auto ptrOf=[&](uint32_t sc,uint32_t ty)->uint32_t{ uint64_t k=((uint64_t)sc<<32)|ty; auto it=ptr.find(k); if(it!=ptr.end())return it->second; uint32_t id=nid(); newTypes.push_back({32,{0,id,sc,ty}}); ptr[k]=id; return id; };
-    if (!tV4){ tV4=nid(); newTypes.push_back({23,{0,tV4,tFloat,4}}); }
-    const uint32_t GLSL_FRACT=10, GLSL_STEP=48;
+    auto fconst=[&](float val)->uint32_t{ int64_t k=fround(val); auto it=fltc.find(k); if(it!=fltc.end())return it->second; uint32_t id=nid(); newGlobals.push_back({43,{0,tFloat,id,fbits(val)}}); fltc[k]=id; return id; };
+    auto iconst=[&](int32_t val)->uint32_t{ auto it=intc.find(val); if(it!=intc.end())return it->second; uint32_t id=nid(); newGlobals.push_back({43,{0,tInt,id,(uint32_t)val}}); intc[val]=id; return id; };
+    auto ptrOf=[&](uint32_t sc,uint32_t ty)->uint32_t{ uint64_t k=((uint64_t)sc<<32)|ty; auto it=ptr.find(k); if(it!=ptr.end())return it->second; uint32_t id=nid(); newGlobals.push_back({32,{0,id,sc,ty}}); ptr[k]=id; return id; };
+    if (!tV4){ tV4=nid(); newGlobals.push_back({23,{0,tV4,tFloat,4}}); }
+    const uint32_t GLSL_FRACT=10, GLSL_SCLAMP=45;
     if (loopSec<=1e-4f) loopSec=1.f;
     uint32_t c_invloop=fconst(1.0f/loopSec), c_N=fconst((float)N), c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
-    std::vector<std::array<uint32_t,4>> fc((size_t)N);
-    for (int i=0;i<N;i++) for (int c=0;c<4;c++) fc[i][c]=fconst(rgba[(size_t)i*4+c]);
-    uint32_t pt=nid(),tt=nid(),tn=nid(),t01=nid(),fphase=nid();
+    uint32_t c_i0=iconst(0), c_iN1=iconst(N-1);
+    // per-key vec4 constants -> array constant -> Private variable with initializer
+    std::vector<uint32_t> keyIds((size_t)N);
+    for (int i=0;i<N;i++){
+        uint32_t r=fconst(rgba[(size_t)i*4]), g=fconst(rgba[(size_t)i*4+1]), b=fconst(rgba[(size_t)i*4+2]), a=fconst(rgba[(size_t)i*4+3]);
+        uint32_t kc=nid(); newGlobals.push_back({44,{0,tV4,kc,r,g,b,a}}); keyIds[(size_t)i]=kc;   // OpConstantComposite vec4
+    }
+    uint32_t cLen=iconst(N);
+    uint32_t tArr=nid(); newGlobals.push_back({28,{0,tArr,tV4,cLen}});                              // OpTypeArray vec4[N]
+    uint32_t arrId=nid();
+    { Inst arrC; arrC.op=44; arrC.w.push_back(0); arrC.w.push_back(tArr); arrC.w.push_back(arrId); // OpConstantComposite vec4[N]{keys...}
+      for (int i=0;i<N;i++) arrC.w.push_back(keyIds[(size_t)i]);
+      newGlobals.push_back(std::move(arrC)); }
+    uint32_t pArr=ptrOf(6,tArr);                                                                    // Private ptr to array
+    uint32_t var=nid(); newGlobals.push_back({59,{0,pArr,var,6,arrId}});                            // OpVariable Private, initializer=array
+    uint32_t pV4=ptrOf(6,tV4);
+    uint32_t pt2=nid(),tt=nid(),tn=nid(),t01=nid(),fphase=nid(),idxF=nid(),idxC=nid(),ac2=nid(),tintv=nid(),tinted=nid();
     std::vector<Inst> pre = {
-        {65,{0,pUf,pt,gu,c_time}}, {61,{0,tFloat,tt,pt}},       // time
+        {65,{0,pUf,pt2,gu,c_time}}, {61,{0,tFloat,tt,pt2}},     // time
         {133,{0,tFloat,tn,tt,c_invloop}},                       // time/loopSec
         {12,{0,tFloat,t01,glsl,GLSL_FRACT,tn}},                 // fract -> [0,1)
         {133,{0,tFloat,fphase,t01,c_N}},                        // *N -> [0,N)
+        {110,{0,tInt,idxF,fphase}},                             // OpConvertFToS
+        {12,{0,tInt,idxC,glsl,GLSL_SCLAMP,idxF,c_i0,c_iN1}},    // clamp [0,N-1]
+        {65,{0,pV4,ac2,var,idxC}},                              // OpAccessChain curve[idx]
+        {61,{0,tV4,tintv,ac2}},                                 // OpLoad vec4 (the EXACT authored key)
     };
-    uint32_t acc[4] = { fc[0][0], fc[0][1], fc[0][2], fc[0][3] };   // frame-SNAP select per channel, SHARED step weight
-    for (int i=1;i<N;i++){ uint32_t c_i=fconst((float)i);
-        uint32_t w=nid(); pre.push_back({12,{0,tFloat,w,glsl,GLSL_STEP,c_i,fphase}});       // step(i,fphase) once
-        for (int c=0;c<4;c++){
-            uint32_t dd=nid(); pre.push_back({131,{0,tFloat,dd,fc[i][c],acc[c]}});          // tint[i]-acc
-            uint32_t s=nid(); pre.push_back({133,{0,tFloat,s,dd,w}});                       // *w
-            uint32_t n2=nid(); pre.push_back({129,{0,tFloat,n2,acc[c],s}}); acc[c]=n2;      // acc += diff*w
-        }
-    }
-    uint32_t v4=nid(), tinted=nid();
     std::vector<Inst> out; bool addedG=false;
     for (size_t k=0;k<insts.size();++k){
-        if (!addedG && insts[k].op==54){ for(auto&t2:newTypes)out.push_back(t2); for(auto&c:newConsts)out.push_back(c); addedG=true; }
+        if (!addedG && insts[k].op==54){ for(auto&t2:newGlobals)out.push_back(t2); addedG=true; }
         if ((int)k==sampIdx){
             for(auto&b:pre) out.push_back(b);
             out.push_back(insts[k]);                                            // the base-color sample (result = sampRes)
-            out.push_back({0x50,{0,tV4,v4,acc[0],acc[1],acc[2],acc[3]}});       // OpCompositeConstruct vec4(r,g,b,a)
-            out.push_back({133,{0,tV4,tinted,sampRes,v4}});                     // OpFMul: sampled·tint
+            out.push_back({133,{0,tV4,tinted,sampRes,tintv}});                  // OpFMul: sampled·curve[idx]
             continue;
         }
         if ((int)k>sampIdx){ Inst t2=insts[k]; for(size_t j=1;j<t2.w.size();++j) if(t2.w[j]==sampRes) t2.w[j]=tinted; out.push_back(t2); continue; }
+        out.push_back(insts[k]);
+    }
+    if (!addedG) return {};
+    std::vector<uint32_t> words={0x07230203u,version,generator,bound,0u};
+    for(auto&t2:out){ uint32_t hdr=((uint32_t)t2.w.size()<<16)|(uint32_t)t2.op; words.push_back(hdr); for(size_t j=1;j<t2.w.size();++j)words.push_back(t2.w[j]); }
+    std::vector<uint8_t> mod(words.size()*4); memcpy(mod.data(),words.data(),mod.size());
+    return mod;
+}
+
+// VERTEX-stage TINT REPLAY (the device leaf-color fix): BOTH fragment encodings of the tint curve (512-step
+// unroll AND const-array indexed load) rendered as garbage "sticks" on the Quest driver while running perfectly
+// on desktop — but the r25 plain-cutout FRAG is device-proven, and the getTime VERTEX edits (rot/osc/scale) are
+// device-proven. So evaluate the curve PER-VERTEX and fold it into the color the frag already multiplies:
+// find the Output block's member-0 (color) store `Out.color = v.vertexColor0` and multiply the stored value by
+// curve[int(fract(time/loop)*N)] — same const-array data (EVERY key verbatim), executed 794 times instead of
+// per-fragment, and the fragment module stays byte-identical to the working cutout.
+inline std::vector<uint8_t> editVertTintReplay(const uint8_t* sd, uint32_t spvLen, const std::vector<float>& rgba, int N, float loopSec){
+    using namespace detail;
+    if (N < 2 || (int)rgba.size() < N*4) return {};
+    size_t nw=spvLen/4; auto W=[&](size_t k){ return u32(sd,spvLen,(int64_t)k*4); };
+    uint32_t version=W(1), generator=W(2), bound=W(3);
+    std::vector<Inst> insts;
+    for (size_t i=5;i<nw;){ uint32_t ins=W(i),wc=ins>>16,op=ins&0xffff; if(!wc)break; Inst t; t.op=(int)op; for(uint32_t k=0;k<wc;++k)t.w.push_back(W(i+k)); insts.push_back(std::move(t)); i+=wc; }
+    uint32_t tFloat=0,tInt=0,tV4=0,glsl=0,gu=0; int timeIdx=-1;
+    std::map<int64_t,uint32_t> fltc; std::map<int32_t,uint32_t> intc; std::map<uint64_t,uint32_t> ptr;
+    std::map<uint32_t,std::string> names;
+    auto fround=[](float v){ return (int64_t)llround((double)v*1e6); };
+    for (auto& t:insts){ auto&w=t.w;
+        if (t.op==5) names[w[1]]=wstr(w,2);
+        else if (t.op==6){ if (wstr(w,3)=="time") timeIdx=(int)w[2]; }
+        else if (t.op==11 && wstr(w,2).find("GLSL")!=std::string::npos) glsl=w[1];
+        else if (t.op==22 && w[2]==32) tFloat=w[1];
+        else if (t.op==21 && w[2]==32 && (w.size()<4 || w[3]==1)) tInt=w[1]; }
+    for (auto& t:insts){ auto&w=t.w; if (t.op==23 && w[2]==tFloat && w[3]==4) tV4=w[1]; else if (t.op==32) ptr[((uint64_t)w[2]<<32)|w[3]]=w[1]; }
+    for (auto& t:insts){ auto&w=t.w; if (t.op==43 && w[1]==tInt){ int32_t iv; memcpy(&iv,&w[3],4); intc[iv]=w[2]; } else if (t.op==43 && w[1]==tFloat){ float fv; memcpy(&fv,&w[3],4); fltc[fround(fv)]=w[2]; } }
+    for (auto& kv:names) if (kv.second=="globalUniforms") gu=kv.first;
+    if (!tFloat||!tInt||!glsl||!gu||timeIdx<0||!tV4) return {};
+    // find the Output-class struct variable + the store to its member 0 (Out.color)
+    std::set<uint32_t> outVars;
+    for (auto& t:insts) if (t.op==59 && t.w.size()>=4 && t.w[3]==3) outVars.insert(t.w[2]);   // OpVariable Output
+    uint32_t c0int=0; { auto it=intc.find(0); if(it!=intc.end()) c0int=it->second; }
+    int storeIdx=-1; uint32_t storeVal=0, colorPtr=0;
+    std::map<uint32_t,Inst*> byId;
+    for (auto& t:insts) if (t.w.size()>=3 && (t.op==65)) byId[t.w[2]]=&t;   // access chains by result id
+    for (size_t k=0;k<insts.size();++k){
+        Inst& t=insts[k];
+        if (t.op!=62 || t.w.size()<3) continue;   // OpStore
+        auto it=byId.find(t.w[1]); if (it==byId.end()) continue;
+        Inst& ac=*it->second;                     // OpAccessChain: [type,res,base,idx...]
+        if (ac.w.size()<5) continue;
+        if (!outVars.count(ac.w[3])) continue;
+        if (c0int && ac.w[4]!=c0int) continue;    // member 0 = color (when int-0 const known; else first store wins)
+        storeIdx=(int)k; storeVal=t.w[2]; colorPtr=t.w[1]; break;
+    }
+    if (storeIdx<0) return {};
+    (void)colorPtr;
+    std::vector<Inst> newGlobals;
+    auto nid=[&](){ return bound++; };
+    auto fbits=[](float f){ uint32_t u; memcpy(&u,&f,4); return u; };
+    auto fconst=[&](float val)->uint32_t{ int64_t k=fround(val); auto it=fltc.find(k); if(it!=fltc.end())return it->second; uint32_t id=nid(); newGlobals.push_back({43,{0,tFloat,id,fbits(val)}}); fltc[k]=id; return id; };
+    auto iconst=[&](int32_t val)->uint32_t{ auto it=intc.find(val); if(it!=intc.end())return it->second; uint32_t id=nid(); newGlobals.push_back({43,{0,tInt,id,(uint32_t)val}}); intc[val]=id; return id; };
+    auto ptrOf=[&](uint32_t sc,uint32_t ty)->uint32_t{ uint64_t k=((uint64_t)sc<<32)|ty; auto it=ptr.find(k); if(it!=ptr.end())return it->second; uint32_t id=nid(); newGlobals.push_back({32,{0,id,sc,ty}}); ptr[k]=id; return id; };
+    const uint32_t GLSL_FRACT=10, GLSL_SCLAMP=45;
+    if (loopSec<=1e-4f) loopSec=1.f;
+    uint32_t c_invloop=fconst(1.0f/loopSec), c_N=fconst((float)N), c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
+    uint32_t c_i0=iconst(0), c_iN1=iconst(N-1);
+    std::vector<uint32_t> keyIds((size_t)N);
+    for (int i=0;i<N;i++){
+        uint32_t r=fconst(rgba[(size_t)i*4]), g=fconst(rgba[(size_t)i*4+1]), b=fconst(rgba[(size_t)i*4+2]), a=fconst(rgba[(size_t)i*4+3]);
+        uint32_t kc=nid(); newGlobals.push_back({44,{0,tV4,kc,r,g,b,a}}); keyIds[(size_t)i]=kc;
+    }
+    uint32_t cLen=iconst(N);
+    uint32_t tArr=nid(); newGlobals.push_back({28,{0,tArr,tV4,cLen}});
+    uint32_t arrId=nid();
+    { Inst arrC; arrC.op=44; arrC.w.push_back(0); arrC.w.push_back(tArr); arrC.w.push_back(arrId);
+      for (int i=0;i<N;i++) arrC.w.push_back(keyIds[(size_t)i]);
+      newGlobals.push_back(std::move(arrC)); }
+    uint32_t pArr=ptrOf(6,tArr);
+    uint32_t var=nid(); newGlobals.push_back({59,{0,pArr,var,6,arrId}});
+    uint32_t pV4=ptrOf(6,tV4);
+    uint32_t pt2=nid(),tt=nid(),tn=nid(),t01=nid(),fphase=nid(),idxF=nid(),idxC=nid(),ac2=nid(),tintv=nid(),tinted=nid();
+    std::vector<Inst> pre = {
+        {65,{0,pUf,pt2,gu,c_time}}, {61,{0,tFloat,tt,pt2}},
+        {133,{0,tFloat,tn,tt,c_invloop}},
+        {12,{0,tFloat,t01,glsl,GLSL_FRACT,tn}},
+        {133,{0,tFloat,fphase,t01,c_N}},
+        {110,{0,tInt,idxF,fphase}},
+        {12,{0,tInt,idxC,glsl,GLSL_SCLAMP,idxF,c_i0,c_iN1}},
+        {65,{0,pV4,ac2,var,idxC}},
+        {61,{0,tV4,tintv,ac2}},
+    };
+    std::vector<Inst> out; bool addedG=false;
+    for (size_t k=0;k<insts.size();++k){
+        if (!addedG && insts[k].op==54){ for(auto&t2:newGlobals)out.push_back(t2); addedG=true; }
+        if ((int)k==storeIdx){
+            for(auto&b:pre) out.push_back(b);
+            out.push_back({133,{0,tV4,tinted,storeVal,tintv}});   // OpFMul color·curve[idx]
+            Inst st=insts[k]; st.w[2]=tinted; out.push_back(st);  // store the tinted color instead
+            continue;
+        }
         out.push_back(insts[k]);
     }
     if (!addedG) return {};
@@ -937,7 +1169,8 @@ inline std::vector<uint8_t> transformFragGlsl(const std::vector<uint8_t>& src, c
 // depth-only stages lack inUv -> editVertModule returns {} -> harmlessly skipped, so only real position stages grow.)
 inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode, float p0, float p1=0, float ax=0, float ay=1, float az=0,
                                      const std::vector<float>& tframes = {}, int tN = 0,
-                                     const std::vector<float>& fade = {}, float fadeLoop = 0.f){   // FLIPBOOK: opacity-fade curve (mat.sanim tint alpha) + its loop
+                                     const std::vector<float>& fade = {}, float fadeLoop = 0.f,   // FLIPBOOK: opacity-fade curve (mat.sanim tint alpha) + its loop
+                                     const float* fbCellClamp = nullptr){                         // FLIPBOOK replay: {umin,vmin,umax,vmax,padU,padV} per-frame cell clamp (spritesheet seam fix)
     using namespace detail;
     const uint8_t* d = src.data(); size_t N = src.size();
     if (mode==CUTOUT){   // edit the FORWARD FRAGMENT (alpha-test discard); the depth/shadow/motion frags don't need it
@@ -950,7 +1183,35 @@ inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode,
         uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
         o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
         o.insert(o.end(),mod.begin(),mod.end());
-        uint32_t rel=nv-(uint32_t)slot; memcpy(o.data()+slot,&rel,4);   // repoint the forward-frag SPIR-V uoffset
+        (void)slot; detail::repointAll(o, (size_t)nv, spvOff-4, nv);   // repoint EVERY pass entry sharing the old module (shared-module fix)
+        return o;
+    }
+    if (mode==FOLIAGE){   // sharpen-alpha masked foliage (pair with the MATL masked/a2c flags); p0 = alpha cutoff
+        int64_t slot,spvOff; uint32_t spvLen;
+        if (!detail::findFwdFragSpv(d,N,slot,spvOff,spvLen)) return {};
+        std::vector<uint8_t> mod = editFragFoliageSharpen(d+spvOff, spvLen, p0>0.f ? p0 : 0.30f);
+        if (mod.empty()) return {};
+        std::vector<uint8_t> o = src;
+        while (o.size()%4) o.push_back(0);
+        uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
+        o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
+        o.insert(o.end(),mod.begin(),mod.end());
+        (void)slot; detail::repointAll(o, (size_t)nv, spvOff-4, nv);   // repoint EVERY pass entry sharing the old module (shared-module fix)
+        return o;
+    }
+    if (mode==TINTREPLAY_VERT){   // per-frame RGBA MaterialTint replay in the forward VERTEX (skinned meshes: the
+        // fragment tint edits — unroll AND const-array — both broke the Quest driver; vertex getTime edits are
+        // device-proven, and the frag already multiplies base×vertexColor0, so the vert multiply = V79-exact)
+        int64_t slot,spvOff; uint32_t spvLen;
+        if (!detail::findFwdVertSpv(d,N,slot,spvOff,spvLen)) return {};
+        std::vector<uint8_t> mod = editVertTintReplay(d+spvOff, spvLen, tframes, tN, p0);   // p0 = loopSec
+        if (mod.empty()) return {};
+        std::vector<uint8_t> o = src;
+        while (o.size()%4) o.push_back(0);
+        uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
+        o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
+        o.insert(o.end(),mod.begin(),mod.end());
+        (void)slot; detail::repointAll(o, (size_t)nv, spvOff-4, nv);   // repoint EVERY pass entry sharing the old vert module
         return o;
     }
     if (mode==TINTREPLAY){   // per-frame RGBA MaterialTint replay in the forward FRAGMENT (chainable onto any surface)
@@ -963,7 +1224,7 @@ inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode,
         uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
         o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
         o.insert(o.end(),mod.begin(),mod.end());
-        uint32_t rel=nv-(uint32_t)slot; memcpy(o.data()+slot,&rel,4);   // repoint the forward-frag SPIR-V uoffset
+        (void)slot; detail::repointAll(o, (size_t)nv, spvOff-4, nv);   // repoint EVERY pass entry sharing the old module (shared-module fix)
         return o;
     }
     if ((mode==FLIPBOOK || mode==UVSCROLL) && !std::getenv("HSR_VERTFLIP")){   // DEFAULT: FRAGMENT-stage UV anim (animates on device; vertex-UV did not)
@@ -972,7 +1233,7 @@ inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode,
         std::vector<uint8_t> mod;
         if (mode==FLIPBOOK) {
             if (!tframes.empty() && tN>=2)   // EXACT per-frame MATRIX replay (p0=loopSec, tframes=N*6 verbatim source matrices) — matches the desktop
-                mod = editFragUvMatrixReplay(d+spvOff, spvLen, tframes, tN, p0);
+                mod = editFragUvMatrixReplay(d+spvOff, spvLen, tframes, tN, p0, fbCellClamp);
             else                              // legacy derived cols/rows grid (p0=cols p1=rows ax=frames ay=fps az=offsetFlag)
                 mod = editFragFlipbook(d+spvOff, spvLen, (int)(p0+0.5f),(int)(p1+0.5f),(int)(ax+0.5f), ay, az>0.5f);
             // OPACITY FADE (fog/dust MaterialTint alpha) layered on the SAME forward-frag module — fades the card to 0
@@ -989,7 +1250,7 @@ inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode,
         uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
         o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
         o.insert(o.end(),mod.begin(),mod.end());
-        uint32_t rel=nv-(uint32_t)slot; memcpy(o.data()+slot,&rel,4);   // repoint the forward-frag SPIR-V uoffset
+        (void)slot; detail::repointAll(o, (size_t)nv, spvOff-4, nv);   // repoint EVERY pass entry sharing the old module (shared-module fix)
         return o;
     }
     if (mode==ROTATE || mode==OSCILLATE || mode==ROTREPLAY){ float l=std::sqrt(ax*ax+ay*ay+az*az); if (l<=0.f) l=1.f; ax/=l; ay/=l; az/=l; }  // axis -> unit (UVSCROLL/FLIPBOOK/TRANSLATE use these args as params, not an axis)

@@ -552,8 +552,13 @@ public:
             // combined, built from the SKINNED blend base): the old test overrode them with the generic
             // unlitdoublesidedskinned program -> the river/fog cards lost their UV animation in HSL preview
             // and sampled the WRONG atlas region ("fucked up texture" — device was fine, shader is skinned).
+            // "skin*" prefix = ALL cooker-generated skinned-base variants (skincutout_* / skinfol_* /
+            // skinblend_* / skinuv_*). The old test only matched the substring "skinned" — so the zen tree's
+            // skincutout_c50_* program (WITH the alpha-test discard) was resolved correctly and then
+            // OVERRIDDEN here with the generic unlitdoublesidedskinned program (NO discard) = the canopy drew
+            // solid uncut quads while every cooked byte was correct (the final hop of the leaf saga).
             bool ownIsSkinned = gm.progIdx >= 0 && (programs[gm.progIdx].surface.find("skinned") != std::string::npos
-                                                 || programs[gm.progIdx].surface.rfind("skinuv_", 0) == 0);
+                                                 || programs[gm.progIdx].surface.rfind("skin", 0) == 0);
             if (!ownIsSkinned) { int sp = programForSkinned(); if (sp >= 0) gm.progIdx = sp; }
         }
 
@@ -1469,8 +1474,16 @@ public:
           // (p.pipeAlphaTest = p.pipe), so flipping a cooked unlitblend mountain card to alphaTest there left it OPAQUE
           // with a BLACK transparent silhouette (user: cooked HSL preview "transparent background rendered black"). The
           // cook already ships these as unlitblend (md flags) -> in HSL preview keep them BLEND. So require the discard frag.
+          // FLAT-HORIZONTAL exemption (pond_white "z-fighting / hiding most of the stuff EVEN IN RENDER MODE"):
+          // a near-planar-in-Y blend layer (pond sparkle overlay, floor decals) flipped to a depth-WRITING
+          // cutout here fights the coplanar surface beneath it — same guard the cook applies (hsl_cooker).
+          bool flatHorizY = false;
+          { float pmn[3]={1e30f,1e30f,1e30f}, pmx[3]={-1e30f,-1e30f,-1e30f};
+            for (size_t v2=0; v2+2 < md.positions.size(); v2+=3) for (int a2=0;a2<3;a2++){ float p=md.positions[v2+a2]; if(p<pmn[a2])pmn[a2]=p; if(p>pmx[a2])pmx[a2]=p; }
+            float exX=pmx[0]-pmn[0], exY=pmx[1]-pmn[1], exZ=pmx[2]-pmn[2];
+            flatHorizY = (exY < 0.20f*exX && exY < 0.20f*exZ); }
           if (!alphaTestFragSpirv.empty() && gm.progIdx < 0
-              && gm.useBlend && !gm.alphaTest && !gm.additive && !gm.overlayKind && !computesAlpha && taN>0
+              && gm.useBlend && !gm.alphaTest && !gm.additive && !gm.overlayKind && !computesAlpha && taN>0 && !flatHorizY
               && (float)taMid/(float)taN < 0.05f && (float)taOpq/(float)taN > 0.004f) {   // BIMODAL (hard-edged) + has real opaque content
               gm.alphaTest = true; gm.useBlend = false;   // MAKEOPAQUE cutout: SOLID scenery depth-writes + discards its silhouette (OPA preview only)
           }
@@ -3046,24 +3059,42 @@ public:
         VkPipelineLayoutCreateInfo pl={}; pl.sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO; pl.setLayoutCount=3; pl.pSetLayouts=sl; pl.pushConstantRangeCount=1; pl.pPushConstantRanges=&pc;
         vkCreatePipelineLayout(device,&pl,nullptr,&p.pipeLayout);
         VkGraphicsPipelineCreateInfo gp={}; gp.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO; gp.stageCount=2; gp.pStages=stages; gp.pVertexInputState=&vi; gp.pInputAssemblyState=&ia; gp.pViewportState=&vps; gp.pMultisampleState=&ms; gp.pDynamicState=&dd; gp.layout=p.pipeLayout; gp.renderPass=renderPass; gp.subpass=0;
-        gp.pRasterizationState=&rs;     gp.pDepthStencilState=&ds;   gp.pColorBlendState=&cbIO; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipe);
-        gp.pRasterizationState=&rs;     gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIB; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeBlend);
-        gp.pRasterizationState=&rsCull; gp.pDepthStencilState=&ds;   gp.pColorBlendState=&cbIO; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeCull);
-        gp.pRasterizationState=&rsCull; gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIB; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeBlendCull);
-        gp.pRasterizationState=&rs;     gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIA; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeAdditive);
+        // Transparent variants get the anti-z-fight depth bias (reversed-Z: positive = toward viewer) —
+        // coplanar authored overlays (ringGlass on the platform ring, pond layers) never depth-tie the
+        // opaque surface beneath them. Opaque pipelines stay unbiased.
+        VkPipelineRasterizationStateCreateInfo rsBias=rs;     rsBias.depthBiasEnable=VK_TRUE;     rsBias.depthBiasConstantFactor=4.0f;     rsBias.depthBiasSlopeFactor=1.0f;
+        VkPipelineRasterizationStateCreateInfo rsCullBias=rsCull; rsCullBias.depthBiasEnable=VK_TRUE; rsCullBias.depthBiasConstantFactor=4.0f; rsCullBias.depthBiasSlopeFactor=1.0f;
+        gp.pRasterizationState=&rs;         gp.pDepthStencilState=&ds;   gp.pColorBlendState=&cbIO; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipe);
+        gp.pRasterizationState=&rsBias;     gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIB; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeBlend);
+        gp.pRasterizationState=&rsCull;     gp.pDepthStencilState=&ds;   gp.pColorBlendState=&cbIO; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeCull);
+        gp.pRasterizationState=&rsCullBias; gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIB; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeBlendCull);
+        gp.pRasterizationState=&rsBias;     gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIA; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeAdditive);
         // Wireframe variant on THIS program's layout — so the editor "vertex structure" (F) + selection
         // highlight can draw per-material meshes without binding their descSet2 to the global-layout
         // wireframe pipeline (that mismatch HANGS the GPU on HSL — the click-freeze).
         { VkPipelineRasterizationStateCreateInfo rsWire=rs; rsWire.polygonMode=VK_POLYGON_MODE_LINE; rsWire.cullMode=VK_CULL_MODE_NONE;
           gp.pRasterizationState=&rsWire; gp.pDepthStencilState=&ds; gp.pColorBlendState=&cbIO;
           vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeWire); }
-        p.pipeAlphaTest = p.pipe;   // no per-program discard frag; cutouts draw opaque in per-mat path
+        // Cutouts get a DEPTH-BIASED variant of the opaque pipeline (same shader — the cooked frag carries its
+        // own discard): a masked decal coplanar with the surface beneath it depth-ties without the bias
+        // (the residual "still z fighting" after the transparent-only pass).
+        { VkGraphicsPipelineCreateInfo gpAT = gp;
+          VkPipelineRasterizationStateCreateInfo rsATBias = rs; rsATBias.depthBiasEnable=VK_TRUE; rsATBias.depthBiasConstantFactor=4.0f; rsATBias.depthBiasSlopeFactor=1.0f;
+          gpAT.pRasterizationState=&rsATBias; gpAT.pDepthStencilState=&ds; gpAT.pColorBlendState=&cbIO;
+          if (vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gpAT,nullptr,&p.pipeAlphaTest) != VK_SUCCESS)
+              p.pipeAlphaTest = p.pipe; }   // fallback: unbiased opaque
         vkDestroyShaderModule(device,vm,nullptr); vkDestroyShaderModule(device,fm,nullptr);
     }
 
     // Introspect a program's SPIR-V (via the existing global introspectors + save/restore of the
     // global scratch), build its descriptor layouts + pipelines. set1 reuses the synthesized lighting.
     void buildProgram(ShaderProgram& p) {
+        if (std::getenv("HSR_VERBOSE")) {   // PROOF probe: does the frag this program compiles contain OpKill (discard)?
+            int kills = 0;
+            for (size_t wi = 5; wi + 1 < p.frag.size();) { u32 w = p.frag[wi], op = w & 0xFFFF, wc = w >> 16;
+                if (!wc) break; if (op == 252) kills++; wi += wc; }
+            log("[PROG] frag %zu words, OpKill x%d", p.frag.size(), kills);
+        }
         auto sVI=vertInputs; auto sVS=vertStride; auto s1=set1Binds; auto s2=set2Binds; auto s0=set0Binds;
         auto sM=matParamsMembers; auto sB=set2BaseColorBinding; auto sH=hasSet1;
         introspectVertexInputs(p.vert);
@@ -3330,7 +3361,16 @@ public:
             VkPipelineColorBlendStateCreateInfo cbBlendInfo = cbInfo;
             cbBlendInfo.pAttachments = &cbBlendAtt;
 
-            pipeInfo.pRasterizationState = &rsInfo;
+            // Z-FIGHT PROOFING (ringGlass over platform ring, pond overlays over water — coplanar authored
+            // geometry): bias every TRANSPARENT draw slightly TOWARD the viewer so it never depth-ties the
+            // opaque surface it overlays. Reversed-Z (GREATER_OR_EQUAL): toward-viewer = larger depth =>
+            // POSITIVE bias. Blends don't depth-write, so the bias only affects their own depth TEST.
+            VkPipelineRasterizationStateCreateInfo rsBlendBias = rsInfo;
+            rsBlendBias.depthBiasEnable = VK_TRUE;
+            rsBlendBias.depthBiasConstantFactor = 4.0f;   // ~4 ULP of the D32F depth buffer
+            rsBlendBias.depthBiasSlopeFactor = 1.0f;
+
+            pipeInfo.pRasterizationState = &rsBlendBias;
             pipeInfo.pDepthStencilState = &dsBlend;
             pipeInfo.pColorBlendState = &cbBlendInfo;
 
@@ -3351,8 +3391,12 @@ public:
             if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &graphicsPipelineCull) != VK_SUCCESS)
                 log("WARN: opaque cull pipeline creation failed");
             else log("  Opaque (cull) pipeline created OK");
-            // blend cull variant
-            pipeInfo.pRasterizationState = &rsCull;
+            // blend cull variant (same z-fight depth bias as the no-cull blend pipeline)
+            VkPipelineRasterizationStateCreateInfo rsCullBias = rsCull;
+            rsCullBias.depthBiasEnable = VK_TRUE;
+            rsCullBias.depthBiasConstantFactor = 4.0f;
+            rsCullBias.depthBiasSlopeFactor = 1.0f;
+            pipeInfo.pRasterizationState = &rsCullBias;
             pipeInfo.pDepthStencilState  = &dsBlend;
             pipeInfo.pColorBlendState    = &cbBlendInfo;
             if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &blendPipelineCull) != VK_SUCCESS)
@@ -3406,7 +3450,11 @@ public:
             atStages[1].module = fragAlphaMod;
             VkGraphicsPipelineCreateInfo atInfo = pipeInfo;
             atInfo.pStages = atStages;
-            atInfo.pRasterizationState = &rsInfo;      // fill
+            // depth-biased like the blend pipelines: masked decals coplanar with their backing surface
+            // (OPA mode) were the remaining z-fights after the transparent-only bias pass
+            VkPipelineRasterizationStateCreateInfo rsATBias = rsInfo;
+            rsATBias.depthBiasEnable = VK_TRUE; rsATBias.depthBiasConstantFactor = 4.0f; rsATBias.depthBiasSlopeFactor = 1.0f;
+            atInfo.pRasterizationState = &rsATBias;    // fill + bias
             atInfo.pDepthStencilState = &dsInfo;       // depth test + WRITE on (occludes)
             atInfo.pColorBlendState = &cbInfo;         // no blend (cbAtt)
             VkResult atRes = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &atInfo, nullptr, &alphaTestPipeline);

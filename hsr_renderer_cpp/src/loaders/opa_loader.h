@@ -187,6 +187,10 @@ public:
         // no-albedo metallic/gem shells (divingHelmet metallic=1, rubyGem metallic=0 rough=0, etc).
         float metallic=0.0f, roughness=1.0f;
         float speciblDiffScale=1.0f, speciblSpecScale=1.0f;
+        float alphaCutoff=0.5f;      // 'alphatestthreshold' UNIFORM — the AUTHORED AlphaTest discard threshold
+                                     // (V79 frag: `if (color.a < AlphaCutoff) discard`). The zen tree canopy
+                                     // authors 0.25; hardcoding 0.5 discarded its abundant 0.25-0.5 mid-alpha
+                                     // leaf detail = thin holey "blocky" canopy.
         float lightmapPower[3]={1.0f,1.0f,1.0f};  // per-channel lightmap HDR boost (the neon/glow tint)
         bool  isSpecibl=false;       // Shader: SpecIbl
         bool found=false;
@@ -1123,16 +1127,37 @@ public:
         if (tr.nFrames < 2 || animFps <= 0.f) return false;
         const float* M0 = tr.m.data();
         if (std::fabs(M0[0]-1.f)>0.05f || std::fabs(M0[4]-1.f)>0.05f || std::fabs(M0[1])>0.05f || std::fabs(M0[3])>0.05f) return false;  // flipbook atlas, not a continuous scroll
-        int win = tr.nFrames - 1; if (win > 256) win = 256;   // water tracks are uniform; a capped window avoids iterating 10k+ frames
-        double sdu=0, sdv=0; int n=0;
+        // SWIRL detection (pond_color_rgCombo "water colors swirling" — user-proven): a UV ROTATION lives in
+        // the 2x2 part (a,b,d,e) and builds up over the loop while the translation stays ~0 — every earlier
+        // check here (and the frame dumps) only looked at the c,f translations and the FIRST frames, so the
+        // swirl track summarized as "scroll 0.001/s" = static. If the 2x2 deviates anywhere along the track,
+        // this is NOT a scroll: return false so the mesh routes to the exact per-frame UV-MATRIX REPLAY.
+        { int step = tr.nFrames > 64 ? tr.nFrames/64 : 1;
+          for (int f=step; f<tr.nFrames; f+=step){ const float* M=&tr.m[(size_t)f*6];
+              if (std::fabs(M[0]-M0[0])>0.02f || std::fabs(M[1]-M0[1])>0.02f ||
+                  std::fabs(M[3]-M0[3])>0.02f || std::fabs(M[4]-M0[4])>0.02f) return false; } }
+        // FULL track window (the rgCombo "water colors swirling" fix): the authored track is a u-translation
+        // OSCILLATION 0→0.01→0 over 439 frames; the old 256-frame cap saw mostly the RISING half, so the
+        // oscillation gate below never triggered and the slosh cooked as a linear 0.001/s drift (= static).
+        // Scanning the whole track costs microseconds and lets the gate see the deltas cancel.
+        int win = tr.nFrames - 1;
+        double sdu=0, sdv=0; int n=0; double sadu=0, sadv=0;
         for (int f=0; f<win; f++) {
             float dc = tr.m[(size_t)(f+1)*6+2] - tr.m[(size_t)f*6+2];
             float df = tr.m[(size_t)(f+1)*6+5] - tr.m[(size_t)f*6+5];
             if (std::fabs(dc)>0.5f || std::fabs(df)>0.5f) continue;   // skip a wrap-around jump
             sdu += dc; sdv += df; ++n;
+            sadu += std::fabs(dc); sadv += std::fabs(df);
         }
         if (n < 1) return false;
         double avgDu = sdu / n, avgDv = sdv / n;
+        // OSCILLATION test (pond_color_rgCombo "aint animating" fix): a back-and-forth track (water slosh)
+        // has per-frame deltas that CANCEL — the signed mean ≈ 0 while the |delta| mean is real, and cooking
+        // that mean as a "scroll" freezes the animation (rate 0.001 UV/s = static). If most of the motion is
+        // NOT explained by the mean (|mean| << mean|delta|), this is NOT a constant scroll — return false so
+        // the mesh falls through to the exact per-frame UV-MATRIX REPLAY.
+        { double meanMag = std::sqrt(avgDu*avgDu + avgDv*avgDv), absMag = (sadu + sadv) / n;
+          if (absMag > 1e-6 && meanMag < 0.25 * absMag) return false; }
         if (std::fabs(avgDu) > 0.04 || std::fabs(avgDv) > 0.04) return false;   // cell-stepping flipbook, not a scroll (texture names confirm: *_flipbook / *_spritesheet)
         ru = (float)(avgDu * animFps); rv = (float)(avgDv * animFps);   // UV/sec = the track's AUTHORED visible speed at the base fps
         // FAITHFUL: libshell plays the mat.sanim UVTransform by feeding the per-frame 2x3 matrix into the vertex
@@ -1989,6 +2014,7 @@ private:
                 };
                 mp.metallic         = uniScalar("metallic", 0.0f);
                 mp.roughness        = uniScalar("roughness", 1.0f);
+                mp.alphaCutoff      = uniScalar("alphatestthreshold", 0.5f);   // authored AlphaTest discard threshold
                 mp.speciblDiffScale = uniScalar("specibldiffusescale", 1.0f);
                 mp.speciblSpecScale = uniScalar("speciblspecularscale", 1.0f);
                 // lightmappower: per-channel HDR boost on the baked lightmap = the neon/glow tint.
@@ -2532,6 +2558,12 @@ private:
                     float u=0, v=0;
                     if (oi < nstd) { uint16_t hu, hv; memcpy(&hu, stdP+oi*20+12, 2); memcpy(&hv, stdP+oi*20+14, 2); u=h2f(hu); v=h2f(hv); if (!novflip) v=1.0f-v; }
                     md.uvs.push_back(u); md.uvs.push_back(v);
+                    // EXTRACT ALL OPA PROPERTIES: StdData a_color u8x4 @8 — authored per-vertex shading
+                    // (leaf AO/color variation). The skin path DROPPED it entirely; the preview and the
+                    // cook's COLOR_0 both multiply base×vertexColor, so carrying it is the 1:1 port.
+                    if (oi < nstd) { const uint8_t* cc = stdP+oi*20+8;
+                        md.colors.push_back(cc[0]); md.colors.push_back(cc[1]); md.colors.push_back(cc[2]); md.colors.push_back(cc[3]); }
+                    else { md.colors.push_back(255); md.colors.push_back(255); md.colors.push_back(255); md.colors.push_back(255); }
                     if (canSkin) {   // SkinnedPos: weights f16x4 @12, bone idx u8x4 @20 (jidx = SKIN bone)
                         const uint8_t* sv = posP + oi*posStride;
                         for (int w=0; w<4; ++w) {
@@ -2545,10 +2577,21 @@ private:
                 md.indices.push_back((u32)ni);
             }
             md.nVerts = (u32)(md.positions.size()/3); md.nIdx = (u32)md.indices.size();
+            if (std::getenv("HSR_VERBOSE") && md.uvs.size() >= 12) {   // SOURCE uv values for cook-fidelity diff vs the shipped RENDMESH f16 stream
+                fprintf(stderr, "[SKINUV] '%s' uv0..5:", fn.c_str());
+                for (int q3=0; q3<6; q3++) fprintf(stderr, " (%.4f,%.4f)", md.uvs[q3*2], md.uvs[q3*2+1]);
+                fprintf(stderr, "\n");
+            }
+            if (std::getenv("HSR_VERBOSE") && md.colors.size() >= 8) {   // authored a_color stats (is it real shading data?)
+                int mn[4]={255,255,255,255}, mx[4]={0,0,0,0}; long sum[4]={0,0,0,0}; size_t n4=md.colors.size()/4;
+                for (size_t q2=0;q2<n4;q2++) for (int c2=0;c2<4;c2++){ int vv2=md.colors[q2*4+c2]; if(vv2<mn[c2])mn[c2]=vv2; if(vv2>mx[c2])mx[c2]=vv2; sum[c2]+=vv2; }
+                fprintf(stderr, "[SKINCOLOR] '%s' a_color r[%d..%d avg %ld] g[%d..%d avg %ld] b[%d..%d avg %ld] a[%d..%d avg %ld]\n",
+                        fn.c_str(), mn[0],mx[0],sum[0]/(long)n4, mn[1],mx[1],sum[1]/(long)n4, mn[2],mx[2],sum[2]/(long)n4, mn[3],mx[3],sum[3]/(long)n4);
+            }
             if (tex) { md.texW=tex->w; md.texH=tex->h; md.hasTexture=true; md.texRGBA=tex->rgba;
                        md.srcAstc=tex->srcAstc; md.srcAstcBw=tex->srcBw; md.srcAstcBh=tex->srcBh; md.srcAstcMips=tex->srcMips;
                        md.tint[0]=md.tint[1]=md.tint[2]=1.0f; md.useBlend = mp ? (mp->transparent||mp->additive) : tex->hasAlpha;
-                       md.alphaTest = mp ? mp->alphaTest : false; }
+                       md.alphaTest = mp ? mp->alphaTest : false; md.alphaCutoff = mp ? mp->alphaCutoff : 0.5f; }
             else     { md.texW=md.texH=1; md.hasTexture=true;   // no texture -> flat diffuse UNIFORM color (not grey)
                        float dr=mp?mp->diffuseColor[0]:1.f, dg=mp?mp->diffuseColor[1]:1.f, db=mp?mp->diffuseColor[2]:1.f;
                        auto cl=[](float x){return (u8)(x<0?0:x>1?255:x*255.f+0.5f);};
@@ -2923,6 +2966,7 @@ private:
                     md.useBlend = mp ? (mp->transparent || mp->additive) : tex->hasAlpha;
                     md.additive = mp ? mp->additive : false;   // god-rays/glow -> ADD blend (not alpha)
                     md.alphaTest = mp ? mp->alphaTest : false;  // cutout -> opaque pass + discard
+                    md.alphaCutoff = mp ? mp->alphaCutoff : 0.5f;   // AUTHORED discard threshold (zen tree 0.25)
                     // Scale the per-mesh texture alpha by the material 'alpha' UNIFORM (libshell does
                     // this in the shader). A transparent effect with a fully-opaque texture but a low
                     // alpha uniform (forge flicker=0.27) must be a FAINT overlay, not an opaque dark

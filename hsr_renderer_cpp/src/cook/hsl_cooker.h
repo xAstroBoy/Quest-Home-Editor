@@ -270,7 +270,7 @@ enum : uint32_t { TGT_MESH = 0x4D455348, TGT_TEX = 0x6E4CC522, TGT_SURFACE = 0xA
 // formatCode = color/pixel format enum (11 = sRGB albedo, like nuxd's tx_dome). f2 = ASTC block enum
 // (6x6->18, 8x8->20, 12x12->24). The device GPU-uploads the full mip chain (ErrorInvalidArg without it / with a
 // bad format). A box-filtered RGBA mip chain down to 1x1, each level ASTC-encoded and concatenated into f9.
-inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, int bw = 8, int bh = 8, uint8_t formatCode = 11, bool alphaWeighted = false, int capCols = 1, int capRows = 1, bool coveragePreserve = false) {
+inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, int bw = 8, int bh = 8, uint8_t formatCode = 11, bool alphaWeighted = false, int capCols = 1, int capRows = 1, bool coveragePreserve = false, float covCut = 0.5f) {
     // capCols/capRows > 1: SPRITESHEET flipbook atlas (capCols×capRows cells). CAP the mip chain so coarse mips never
     // AVERAGE ADJACENT CELLS (device "borders around the animated cards": at distance the GPU picks a coarse mip where
     // all cells blur together, bleeding the neighbour frame in as a rectangular border; desktop uses mip0 so it's clean).
@@ -289,7 +289,8 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
     { size_t nb=(size_t)w*h*4, n64=nb/8; const uint64_t* p=(const uint64_t*)rgba;
       for (size_t k=0;k<n64;k++) mix(p[k]); for (size_t k=n64*8;k<nb;k++) mix(rgba[k]);
       mix(((uint64_t)(uint32_t)w<<32)|(uint32_t)h); mix(((uint64_t)bw<<8)|(uint32_t)bh); mix(alphaWeighted?0x4157u:0u);
-      mix(coveragePreserve?0xC0FEu:0u);   // coverage-preserving alpha mips = distinct chain
+      mix(coveragePreserve?0xC0FFu:0u);   // coverage-preserving alpha mips = distinct chain (bumped: THOROUGH re-encode invalidates old MEDIUM caches)
+      if (coveragePreserve) mix((uint64_t)(uint32_t)(covCut*1000.f));   // per-cutoff coverage target = distinct chain
       mix(((uint64_t)(uint32_t)capCols<<32)|(uint32_t)capRows); }   // cap is part of the mip chain -> distinct cache entry
     std::error_code _ec; std::filesystem::path cdir = std::filesystem::temp_directory_path()/"hsr_texcache";
     bool useCache = !std::getenv("HSR_NOTEXCACHE");
@@ -309,7 +310,11 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
     if (useCache) { std::ifstream f(cf,std::ios::binary); if (f){ data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()); } }
     if (data.empty()) {                                        // cache miss -> ENCODE (multi-threaded by default)
         astcenc_config cfg{};
-        if (astcenc_config_init(ASTCENC_PRF_LDR, (unsigned)bw, (unsigned)bh, 1, ASTCENC_PRE_MEDIUM, 0, &cfg) != ASTCENC_SUCCESS) return {};
+        // Masked (coverage-preserved) textures encode at THOROUGH: their mip0 is a re-encode (the coverage
+        // chain replaces the byte-exact pass-through) and MEDIUM softened it — balloons "don't look high
+        // res". Few masked textures per env, so the extra effort is affordable; everything else stays MEDIUM.
+        float q = coveragePreserve ? ASTCENC_PRE_THOROUGH : ASTCENC_PRE_MEDIUM;
+        if (astcenc_config_init(ASTCENC_PRF_LDR, (unsigned)bw, (unsigned)bh, 1, q, 0, &cfg) != ASTCENC_SUCCESS) return {};
         const astcenc_swizzle swz = { ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
         unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());   // ASTC compress parallelizes across all cores
         astcenc_context* ctx = nullptr; if (astcenc_context_alloc(&cfg, nthreads, &ctx) != ASTCENC_SUCCESS) return {};
@@ -320,7 +325,8 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
         // leaves the device shows at range). Rescale each coarse mip's alpha so its coverage matches mip0 →
         // leaves keep their shape + area at every distance instead of dissolving into blocks.
         double covTarget = 0.0;
-        if (coveragePreserve) { size_t cov=0, tot=(size_t)w*h; for (size_t k=0;k<tot;k++) if (rgba[k*4+3]>=128) cov++; covTarget = tot? (double)cov/tot : 0.0; }
+        const float covThr255 = covCut * 255.f;   // coverage measured at the AUTHORED discard threshold (tree = 0.25)
+        if (coveragePreserve) { size_t cov=0, tot=(size_t)w*h; for (size_t k=0;k<tot;k++) if (rgba[k*4+3]>=covThr255) cov++; covTarget = tot? (double)cov/tot : 0.0; }
         while (true) {
             int cols = (cw + bw - 1) / bw, rows = (ch + bh - 1) / bh;
             std::vector<uint8_t> blocks((size_t)cols * rows * 16);
@@ -352,10 +358,17 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
                     o[c] = (uint8_t)((p[0][c] + p[1][c] + p[2][c] + p[3][c] + 2) / 4);
             }
             if (coveragePreserve && covTarget > 0.0 && covTarget < 1.0) {
-                // find an alpha SCALE s so fraction(alpha*s >= 128) == covTarget (binary search; monotonic in s).
+                // find an alpha SCALE s so fraction(alpha*s >= cutoff) == covTarget (binary search; monotonic in s).
+                // CLAMPED to [0.5, 2.0]: the unbounded lift (up to 32x) pushed near-zero-alpha texels — whose
+                // alpha-weighted RGB is dark/black matte — over the discard threshold = the "BLACK where it
+                // should be transparent" blotches. A 2x cap preserves coverage against the box-filter shrink
+                // (the "all sticks at distance" fix) without ever promoting background texels into view.
                 size_t np = (size_t)nw*nh;
-                auto coverageAt=[&](float s)->double{ size_t c=0; for (size_t k=0;k<np;k++){ float a=nx[k*4+3]*s; if (a>=128.f) c++; } return (double)c/np; };
-                float lo=0.03f, hi=32.f;
+                auto coverageAt=[&](float s)->double{ size_t c=0; for (size_t k=0;k<np;k++){ float a=nx[k*4+3]*s; if (a>=covThr255) c++; } return (double)c/np; };
+                // UP-ONLY [1,2]: a dense leaf carpet's box-filtered alpha can EXCEED the mip0 coverage
+                // (gaps blur INTO leaves), and letting the search depress alpha (s<1) erased the canopy at
+                // coarse mips = "still all sticks". Coverage preservation only ever needs to FIGHT SHRINK.
+                float lo=1.0f, hi=2.0f;
                 for (int it=0; it<18; ++it){ float mid=0.5f*(lo+hi); if (coverageAt(mid) < covTarget) lo=mid; else hi=mid; }
                 float s=0.5f*(lo+hi);
                 for (size_t k=0;k<np;k++){ int a=(int)(nx[k*4+3]*s+0.5f); nx[k*4+3]=(uint8_t)(a<0?0:a>255?255:a); }
@@ -370,6 +383,8 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
     FB b(data.size() + 512);
     int dv = b.createByteVector(data.data(), data.size());
     b.startObject(10);
+    b.addScalar<uint16_t>(0, 2);   // f0=2 (official Meta textures ALL carry it; absent => device samples LINEAR
+                                   // instead of sRGB = washed colors on EVERY cooked albedo — "preview ok, quest not")
     b.addScalar<uint8_t>(2, blkEnum);
     b.addScalar<uint16_t>(3, (uint16_t)w); b.addScalar<uint16_t>(4, (uint16_t)h);
     b.addScalar<uint16_t>(5, 1);
@@ -391,6 +406,7 @@ inline std::vector<uint8_t> encodeRendTxtrFromAstc(const std::vector<uint8_t>& a
     FB b(astcMips.size() + 512);
     int dv = b.createByteVector(astcMips.data(), astcMips.size());
     b.startObject(10);
+    b.addScalar<uint16_t>(0, 2);   // f0=2 sRGB tag (see encodeRendTxtr — device washes colors without it)
     b.addScalar<uint8_t>(2, blkEnum);
     b.addScalar<uint16_t>(3, (uint16_t)w); b.addScalar<uint16_t>(4, (uint16_t)h);
     b.addScalar<uint16_t>(5, 1);
@@ -414,19 +430,30 @@ inline std::vector<uint8_t> extendAstcMipChain(const std::vector<uint8_t>& srcAs
     if (srcMips >= fullMips) return {};                        // chain already complete
     // dims of the first MISSING level
     int cw = w, ch = h; for (int l=0; l<srcMips; l++){ cw = cw>1?cw/2:1; ch = ch>1?ch/2:1; }
-    // box-filter the decoded mip0 down to that level
-    std::vector<uint8_t> cur(rgba, rgba + (size_t)w*h*4); int dw = w, dh = h;
-    while (dw > cw || dh > ch) {
+    // ALPHA-WEIGHTED downsample (the city "white border on every card" fix): a plain box average lets the
+    // transparent texels' garbage RGB (white matte) bleed into the synthesized coarse mips -> a white halo
+    // tracing every building silhouette at distance. RGB = sum(rgb*a)/sum(a); alpha = plain box.
+    auto downStep=[&](std::vector<uint8_t>& cur, int& dw, int& dh){
         int nw = dw>1?dw/2:1, nh = dh>1?dh/2:1;
         std::vector<uint8_t> nx((size_t)nw*nh*4);
-        for (int y=0;y<nh;y++) for (int x=0;x<nw;x++) for (int c=0;c<4;c++){
+        for (int y=0;y<nh;y++) for (int x=0;x<nw;x++){
             int sx=x*2, sy=y*2, sx1=sx+1<dw?sx+1:sx, sy1=sy+1<dh?sy+1:sy;
-            nx[((size_t)y*nw+x)*4+c] = (uint8_t)((cur[((size_t)sy*dw+sx)*4+c]+cur[((size_t)sy*dw+sx1)*4+c]
-                                                 +cur[((size_t)sy1*dw+sx)*4+c]+cur[((size_t)sy1*dw+sx1)*4+c]+2)/4); }
+            const uint8_t* p[4] = { &cur[((size_t)sy*dw+sx)*4], &cur[((size_t)sy*dw+sx1)*4],
+                                    &cur[((size_t)sy1*dw+sx)*4], &cur[((size_t)sy1*dw+sx1)*4] };
+            uint8_t* o = &nx[((size_t)y*nw+x)*4];
+            int wsum = p[0][3]+p[1][3]+p[2][3]+p[3][3];
+            o[3] = (uint8_t)((wsum+2)/4);
+            if (wsum > 0) for (int c=0;c<3;c++) o[c] = (uint8_t)((p[0][c]*p[0][3]+p[1][c]*p[1][3]+p[2][c]*p[2][3]+p[3][c]*p[3][3]+wsum/2)/wsum);
+            else { o[0]=p[0][0]; o[1]=p[0][1]; o[2]=p[0][2]; }   // fully transparent: keep a source color (no white matte)
+        }
         cur.swap(nx); dw=nw; dh=nh;
-    }
+    };
+    std::vector<uint8_t> cur(rgba, rgba + (size_t)w*h*4); int dw = w, dh = h;
+    while (dw > cw || dh > ch) downStep(cur, dw, dh);
     astcenc_config cfg{};
-    if (astcenc_config_init(ASTCENC_PRF_LDR, (unsigned)bw, (unsigned)bh, 1, ASTCENC_PRE_MEDIUM, 0, &cfg) != ASTCENC_SUCCESS) return {};
+    // THOROUGH ("city doesn't look high res"): the synthesized levels are the ones the device samples at
+    // mid distance; they're tiny (mip1+ of the source count) so the extra encode effort costs ~nothing.
+    if (astcenc_config_init(ASTCENC_PRF_LDR, (unsigned)bw, (unsigned)bh, 1, ASTCENC_PRE_THOROUGH, 0, &cfg) != ASTCENC_SUCCESS) return {};
     const astcenc_swizzle swz = { ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
     unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());
     astcenc_context* ctx = nullptr; if (astcenc_context_alloc(&cfg, nthreads, &ctx) != ASTCENC_SUCCESS) return {};
@@ -444,13 +471,7 @@ inline std::vector<uint8_t> extendAstcMipChain(const std::vector<uint8_t>& srcAs
         out.insert(out.end(), blocks.begin(), blocks.end()); mips++;
         if (dw==1 && dh==1) break;
         astcenc_compress_reset(ctx);
-        int nw=dw>1?dw/2:1, nh=dh>1?dh/2:1;
-        std::vector<uint8_t> nx((size_t)nw*nh*4);
-        for (int y=0;y<nh;y++) for (int x=0;x<nw;x++) for (int c=0;c<4;c++){
-            int sx=x*2, sy=y*2, sx1=sx+1<dw?sx+1:sx, sy1=sy+1<dh?sy+1:sy;
-            nx[((size_t)y*nw+x)*4+c] = (uint8_t)((cur[((size_t)sy*dw+sx)*4+c]+cur[((size_t)sy*dw+sx1)*4+c]
-                                                 +cur[((size_t)sy1*dw+sx)*4+c]+cur[((size_t)sy1*dw+sx1)*4+c]+2)/4); }
-        cur.swap(nx); dw=nw; dh=nh;
+        downStep(cur, dw, dh);   // alpha-weighted (same as the pre-loop steps — no white-matte bleed)
     }
     astcenc_context_free(ctx);
     if (fail) return {};
@@ -1461,6 +1482,7 @@ struct ExportMesh {
     bool transAnim = false; std::vector<float> transFrames; int transN = 0; float transLoop = 0.f;   // transN frames of vec3 OFFSET, loop seconds
     bool fadeAnim = false; std::vector<float> fadeFrames; int fadeN = 0; float fadeLoop = 0.f;   // mat.sanim MaterialTint ALPHA fade curve replayed in the flipbook frag; fadeLoop synced to transLoop
     bool tintAnim = false; std::vector<float> tintFrames; int tintN = 0; float tintLoop = 0.f;   // mat.sanim MaterialTint FULL RGBA cycle (fireworks flashes / window-light flicker) -> shadergen::TINTREPLAY chained onto the mesh's shader (supersedes the alpha-only fade when set)
+    float alphaCutoff = 0.5f;   // AUTHORED 'alphatestthreshold' (V79 uniform; zen tree canopy = 0.25) — the cutout discard threshold
     // GENERAL node SCALE "breathe" replay (Erebor's 12 wisps, NON-UNIFORM per-axis) -> shadergen::SCALE getTime() shader.
     // scaleFrames = scaleN frames of per-axis FACTOR (= scale(t)/scale(0), frame0=(1,1,1)); scalePivot = node WORLD origin.
     bool scaleAnim = false; std::vector<float> scaleFrames; int scaleN = 0; float scaleLoop = 0.f; float scalePivot[3] = {0,0,0};
@@ -1580,7 +1602,7 @@ inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMe
         bool haveUv = m.uvs.size() >= nv * 2;
         size_t ntri = m.indices.size() / 3, t = 0;
         while (t < ntri) {
-            ExportMesh c; c.name = m.name; c.blend = m.blend; c.alphaTest = m.alphaTest; c.additive = m.additive; c.w = m.w; c.h = m.h; c.rgba = m.rgba;
+            ExportMesh c; c.name = m.name; c.blend = m.blend; c.alphaTest = m.alphaTest; c.alphaCutoff = m.alphaCutoff; c.additive = m.additive; c.w = m.w; c.h = m.h; c.rgba = m.rgba;
             c.srcAstc = m.srcAstc; c.srcAstcBw = m.srcAstcBw; c.srcAstcBh = m.srcAstcBh; c.srcAstcMips = m.srcAstcMips;   // split parts keep the lossless source-ASTC pass-through
             c.skybox = m.skybox;   // split parts MUST inherit the skybox mark, else a big dome (>60k verts) loses it -> far-clipped/black
             for (int k = 0; k < 4; k++) c.matTint[k] = m.matTint[k];
@@ -2249,10 +2271,39 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             } else { if (m.flipCols > 1) capCols = m.flipCols; if (m.flipRows > 1) capRows = m.flipRows; }
             if (capCols < 1) capCols = 1; if (capRows < 1) capRows = 1;
             if (capCols > 64) capCols = 1; if (capRows > 64) capRows = 1;   // a huge "grid" = a fine continuous SCROLL, not a real spritesheet -> don't mip-cap (was mis-capping the aurora as 278x1)
+            // UV-SPAN fallback (sparkles cell sheet): flipbook-scoped only — the user rejected generalizing
+            // mip caps ("NO CAP/LIMITING BS"); non-flipbook texture wrongness must be found at its true
+            // source (shader/UV binding), not papered over with chain limits.
+            if (capCols == 1 && capRows == 1 && m.uvs.size() >= 4) {
+                float umin=1e9f,umax=-1e9f,vmin=1e9f,vmax=-1e9f;
+                for (size_t k2=0;k2+1<m.uvs.size();k2+=2){ float u=m.uvs[k2],v=m.uvs[k2+1];
+                    if(u<umin)umin=u; if(u>umax)umax=u; if(v<vmin)vmin=v; if(v>vmax)vmax=v; }
+                float su=umax-umin, sv=vmax-vmin;
+                if (su > 1e-4f && su < 0.6f) { int c2=(int)(1.0f/su+0.5f); if (c2>=2 && c2<=64) capCols=c2; }
+                if (sv > 1e-4f && sv < 0.6f) { int r2=(int)(1.0f/sv+0.5f); if (r2>=2 && r2<=64) capRows=r2; }
+            }
+        }
+        // SPRITESHEET close-up seam fix (shader-side): per-frame CELL CLAMP baked into the flipbook replay shader —
+        // the base-UV span (= one cell) is pushed through each frame's matrix in-shader and the sampled UV is clamped
+        // to it minus an ASTC-block pad (8 texels). Pins only edge-touching samples; the frame interior stays
+        // pixel-exact (the old cook-side 8-texel RESCALE squeezed 25% of the 63px knife cells = 2 broken meshes).
+        float fbClampArr[6]; const float* fbClamp = nullptr;
+        if ((capCols > 1 || capRows > 1) && m.uvs.size() >= 4 && m.w > 0 && m.h > 0) {
+            float umin=1e9f,umax=-1e9f,vmin=1e9f,vmax=-1e9f;
+            for (size_t k2=0;k2+1<m.uvs.size();k2+=2){ float u=m.uvs[k2],v=m.uvs[k2+1];
+                if(u<umin)umin=u; if(u>umax)umax=u; if(v<vmin)vmin=v; if(v>vmax)vmax=v; }
+            float padU=8.0f/(float)m.w, padV=8.0f/(float)m.h;
+            if (padU > 0.2f*(umax-umin)) padU = 0.2f*(umax-umin);   // never pin more than 20% of a tiny cell per side
+            if (padV > 0.2f*(vmax-vmin)) padV = 0.2f*(vmax-vmin);
+            fbClampArr[0]=umin; fbClampArr[1]=vmin; fbClampArr[2]=umax; fbClampArr[3]=vmax; fbClampArr[4]=padU; fbClampArr[5]=padV;
+            fbClamp = fbClampArr;
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] m%03zu '%s' CELL-CLAMP %dx%d pad=(%.4f,%.4f) uv[%.3f..%.3f, %.3f..%.3f] (shader-side seam fix)\n",
+                                                    i, m.name.c_str(), capCols, capRows, padU, padV, umin, umax, vmin, vmax);
         }
         if (m.rgba.size() >= (size_t)m.w * m.h * 4 && m.w && m.h && !droidWhite) {
             uint64_t rh = murmur64A(texSrc, (size_t)m.w * m.h * 4);   // dedup identical textures (esp. the chunks a big mesh was split into)
             rh ^= (uint64_t)(uint32_t)(capCols*73856093 ^ capRows*19349663);   // spritesheet cap is part of the encoded chain -> distinct entry
+            if (m.alphaTest && !m.blend) rh ^= 0xC07C07u ^ (uint64_t)(uint32_t)(m.alphaCutoff*1000.f);   // coverage-preserved chain at THIS cutoff = distinct entry
             auto cit = texCache.find(rh);
             if (cit != texCache.end()) { texK = cit->second.first; pTex = cit->second.second; }  // reuse the shared texture; leave `tex` empty so it isn't re-encoded/re-pushed
             else { texK = keyForPath(pTex);
@@ -2263,7 +2314,13 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                   // source quality + faster (no encode) + the ORIGINAL Meta mips (authoritative). Skip for
                   // spritesheets (need the per-cell mip cap). HSR_NOTEXPASS forces re-encode.
                   bool unmodified = (texSrc == m.rgba.data());
+                  // MASKED foliage -> coverage-preserving re-encode (alpha-weighted RGB + CLAMPED per-mip alpha
+                  // rescale at the AUTHORED cutoff). With the discard finally RUNNING on the drawn pass (the
+                  // forwardSkinned fix), the source KTX's plain box-filtered mips collapse the canopy's alpha
+                  // below the cutoff at range = "now is all sticks". The earlier BLACK-blotch regression was the
+                  // UNBOUNDED rescale (now clamped to 2x). HSR_FOLIAGE_SRCMIPS restores the verbatim pass-through.
                   bool canPass = unmodified && !m.srcAstc.empty() && capCols==1 && capRows==1
+                               && !(m.alphaTest && !m.blend && !std::getenv("HSR_FOLIAGE_SRCMIPS"))
                                && !std::getenv("HSR_NOTEXPASS")
                                && ((m.srcAstcBw==8&&m.srcAstcBh==8)||(m.srcAstcBw==6&&m.srcAstcBh==6)||(m.srcAstcBw==12&&m.srcAstcBh==12));
                   int passMips = (int)m.srcAstcMips;
@@ -2272,9 +2329,17 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                       // pass-through leaves the device minifying mip0 with no chain = shimmer/aliasing at distance
                       // ("low quality texture"). Keep the source levels byte-exact and SYNTHESIZE only the missing
                       // coarser levels from the decoded mip0 (tiny; encode softness invisible there).
+                      // ⛔ NO synthesized mips for MASKED (alpha-test) textures: box-filtered alpha on a dense
+                      // leaf atlas (61% >= cutoff) converges ABOVE the discard threshold — the synthesized coarse
+                      // levels stop the cutout from firing at ANY minification = the canopy renders as SOLID
+                      // SMEARED QUADS (and quantizes BLOCKY at the boundary). The source KTX's own mip count is
+                      // what V79 shipped; keep it verbatim for masked. (Proven: source md.uvs == cooked f16 UVs
+                      // byte-exact, shipped alpha intact, shader discard present — the mips were the last delta.)
                       int extMips = 0;
-                      auto ext = extendAstcMipChain(m.srcAstc, m.rgba.data(), (int)m.w, (int)m.h,
-                                                    (int)m.srcAstcBw, (int)m.srcAstcBh, (int)m.srcAstcMips, extMips);
+                      std::vector<uint8_t> ext;
+                      if (!(m.alphaTest && !m.blend))
+                          ext = extendAstcMipChain(m.srcAstc, m.rgba.data(), (int)m.w, (int)m.h,
+                                                   (int)m.srcAstcBw, (int)m.srcAstcBh, (int)m.srcAstcMips, extMips);
                       if (!ext.empty()) { tex = encodeRendTxtrFromAstc(ext, (int)m.w, (int)m.h, (int)m.srcAstcBw, (int)m.srcAstcBh, extMips); passMips = extMips; }
                       else               tex = encodeRendTxtrFromAstc(m.srcAstc, (int)m.w, (int)m.h, (int)m.srcAstcBw, (int)m.srcAstcBh, (int)m.srcAstcMips);
                   }
@@ -2282,7 +2347,14 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                       // alpha-test foliage (masked trees/leaves): alpha-weight the mip RGB (no transparent-bg bleed halo) AND
                       // preserve alpha COVERAGE down the chain, so the leaves don't dissolve into blocky ASTC chunks at range.
                       bool aw = m.blend || m.alphaTest; bool cov = m.alphaTest && !m.blend;
-                      tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, 8, 8, 11, aw, capCols, capRows, cov);
+                      float covCut = (cov && m.alphaCutoff > 0.f && m.alphaCutoff < 1.f) ? m.alphaCutoff : 0.5f;
+                      // SOURCE footprint (balloons "worse than high def" fix): the re-encode hardcoded 8x8
+                      // (2 bpp) even when the source authored 6x6 (3.56 bpp) — a straight quality downgrade
+                      // for every re-encoded 6x6 texture. Keep the authored block size when the device
+                      // supports it (6x6/8x8/12x12 enums).
+                      int ebw = 8, ebh = 8;
+                      if ((m.srcAstcBw==6&&m.srcAstcBh==6)||(m.srcAstcBw==8&&m.srcAstcBh==8)||(m.srcAstcBw==12&&m.srcAstcBh==12)) { ebw=(int)m.srcAstcBw; ebh=(int)m.srcAstcBh; }
+                      tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, ebw, ebh, 11, aw, capCols, capRows, cov, covCut);
                   } else if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' TEX PASS-THROUGH (source ASTC %dx%d %ux->%dx mips, lossless base)\n", i, m.name.c_str(), (int)m.srcAstcBw, (int)m.srcAstcBh, m.srcAstcMips, passMips);
                   texCache[rh] = { texK, pTex };
                   if ((capCols>1||capRows>1) && std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SPRITESHEET %dx%d -> mip-capped\n", i, m.name.c_str(), capCols, capRows); }
@@ -2534,28 +2606,34 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // together with the luminance-alpha texture the additive branch already bakes (alpha = max(rgb)·a) →
                 // the bright beam feathers in over the sky and the dark atlas background drops out = a real glow.
                 AssetKey3 sk = ((m.blend || foliageBlend || m.additive) && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
-                // SKINNED BLEND + MaterialTint RGBA cycle (stinson zen tree canopy: the SOURCE SHADER cycles the
-                // tint green→cyan→pink — NOT a static green): chain TINTREPLAY onto the skinned BLEND frag, same
-                // fragment-only edit the static/cutout paths use (vertex skinning untouched). Per-curve cache.
-                if ((m.blend || foliageBlend) && !m.additive && !shadSkinB.empty()
-                    && m.tintAnim && m.tintN >= 2 && m.tintFrames.size() >= (size_t)m.tintN*4 && m.tintLoop > 1e-4f) {
-                    uint32_t th = 0x811C9DC5u ^ (uint32_t)(long)(m.tintLoop*1000);
-                    for (float v : m.tintFrames) th = th*16777619u ^ (uint32_t)(long)(v*10000);
-                    char bfn[80]; snprintf(bfn, sizeof bfn, "cooker/skinblend_t%08x.surface.bin", th);
-                    AssetKey3 skinTintK{};
-                    auto itb0 = rotShaders.find(bfn);
-                    if (itb0 != rotShaders.end()) skinTintK = itb0->second;
-                    else {
-                        auto bb = readFileBytes(bfn);
-                        if (bb.empty()) { bb = shadergen::generate(shadSkinB, shadergen::TINTREPLAY, m.tintLoop, 0,0,0,0, m.tintFrames, m.tintN);
-                                          if (!bb.empty()) writeFileBytes(bfn, bb); }
-                        if (!bb.empty()) {
-                            std::string base(bfn+7); size_t dot = base.rfind(".bin"); if (dot!=std::string::npos) base = base.substr(0,dot);
-                            char bp2[200]; snprintf(bp2, sizeof bp2, "%s/shaders/%s/shader", MH.c_str(), base.c_str());
-                            skinTintK = keyForPath(bp2); assets.push_back({ bp2, skinTintK.tgt, bb, skinTintK }); rotShaders[bfn] = skinTintK; }
+                // SKINNED (blend OR opaque) + MaterialTint RGBA cycle (stinson zen tree: the SOURCE SHADER
+                // cycles the tint green→cyan→pink): chain TINTREPLAY onto the matching skinned frag. This
+                // covers the OPAQUE skinned meshes too (materialsplit_fill — the tree's opaque inner-canopy
+                // mass, Foliage_dblsided AlphaTest:false): without it the fill stayed frame-0 green while the
+                // cutout cards cycled = mismatched core mid-cycle. (The masked/cutout branch below overrides
+                // sk with its own cutout+tint chain.) Per-curve+base cache.
+                if (!m.additive && m.tintAnim && m.tintN >= 2 && m.tintFrames.size() >= (size_t)m.tintN*4 && m.tintLoop > 1e-4f) {
+                    bool blendBase = (m.blend || foliageBlend) && !shadSkinB.empty();
+                    const std::vector<uint8_t>& tintBase = blendBase ? shadSkinB : shadSkin;
+                    if (!tintBase.empty()) {
+                        uint32_t th = 0x811C9DC5u ^ (uint32_t)(long)(m.tintLoop*1000);
+                        for (float v : m.tintFrames) th = th*16777619u ^ (uint32_t)(long)(v*10000);
+                        char bfn[80]; snprintf(bfn, sizeof bfn, "cooker/%s_t%08x.surface.bin", blendBase?"skinblend":"skinopq", th);
+                        AssetKey3 skinTintK{};
+                        auto itb0 = rotShaders.find(bfn);
+                        if (itb0 != rotShaders.end()) skinTintK = itb0->second;
+                        else {
+                            auto bb = readFileBytes(bfn);
+                            if (bb.empty()) { bb = shadergen::generate(tintBase, shadergen::TINTREPLAY_VERT, m.tintLoop, 0,0,0,0, m.tintFrames, m.tintN);
+                                              if (!bb.empty()) writeFileBytes(bfn, bb); }
+                            if (!bb.empty()) {
+                                std::string base(bfn+7); size_t dot = base.rfind(".bin"); if (dot!=std::string::npos) base = base.substr(0,dot);
+                                char bp2[200]; snprintf(bp2, sizeof bp2, "%s/shaders/%s/shader", MH.c_str(), base.c_str());
+                                skinTintK = keyForPath(bp2); assets.push_back({ bp2, skinTintK.tgt, bb, skinTintK }); rotShaders[bfn] = skinTintK; }
+                        }
+                        if (skinTintK.pkg || skinTintK.ing) { sk = skinTintK;
+                            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SKINNED-%s+TINTREPLAY (%d frames loop=%.2fs)\n", i, m.name.c_str(), blendBase?"BLEND":"OPAQUE", m.tintN, m.tintLoop); }
                     }
-                    if (skinTintK.pkg || skinTintK.ing) { sk = skinTintK;
-                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SKINNED-BLEND+TINTREPLAY (%d frames loop=%.2fs)\n", i, m.name.c_str(), m.tintN, m.tintLoop); }
                 }
                 // MASKED skinned foliage (stinson materialsplit trees: authored AlphaTest, "_masked") -> a skinned
                 // CUTOUT shader: the opaque skinned base + an alpha<0.5 discard in the forward frag (same
@@ -2569,18 +2647,41 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     // vertex SKINNING is untouched). Cache key folds the tint curve so each distinct cycle
                     // dedups. No tint -> the shared plain skincutout (unchanged for the palm/materialsplit trees).
                     bool sctint = m.tintAnim && m.tintN >= 2 && m.tintFrames.size() >= (size_t)m.tintN*4 && m.tintLoop > 1e-4f;
-                    char cfn[80];
+                    // DEFAULT = plain 0.5 discard — the EXACT desktop V79 renderer recipe (kV79FragAlphaSpirv
+                    // discards a<0.5; extracted from the SPIR-V — the preview the user judges as CORRECT). The
+                    // sharpen+masked-flags experiment is opt-in HSR_FOLIAGE_SHARPEN: on-device it rendered the
+                    // canopy FLAT (quads barely cut — the flags don't give our technique a2c, and the 0.02 kill
+                    // keeps whole cards). The remaining desktop-vs-device delta was the MIPS, fixed at the
+                    // texture encode (coverage-preserving, no pass-through for masked foliage).
+                    bool folSharp = std::getenv("HSR_FOLIAGE_SHARPEN") != nullptr;
+                    // AUTHORED discard threshold (the zen tree "not like leaves" fix): the V79 material carries
+                    // 'alphatestthreshold' (tree canopy 0.25); the old hardcoded 0.5 discarded its mid-alpha leaf
+                    // detail. Per-cutoff shader cache (c25/c50...) so different thresholds never collide.
+                    float aCut = (m.alphaCutoff > 0.f && m.alphaCutoff < 1.f) ? m.alphaCutoff : 0.5f;
+                    int cutPct = (int)(aCut*100.f + 0.5f);
+                    char cfn[96];
                     if (sctint) { uint32_t th = 0x811C9DC5u ^ (uint32_t)(long)(m.tintLoop*1000);
                         for (float v : m.tintFrames) th = th*16777619u ^ (uint32_t)(long)(v*10000);
-                        snprintf(cfn, sizeof cfn, "cooker/skincutout_t%08x.surface.bin", th); }
-                    else snprintf(cfn, sizeof cfn, "cooker/skincutout.surface.bin");
+                        snprintf(cfn, sizeof cfn, "cooker/%s_c%02d_t%08x.surface.bin", folSharp?"skinfol":"skincutout", cutPct, th); }
+                    else snprintf(cfn, sizeof cfn, "cooker/%s_c%02d.surface.bin", folSharp?"skinfol":"skincutout", cutPct);
                     AssetKey3 skinCutK{};
                     auto itc0 = rotShaders.find(cfn);
                     if (itc0 != rotShaders.end()) skinCutK = itc0->second;
                     else {
                         auto cb = readFileBytes(cfn);
-                        if (cb.empty()) { cb = shadergen::generate(shadSkin, shadergen::CUTOUT, 0.5f);
-                                          if (!cb.empty() && sctint) { auto tb = shadergen::generate(cb, shadergen::TINTREPLAY, m.tintLoop, 0,0,0,0, m.tintFrames, m.tintN); if (!tb.empty()) cb = tb; }
+                        // V79-TRANSPILED variant FIRST (tools/v79_transpile.py: the decompiled V205 forward frag
+                        // with the V79 post-multiply `if (color.a < authoredCutoff) discard` recompiled via
+                        // glslang — 1:1 authored shading; the cooker only ADAPTS). Falls back to the shadergen
+                        // SPIR-V edit when the pre-transpiled surface isn't present.
+                        if (cb.empty() && !folSharp) {
+                            char v79fn[96]; snprintf(v79fn, sizeof v79fn, "cooker/v79gen/v79_skin_c%02d.surface.bin", cutPct);
+                            auto vb = readFileBytes(v79fn);
+                            if (!vb.empty()) { cb = std::move(vb);
+                                if (sctint) { auto tb = shadergen::generate(cb, shadergen::TINTREPLAY_VERT, m.tintLoop, 0,0,0,0, m.tintFrames, m.tintN); if (!tb.empty()) cb = tb; }
+                                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu V79-TRANSPILED skin cutout c%02d%s\n", i, cutPct, sctint?"+TINTREPLAY":""); }
+                        }
+                        if (cb.empty()) { cb = shadergen::generate(shadSkin, folSharp ? shadergen::FOLIAGE : shadergen::CUTOUT, aCut);
+                                          if (!cb.empty() && sctint) { auto tb = shadergen::generate(cb, shadergen::TINTREPLAY_VERT, m.tintLoop, 0,0,0,0, m.tintFrames, m.tintN); if (!tb.empty()) cb = tb; }
                                           if (!cb.empty()) writeFileBytes(cfn, cb); }
                         if (!cb.empty()) {
                             // asset path = the cache filename's basename (e.g. "skincutout_t1a2b3c4d.surface"),
@@ -2590,16 +2691,17 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                             skinCutK = keyForPath(cp2); assets.push_back({ cp2, skinCutK.tgt, cb, skinCutK }); rotShaders[cfn] = skinCutK; }
                     }
                     if (skinCutK.pkg || skinCutK.ing) { sk = skinCutK;
-                        // ⛔ REVERTED experiment (opt-in HSR_FOLIA2C): copying haven2025's masked-leaf MATL field0
-                        // bits (flags 0x7C @76 + alphaCutoff 0.30 @80) onto OUR skinned MATL rendered the zen tree
-                        // as a "GOOPY MESS with leaves texture" on device — those bits pair with Meta's OWN
-                        // pbrlightmap_masked technique, not our custom skinned pipeline; on ours they melt the
-                        // alpha edges. Plain 0.5-discard skincutout is the working masked look.
-                        if (matl.size() >= 84 && std::getenv("HSR_FOLIA2C")) {
+                        // OFFICIAL masked MATL flags (haven2025 leaf byte-diff: flags 0x7C @76, alphaCutoff 0.30
+                        // @80) — REQUIRED with the FOLIAGE sharpen frag: flags enable the masked/a2c pipeline and
+                        // the sharpen turns the mip-soft alpha into a crisp 1-texel transition for coverage.
+                        // The FIRST attempt shipped these flags with the plain 0.5 hard-discard frag = raw soft
+                        // alpha into a2c = the on-device "GOOPY MESS". Flags without sharpen = goop; sharpen
+                        // without flags = plain cutout. Both together = the native smooth+depth foliage.
+                        if (matl.size() >= 84 && folSharp) {
                             uint16_t fl = 0x7C; std::memcpy(matl.data()+76, &fl, 2);
                             float cut = 0.30f;  std::memcpy(matl.data()+80, &cut, 4);
                         }
-                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SKINNED-CUTOUT%s (masked foliage, discard a<0.5)\n", i, m.name.c_str(), sctint?"+TINTREPLAY":""); }
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SKINNED-%s%s (masked foliage, authored cutoff %.2f)\n", i, m.name.c_str(), folSharp?"FOLIAGE-SHARPEN":"CUTOUT", sctint?"+TINTREPLAY":"", aCut); }
                 }
                 // ── COMBINED effect card (RIGID-HZANIM + material UV/fade) — NO EXCLUSION ──────────────────────────
                 // A fog/dust card whose node has R/S rides a RIGID-HZANIM skeleton (faithful T+R+S) AND has a UV flipbook
@@ -2614,6 +2716,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     for (size_t k=0;k<m.flipUVMats.size();++k) hh = hh*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000);
                     if (skFade) { hh = hh*16777619u ^ (uint32_t)(long)(m.fadeLoop*1000);
                         for (size_t k=0;k<m.fadeFrames.size();++k) hh = hh*16777619u ^ (uint32_t)(long)(m.fadeFrames[k]*100000); }
+                    if (fbClamp) for (int k2=0;k2<6;k2++) hh = hh*16777619u ^ (uint32_t)(long)(fbClamp[k2]*100000);   // cell clamp is baked in the shader -> distinct cache entry
                     char sfn[168]; snprintf(sfn,sizeof sfn,"cooker/skinuv_%08x%s.surface.bin", hh, m.blend?"_b":"");
                     auto itc = rotShaders.find(sfn);
                     if (itc != rotShaders.end()) sk = itc->second;
@@ -2621,7 +2724,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                         auto sb = readFileBytes(sfn);
                         if (sb.empty() && !sbase.empty()) { static const std::vector<float> noFade;
                             sb = shadergen::generate(sbase, shadergen::FLIPBOOK, m.flipLoop, 0.f,0.f,1.f,0.f, m.flipUVMats, m.flipN,
-                                                     skFade ? m.fadeFrames : noFade, skFade ? m.fadeLoop : 0.f);
+                                                     skFade ? m.fadeFrames : noFade, skFade ? m.fadeLoop : 0.f, fbClamp);
                             if (!sb.empty()) writeFileBytes(sfn, sb); }
                         if (!sb.empty()) { char sp[184]; snprintf(sp,sizeof sp,"%s/shaders/skinuv_%08x%s.surface/shader", MH.c_str(), hh, m.blend?"_b":"");
                             sk = keyForPath(sp); assets.push_back({ sp, sk.tgt, sb, sk }); rotShaders[sfn] = sk;
@@ -2790,7 +2893,8 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             uint32_t h = (uint32_t)(0x9E3779B9u*(uint32_t)m.transN ^ 0x85EBCA6Bu*(uint32_t)(long)(m.transLoop*1000));
             for (size_t k=0;k<m.transFrames.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.transFrames[k]*10000);
             if (tflip) { h = h*16777619u ^ (uint32_t)(m.flipCols*73856093 ^ m.flipRows*19349663 ^ m.flipFrames*83492791 ^ (int)(m.flipFps*100));
-                for (size_t k=0;k<m.flipUVMats.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000); }
+                for (size_t k=0;k<m.flipUVMats.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000);
+                if (fbClamp) for (int k2=0;k2<6;k2++) h = h*16777619u ^ (uint32_t)(long)(fbClamp[k2]*100000); }   // cell clamp baked in the shader -> distinct cache entry
             bool tfade = tflip && m.fadeAnim && m.fadeN>=2 && m.fadeFrames.size()>=(size_t)m.fadeN && m.fadeLoop>1e-4f;
             if (tfade) { h = h*16777619u ^ (uint32_t)(long)(m.fadeLoop*1000);
                 for (size_t k=0;k<m.fadeFrames.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.fadeFrames[k]*100000); }
@@ -2807,7 +2911,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     if (tflip) { bool rep = m.flipUVMats.size() >= (size_t)m.flipN*6 && m.flipN >= 2;
                         static const std::vector<float> noFade;
                         auto fb = rep ? shadergen::generate(gbase, shadergen::FLIPBOOK, m.flipLoop, 0.f,0.f,1.f,0.f, m.flipUVMats, m.flipN,
-                                            tfade ? m.fadeFrames : noFade, tfade ? m.fadeLoop : 0.f)   // EXACT per-frame matrix replay + opacity fade (matches desktop)
+                                            tfade ? m.fadeFrames : noFade, tfade ? m.fadeLoop : 0.f, fbClamp)   // EXACT per-frame matrix replay + opacity fade + cell clamp (matches desktop)
                                       : shadergen::generate(gbase, shadergen::FLIPBOOK, (float)m.flipCols,(float)m.flipRows,(float)m.flipFrames,m.flipFps, m.flipOffset?1.f:0.f);
                         if (!fb.empty()) base2 = fb; }
                     else if (tscroll) { auto fb = shadergen::generate(gbase, shadergen::UVSCROLL, m.uvRate[0], m.uvRate[1]); if (!fb.empty()) base2 = fb; }
@@ -2917,29 +3021,36 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             bool ffade = !ftint && useReplay && m.fadeAnim && m.fadeN>=2 && m.fadeFrames.size()>=(size_t)m.fadeN && m.fadeLoop>1e-4f;   // opacity fade curve (alpha-only subset — superseded by the RGBA tint replay)
             uint32_t h;
             if (useReplay) { h = (uint32_t)(0x9E3779B9u*(uint32_t)m.flipN ^ 0x85EBCA6Bu*(uint32_t)(long)(m.flipLoop*1000));
-                for (size_t k=0;k<m.flipUVMats.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000); }
+                for (size_t k=0;k<m.flipUVMats.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000);
+                if (fbClamp) for (int k2=0;k2<6;k2++) h = h*16777619u ^ (uint32_t)(long)(fbClamp[k2]*100000); }   // cell clamp baked in the shader -> distinct cache entry
             else h=(uint32_t)(0x9E3779B9u*(uint32_t)fcols ^ 0xC2B2AE35u*(uint32_t)frows ^ 0x27D4EB2Fu*(uint32_t)fframes ^ 0x85EBCA6Bu*(uint32_t)(long)(ffps*1000) ^ (m.flipOffset?0xA1B2C3D4u:0u));
             if (ffade) { h = h*16777619u ^ (uint32_t)(long)(m.fadeLoop*1000);
                 for (size_t k=0;k<m.fadeFrames.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.fadeFrames[k]*100000); }
             if (ftint) { h = h*16777619u ^ (uint32_t)m.tintN ^ (uint32_t)(long)(m.tintLoop*1000);   // fold the tint cycle into the cache key
                 for (float v : m.tintFrames) h = h*16777619u ^ (uint32_t)(long)(v*10000); }
-            char ffn[160]; snprintf(ffn,sizeof ffn,"cooker/flipbook_%08x%s%s%s%s%s.surface.bin", h, useReplay?"r":"", ffade?"a":"", ftint?"t":"", m.flipOffset?"o":"", meshFar?"_dc":"");
+            // AUTHORED blend (platform_Pads "fully see-thru + frustum culled" fix): this path hardcoded the
+            // BLEND base + matBlend for EVERY flipbook mesh — an authored-OPAQUE mesh whose UV track routes
+            // to the matrix replay (the pads' 120-frame glow slosh) rendered transparent-pass see-through.
+            // Honor m.blend exactly like the TRANSLATE block: opaque meshes keep the opaque base + matTpl
+            // (depth-write, opaque pass, normal far/cull handling).
+            bool fblend = m.blend && haveBlend;
+            char ffn[160]; snprintf(ffn,sizeof ffn,"cooker/flipbook_%08x%s%s%s%s%s%s.surface.bin", h, useReplay?"r":"", ffade?"a":"", ftint?"t":"", m.flipOffset?"o":"", fblend?"":"_op", meshFar?"_dc":"");
             AssetKey3 flipK{}; auto it=rotShaders.find(ffn);
             if (it!=rotShaders.end()) flipK=it->second;
             else {
                 auto fbytes=readFileBytes(ffn);
-                if (fbytes.empty()) { const std::vector<uint8_t>& gbase = meshFar?shadBlendDC:shadBlend;   // unlitblend base (FAR -> depth-clamp remap)
+                if (fbytes.empty()) { const std::vector<uint8_t>& gbase = meshFar ? (fblend?shadBlendDC:shadDC) : (fblend?shadBlend:shad);
                     static const std::vector<float> noFade;
                     fbytes = useReplay ? shadergen::generate(gbase, shadergen::FLIPBOOK, m.flipLoop, 0.f,0.f,1.f,0.f, m.flipUVMats, m.flipN,
-                                             ffade ? m.fadeFrames : noFade, ffade ? m.fadeLoop : 0.f)   // EXACT per-frame matrix replay + opacity fade (desktop data)
+                                             ffade ? m.fadeFrames : noFade, ffade ? m.fadeLoop : 0.f, fbClamp)   // EXACT per-frame matrix replay + opacity fade + cell clamp (desktop data)
                                        : shadergen::generate(gbase, shadergen::FLIPBOOK, (float)fcols,(float)frows,(float)fframes,ffps,foff);    // grid
                     // MaterialTint RGBA cycle (fireworks flash colors) chained onto the flipbook frag — replaces the
                     // alpha-only fade (the tint table carries alpha too, so both channels replay in one pass)
                     if (!fbytes.empty() && ftint) { auto tb = shadergen::generate(fbytes, shadergen::TINTREPLAY, m.tintLoop, 0,0,0,0, m.tintFrames, m.tintN); if (!tb.empty()) fbytes = tb; }
                     if(!fbytes.empty()) writeFileBytes(ffn,fbytes); }
-                if(!fbytes.empty()){ char fp2[176]; snprintf(fp2,sizeof fp2,"%s/shaders/flipbook_%08x%s%s%s%s%s.surface/shader", MH.c_str(), h, useReplay?"r":"", ffade?"a":"", ftint?"t":"", m.flipOffset?"o":"", meshFar?"_dc":"");
+                if(!fbytes.empty()){ char fp2[176]; snprintf(fp2,sizeof fp2,"%s/shaders/flipbook_%08x%s%s%s%s%s%s.surface/shader", MH.c_str(), h, useReplay?"r":"", ffade?"a":"", ftint?"t":"", m.flipOffset?"o":"", fblend?"":"_op", meshFar?"_dc":"");
                     flipK=keyForPath(fp2); assets.push_back({fp2, flipK.tgt, fbytes, flipK}); rotShaders[ffn]=flipK; } }
-            matl = matBlend;
+            matl = fblend ? matBlend : matTpl;
             if (flipK.ing){ memcpy(matl.data()+48,&flipK.pkg,8); memcpy(matl.data()+56,&flipK.ing,8); }   // field7 -> generated flipbook shader
             memcpy(matl.data()+120,&texK.pkg,8); memcpy(matl.data()+128,&texK.ing,8);                      // base tex -> the full spritesheet
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FLIPBOOK %dx%d %dframes @%.2ffps %s (auto-gen) %s\n", i, m.name.c_str(), fcols,frows,fframes,ffps, m.flipOffset?"OFFSET":"scale", flipK.ing?"":"(MISSING -> static)");
@@ -2993,7 +3104,12 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // midF 0.28 (stinson fogB opF=0.30 midF=0.28). The lax 0.30 cap routed the fog to CUTOUT(solid-body):
                 // an alpha-test on a card whose alpha is ~all soft 0.3s discards nearly EVERY pixel = "i dont see the
                 // fog". Fog/haze keeps a real mid-alpha gradient everywhere -> stays BLEND.
-                bool solidBody = (opF > 0.25f && midF < 0.18f);
+                // ANIMATED-FX gate (stinson fogC opF=0.31 midF=0.08 slipped the midF cap): a card with ANY authored
+                // material animation (UV scroll/flipbook/tint/fade) is soft FX by construction — V79 authored it
+                // Transparent and ANIMATES it; hard-cutting it kills both the softness and the visible motion
+                // ("fogC not ported properly"). Solid-body reclassification is for STATIC diorama scenery only.
+                bool animatedFx = m.tintAnim || m.fadeAnim || m.flipbook || m.uvScroll || m.transAnim || m.scaleAnim || m.rotAnim;
+                bool solidBody = (opF > 0.25f && midF < 0.18f && !animatedFx);
                 // FLAT HORIZONTAL DECAL guard (property, not name): a pond shadow / water-colour overlay lies IN the
                 // floor plane (Y is its SMALLEST extent) and paints translucently ONTO the coplanar floor — it must
                 // NOT depth-write or it z-fights the floor ("texture fighting" on pond_color_sh over platformCenter).
@@ -3002,7 +3118,15 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 float pmn[3]={1e30f,1e30f,1e30f}, pmx[3]={-1e30f,-1e30f,-1e30f};
                 for (size_t q=0; q+2<m.positions.size(); q+=3) for(int a=0;a<3;a++){ float p=m.positions[q+a]; if(p<pmn[a])pmn[a]=p; if(p>pmx[a])pmx[a]=p; }
                 float exX=pmx[0]-pmn[0], exY=pmx[1]-pmn[1], exZ=pmx[2]-pmn[2];
-                bool flatHorizontalDecal = (exY < 0.15f*exX && exY < 0.15f*exZ);   // near-planar in Y = ground/pond decal
+                // 0.20 (was 0.15): pond_white's rim lifts its Y ratio to 0.155 and fogC's haze sheet to 0.145 —
+                // both are HORIZONTAL soft layers (pond sparkle overlay / under-city fog sheet) that the solid-body
+                // rule hard-cut WITH depth-write = pond z-fight + clumpy fog. Vista diorama cards are VERTICAL
+                // (Y-dominant) and stay unaffected by the flat guard.
+                bool flatHorizontalDecal = (exY < 0.20f*exX && exY < 0.20f*exZ);   // near-planar in Y = ground/pond/fog layer
+                // GIANT SOFT SHEET (fogC: a 1020m sloped haze sheet, midF=0.08): scenery hundreds of meters across
+                // with a REAL soft-alpha gradient is atmosphere, not a diorama card — hard-cutting it makes clumpy
+                // fog with depth-writes. Hard-silhouette giants (bgMountains: midF≈0.01 bimodal) keep their cutout.
+                if ((exX > 300.f || exZ > 300.f) && midF > 0.05f) flatHorizontalDecal = true;
                 if (!flatHorizontalDecal && ((bimodal && hasOpaque) || solidBody)) {   // flat floor decals stay BLEND (no depth-write = no z-fight with the coplanar floor)
                     cutoutOK = true;
                     isTreeCutout = true;   // LOW 0.12 discard: depth-writes + keeps any faint soft edge; for midF~0 it equals a 0.5 cut
@@ -3011,9 +3135,33 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             }
             matl = (m.blend && haveBlend && !cutoutOK) ? matBlend : matTpl;
             if (cutoutOK) {   // CUTOUT = opaque MATL + alpha-test DISCARD shader -> DEPTH-WRITE: authored MASK scenery OCCLUDES (fixes back-overlays-front); discard cuts the hard mask. Double-sided handled by the cook's reversed-tri append.
-                const AssetKey3& ck = (isTreeCutout && haveCutoutTree) ? shaderCutoutTreeK : shaderCutoutK;   // sparse tree cards -> low (0.12) threshold so the foliage survives the discard
+                AssetKey3 ck = (isTreeCutout && haveCutoutTree) ? shaderCutoutTreeK : shaderCutoutK;   // sparse tree cards -> low (0.12) threshold so the foliage survives the discard
+                // AUTHORED masked STATIC meshes: prefer the V79-TRANSPILED per-cutoff surface (tools/
+                // v79_transpile.py — the 1:1 authored discard, post-multiply alpha exactly like the ripped
+                // MeshShellEnv frag); fall back to a shadergen per-cutoff variant when it isn't pre-built.
+                if (m.alphaTest && !isTreeCutout && !shad.empty()
+                    && m.alphaCutoff > 0.f && m.alphaCutoff < 1.f) {
+                    int cp = (int)(m.alphaCutoff*100.f+0.5f);
+                    char sfn2[64]; snprintf(sfn2, sizeof sfn2, "cooker/unlitcutout_c%02d.surface.bin", cp);
+                    auto itk = rotShaders.find(sfn2);
+                    AssetKey3 ckA{};
+                    if (itk != rotShaders.end()) ckA = itk->second;
+                    else {
+                        char v79fn[96]; snprintf(v79fn, sizeof v79fn, "cooker/v79gen/v79_static_c%02d.surface.bin", cp);
+                        auto cbytes = readFileBytes(v79fn);
+                        bool v79used = !cbytes.empty();
+                        if (cbytes.empty() && std::fabs(m.alphaCutoff-0.5f) > 0.02f)
+                            cbytes = shadergen::generate(shad, shadergen::CUTOUT, m.alphaCutoff);
+                        if (!cbytes.empty()) {
+                            char cps[128]; snprintf(cps, sizeof cps, "%s/shaders/unlitcutout_c%02d.surface/shader", MH.c_str(), cp);
+                            ckA = keyForPath(cps); assets.push_back({ cps, ckA.tgt, cbytes, ckA }); rotShaders[sfn2] = ckA;
+                            if (v79used && std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu V79-TRANSPILED static cutout c%02d\n", i, cp);
+                        }
+                    }
+                    if (ckA.pkg || ckA.ing) ck = ckA;
+                }
                 memcpy(matl.data()+48,&ck.pkg,8); memcpy(matl.data()+56,&ck.ing,8);
-                if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] m%03zu '%s' CUTOUT depth-write (blend=%d mask=%d tree=%d)\n", i, m.name.c_str(), (int)m.blend, (int)m.alphaTest, (int)isTreeCutout);
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] m%03zu '%s' CUTOUT depth-write (blend=%d mask=%d tree=%d cutoff=%.2f)\n", i, m.name.c_str(), (int)m.blend, (int)m.alphaTest, (int)isTreeCutout, m.alphaTest?m.alphaCutoff:(isTreeCutout?0.12f:0.5f));
             } else if (meshFar) { AssetKey3 dck = (m.blend && haveBlend) ? shaderBlendDCK : shaderDCK;   // FAR -> remap shader (renders past the 5000 clip); near keeps unlit/unlitblend = byte-exact
                            if (dck.ing) { memcpy(matl.data()+48,&dck.pkg,8); memcpy(matl.data()+56,&dck.ing,8); } }
             else if (m.additive && haveBlend) {
@@ -3212,6 +3360,10 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         //  (2) DOUBLE-SIDED: a dome viewed from inside has outward (back) faces -> culled -> invisible. Append reversed tris.
         std::vector<float> skyPos; const std::vector<float>* posPtr = staticPos;
         std::vector<uint32_t> dsIdx;   const std::vector<uint32_t>* sIdx = &m.indices;
+        // (Geometry lifting for z-fight proofing was tried and REJECTED by the user — "NO LIFTING". The
+        // device-side fix must come from the shader containers' PASS STATE instead: a GREATER_OR_EQUAL /
+        // tie-wins depth compare on the transparent techniques resolves exactly-coplanar overlays
+        // deterministically with ZERO geometry change. See memory: pass-state depth-func edit.)
         if (m.skybox && !useHz) {
             skyPos = *staticPos; size_t nvp = skyPos.size()/3; double cc[3]={0,0,0};
             for (size_t v=0; v<nvp; v++){ cc[0]+=skyPos[v*3]; cc[1]+=skyPos[v*3+1]; cc[2]+=skyPos[v*3+2]; }
@@ -3240,19 +3392,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             if (!useHz) sIdx = &dsIdx;
         }
         const std::vector<uint32_t>& hzIdx = (wantDouble && useHz) ? dsIdxHz : m.indices;
-        // SPRITESHEET flipbook (fire/smoke): INSET the card's base UVs a couple texels toward their cell so the per-cell
-        // sample never touches the cell EDGE — kills the residual CLOSE-UP seam (mip0 linear-filter + ASTC-block bleed into
-        // the neighbour cell). The mip-cap handled the distant coarse-mip bleed; this handles up-close. Real grids only.
-        const std::vector<float>* uvPtr = &m.uvs; std::vector<float> insetUv;
-        if ((capCols>1 || capRows>1) && m.uvs.size()>=4) {
-            float umin=1e9f,umax=-1e9f,vmin=1e9f,vmax=-1e9f;
-            for (size_t k=0;k+1<m.uvs.size();k+=2){ float u=m.uvs[k],v=m.uvs[k+1]; if(u<umin)umin=u;if(u>umax)umax=u;if(v<vmin)vmin=v;if(v>vmax)vmax=v; }
-            float du=umax-umin, dv=vmax-vmin, mu=(m.w>0)?8.0f/(float)m.w:0.f, mv=(m.h>0)?8.0f/(float)m.h:0.f;   // inset one ASTC block (8 texels) so the sample clears the cell-boundary block that straddles two cells
-            if (du>4*mu && dv>4*mv) { insetUv=m.uvs; float su=(du-2*mu)/du, sv=(dv-2*mv)/dv;
-                for (size_t k=0;k+1<insetUv.size();k+=2){ insetUv[k]=umin+mu+(insetUv[k]-umin)*su; insetUv[k+1]=vmin+mv+(insetUv[k+1]-vmin)*sv; }
-                uvPtr=&insetUv;
-                if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] m%03zu '%s' UV-INSET 8 texels toward cell (close-up seam fix)\n", i, m.name.c_str()); }
-        }
+        // SPRITESHEET close-up seams are handled by the PER-FRAME CELL CLAMP inside the flipbook replay shader
+        // (editFragUvMatrixReplay cellClamp) — pins only edge-touching samples, frame interior stays pixel-exact.
+        // The old 8-texel UV RESCALE here squeezed the whole frame (25% content loss on the 63px-wide knife cells:
+        // BG_RearAnim_Knife + BG_fireworkBLights "u fucked 2 things") — removed, base UVs ship VERBATIM.
+        const std::vector<float>* uvPtr = &m.uvs;
         auto mesh = useHz ? encodeRendMeshParts(hzMeshPos, *uvPtr, hzIdx, matl, 0, m.hzBoneIdx, m.hzBoneWgt, jointIds, false, vertCol)
                           : encodeRendMeshParts(*posPtr, *uvPtr, *sIdx, matl, useVat ? vc : 0, {}, {}, {}, useRot, vertCol);
         // COOK-TIME VERIFY: check the just-cooked skinned RENDMESH against the Meta-shipped reference schema (the

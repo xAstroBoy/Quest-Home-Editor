@@ -252,6 +252,8 @@ struct MeshData {
     // Alpha-test cutout: opaque pass, depth-write ON, fragment discards below threshold
     // (libshell AlphaTest materials — flags/foliage/animals). Distinct from useBlend.
     bool alphaTest = false;
+    float alphaCutoff = 0.5f;   // AUTHORED 'alphatestthreshold' uniform (zen tree canopy = 0.25) — the V79
+                                // frag discards color.a < AlphaCutoff; hardcoding 0.5 ate its mid-alpha leaves
 
     // Editor overlay kind: normally these meshes are authored alongside render geometry but NOT
     // drawn (collision/navigation). The editor loads them as translucent flat-colour overlays so

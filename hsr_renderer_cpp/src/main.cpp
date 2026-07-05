@@ -1425,15 +1425,21 @@ int main(int argc, char** argv) {
             if (!std::getenv("HSR_NOTINT")) {
                 std::vector<float> trgba; int tn = 0; float tloop = 0.f;
                 if (opa.cookExtractTintRGBA(meshIdx, 512, trgba, tn, tloop) && tn >= 2) {
-                    // SKINNED meshes take the SAME replay: the source SHADER animates the tint (stinson zen tree
-                    // canopy cycles green→cyan→pink in the OPA — user: "is not hardcoded green"), so a static
-                    // frame-0 COLOR_0 bake was WRONG. The cooker chains TINTREPLAY onto the skinned blend/cutout
-                    // frag (fragment-only edit, skinning untouched).
-                    // undo the baked frame-0 tint exactly (em.curTint = md.curTint(frame0)·edit·light); a channel
-                    // that STARTS at 0 (firework light OFF at t=0) is unrecoverable -> neutral 1 (the replay owns it)
-                    for (int c = 0; c < 4; c++) { float f0 = trgba[c]; em.curTint[c] = (f0 > 1e-4f) ? em.curTint[c]/f0 : 1.0f; }
+                    // FAIL-SAFE tint replay (the zen tree "WHITE canopy" device fix): keep the FRAME-0 tint BAKED
+                    // in COLOR_0 (the resting leaf green — always renders, every pipeline) and ship the replay as
+                    // a per-channel RATIO to frame 0 (ratio(0)=1). Device replay drives -> baked·ratio(t) = the
+                    // EXACT authentic tint(t) cycle; replay silently dead (the skinned pipeline has eaten the
+                    // getTime frag stage before) -> leaves stay the correct frame-0 GREEN instead of untinted
+                    // WHITE. A channel that RESTS at 0 (firework light off at t=0) keeps the ABSOLUTE curve for
+                    // that channel with COLOR_0=1 (ratio undefined; replay owns it — the pre-existing lights
+                    // behavior, device-proven).
+                    for (int c = 0; c < 4; c++) {
+                        float f0 = trgba[c];
+                        if (f0 > 1e-4f) { for (int k = 0; k < tn; k++) trgba[(size_t)k*4+c] /= f0; }   // ratio curve; em.curTint keeps frame-0 baked
+                        else em.curTint[c] = 1.0f;                                                      // absolute curve for this channel
+                    }
                     em.tintAnim = true; em.tintFrames = std::move(trgba); em.tintN = tn; em.tintLoop = tloop;
-                    if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%d MaterialTint RGBA cycle %d frames loop=%.2fs -> TINTREPLAY%s\n", meshIdx, tn, tloop, opa.isSkinnedMesh(meshIdx)?" (skinned)":"");
+                    if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%d MaterialTint RGBA cycle %d frames loop=%.2fs -> TINTREPLAY ratio+frame0 bake%s\n", meshIdx, tn, tloop, opa.isSkinnedMesh(meshIdx)?" (skinned)":"");
                 }
             }
             // PURE CONTINUOUS SCROLL (waterfall / water / foam / stream: identity 2x2 + a small CONSTANT per-frame
@@ -1908,6 +1914,11 @@ int main(int argc, char** argv) {
                         snprintf(tmp,sizeof tmp,"  nVerts=%u nIdx=%u vboStride=%u posOff=%u uvOff=%u\n", md.nVerts, md.nIdx, gm.vboStride, gm.posOffset, gm.uvOffset); out += tmp;
                         // -- SHADER --
                         snprintf(tmp,sizeof tmp,"[SHADER] path=%s\n  shaderIng=%llu progIdx=%d\n", md.shaderPath.c_str(), (unsigned long long)md.shaderIng, gm.progIdx); out += tmp;
+                        if (gm.progIdx >= 0 && gm.progIdx < (int)vkRenderer.programs.size()) {   // does the BOUND program's frag actually discard?
+                            const auto& pf = vkRenderer.programs[gm.progIdx].frag;
+                            int kills = 0; for (size_t wi=5; wi+1<pf.size();){ u32 w=pf[wi],op=w&0xFFFF,wc=w>>16; if(!wc)break; if(op==252)kills++; wi+=wc; }
+                            snprintf(tmp,sizeof tmp,"  progFrag=%zu words OpKill=%d\n", pf.size(), kills); out += tmp;
+                        }
                         // -- MATERIAL flags + tint --
                         snprintf(tmp,sizeof tmp,"[MATERIAL] blend=%d additive=%d alphaTest=%d doubleSided=%d tiled=%d iblLit=%d skybox=%d\n",
                             (int)md.useBlend,(int)md.additive,(int)md.alphaTest,(int)md.doubleSided,(int)md.tiled,(int)md.iblLit,(int)md.isSkybox); out += tmp;

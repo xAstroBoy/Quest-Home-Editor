@@ -104,8 +104,17 @@ inline bool parseRendShadForward(const std::vector<u8>& data, std::vector<SpirvB
             std::string s=strAt(vtField(e0,ef));
             if (s=="forward"||s=="forward_debug"||s.rfind("forward",0)==0) {
                 passesBase=base; nPasses=cnt;
+                // Prefer "forwardSkinned" when present — SKINNED surfaces carry forwardSkinned/forward/_debug
+                // passes and skinned meshes draw forwardSkinned; loading plain "forward" gave the preview a
+                // frag the mesh never runs (and missed shadergen's edits, which now land on forwardSkinned).
+                int fwdPlain=-1, fwdSkin=-1;
                 for (u32 pi=0; pi<cnt; ++pi){ size_t pe=base+pi*4; size_t pt=pe+rd32(pe);
-                    for (u32 pf=0; pf<vtNFields(pt)&&pf<4; ++pf) if (strAt(vtField(pt,pf))=="forward"){ fwdIdx=(int)pi; break; } }
+                    for (u32 pf=0; pf<vtNFields(pt)&&pf<4; ++pf){ std::string pn=strAt(vtField(pt,pf));
+                        if (pn=="forward"){ fwdPlain=(int)pi; break; }
+                        else if (pn=="forwardSkinned"){ fwdSkin=(int)pi; break; } } }
+                fwdIdx = (fwdSkin>=0) ? fwdSkin : fwdPlain;
+                if (std::getenv("HSR_SHADDBG"))
+                    fprintf(stderr, "    [PASSPICK] nPasses=%u fwdPlain=%d fwdSkin=%d -> fwdIdx=%d\n", cnt, fwdPlain, fwdSkin, fwdIdx);
                 break;
             }
         }
@@ -118,17 +127,28 @@ inline bool parseRendShadForward(const std::vector<u8>& data, std::vector<SpirvB
     if (fwdIdx<0 || nStages==0 || nPasses==0 || nStages != 2*nPasses) return false;
     auto stageSpirv = [&](u32 si, SpirvBlob& blob)->bool{
         if (si>=nStages) return false; size_t se=stagesBase+si*4; size_t st=se+rd32(se);
+        // Pick the candidate whose data sits LATEST in the file (largest offset): shadergen's edited
+        // modules (cutout/tint/flipbook) are APPENDED at EOF with the slot repointed — taking the FIRST
+        // spirv-looking field returned the ORIGINAL un-edited frag, so the preview rendered cooked
+        // CUTOUT foliage as SOLID QUADS ("flat / transparency incorrectly added") while the device
+        // (which follows the repointed slot) discarded correctly. Preview must read the same module.
+        size_t bestStart=0; u32 bestBc=0;
         for (u32 ef=0; ef<vtNFields(st)&&ef<6; ++ef){ size_t sp=vtField(st,ef); if(!sp) continue;
             u32 so=rd32(sp); size_t sv=sp+so; if(sv+4>N) continue; u32 bc=rd32(sv);
             if (bc>500 && sv+4+bc<=N && (bc%4)==0){ size_t start=sv+4;
                 if (rd32(start)!=0x07230203u) continue;            // SPIR-V magic
-                blob.code.resize(bc/4); memcpy(blob.code.data(), d+start, bc);
-                blob.stageType=0xFFFFFFFFu;
-                for (size_t wi=5; wi+1<blob.code.size() && wi<60;){ u32 w=blob.code[wi],op=w&0xFFFF,wc=w>>16;
-                    if(wc==0)break; if(op==15){blob.stageType=blob.code[wi+1];break;} wi+=wc; }
-                return true; }
+                if (start > bestStart){ bestStart=start; bestBc=bc; } }
         }
-        return false;
+        if (!bestStart) return false;
+        blob.code.resize(bestBc/4); memcpy(blob.code.data(), d+bestStart, bestBc);
+        blob.stageType=0xFFFFFFFFu;
+        for (size_t wi=5; wi+1<blob.code.size() && wi<60;){ u32 w=blob.code[wi],op=w&0xFFFF,wc=w>>16;
+            if(wc==0)break; if(op==15){blob.stageType=blob.code[wi+1];break;} wi+=wc; }
+        if (std::getenv("HSR_SHADDBG")) {
+            int kills=0; for (size_t wi=5; wi+1<blob.code.size();){ u32 w=blob.code[wi],op=w&0xFFFF,wc=w>>16; if(!wc)break; if(op==252)kills++; wi+=wc; }
+            fprintf(stderr, "    [STAGEPICK] si=%u data@%zu len=%u exec=%u OpKill=%d\n", si, bestStart, bestBc, blob.stageType, kills);
+        }
+        return true;
     };
     // FAITHFUL transparent-pass detection (data-proven on calming, NOT a name heuristic): in the
     // RENDSHAD forward pass table, field 4 is PRESENT (=0xFFFFFFFF) for every OPAQUE forward shader

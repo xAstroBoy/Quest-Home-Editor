@@ -5000,6 +5000,7 @@ struct Editor {
             //   Transparent (mountain/cliff/lakeshore cards, foliage, fog) -> BLEND (unlitblend) = composites over the SkyDome.
             //   AlphaTest:true ("_masked" GROUND) -> cutout discard shader. Additive (foam/glow) -> additive.
             em.alphaTest = md.alphaTest && !md.additive && !std::getenv("HSR_NOCUTOUT");
+            em.alphaCutoff = md.alphaCutoff;   // AUTHORED 'alphatestthreshold' (zen tree 0.25) -> cook discards at the source's own threshold
             em.blend = (md.useBlend || md.additive) && !em.alphaTest;   // genuine alpha-blend from the authored flag (cutout is the opaque-pass discard shader)
             em.doubleSided = md.doubleSided;   // WAS DROPPED -> cooked single-sided -> flat/open doubleSided meshes (monitor screens, thin panels) back-face-culled on device = see-through HOLES. Carry it so the cook double-sides them (reversed tris). Renderer honors doubleSided (gm.cullBack=!doubleSided) so the live preview already looked right.
             em.wantCollider = isAnimCollider((int)i);   // user marked this animated mesh -> same-entity kinematic collider
@@ -5029,6 +5030,40 @@ struct Editor {
                    if (hzAnimExtractor) hzAnimExtractor((int)i,64,em); }
             if (md.hasTexture && md.texRGBA.size()>=(size_t)md.texW*md.texH*4){ em.rgba=md.texRGBA; em.w=md.texW; em.h=md.texH;
                 em.srcAstc=md.srcAstc; em.srcAstcBw=md.srcAstcBw; em.srcAstcBh=md.srcAstcBh; em.srcAstcMips=md.srcAstcMips; }
+            // ATLAS SUB-RECT CROP (the "balloons should be NITID and visible from far" fix — fidelity, not a
+            // cap): a card that samples ONE CELL of a shared multi-design atlas (each balloon = 1 of 5 in the
+            // sheet) inherits the WHOLE sheet's mip chain — the deep mips average every design = a muddy
+            // "green dot without details" at distance. Crop the texture to the mesh's own UV sub-rect (+8px
+            // pad) and remap the UVs: every mip level down to 1x1 now averages ONLY this card's content = a
+            // crisp correctly-colored image at any distance. Static-UV meshes only (UV-animated cards sample
+            // outside their base span); tiling (UVs beyond [0,1]) exempt.
+            if (!em.rgba.empty() && em.w >= 256 && em.uvs.size() >= 4
+                && !em.flipbook && !em.uvScroll && em.flipUVMats.empty() && !em.skybox) {
+                float umin=1e9f,umax=-1e9f,vmin=1e9f,vmax=-1e9f;
+                for (size_t k=0;k+1<em.uvs.size();k+=2){ float u=em.uvs[k],v=em.uvs[k+1];
+                    if(u<umin)umin=u; if(u>umax)umax=u; if(v<vmin)vmin=v; if(v>vmax)vmax=v; }
+                bool inUnit = umin > -0.001f && umax < 1.001f && vmin > -0.001f && vmax < 1.001f;
+                float area = (umax-umin)*(vmax-vmin);
+                if (inUnit && area > 1e-6f && area < 0.4f) {
+                    int W=(int)em.w, H=(int)em.h, PAD=8;
+                    int x0=(int)std::floor(umin*W)-PAD, y0=(int)std::floor(vmin*H)-PAD;
+                    int x1=(int)std::ceil (umax*W)+PAD, y1=(int)std::ceil (vmax*H)+PAD;
+                    x0=std::max(0,x0); y0=std::max(0,y0); x1=std::min(W,x1); y1=std::min(H,y1);
+                    int cw=x1-x0, ch=y1-y0;
+                    if (cw>=16 && ch>=16 && (size_t)cw*ch < (size_t)W*H) {
+                        std::vector<u8> crop((size_t)cw*ch*4);
+                        for (int y=0;y<ch;y++) memcpy(&crop[(size_t)y*cw*4], &em.rgba[((size_t)(y0+y)*W + x0)*4], (size_t)cw*4);
+                        em.rgba.swap(crop); em.w=cw; em.h=ch;
+                        em.srcAstc.clear(); em.srcAstcBw=em.srcAstcBh=em.srcAstcMips=0;   // cropped -> re-encode (source footprint + quality kept by the cook)
+                        for (size_t k=0;k+1<em.uvs.size();k+=2){
+                            em.uvs[k]   = (em.uvs[k]  *W - (float)x0) / (float)cw;
+                            em.uvs[k+1] = (em.uvs[k+1]*H - (float)y0) / (float)ch;
+                        }
+                        fprintf(stderr, "[COOK] m%zu '%s' ATLAS-CROP %dx%d -> %dx%d (uv sub-rect %.0f%%; nitid mips)\n",
+                                i, md.name.c_str(), W, H, cw, ch, area*100.f);
+                    }
+                }
+            }
             // TWO-PASS foliage: FUNDAMENTALLY BROKEN and disabled by default (opt-in HSR_FOLIAGE_2PASS). The opaque
             // depth-write cutout SIBLING is drawn behind the transparent blend, but the blend is see-through so the
             // BLOCKY cutout edges show THROUGH it -> "leaves back to being blocky". Shrinking the cutout doesn't help
