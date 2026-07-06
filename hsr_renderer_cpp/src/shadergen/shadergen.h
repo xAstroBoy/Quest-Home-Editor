@@ -1317,14 +1317,21 @@ inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode,
     }
     if (stages.empty()) return {};
     std::vector<uint8_t> o = src; int edited = 0;
+    std::vector<int64_t> done;   // dedup by physical module (shared modules edited ONCE; repointAll moves every sharer)
     for (const auto& st : stages){
-        std::vector<uint8_t> mod = editVertModule(d + st.spvOff, st.spvLen, mode, p0, p1, ax, ay, az, tframes, tN);
+        bool dup=false; for (int64_t v : done) if (v==st.spvOff){ dup=true; break; }
+        if (dup) continue; done.push_back(st.spvOff);
+        std::vector<uint8_t> mod = editVertModule(o.data() + st.spvOff, st.spvLen, mode, p0, p1, ax, ay, az, tframes, tN);
         if (mod.empty()) continue;     // this vertex stage lacks the needed input for this mode -> skip (harmless)
         while (o.size()%4) o.push_back(0);
         uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
         o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
         o.insert(o.end(),mod.begin(),mod.end());
-        uint32_t rel=nv-(uint32_t)st.slot; memcpy(o.data()+st.slot,&rel,4);   // FlatBuffer uoffset is self-relative
+        // repoint EVERY table field referencing the old module — the single-slot memcpy left any OTHER pass
+        // entry sharing the module on the UN-EDITED original, and which entry the device reads is table-order
+        // dependent (synthwave sky cylinder: SPIN shipped in both edited copies yet the device drew a stale
+        // shared reference = static skybox; same bug class as the balloons' fragment-side fix).
+        detail::repointAll(o, (size_t)nv, st.spvOff-4, nv);
         ++edited;
     }
     return edited ? o : std::vector<uint8_t>();
