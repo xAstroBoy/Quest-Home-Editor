@@ -125,34 +125,65 @@ struct Editor {
     float  questPlayerPos[3]  = {0,0,0}; // device player FEET (world)
     float  questPlayerHead[3] = {0,0,0}; // device head/eye (world)
     float  questPlayerYaw = 0.f;         // commanded facing yaw (radians)
+    float  questPlayerFace = 0.f;        // DEVICE head-forward heading (radians) — what the player is actually looking at
+    bool   questPlayerFaceOk = false;    // face= was reported (env rendering)
     int    questPlayerDev = -1;          // device nograv state readback (-1 unknown, 0/1)
-    double lastPlayerQueryMs = 0.0;
-    double lastPlayerSendMs  = 0.0;
-    // Poll the device player pose (`playerpos` -> "head=..x,y,z.. feet=..x,y,z.. nograv=N").
-    void pollQuestPlayer() {
-        std::thread([this]{
-            SOCKET s = socket(AF_INET, SOCK_STREAM, 0); if (s == INVALID_SOCKET) return;
-            hsrSockTimeoutMs(s, 300);
-            sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(27042); a.sin_addr.s_addr=inet_addr("127.0.0.1");
-            if (connect(s,(sockaddr*)&a,sizeof a)==0) {
-                const char* c="playerpos\n"; send(s,c,10,0);
-                char rb[512]; int n=recv(s,rb,sizeof rb-1,0);
-                if (n>0) { rb[n]=0;
-                    const char* pf=strstr(rb,"feet="); if (pf){ float x,y,z; if(sscanf(pf+5,"%f,%f,%f",&x,&y,&z)==3){ questPlayerPos[0]=x; questPlayerPos[1]=y; questPlayerPos[2]=z; } }
-                    const char* ph=strstr(rb,"head="); if (ph){ float x,y,z; if(sscanf(ph+5,"%f,%f,%f",&x,&y,&z)==3){ questPlayerHead[0]=x; questPlayerHead[1]=y; questPlayerHead[2]=z; } }
-                    const char* pn=strstr(rb,"nograv="); if (pn) questPlayerDev = atoi(pn+7);
-                }
+    // ── PERSISTENT player-control channel (the "gizmo laggy" fix): ONE kept-open socket + a worker thread.
+    //    The UI coalesces the latest warp/rot into pcSend; the worker streams it + polls playerpos over the
+    //    same socket at ~60 Hz = NO per-drag connect/recv round-trip. Reconnects if the socket drops. ──
+    std::thread pcThread; std::atomic<bool> pcRun{false};
+    std::mutex  pcMx; std::string pcSend;   // latest command (overwrite = coalesce drag spam)
+    void ensureAdbForward() {
+#ifdef _WIN32
+        system("adb forward tcp:27042 tcp:27042 >nul 2>&1");
+#else
+        system("adb forward tcp:27042 tcp:27042 >/dev/null 2>&1");
+#endif
+    }
+    void pcQueue(const std::string& c){ std::lock_guard<std::mutex> l(pcMx); pcSend=c; }
+    static int pcRecvLine(SOCKET s, char* buf, int cap){ int n=0; char ch;
+        while (n<cap-1){ int r=recv(s,&ch,1,0); if(r<=0) return n>0?n:-1; if(ch=='\n') break; buf[n++]=ch; } buf[n]=0; return n; }
+    void parsePlayerpos(const char* rb){
+        const char* pf=strstr(rb,"feet="); if (pf){ float x,y,z; if(sscanf(pf+5,"%f,%f,%f",&x,&y,&z)==3){ questPlayerPos[0]=x; questPlayerPos[1]=y; questPlayerPos[2]=z; } }
+        const char* ph=strstr(rb,"head="); if (ph){ float x,y,z; if(sscanf(ph+5,"%f,%f,%f",&x,&y,&z)==3){ questPlayerHead[0]=x; questPlayerHead[1]=y; questPlayerHead[2]=z; } }
+        const char* pc=strstr(rb,"face="); if (pc){ float d; if(sscanf(pc+5,"%f",&d)==1){ questPlayerFace=d*0.0174533f; questPlayerFaceOk=true; } }
+        const char* pn=strstr(rb,"nograv="); if (pn) questPlayerDev = atoi(pn+7);
+    }
+    void startPlayerChannel(){
+        if (pcRun.exchange(true)) return;
+        ensureAdbForward();
+        pcThread = std::thread([this]{
+            SOCKET s=INVALID_SOCKET; double lastPoll=0; char rb[512];
+            while (pcRun.load()){
+                if (s==INVALID_SOCKET){ s=socket(AF_INET,SOCK_STREAM,0);
+                    if (s!=INVALID_SOCKET){ hsrSockTimeoutMs(s,400);
+                        sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(27042); a.sin_addr.s_addr=inet_addr("127.0.0.1");
+                        if (connect(s,(sockaddr*)&a,sizeof a)!=0){ closesocket(s); s=INVALID_SOCKET; } }
+                    if (s==INVALID_SOCKET){ std::this_thread::sleep_for(std::chrono::milliseconds(300)); continue; } }
+                // 1) flush the latest queued command (coalesced)
+                std::string c; { std::lock_guard<std::mutex> l(pcMx); c.swap(pcSend); }
+                if (!c.empty()){ c+="\n"; if (send(s,c.c_str(),(int)c.size(),0)<=0 || pcRecvLine(s,rb,sizeof rb)<0){ closesocket(s); s=INVALID_SOCKET; continue; } }
+                // 2) poll the pose ~6 Hz on the SAME socket
+                double now=nowMs(); if (now-lastPoll>160.0){ lastPoll=now;
+                    if (send(s,"playerpos\n",10,0)<=0){ closesocket(s); s=INVALID_SOCKET; continue; }
+                    if (pcRecvLine(s,rb,sizeof rb)<0){ closesocket(s); s=INVALID_SOCKET; continue; }
+                    parsePlayerpos(rb); }
+                std::this_thread::sleep_for(std::chrono::milliseconds(12));
             }
-            closesocket(s);
-        }).detach();
+            if (s!=INVALID_SOCKET) closesocket(s);
+        });
     }
-    // Send the device player to a world pos (gravity-defying when playerNoGrav) — `warp x y z [yaw]`.
+    void stopPlayerChannel(){ if (!pcRun.exchange(false)) return; if (pcThread.joinable()) pcThread.join(); }
+    // legacy one-shot poll (used on first show before the channel starts)
+    void pollQuestPlayer(){ ensureAdbForward(); startPlayerChannel(); }
+    // Send the device player to a world pos (gravity-defying when playerNoGrav) — `warp x y z yaw`.
     void sendPlayerWarp(float x, float y, float z) {
+        startPlayerChannel();
         char b[96]; snprintf(b,sizeof b,"warp %.3f %.3f %.3f %.4f", x,y,z, questPlayerYaw);
-        sendQuestCmd(b); questPlayerPos[0]=x; questPlayerPos[1]=y; questPlayerPos[2]=z;
+        pcQueue(b); questPlayerPos[0]=x; questPlayerPos[1]=y; questPlayerPos[2]=z;
     }
-    void sendPlayerYaw(float yaw) { questPlayerYaw=yaw; char b[48]; snprintf(b,sizeof b,"rot %.4f", yaw); sendQuestCmd(b); }
-    void sendPlayerNoGravity(bool on) { playerNoGrav=on; sendQuestCmd(on?"nogravity 1":"nogravity 0"); }
+    void sendPlayerYaw(float yaw) { startPlayerChannel(); questPlayerYaw=yaw; char b[48]; snprintf(b,sizeof b,"rot %.4f", yaw); pcQueue(b); }
+    void sendPlayerNoGravity(bool on) { startPlayerChannel(); playerNoGrav=on; pcQueue(on?"nogravity 1":"nogravity 0"); }
     double nowMs() { return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     std::vector<MeshData>* sceneMeshes = nullptr;                                  // CPU geometry for Cook
     std::function<std::vector<float>(int,int,int&)> vatBaker;                      // V79 VAT bake hook
@@ -3405,6 +3436,7 @@ struct Editor {
         ready = true;
     }
     void shutdown() {
+        stopPlayerChannel();   // stop the persistent Quest player-control worker
         if (cookThread.joinable()) cookThread.join();
         if (restoreThread.joinable()) restoreThread.join();
         if (javaThread.joinable()) javaThread.join();
@@ -4469,35 +4501,24 @@ struct Editor {
         cx.label(x,y,w,rh,"Player (Quest)",th.text); y+=rh+2*uiScale;
         { bool tp0=trackPlayer;
           cx.checkbox(ui::hashId("plTrack"), x, y, "Track player  (live marker + drag)", trackPlayer); y+=rh;
-          if (trackPlayer!=tp0) {
-#ifdef _WIN32
-              if (trackPlayer) system("adb forward tcp:27042 tcp:27042 >nul 2>&1");
-#else
-              if (trackPlayer) system("adb forward tcp:27042 tcp:27042 >/dev/null 2>&1");
-#endif
-              if (trackPlayer) pollQuestPlayer();
-          }
+          if (trackPlayer!=tp0) { if (trackPlayer) startPlayerChannel(); else stopPlayerChannel(); }
           bool ng0=playerNoGrav;
           cx.checkbox(ui::hashId("plNoGrav"), x, y, "No gravity  (hold height, no fall/reset)", playerNoGrav); y+=rh;
-          if (playerNoGrav!=ng0) sendPlayerNoGravity(playerNoGrav);
-          char pb[96];
+          if (playerNoGrav!=ng0) sendPlayerNoGravity(playerNoGrav);   // ensures the channel + adb-forward on its own
+          char pb[110];
           snprintf(pb,sizeof pb,"pos %.2f, %.2f, %.2f", questPlayerPos[0],questPlayerPos[1],questPlayerPos[2]);
           cx.label(x,y,w,rh*0.9f,pb,th.textDim); y+=rh*0.9f;
-          snprintf(pb,sizeof pb,"yaw %.0f deg   device no-gravity: %s", questPlayerYaw*57.2958f,
+          snprintf(pb,sizeof pb,"looking %.0f deg   device no-gravity: %s",
+                   (questPlayerFaceOk?questPlayerFace:questPlayerYaw)*57.2958f,
                    questPlayerDev<0?"?":(questPlayerDev?"ON":"off"));
           cx.label(x,y,w,rh*0.9f,pb,th.textDim); y+=rh+2*uiScale;
           float bw2=(w-8*uiScale)/2;
           if (cx.button(ui::hashId("plToCam"), x, y, bw2, rh, "Teleport to camera")) {
+              trackPlayer=true;
               questPlayerPos[0]=r->cam.pos[0]; questPlayerPos[1]=r->cam.pos[1]-1.6f; questPlayerPos[2]=r->cam.pos[2];   // feet ~1.6m below the eye
-              questPlayerYaw=r->cam.yaw; sendPlayerWarp(questPlayerPos[0],questPlayerPos[1],questPlayerPos[2]); sendPlayerYaw(questPlayerYaw);
-              if (!trackPlayer){ trackPlayer=true;
-#ifdef _WIN32
-                  system("adb forward tcp:27042 tcp:27042 >nul 2>&1");
-#else
-                  system("adb forward tcp:27042 tcp:27042 >/dev/null 2>&1");
-#endif
-              } }
-          if (cx.button(ui::hashId("plReset"), x+bw2+6*uiScale, y, bw2, rh, "Warp to spawn")) { sendPlayerWarp(0,0,0); }
+              questPlayerYaw=r->cam.yaw;                                           // device yaw == cam yaw (both: 0 faces -Z) -> player faces the camera dir
+              sendPlayerWarp(questPlayerPos[0],questPlayerPos[1],questPlayerPos[2]); sendPlayerYaw(questPlayerYaw); }
+          if (cx.button(ui::hashId("plReset"), x+bw2+6*uiScale, y, bw2, rh, "Warp to spawn")) { trackPlayer=true; questPlayerYaw=0.f; sendPlayerWarp(0,0,0); sendPlayerYaw(0.f); }
           y+=rh+6*uiScale;
         }
         dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
@@ -5256,7 +5277,19 @@ struct Editor {
         if (busy) { cx.progressBar(x, y, w, th.rowH+2*uiScale, cookProg.load(), stageStr().c_str()); }
         else { y0=y; if (cx.button(ui::hashId("cookgo"), x, y, w, th.rowH+4*uiScale, installAfterCook?"COOK + SIGN + INSTALL":"COOK  +  SIGN", true)) startCook();
                cx.tip(x,y0,w,th.rowH+4*uiScale,"Cook the edited scene to APK(s), sign them, and (if Install\nis on) push to the headset. Outputs land next to the loaded\nenv:  <env>_Rooted-System.apk  +  <env>_NoRoot-Spoof.apk"); }
-        y += th.rowH+12*uiScale;
+        y += th.rowH+8*uiScale;
+        // ── INSTALL ONLY — skip the cook if the scene is UNCHANGED since the last cook (installs the existing
+        //    APK). Shows whether the cooked APK is up to date / stale / missing so you know if a re-cook is needed.
+        if (!busy) {
+            bool hSys=false,hSpoof=false; int st=cookState(hSys,hSpoof);
+            const char* stTxt = st==0? "cooked APK is UP TO DATE (unchanged)" : st==1? "scene CHANGED since last cook (stale) - re-cook" : "no cooked APK yet - cook first";
+            uint32_t stCol = st==0? ui::rgba(120,220,140) : st==1? ui::rgba(240,200,110) : th.textDim;
+            cx.label(x,y,w,th.rowH*0.9f, stTxt, stCol); y+=th.rowH*0.9f+2*uiScale;
+            y0=y; bool canInstall = st==0;
+            if (cx.button(ui::hashId("installonly"), x, y, w, th.rowH+2*uiScale, "INSTALL ONLY  (no re-cook if unchanged)", canInstall)) installOnly();
+            cx.tip(x,y0,w,th.rowH+2*uiScale,"Install the already-cooked APK WITHOUT re-cooking - but only if\nnothing changed since it was cooked (a .cooksig hash of the scene +\ncook settings + source env is compared). If the scene changed, it\ntells you to re-cook instead of pushing a stale env.");
+            y += th.rowH+10*uiScale;
+        }
         // Undo a spoof: put the REAL Haven 2025 back from the auto-backup (off the UI thread).
         if (!busy && !restoring.load()) {
             y0=y; if (cx.button(ui::hashId("restorehaven"), x, y, w, th.rowH, "Restore original Haven 2025")) {
@@ -5542,8 +5575,7 @@ struct Editor {
     void drawPlayerGizmo() {
         gzPlayerVis=false;
         if (!trackPlayer) return;
-        // poll the device pose ~5 Hz while NOT dragging (dragging owns the position locally)
-        if (!playerDrag) { double now=nowMs(); if (now-lastPlayerQueryMs>200.0){ lastPlayerQueryMs=now; pollQuestPlayer(); } }
+        startPlayerChannel();   // idempotent: the worker polls the pose + streams drag commands over ONE socket
         float feet[3]={questPlayerPos[0],questPlayerPos[1],questPlayerPos[2]};
         float head=questPlayerHead[1]>feet[1]?questPlayerHead[1]:feet[1]+1.6f;   // stature line
         float cs[2]; if(!worldToScreen(feet,cs[0],cs[1])) { return; }
@@ -5558,13 +5590,20 @@ struct Editor {
             float w0[3]={feet[0]+0.4f*std::cos(a0),feet[1],feet[2]+0.4f*std::sin(a0)};
             float w1[3]={feet[0]+0.4f*std::cos(a1),feet[1],feet[2]+0.4f*std::sin(a1)};
             float s0[2],s1[2]; if(worldToScreen(w0,s0[0],s0[1])&&worldToScreen(w1,s1[0],s1[1])) dl.line(s0[0],s0[1],s1[0],s1[1], ui::withA(colBody,150),1.5f); }
-        // facing arrow (yaw): device yaw 0 faces -Z (game convention); rotate around Y
-        float fwd[3]={ std::sin(questPlayerYaw)*0.9f, 0.f, -std::cos(questPlayerYaw)*0.9f };
-        float ft[3]={feet[0]+fwd[0],feet[1],feet[2]+fwd[2]}, fts[2];
+        // FACING arrow — shows what the player is ACTUALLY LOOKING AT (device head-forward, `face=` from the
+        // bridge) when idle; the yaw you're commanding while dragging the yaw handle. yaw 0 = -Z (matches cam).
+        float showYaw = (playerDrag && playerDragMode==2) ? questPlayerYaw : (questPlayerFaceOk ? questPlayerFace : questPlayerYaw);
+        float aLen=1.3f;   // longer = clearer
+        float fwd[3]={ std::sin(showYaw)*aLen, 0.f, -std::cos(showYaw)*aLen };
+        float ft[3]={feet[0]+fwd[0], head*0.5f+feet[1]*0.5f, feet[2]+fwd[2]}, fts[2];   // mid-height so it's not lost in the ground ring
         bool yhot=(playerGizmoHit((float)cx.in.mx,(float)cx.in.my)==2)||(playerDrag&&playerDragMode==2);
+        uint32_t faceCol = yhot?ui::rgba(255,235,80):ui::rgba(96,230,120);
         if (worldToScreen(ft,fts[0],fts[1])) { gzPlayerYawTip[0]=fts[0]; gzPlayerYawTip[1]=fts[1];
-            dl.line(cs[0],cs[1],fts[0],fts[1], yhot?ui::rgba(255,235,80):ui::rgba(96,210,96), yhot?3.f:2.f);
-            float hs2=6*uiScale; dl.triangle(fts[0]-hs2,fts[1]+hs2, fts[0]+hs2,fts[1]+hs2, fts[0],fts[1]-hs2*1.4f, yhot?ui::rgba(255,235,80):ui::rgba(96,210,96)); }
+            float midh[3]={feet[0],ft[1],feet[2]}, ms2[2];
+            if (worldToScreen(midh,ms2[0],ms2[1])) dl.line(ms2[0],ms2[1],fts[0],fts[1], faceCol, yhot?4.f:3.f);
+            else dl.line(cs[0],cs[1],fts[0],fts[1], faceCol, yhot?4.f:3.f);
+            float hs2=8*uiScale; dl.triangle(fts[0]-hs2,fts[1]+hs2, fts[0]+hs2,fts[1]+hs2, fts[0],fts[1]-hs2*1.4f, faceCol);
+            cx.textAligned(fts[0]+hs2+2, fts[1]-8*uiScale, 60*uiScale,16*uiScale, "look", faceCol, 0); }
         // height handle (up) at head height
         float up[3]={feet[0],head+0.3f,feet[2]}, ups[2];
         bool uhot=(playerGizmoHit((float)cx.in.mx,(float)cx.in.my)==1)||(playerDrag&&playerDragMode==1);
@@ -5580,15 +5619,15 @@ struct Editor {
         gzPlayerVis=true;
         dl.popClip();
     }
-    // per-frame drag apply (called from the frame loop when playerDrag)
+    // per-frame drag apply (called from the frame loop when playerDrag). Queues the latest command every frame;
+    // the persistent channel worker coalesces (only the newest matters) + streams it = smooth, no per-frame connect.
     void updatePlayerDrag() {
         if (!playerDrag || !trackPlayer || !cx.in.down[0]) return;
         if (playerDragMode==0) { float g[3]; if (screenToGround((float)cx.in.mx,(float)cx.in.my,questPlayerPos[1],g)){ questPlayerPos[0]=g[0]; questPlayerPos[2]=g[2]; } }
         else if (playerDragMode==1) { questPlayerPos[1] = pdY0 + (pdMy0-(float)cx.in.my)*0.02f; }          // drag up = higher
         else if (playerDragMode==2) { questPlayerYaw = pdYaw0 + ((float)cx.in.mx-pdMx0)*0.01f; }            // drag right = turn
-        double now=nowMs(); if (now-lastPlayerSendMs>60.0){ lastPlayerSendMs=now;
-            if (playerDragMode==2) sendPlayerYaw(questPlayerYaw);
-            else sendPlayerWarp(questPlayerPos[0],questPlayerPos[1],questPlayerPos[2]); }
+        if (playerDragMode==2) sendPlayerYaw(questPlayerYaw);
+        else sendPlayerWarp(questPlayerPos[0],questPlayerPos[1],questPlayerPos[2]);
     }
     void drawGizmo() {
         gzVisible = false;
@@ -5894,6 +5933,73 @@ struct Editor {
         std::error_code ec; std::filesystem::create_directories("cooked", ec);   // make the output dir (no-op if it exists)
         return "cooked/" + base + "_cooked.apk";
     }
+    // ── COOK-UP-TO-DATE detection ("Install only if nothing changed") ────────────────────────────────────
+    // The cooked APKs share a stem: cooked/<env>_Rooted-System.apk / _NoRoot-Spoof.apk. Alongside them we drop
+    // <env>.cooksig = a content hash of everything that affects the cooked output (the serialized session incl.
+    // every cook toggle + material/transform/item edit, the created-mesh .geom sidecar, and the base env's
+    // identity). "Install only" recomputes this and, if it matches the recorded sig AND an APK exists, installs
+    // the existing APK WITHOUT re-cooking. Camera orbit is excluded (the spawn is cosmetic, not a content change).
+    std::string cookStem() {
+        std::string out=cookOutPath(); size_t d=out.rfind(".apk"); if(d!=std::string::npos) out=out.substr(0,d);
+        if (out.size()>=7 && out.substr(out.size()-7)=="_cooked") out=out.substr(0,out.size()-7);
+        return out;
+    }
+    std::string cookSigPath() { return cookStem()+".cooksig"; }
+    static uint64_t fnv1a(const void* p, size_t n, uint64_t h=1469598103934665603ull){
+        const uint8_t* b=(const uint8_t*)p; for(size_t i=0;i<n;i++){ h^=b[i]; h*=1099511628211ull; } return h; }
+    uint64_t cookInputHash() {
+        // serialized session MINUS the CAM line (a camera orbit isn't a content change)
+        std::string ses=serializeSession(), noCam;
+        { size_t i=0; while(i<ses.size()){ size_t e=ses.find('\n',i); std::string ln=ses.substr(i,e==std::string::npos?std::string::npos:e-i+1);
+            if (ln.rfind("CAM ",0)!=0) noCam+=ln; i=(e==std::string::npos)?ses.size():e+1; } }
+        uint64_t h=fnv1a(noCam.data(), noCam.size());
+        // created-mesh geometry (the .geom sidecar written next to the session on save/cook)
+        std::string gp = saveTargetFile()+".geom";
+        if (FILE* f=fopen(gp.c_str(),"rb")){ fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
+            if(n>0){ std::vector<uint8_t> buf((size_t)n); size_t rd=fread(buf.data(),1,(size_t)n,f); h=fnv1a(buf.data(), rd, h); } fclose(f); }
+        // base env identity (path + size) so a different / updated source env invalidates
+        h=fnv1a(sourceEnvPath.data(), sourceEnvPath.size(), h);
+        std::error_code ec; uint64_t sz = std::filesystem::exists(sourceEnvPath,ec) ? (uint64_t)std::filesystem::file_size(sourceEnvPath,ec) : 0;
+        h=fnv1a(&sz,sizeof sz,h);
+        return h;
+    }
+    std::string cookSignatureHex() { char b[20]; snprintf(b,sizeof b,"%016llx",(unsigned long long)cookInputHash()); return b; }
+    void writeCookSig() { std::string sig=cookSignatureHex(); if (FILE* f=fopen(cookSigPath().c_str(),"w")){ fputs(sig.c_str(),f); fclose(f); } }
+    std::string readCookSig() { std::string rec; if (FILE* f=fopen(cookSigPath().c_str(),"r")){ char b[64]={0}; if(fgets(b,sizeof b,f)) rec=b; fclose(f);
+        while(!rec.empty()&&(rec.back()=='\n'||rec.back()=='\r'||rec.back()==' ')) rec.pop_back(); } return rec; }
+    // 0 = up to date (unchanged since last cook), 1 = changed/stale, 2 = never cooked (no APK). Fills apkStem sizes.
+    int cookState(bool& haveSys, bool& haveSpoof) {
+        std::string stem=cookStem(); haveSys=fileEx(stem+"_Rooted-System.apk"); haveSpoof=fileEx(stem+"_NoRoot-Spoof.apk");
+        if (!haveSys && !haveSpoof) return 2;
+        std::string rec=readCookSig(); if (rec.empty()) return 1;   // APK exists but no sig (older cook) -> treat as stale
+        return (rec==cookSignatureHex()) ? 0 : 1;
+    }
+    // Install the ALREADY-COOKED APK for this env WITHOUT re-cooking, but only if the scene is unchanged.
+    void installOnly() {
+        if (cooking.load()) { setStatus("busy — a cook is already running"); return; }
+        saveProject();   // persist current edits so the signature reflects exactly what's on screen
+        bool haveSys=false, haveSpoof=false; int st=cookState(haveSys,haveSpoof);
+        if (st==2) { setStatus("No cooked APK for this env yet — run COOK first."); return; }
+        if (st==1) { setStatus("Scene CHANGED since the last cook (or the cook predates change-tracking) — the cooked APK is STALE. Run COOK to rebuild; Install-only skipped so you don't push an outdated env."); return; }
+        if (!deviceConnected()) { setStatus("Scene is up to date, but NO device is connected — connect the Quest (USB / adb connect) and press Install only again."); return; }
+        std::string stem=cookStem(), sysApk=stem+"_Rooted-System.apk", spoofApk=stem+"_NoRoot-Spoof.apk";
+        cooking.store(true); cookProg.store(0.f);
+        if (cookThread.joinable()) cookThread.join();
+        cookThread = std::thread([this,sysApk,spoofApk,haveSys,haveSpoof]{
+            auto progress=[this](float f,const char* s){ setStage(f,s); };
+            std::string msg="Install-only (scene unchanged — no re-cook): ";
+            bool rooted=deviceIsRooted();
+            if (rooted && haveSys) { bool ok=installToDevice(sysApk, cookPkg, progress);
+                msg += ok? "installed "+sysApk+" ("+cookPkg+") + relaunched shell" : "install FAILED (adb/device?)"; }
+            else if (haveSpoof) {
+                std::string bkp; HavenBkp hb=backupOriginalHaven(bkp);
+                if (hb==HB_FAILED) msg += "ABORTED: could NOT back up the original Haven 2025 (left untouched).";
+                else { bool ok=installToDevice(spoofApk, HAVEN_PKG(), progress, /*uninstallFirst=*/true);
+                    msg += ok? "installed the SPOOF ("+spoofApk+") + relaunched shell" : "spoof install FAILED (try the Rooted-System APK)."; }
+            } else msg += rooted? "no Rooted-System APK found (cook with a rooted device, or use the spoof)." : "no spoof APK found (enable the spoof toggle + cook once).";
+            setStatus(msg); setStage(1.f,"Done"); cooking.store(false);
+        });
+    }
 
     void setStage(float f, const char* s){ cookProg.store(f); std::lock_guard<std::mutex> l(statusMx); cookStage=s; }
     void setStatus(const std::string& s){ std::lock_guard<std::mutex> l(statusMx); cookStatus=s; fprintf(stderr,"[COOK] %s\n", s.c_str()); }
@@ -5994,8 +6100,15 @@ struct Editor {
             }
         }
         if (terminalBar) fprintf(stderr, "\n");
+        // record the cook signature next to the APKs so "Install only" can detect an unchanged scene and skip
+        // the re-cook next time. pendingCookSig was computed on the UI thread at cook start (the exact state
+        // being cooked) — writing it here (worker) is a plain file write, no shared-state read.
+        if ((!finalSystem.empty() || !finalSpoof.empty()) && !pendingCookSig.empty()) {
+            if (FILE* f=fopen(cookSigPath().c_str(),"w")){ fputs(pendingCookSig.c_str(),f); fclose(f); }
+        }
         setStatus(msg); setStage(1.f, "Done"); cooking.store(false);
     }
+    std::string pendingCookSig;   // cook-input signature computed on the UI thread at cook start; runCook writes it on success
     static bool fileEx(const std::string& p){ FILE* f=fopen(p.c_str(),"rb"); if(f){ fclose(f); return true; } return false; }
     // adb resolution order: $HSR_ADB -> bundled beside the exe (adb.exe + AdbWinApi.dll + AdbWinUsbApi.dll, or a
     // platform-tools/ folder next to the renderer) -> the usual SDK path -> "adb" on PATH. Bundling those 3 files
@@ -6304,6 +6417,7 @@ struct Editor {
         auto ems = buildExportMeshes();
         if (ems.empty()) { setStatus("ERROR: no exportable meshes"); return; }
         if (cookThread.joinable()) cookThread.join();
+        pendingCookSig = cookSignatureHex();   // snapshot the up-to-date signature (UI thread) — runCook writes it on success
         cooking.store(true); cookProg.store(0.f);
         std::array<float,3> spawn{ r->cam.pos[0], r->cam.pos[1], r->cam.pos[2] };
         std::vector<sitem::Item> its=items; bakeNavmeshes(its);
@@ -6321,6 +6435,7 @@ struct Editor {
         auto ems = buildExportMeshes();
         std::array<float,3> spawn{ r->cam.pos[0], r->cam.pos[1], r->cam.pos[2] };
         std::vector<sitem::Item> its=items; bakeNavmeshes(its);
+        pendingCookSig = cookSignatureHex();   // record for "Install only" change-detection
         cooking.store(true); runCook(std::move(ems), spawn, cookPkg, autoSign, spoofHaven, true, std::move(its));
     }
     // The meshes a navmesh draws from: its explicit selection, else the whole walkable scene (non-backdrop, visible).
