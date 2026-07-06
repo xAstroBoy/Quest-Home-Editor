@@ -217,6 +217,68 @@ inline void collectVertStages(const uint8_t* d, size_t N, std::vector<VStage>& o
     }
 }
 
+// Collect ALL FRAGMENT stages across ALL passes (forwardSkinned / forward / LOD + _debug twins). Mirrors
+// collectVertStages with execution model 4. The device picks a pass per technique/LOD — editing only
+// findFwdFragSpv's single pick left the OTHER pass frags UN-EDITED, so a DISTANT mesh drawing a lower
+// technique rendered the RAW base (stinson balloons at 3km: no cutout discard + alpha forced 1.0 =
+// opaque rectangle cards, "wrong render"). Every frag edit must cover every stage that accepts it.
+inline void collectFragStages(const uint8_t* d, size_t N, std::vector<VStage>& out){
+    using namespace detail;
+    int64_t root=u32(d,N,0); int64_t stagesBase=0; int nPasses=0,nStages=0;
+    for (int fi=0,nf=vt_nf(d,N,root); fi<nf; ++fi){
+        int64_t fp=vt_field(d,N,root,fi); if(!fp||!u32(d,N,fp)) continue;
+        int64_t vec=fp+u32(d,N,fp); if(vec+4>(int64_t)N) continue;
+        uint32_t cnt=u32(d,N,vec); if(!(cnt>0&&cnt<=64)) continue;
+        int64_t base=vec+4; if(base+(int64_t)cnt*4>(int64_t)N) continue;
+        int64_t e0=base+u32(d,N,base);
+        for(int ef=0,m=std::min(vt_nf(d,N,e0),4);ef<m;++ef)
+            if(str_at(d,N,vt_field(d,N,e0,ef)).rfind("forward",0)==0) nPasses=(int)cnt;
+        for(int ef=0,m=std::min(vt_nf(d,N,e0),4);ef<m;++ef){
+            int64_t sp=vt_field(d,N,e0,ef); if(!sp) continue;
+            int64_t sv=sp+u32(d,N,sp); if(sv+4>(int64_t)N) continue;
+            uint32_t L=u32(d,N,sv); if(L>500&&L<2000000&&sv+4+(int64_t)L<=(int64_t)N){ stagesBase=base; nStages=(int)cnt; }
+        }
+    }
+    if(!stagesBase||nPasses==0||nStages!=2*nPasses) return;
+    for(int si=0; si<nStages; ++si){
+        int64_t se=stagesBase+(int64_t)si*4; int64_t st=se+u32(d,N,se);
+        for(int ef=0,mm=std::min(vt_nf(d,N,st),6);ef<mm;++ef){
+            int64_t sp=vt_field(d,N,st,ef); if(!sp) continue;
+            int64_t vv=sp+u32(d,N,sp); if(vv+4>(int64_t)N) continue;
+            uint32_t L=u32(d,N,vv);
+            if(L>500&&vv+4+(int64_t)L<=(int64_t)N&&L%4==0&&u32(d,N,vv+4)==0x07230203){
+                const uint8_t* sd=d+vv+4; int em=-1; size_t nw2=L/4,i=5;
+                while(i<nw2){ uint32_t ins=u32(sd,L,(int64_t)i*4); uint32_t op=ins&0xffff,wc=ins>>16; if(!wc)break; if(op==15){em=(int)u32(sd,L,(int64_t)(i+1)*4);break;} i+=wc; }
+                if(em==4) out.push_back({sp, vv+4, L});
+                break;
+            }
+        }
+    }
+}
+// Apply a fragment-module edit to EVERY Fragment stage in the surface. Modules that can't take the edit
+// (depth/shadow frags with no base-color sample) return {} from `edit` and are skipped. Shared physical
+// modules are edited ONCE (dedup by offset) — repointAll moves every table entry that referenced them.
+template <typename F>
+inline std::vector<uint8_t> editAllFragStages(const std::vector<uint8_t>& src, F&& edit){
+    std::vector<VStage> stages; collectFragStages(src.data(), src.size(), stages);
+    if (stages.empty()) return {};
+    std::vector<uint8_t> o = src; int edited = 0;
+    std::vector<int64_t> done;
+    for (const auto& st : stages){
+        bool dup=false; for (int64_t v : done) if (v==st.spvOff){ dup=true; break; }
+        if (dup) continue; done.push_back(st.spvOff);
+        std::vector<uint8_t> mod = edit(o.data()+st.spvOff, st.spvLen);   // originals stay in place (orphaned) -> offsets valid
+        if (mod.empty()) continue;
+        while (o.size()%4) o.push_back(0);
+        uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
+        o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
+        o.insert(o.end(),mod.begin(),mod.end());
+        detail::repointAll(o, (size_t)nv, st.spvOff-4, nv);
+        ++edited;
+    }
+    return edited ? o : std::vector<uint8_t>();
+}
+
 // Inject the getTime() animation into ONE vertex SPIR-V module (sd -> the 0x07230203 magic word, spvLen bytes).
 // Returns the grown module bytes, or {} if this stage can't be animated for this mode (lacks inPos/inUv — safe to skip).
 inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, Mode mode, float p0, float p1, float ax, float ay, float az,
@@ -1196,31 +1258,12 @@ inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode,
                                      const float* fbCellClamp = nullptr){                         // FLIPBOOK replay: {umin,vmin,umax,vmax,padU,padV} per-frame cell clamp (spritesheet seam fix)
     using namespace detail;
     const uint8_t* d = src.data(); size_t N = src.size();
-    if (mode==CUTOUT){   // edit the FORWARD FRAGMENT (alpha-test discard); the depth/shadow/motion frags don't need it
-        int64_t slot,spvOff; uint32_t spvLen;
-        if (!detail::findFwdFragSpv(d,N,slot,spvOff,spvLen)) return {};
-        std::vector<uint8_t> mod = editFragCutout(d+spvOff, spvLen, p0>0.f ? p0 : 0.5f);   // p0 = alpha threshold
-        if (mod.empty()) return {};
-        std::vector<uint8_t> o = src;
-        while (o.size()%4) o.push_back(0);
-        uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
-        o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
-        o.insert(o.end(),mod.begin(),mod.end());
-        (void)slot; detail::repointAll(o, (size_t)nv, spvOff-4, nv);   // repoint EVERY pass entry sharing the old module (shared-module fix)
-        return o;
+    if (mode==CUTOUT){   // alpha-test discard in EVERY color fragment stage (all passes/LOD techniques — the
+        // single-stage edit left the plain-forward/LOD frags UN-CUT: distant balloons drew opaque rectangles)
+        return editAllFragStages(src, [&](const uint8_t* sd, uint32_t L){ return editFragCutout(sd, L, p0>0.f ? p0 : 0.5f); });
     }
     if (mode==FOLIAGE){   // sharpen-alpha masked foliage (pair with the MATL masked/a2c flags); p0 = alpha cutoff
-        int64_t slot,spvOff; uint32_t spvLen;
-        if (!detail::findFwdFragSpv(d,N,slot,spvOff,spvLen)) return {};
-        std::vector<uint8_t> mod = editFragFoliageSharpen(d+spvOff, spvLen, p0>0.f ? p0 : 0.30f);
-        if (mod.empty()) return {};
-        std::vector<uint8_t> o = src;
-        while (o.size()%4) o.push_back(0);
-        uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
-        o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
-        o.insert(o.end(),mod.begin(),mod.end());
-        (void)slot; detail::repointAll(o, (size_t)nv, spvOff-4, nv);   // repoint EVERY pass entry sharing the old module (shared-module fix)
-        return o;
+        return editAllFragStages(src, [&](const uint8_t* sd, uint32_t L){ return editFragFoliageSharpen(sd, L, p0>0.f ? p0 : 0.30f); });
     }
     if (mode==TINTREPLAY_VERT){   // per-frame RGBA MaterialTint replay in the forward VERTEX (skinned meshes: the
         // fragment tint edits — unroll AND const-array — both broke the Quest driver; vertex getTime edits are
@@ -1237,44 +1280,29 @@ inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode,
         (void)slot; detail::repointAll(o, (size_t)nv, spvOff-4, nv);   // repoint EVERY pass entry sharing the old vert module
         return o;
     }
-    if (mode==TINTREPLAY){   // per-frame RGBA MaterialTint replay in the forward FRAGMENT (chainable onto any surface)
-        int64_t slot,spvOff; uint32_t spvLen;
-        if (!detail::findFwdFragSpv(d,N,slot,spvOff,spvLen)) return {};
-        std::vector<uint8_t> mod = editFragTintReplay(d+spvOff, spvLen, tframes, tN, p0);   // p0 = loopSec, tframes = tN*4 RGBA
-        if (mod.empty()) return {};
-        std::vector<uint8_t> o = src;
-        while (o.size()%4) o.push_back(0);
-        uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
-        o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
-        o.insert(o.end(),mod.begin(),mod.end());
-        (void)slot; detail::repointAll(o, (size_t)nv, spvOff-4, nv);   // repoint EVERY pass entry sharing the old module (shared-module fix)
-        return o;
+    if (mode==TINTREPLAY){   // per-frame RGBA MaterialTint replay in EVERY color fragment stage (all passes/LODs)
+        return editAllFragStages(src, [&](const uint8_t* sd, uint32_t L){ return editFragTintReplay(sd, L, tframes, tN, p0); });   // p0 = loopSec, tframes = tN*4 RGBA
     }
     if ((mode==FLIPBOOK || mode==UVSCROLL) && !std::getenv("HSR_VERTFLIP")){   // DEFAULT: FRAGMENT-stage UV anim (animates on device; vertex-UV did not)
-        int64_t slot,spvOff; uint32_t spvLen;
-        if (!detail::findFwdFragSpv(d,N,slot,spvOff,spvLen)) return {};
-        std::vector<uint8_t> mod;
-        if (mode==FLIPBOOK) {
-            if (!tframes.empty() && tN>=2)   // EXACT per-frame MATRIX replay (p0=loopSec, tframes=N*6 verbatim source matrices) — matches the desktop
-                mod = editFragUvMatrixReplay(d+spvOff, spvLen, tframes, tN, p0, fbCellClamp);
-            else                              // legacy derived cols/rows grid (p0=cols p1=rows ax=frames ay=fps az=offsetFlag)
-                mod = editFragFlipbook(d+spvOff, spvLen, (int)(p0+0.5f),(int)(p1+0.5f),(int)(ax+0.5f), ay, az>0.5f);
-            // OPACITY FADE (fog/dust MaterialTint alpha) layered on the SAME forward-frag module — fades the card to 0
-            // at the loop ends so the node-translate's teleport reset + underground tail are invisible. fadeLoop synced
-            // to the translate period by the cooker so alpha≈0 exactly when the card resets/dips low.
-            if (!mod.empty() && !fade.empty() && (int)fade.size()>=2 && fadeLoop>1e-4f) {
-                auto m2 = editFragAlphaFade(mod.data(), (uint32_t)mod.size(), fade, (int)fade.size(), fadeLoop);
-                if (!m2.empty()) mod = m2;
-            }
-        } else mod = editFragUvScroll(d+spvOff, spvLen, p0, p1);   // UVSCROLL: p0=rateU, p1=rateV
-        if (mod.empty()) return {};
-        std::vector<uint8_t> o = src;
-        while (o.size()%4) o.push_back(0);
-        uint32_t nv=(uint32_t)o.size(), modLen=(uint32_t)mod.size();
-        o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4);
-        o.insert(o.end(),mod.begin(),mod.end());
-        (void)slot; detail::repointAll(o, (size_t)nv, spvOff-4, nv);   // repoint EVERY pass entry sharing the old module (shared-module fix)
-        return o;
+        // EVERY color fragment stage (all passes/LOD techniques): the single-stage edit left lower-technique
+        // frags with the STATIC base texture -> distant cards froze/showed the raw sheet.
+        return editAllFragStages(src, [&](const uint8_t* sd, uint32_t L)->std::vector<uint8_t>{
+            std::vector<uint8_t> mod;
+            if (mode==FLIPBOOK) {
+                if (!tframes.empty() && tN>=2)   // EXACT per-frame MATRIX replay (p0=loopSec, tframes=N*6 verbatim source matrices) — matches the desktop
+                    mod = editFragUvMatrixReplay(sd, L, tframes, tN, p0, fbCellClamp);
+                else                              // legacy derived cols/rows grid (p0=cols p1=rows ax=frames ay=fps az=offsetFlag)
+                    mod = editFragFlipbook(sd, L, (int)(p0+0.5f),(int)(p1+0.5f),(int)(ax+0.5f), ay, az>0.5f);
+                // OPACITY FADE (fog/dust MaterialTint alpha) layered on the SAME forward-frag module — fades the card to 0
+                // at the loop ends so the node-translate's teleport reset + underground tail are invisible. fadeLoop synced
+                // to the translate period by the cooker so alpha≈0 exactly when the card resets/dips low.
+                if (!mod.empty() && !fade.empty() && (int)fade.size()>=2 && fadeLoop>1e-4f) {
+                    auto m2 = editFragAlphaFade(mod.data(), (uint32_t)mod.size(), fade, (int)fade.size(), fadeLoop);
+                    if (!m2.empty()) mod = m2;
+                }
+            } else mod = editFragUvScroll(sd, L, p0, p1);   // UVSCROLL: p0=rateU, p1=rateV
+            return mod;
+        });
     }
     if (mode==ROTATE || mode==OSCILLATE || mode==ROTREPLAY){ float l=std::sqrt(ax*ax+ay*ay+az*az); if (l<=0.f) l=1.f; ax/=l; ay/=l; az/=l; }  // axis -> unit (UVSCROLL/FLIPBOOK/TRANSLATE use these args as params, not an axis)
     std::vector<VStage> stages;

@@ -2734,7 +2734,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 if (skFlip) {
                     const std::vector<uint8_t>& sbase = (m.blend && !shadSkinB.empty()) ? shadSkinB : shadSkin;
                     bool skFade = m.fadeAnim && m.fadeN>=2 && m.fadeFrames.size()>=(size_t)m.fadeN && m.fadeLoop>1e-4f;
-                    uint32_t hh = 0x811C9DC5u ^ 0x41525232u ^ (uint32_t)(long)(m.flipLoop*1000);   // "ARR2" encoder version (constant-array replay/fade)
+                    uint32_t hh = 0x811C9DC5u ^ 0x41525233u ^ (uint32_t)(long)(m.flipLoop*1000);   // "ARR3": constant-array replay/fade + ALL-frag-stage edits
                     for (size_t k=0;k<m.flipUVMats.size();++k) hh = hh*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000);
                     if (skFade) { hh = hh*16777619u ^ (uint32_t)(long)(m.fadeLoop*1000);
                         for (size_t k=0;k<m.fadeFrames.size();++k) hh = hh*16777619u ^ (uint32_t)(long)(m.fadeFrames[k]*100000); }
@@ -2915,7 +2915,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             uint32_t h = (uint32_t)(0x9E3779B9u*(uint32_t)m.transN ^ 0x85EBCA6Bu*(uint32_t)(long)(m.transLoop*1000));
             for (size_t k=0;k<m.transFrames.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.transFrames[k]*10000);
             if (tflip) { h = h*16777619u ^ (uint32_t)(m.flipCols*73856093 ^ m.flipRows*19349663 ^ m.flipFrames*83492791 ^ (int)(m.flipFps*100));
-                h = h*16777619u ^ 0x41525232u;   // "ARR2" encoder version: constant-array replay/fade (invalidates unrolled-chain .bin caches)
+                h = h*16777619u ^ 0x41525233u;   // "ARR3": constant-array replay/fade + ALL-frag-stage edits (LOD techniques included)
                 for (size_t k=0;k<m.flipUVMats.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000);
                 if (fbClamp) for (int k2=0;k2<6;k2++) h = h*16777619u ^ (uint32_t)(long)(fbClamp[k2]*100000); }   // cell clamp baked in the shader -> distinct cache entry
             bool tfade = tflip && m.fadeAnim && m.fadeN>=2 && m.fadeFrames.size()>=(size_t)m.fadeN && m.fadeLoop>1e-4f;
@@ -3044,7 +3044,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             bool ffade = !ftint && useReplay && m.fadeAnim && m.fadeN>=2 && m.fadeFrames.size()>=(size_t)m.fadeN && m.fadeLoop>1e-4f;   // opacity fade curve (alpha-only subset — superseded by the RGBA tint replay)
             uint32_t h;
             if (useReplay) { h = (uint32_t)(0x9E3779B9u*(uint32_t)m.flipN ^ 0x85EBCA6Bu*(uint32_t)(long)(m.flipLoop*1000));
-                h = h*16777619u ^ 0x41525232u;   // "ARR2" encoder version: constant-array replay (invalidates the unrolled-chain .bin caches)
+                h = h*16777619u ^ 0x41525233u;   // "ARR3": constant-array replay + ALL-frag-stage edits (LOD techniques included)
                 for (size_t k=0;k<m.flipUVMats.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000);
                 if (fbClamp) for (int k2=0;k2<6;k2++) h = h*16777619u ^ (uint32_t)(long)(fbClamp[k2]*100000); }   // cell clamp baked in the shader -> distinct cache entry
             else h=(uint32_t)(0x9E3779B9u*(uint32_t)fcols ^ 0xC2B2AE35u*(uint32_t)frows ^ 0x27D4EB2Fu*(uint32_t)fframes ^ 0x85EBCA6Bu*(uint32_t)(long)(ffps*1000) ^ (m.flipOffset?0xA1B2C3D4u:0u));
