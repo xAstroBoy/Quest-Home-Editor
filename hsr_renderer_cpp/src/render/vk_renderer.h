@@ -1369,6 +1369,13 @@ public:
         gm.useBlend = md.useBlend || (gm.isSkinned && std::getenv("HSR_SKINBLEND"));
         (void)cpuSkinnedPath;
         if (gm.isSkinned && std::getenv("HSR_SKINOPAQUE")) gm.useBlend = false;
+        // Authored MASK (glTF alphaMode=MASK / .mat AlphaTest -> md.alphaTest) can only CUT OUT on the
+        // builtin path when the discard frag exists; without it the opaque pass would draw the whole
+        // card as an OPAQUE SQUARE (no discard). Fall back to the old blend approximation there.
+        // Per-material meshes (progIdx>=0) keep their own pipeAlphaTest routing — untouched.
+        if (gm.alphaTest && !gm.useBlend && gm.progIdx < 0 && alphaTestFragSpirv.empty()) {
+            gm.alphaTest = false; gm.useBlend = true;
+        }
         gm.cullBack = !md.doubleSided && !gm.isSkinned;   // OPA prism/motes material = DoubleSided -> no cull
         gm.additive = md.additive;       // god-rays/glow -> ADD blend pipeline
         gm.isSkybox = md.isSkybox;       // skybox dome: camera-locked + far-scaled each frame (see render())

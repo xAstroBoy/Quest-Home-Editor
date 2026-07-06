@@ -23,6 +23,7 @@
 #include <cmath>
 #include <functional>
 #include <unordered_map>
+#include <utility>   // std::swap (mirrored-instance winding flip)
 
 class GltfLoader {
 public:
@@ -338,22 +339,41 @@ public:
         };
         // Transparency: glTF alphaMode == "BLEND" (or a translucent baseColorFactor alpha)
         // -> alpha-blend this primitive (e.g. the Incredibles purple environment dome).
+        // alphaMode == "MASK" is NOT blend: it is the AUTHORED alpha-test CUTOUT (discard below
+        // alphaCutoff) that draws in the OPAQUE pass and WRITES DEPTH (libshell HAS_ALPHACUTOFF /
+        // MeshShellEnvMaskDepthWrite). It used to be "approximated with alpha-blend" from before the
+        // renderer had a discard pipeline; that sent authored-MASK fences/gates/grass/vines to the
+        // no-depth-write blend pass whenever the bimodal-texture rescue missed (>=5% mid-alpha texels)
+        // -> per-mesh back-to-front sorting artifacts (sqgraveyard "depth issue"). matIsMask now routes
+        // them to the cutout pipeline (and the cook ships them as depth-writing cutout MATLs).
         auto matIsBlend = [&](int matIdx) -> bool {
             if (matIdx < 0 || !root.has("materials")) return false;
             const auto& mats = root["materials"];
             if ((size_t)matIdx >= mats.size()) return false;
             const auto& m = mats[matIdx];
-            // BLEND = alpha-blend; MASK = alpha cutout (transparent where alpha<cutoff). Both must
-            // honor the texture's alpha so the transparent parts (flame edges, planet/sprite/ship
-            // backgrounds) don't render as opaque squares. (Was only handling BLEND -> the Outer
-            // Wilds fireplace/planets/spaceship "no transparency" bug.) We approximate MASK with
-            // alpha-blend since the shared shader has no discard.
-            if (m.has("alphaMode")) { std::string am = m["alphaMode"].asString(); if (am=="BLEND" || am=="MASK") return true; }
+            if (m.has("alphaMode")) { std::string am = m["alphaMode"].asString(); if (am=="BLEND") return true; if (am=="MASK") return false; }
             if (m.has("pbrMetallicRoughness") && m["pbrMetallicRoughness"].has("baseColorFactor")) {
                 const auto& f = m["pbrMetallicRoughness"]["baseColorFactor"];
                 if (f.size() >= 4 && (float)f[3].asFloat() < 0.99f) return true;
             }
             return false;
+        };
+        // Authored alpha-test cutout (alphaMode == "MASK") + its authored discard threshold
+        // (glTF spec default 0.5; the cook honors the exact value, em.alphaCutoff).
+        auto matIsMask = [&](int matIdx) -> bool {
+            if (matIdx < 0 || !root.has("materials")) return false;
+            const auto& mats = root["materials"];
+            if ((size_t)matIdx >= mats.size()) return false;
+            const auto& m = mats[matIdx];
+            return m.has("alphaMode") && m["alphaMode"].asString()=="MASK";
+        };
+        auto matAlphaCutoff = [&](int matIdx) -> float {
+            if (matIdx < 0 || !root.has("materials")) return 0.5f;
+            const auto& mats = root["materials"];
+            if ((size_t)matIdx >= mats.size()) return 0.5f;
+            const auto& m = mats[matIdx];
+            float c = m.has("alphaCutoff") ? (float)m["alphaCutoff"].asFloat() : 0.5f;
+            return (c > 0.f && c < 1.f) ? c : 0.5f;
         };
         // glTF face culling: a material is single-sided unless doubleSided==true (spec default false).
         // Single-sided -> the renderer back-face culls (libshell-faithful). The cel-shading OUTLINE
@@ -551,6 +571,18 @@ public:
                 local = fromTRS(t,q,s);
             }
             Mat4 world = mul(parent, local);
+            // glTF spec: when the determinant of a node's GLOBAL transform is NEGATIVE (a mirrored
+            // instance — 3ds Max-style exports bake mirrors as scale -1, e.g. sqgraveyard's
+            // Gravestones_*/Names_R/Nmaes_L/Walls/tombGrave: rot180X x scale(1,-1,1) = a Z-mirror),
+            // the winding order of derived triangle faces MUST be inverted. We bake `world` into the
+            // vertex positions, so the flip must be baked into the INDICES too; without it back-face
+            // culling eats the mirrored meshes' FRONT faces (see-through stones, "depth issue") and
+            // one-sided decals show only their BACK — the flat name plaques faced DOWN, readable only
+            // mirrored from below while z-fighting the slab ("text on wrong side").
+            float wdet = world.m[0]*(world.m[5]*world.m[10]-world.m[6]*world.m[9])
+                       - world.m[4]*(world.m[1]*world.m[10]-world.m[2]*world.m[9])
+                       + world.m[8]*(world.m[1]*world.m[6]-world.m[2]*world.m[5]);
+            bool mirroredWinding = wdet < 0.f;
             if (nd.has("mesh")) {
                 int mi = (int)nd["mesh"].asInt();
                 if ((size_t)mi < gmeshes.size()) {
@@ -616,6 +648,11 @@ public:
                             md.uvs[i*2+1] = (i*2+1<uv.size()) ? uv[i*2+1] : 0.f; }
                         if (prim.has("indices")) readIndices((int)prim["indices"].asInt(), md.indices);
                         else { md.indices.resize(nv); for(u32 i=0;i<nv;++i) md.indices[i]=i; }
+                        // Mirrored instance (negative-det world, baked above) -> invert triangle winding
+                        // per the glTF spec. Skinned meshes keep authored winding (their positions come
+                        // from joint matrices, not this bake).
+                        if (mirroredWinding && !isSkinned)
+                            for (size_t t=0; t+2<md.indices.size(); t+=3) std::swap(md.indices[t+1], md.indices[t+2]);
                         md.nVerts=nv; md.nIdx=(u32)md.indices.size();
                         // base color texture
                         int matIdx = prim.has("material") ? (int)prim["material"].asInt() : -1;
@@ -655,7 +692,9 @@ public:
                             u8 c[4]; matSolidColor(matIdx, c);
                             md.texRGBA={c[0],c[1],c[2],c[3]}; md.texW=md.texH=1; md.hasTexture=true;
                         }
-                        md.useBlend = matIsBlend(matIdx);  // alpha-blend transparent materials
+                        md.alphaTest = matIsMask(matIdx);  // authored MASK -> opaque-pass depth-writing cutout (discard)
+                        if (md.alphaTest) md.alphaCutoff = matAlphaCutoff(matIdx);
+                        md.useBlend = !md.alphaTest && matIsBlend(matIdx);  // alpha-blend transparent materials
                         md.additive = md.useBlend && matIsEmissiveGlow(matIdx) && !matHasBaseTex(matIdx);  // emissive BLEND = additive glow ONLY for a textureLESS pure-Emission material; a textured BLEND (the SHIELD) keeps alpha-blend so its texture alpha = the transparency (additive discarded it = opaque purple dome)
                         md.doubleSided = matIsDoubleSided(matIdx);  // single-sided -> back-face cull
                         // This mesh's OWN base-color tint (glTF baseColorFactor; identity-white for a plain textured
