@@ -778,6 +778,13 @@ public:
                 if (ch.node>=0 && (size_t)ch.node<gnodes.size() && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
                     auto& tv = gsamplers[ch.sampler].times;
                     if (!tv.empty() && tv.back() > nodePeriodv[ch.node]) nodePeriodv[ch.node] = tv.back(); }
+            // STAGGER GUARD: any channel that STARTS late marks its node NO-WRAP (period 0 -> global clamp
+            // behavior) — it's a segment of the global choreography (staggered bubble launches), and wrapping
+            // it at its own end time would collapse the authored phase offsets.
+            for (auto& ch : gchannels)
+                if (ch.node>=0 && (size_t)ch.node<gnodes.size() && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
+                    auto& tv = gsamplers[ch.sampler].times;
+                    if (!tv.empty() && tv.front() > 0.05f) nodePeriodv[ch.node] = 0.f; }
         }
         std::vector<GNode> cur = gnodes;
         for (auto& ch : gchannels) {
@@ -938,8 +945,9 @@ public:
         for (size_t k = 0; k < ss->times.size(); ++k) for (int c = 0; c < 3; ++c) { float v = ss->vals[k*(size_t)ss->comps+c]; if(v<mn[c])mn[c]=v; if(v>mx[c])mx[c]=v; }
         const float* rest = &ss->vals[0];   // t=0 scale (clamped first key) = what's baked into the cooked geometry
         for (int c = 0; c < 3; ++c) { float r = (rest[c] != 0.f) ? rest[c] : 1.f; startScale[c] = mn[c] / r; endScale[c] = mx[c] / r; }
-        // the SCALE track's OWN length (per-node loop, like the rigid/translate extractors) — global only as fallback
-        duration = (ss->times.size()>=2 && ss->times.back() > 1e-4f) ? ss->times.back() : animDuration;
+        // the SCALE track's OWN length (per-node loop, like the rigid/translate extractors) — global fallback;
+        // STAGGER GUARD: late-start channel = a global-choreography segment, keep the global duration.
+        duration = (ss->times.size()>=2 && ss->times.back() > 1e-4f && ss->times.front() <= 0.05f) ? ss->times.back() : animDuration;
         return true;
     }
     // GENERAL node TRANSLATION port: sample the node's translation channel at N uniform frames over the loop, as OFFSETS
@@ -949,14 +957,17 @@ public:
     bool extractNodeTranslation(int meshIdx, int N, std::vector<float>& frameOffs, float& loopSec) const {
         int nodeIdx = -1; for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; break; }
         if (nodeIdx < 0 || N < 2 || nodeIdx >= (int)gnodes.size()) return false;
-        // PER-NODE loop period (any of the node's channels — T/R/S stay in lockstep), NOT the global
-        // animDuration: sampling a short action over the global timeline bakes the sampler-CLAMPED parked
-        // tail into the replay (doctorwho Phonebox: 4s tumble in a 16.7s scene = 12.7s frozen per loop on
-        // device, "should be looping"). Matches the rigid extractor's per-node clipDur + the OPA rule.
-        loopSec = 0.f;
-        for (auto& ch : gchannels) if (ch.node==nodeIdx && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
-            auto& tv=gsamplers[ch.sampler].times; if(!tv.empty() && tv.back()>loopSec) loopSec=tv.back(); }
-        if (loopSec <= 1e-4f) loopSec = animDuration;
+        // PER-NODE loop period (node + ANCESTORS — worldAt composes the whole chain, so an animated parent's
+        // motion must fit inside the replay window too), NOT the global animDuration: sampling a short action
+        // over the global timeline bakes the sampler-CLAMPED parked tail into the replay (doctorwho Phonebox:
+        // 2.33s tumble in a 16.7s scene = 14s frozen per loop, "should be looping"). STAGGER GUARD: a channel
+        // that STARTS late is a segment of the global choreography — keep the GLOBAL loop (ensemble phasing).
+        loopSec = 0.f; float latestStart = 0.f;
+        for (int n = nodeIdx, g = 0; n >= 0 && (size_t)n < gnodes.size() && g < 64; n = gnodes[n].parent, ++g)
+            for (auto& ch : gchannels) if (ch.node==n && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
+                auto& tv=gsamplers[ch.sampler].times;
+                if (!tv.empty()){ if (tv.back()>loopSec) loopSec=tv.back(); if (tv.front()>latestStart) latestStart=tv.front(); } }
+        if (loopSec <= 1e-4f || latestStart > 0.05f) loopSec = animDuration;
         if (loopSec <= 1e-4f) return false;
         // Compute the node's full composed WORLD transform at time t (sample EVERY ancestor's T/R/S channel). The cook bakes
         // the geometry in WORLD space (md.positions x gm.model), so the offset MUST be the WORLD translation delta — using
@@ -1052,14 +1063,16 @@ public:
         // PER-NODE clip duration = the latest key time among channels animating this node or any ancestor (the
         // node's own loop, matching the OPA per-node-period fix — sampling a short-period node over the global
         // clip aliases its motion). Falls back to the global animDuration when no channel is found.
-        float clipDur = 0.f;
+        float clipDur = 0.f, latestStart = 0.f;
         for (int n = node, g = 0; n >= 0 && (size_t)n < gnodes.size() && g < 64; n = gnodes[n].parent, ++g)
             for (auto& ch : gchannels)
                 if (ch.node == n && ch.sampler >= 0 && (size_t)ch.sampler < gsamplers.size()) {
                     auto& tv = gsamplers[ch.sampler].times;
-                    if (!tv.empty() && tv.back() > clipDur) clipDur = tv.back();
+                    if (!tv.empty()){ if (tv.back() > clipDur) clipDur = tv.back(); if (tv.front() > latestStart) latestStart = tv.front(); }
                 }
-        if (clipDur <= 1e-4f) clipDur = animDuration;
+        // STAGGER GUARD: a channel starting late is a segment of the global choreography (bubbles-style
+        // staggered launches) — keep the GLOBAL loop so the ensemble stays in phase.
+        if (clipDur <= 1e-4f || latestStart > 0.05f) clipDur = animDuration;
         if (clipDur <= 1e-4f) return e;
         // ~30fps native sampling, floor 64 (short clips), NO cap — FULL PORT (the old 256 "device clip size
         // limit" was a misdiagnosis — official whale clips are 240 KB and the device loads them fine).
@@ -1370,12 +1383,25 @@ public:
         e.jointCount = nj;
         // The skin's OWN clip length — NOT the global animDuration. A 0.83s warp sampled over a 60s scene-max plays its
         // motion then FREEZES for 59s before looping = the "warp too slow / wrong speed" bug. = the latest keytime among
-        // channels animating THIS skin's joints (same per-clip basis the node-ROTATION path already uses). Device loop = this.
-        float clipDur = 0.f;
-        for (auto& ch : gchannels)
-            if (ch.node>=0 && (size_t)ch.node<nodeToJoint.size() && nodeToJoint[ch.node]>=0
-                && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){ auto& tv=gsamplers[ch.sampler].times; if(!tv.empty()&&tv.back()>clipDur) clipDur=tv.back(); }
-        if (clipDur <= 1e-4f) clipDur = animDuration;
+        // channels animating THIS skin's joints AND THEIR ANCESTORS (bubbles: each cluster's 166.8s RISE lives on the
+        // animated instancer PARENT above the skin — scanning only joint channels truncated the clip to the joints'
+        // 13-29s wobble = 5004 frames at fps 273-375, every cluster looping the first sliver of its path near spawn =
+        // "bubbles cramming in one place" + "Instancer_8 ain't moving after cook"). STAGGER GUARD: a contributing
+        // channel that STARTS late (>0.05s) is a segment of the global choreography, not a self-loop — keep the
+        // GLOBAL duration so the ensemble phasing survives.
+        float clipDur = 0.f, latestStart = 0.f;
+        { std::vector<char> relN(gnodes.size(), 0);
+          for (int j = 0; j < nj; ++j)
+              for (int n = sk.joints[j], g = 0; n >= 0 && (size_t)n < gnodes.size() && g < 64; n = gnodes[n].parent, ++g) relN[n] = 1;
+          for (auto& ch : gchannels)
+              if (ch.node>=0 && (size_t)ch.node<relN.size() && relN[ch.node]
+                  && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){ auto& tv=gsamplers[ch.sampler].times;
+                  if (!tv.empty()){ if (tv.back()>clipDur) clipDur=tv.back(); if (tv.front()>latestStart) latestStart=tv.front(); } } }
+        if (clipDur <= 1e-4f || latestStart > 0.05f) clipDur = animDuration;
+        // NATIVE sampling density: the caller sizes `frames` off the GLOBAL timeline (166.8s x 30fps = 5004),
+        // so a 16.7s self-contained clip was oversampled 10x (3MB ACL clips for 500 real keys). Not a cap —
+        // 30/s IS the authored key rate; re-sample at the clip's OWN natural count when the caller overshoots.
+        if ((float)frames > clipDur * 30.f * 1.5f) { int nf2 = (int)(clipDur * 30.f + 1.5f); if (nf2 >= 2) frames = nf2; }
         e.jointPos.resize(nj*3); e.jointQuat.resize(nj*4); e.jointScale.resize(nj); e.parents.resize(nj);
         // Joints can be parented through INTERMEDIATE non-joint nodes (rig groups): the glTF node's LOCAL transform is
         // then NOT relative to the parent JOINT, so storing it directly + dropping the broken parent link gives false

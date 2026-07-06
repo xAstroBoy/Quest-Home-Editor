@@ -6223,7 +6223,14 @@ struct Editor {
         struct TB { float ax,ay,az, bx,by,bz, cx,cy,cz; };   // a walkable triangle (full verts, for height interpolation)
         std::vector<TB> tb; float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f};
         for (int m:ms){ if(m<0||m>=(int)r->gpuMeshes.size())continue; auto& gm=r->gpuMeshes[m];
-            const auto& P=gm.pickPos; const auto& I=gm.pickIdx; if (P.size()<9 || I.size()<3) continue;
+            // ANIMATED/skinned meshes can carry EMPTY (or stale) pick arrays — falling through silently left the
+            // item with NO geometry, and an empty mesh-collider item cooks as the ColliderBox fallback ("tried to
+            // put a meshcollider, all I got was a square box" on the bubbles instancers). Bake from the LIVE scene
+            // mesh (current pose) instead — exact triangles, correct world placement.
+            const std::vector<float>*   Pp=&gm.pickPos;  const std::vector<uint32_t>* Ip=&gm.pickIdx;
+            if ((Pp->size()<9 || Ip->size()<3) && sceneMeshes && m<(int)sceneMeshes->size()){
+                Pp=&(*sceneMeshes)[(size_t)m].positions; Ip=&(*sceneMeshes)[(size_t)m].indices; }
+            const auto& P=*Pp; const auto& I=*Ip; if (P.size()<9 || I.size()<3) continue;
             for (size_t k=0;k+2<I.size(); k+=3){ uint32_t a=I[k],b=I[k+1],c=I[k+2];
                 if ((size_t)a*3+2>=P.size()||(size_t)b*3+2>=P.size()||(size_t)c*3+2>=P.size()) continue;
                 float wa[3],wb[3],wc[3]; xformPoint(gm.model,&P[a*3],wa); xformPoint(gm.model,&P[b*3],wb); xformPoint(gm.model,&P[c*3],wc);
