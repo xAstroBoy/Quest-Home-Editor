@@ -1377,8 +1377,14 @@ struct Editor {
         r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
         r->setDeleted((size_t)mi, true); pushDeleteUndo(hist, histA);
         remapMeshComponents(mi, std::vector<int>(hist.begin()+1, hist.end()));   // colliders follow the halves
-        deselectAll(); holesMesh=-1; geomDirty = true;
-        setStatus("Cut in two ("+std::to_string(made)+" parts, texture kept) - move/delete each; Ctrl+Z un-cuts");
+        // SELECT the pieces (was deselectAll): a knife/slice on a mesh whose halves stay exactly in place is
+        // visually a NO-OP ("tried cutting a sky cloud, it didn't even cut it") — highlighting the two new
+        // halves is the visible proof the cut happened, and move/Del acts on them immediately.
+        sel.clear(); selItems.clear();
+        for (size_t k=1;k<hist.size();++k) sel.push_back(hist[k]);
+        selected = sel.empty() ? -1 : sel.front(); r->selectedMesh = selected;
+        holesMesh=-1; geomDirty = true;
+        setStatus("Cut in two ("+std::to_string(made)+" parts, texture kept, both SELECTED) - move/delete each; Ctrl+Z un-cuts");
         return made>0;
     }
     // axis slice = plane through the mesh's world center, normal along the axis
@@ -1445,7 +1451,19 @@ struct Editor {
                 float rad =std::fabs(n[0])*e[0]+std::fabs(n[1])*e[1]+std::fabs(n[2])*e[2];    // AABB extent along the normal
                 if (std::fabs(dist)<=rad) targets.insert(s2);   // the plane crosses this mesh -> cut it
             }
-            if (targets.empty()) { setStatus("knife: the cut plane misses the SELECTED mesh(es) - draw the line ACROSS them"); return; }
+            if (targets.empty()) {
+                // The stroke plane misses every SELECTED mesh (stale leftover selection / line drawn over
+                // something else): fall back to cutting the mesh actually UNDER the line — never a silent
+                // no-op (the "tried cutting a sky cloud, it didn't even cut it" trap: an old selection ate
+                // the stroke and only a status line said so).
+                std::map<int,int> hits;
+                for (int i2=0;i2<=24;++i2){ float t=(float)i2/24.f;
+                    int hit = pickIndex(ax+(bx-ax)*t, ay+(by-ay)*t);
+                    if (hit>=0) hits[hit]++; }
+                int best=-1, bestN=0; for (auto& kv : hits) if (kv.second>bestN){ best=kv.first; bestN=kv.second; }
+                if (best<0) { setStatus("knife: the cut plane misses the SELECTED mesh(es) and no mesh is under the line"); return; }
+                targets.insert(best);
+            }
         } else {
             // no selection: cut the ONE mesh the stroke is mostly over (most stroke samples), not every
             // neighbor the ends of the line graze; 24 samples so thin/narrow meshes register too

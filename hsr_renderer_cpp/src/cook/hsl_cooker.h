@@ -2120,7 +2120,29 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     const char* navE = getenv("HSR_NAVMESH"); int navIdx = navE ? atoi(navE) : -1;   // base navmesh on one mesh, else whole scene
     float smn[3]={1e30f,1e30f,1e30f}, smx[3]={-1e30f,-1e30f,-1e30f};
     // Split >60000-vert STATIC meshes into separate single-part meshes (multi-part static doesn't render on device).
-    std::vector<ExportMesh> meshesV = splitLargeStaticMeshes(meshes);
+    // ── KING-KAI OPAQUE-TEXTURED BLEND reclassify (snakeway "king kai has 0 depth") ──────────────────────────
+    // A mesh authored BLEND (glTF alphaMode BLEND / .mat Transparent:true) whose texture has NO transparent
+    // texel at all ships a transparent MATL (field2=2) = NO DEPTH-WRITE — the walkable King Kai planet drew
+    // sorted through everything. A 100%-opaque texture has no silhouette to lose, so plain OPAQUE (depth-write,
+    // opaque pass) is strictly correct — this is the OPA preview's taMin>=255 reclassify (the render the user
+    // judges as CORRECT), applied at COOK scope. It was lost when the cook switched to authored-flags routing
+    // (the mountain-card black-silhouette fix — those cards have REAL transparent texels, aMin=0, unaffected).
+    // Guarded to STATIC full-alpha meshes: animated tint/fade or an authored tint alpha < 1 means the blend is
+    // intentional (ghost/fading cards keep BLEND). MUST run BEFORE the >60k splitters: split parts don't all
+    // carry m.rgba (the planet split into 11 parts; only the rgba-bearing one reclassified = 10 still ghosted).
+    // HSR_NOOPAQUEBLEND reverts.
+    std::vector<ExportMesh> meshesPre = meshes;
+    if (!std::getenv("HSR_NOOPAQUEBLEND"))
+        for (size_t mi = 0; mi < meshesPre.size(); ++mi) {
+            ExportMesh& m = meshesPre[mi];
+            if (!m.blend || m.additive || m.alphaTest || m.rgba.size() < 4) continue;
+            if (m.fadeAnim || m.tintAnim || m.curTint[3] < 0.999f || m.matTint[3] < 0.999f) continue;
+            uint8_t aMin = 255;
+            for (size_t k = 3; k < m.rgba.size(); k += 4) { if (m.rgba[k] < aMin) { aMin = m.rgba[k]; if (aMin < 250) break; } }
+            if (aMin >= 250) { m.blend = false;
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' OPAQUE-BLEND reclass (fully-opaque texture aMin=%u, blend -> OPAQUE depth-write)\n", mi, m.name.c_str(), aMin); }
+        }
+    std::vector<ExportMesh> meshesV = splitLargeStaticMeshes(meshesPre);
     // Split >60000-vert SKINNED meshes the SAME way (multi-part skinned CRASHES the device — snakeway 5_Car dragon).
     meshesV = splitLargeSkinnedMeshes(meshesV);
     // ── HSR_FITCLIP: scale EVERY mesh under the shell's fixed far-clip plane (default R=4500, margin under 5000) ──
@@ -2712,7 +2734,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 if (skFlip) {
                     const std::vector<uint8_t>& sbase = (m.blend && !shadSkinB.empty()) ? shadSkinB : shadSkin;
                     bool skFade = m.fadeAnim && m.fadeN>=2 && m.fadeFrames.size()>=(size_t)m.fadeN && m.fadeLoop>1e-4f;
-                    uint32_t hh = 0x811C9DC5u ^ (uint32_t)(long)(m.flipLoop*1000);
+                    uint32_t hh = 0x811C9DC5u ^ 0x41525232u ^ (uint32_t)(long)(m.flipLoop*1000);   // "ARR2" encoder version (constant-array replay/fade)
                     for (size_t k=0;k<m.flipUVMats.size();++k) hh = hh*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000);
                     if (skFade) { hh = hh*16777619u ^ (uint32_t)(long)(m.fadeLoop*1000);
                         for (size_t k=0;k<m.fadeFrames.size();++k) hh = hh*16777619u ^ (uint32_t)(long)(m.fadeFrames[k]*100000); }
@@ -2893,6 +2915,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             uint32_t h = (uint32_t)(0x9E3779B9u*(uint32_t)m.transN ^ 0x85EBCA6Bu*(uint32_t)(long)(m.transLoop*1000));
             for (size_t k=0;k<m.transFrames.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.transFrames[k]*10000);
             if (tflip) { h = h*16777619u ^ (uint32_t)(m.flipCols*73856093 ^ m.flipRows*19349663 ^ m.flipFrames*83492791 ^ (int)(m.flipFps*100));
+                h = h*16777619u ^ 0x41525232u;   // "ARR2" encoder version: constant-array replay/fade (invalidates unrolled-chain .bin caches)
                 for (size_t k=0;k<m.flipUVMats.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000);
                 if (fbClamp) for (int k2=0;k2<6;k2++) h = h*16777619u ^ (uint32_t)(long)(fbClamp[k2]*100000); }   // cell clamp baked in the shader -> distinct cache entry
             bool tfade = tflip && m.fadeAnim && m.fadeN>=2 && m.fadeFrames.size()>=(size_t)m.fadeN && m.fadeLoop>1e-4f;
@@ -3021,6 +3044,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             bool ffade = !ftint && useReplay && m.fadeAnim && m.fadeN>=2 && m.fadeFrames.size()>=(size_t)m.fadeN && m.fadeLoop>1e-4f;   // opacity fade curve (alpha-only subset — superseded by the RGBA tint replay)
             uint32_t h;
             if (useReplay) { h = (uint32_t)(0x9E3779B9u*(uint32_t)m.flipN ^ 0x85EBCA6Bu*(uint32_t)(long)(m.flipLoop*1000));
+                h = h*16777619u ^ 0x41525232u;   // "ARR2" encoder version: constant-array replay (invalidates the unrolled-chain .bin caches)
                 for (size_t k=0;k<m.flipUVMats.size();++k) h = h*16777619u ^ (uint32_t)(long)(m.flipUVMats[k]*100000);
                 if (fbClamp) for (int k2=0;k2<6;k2++) h = h*16777619u ^ (uint32_t)(long)(fbClamp[k2]*100000); }   // cell clamp baked in the shader -> distinct cache entry
             else h=(uint32_t)(0x9E3779B9u*(uint32_t)fcols ^ 0xC2B2AE35u*(uint32_t)frows ^ 0x27D4EB2Fu*(uint32_t)fframes ^ 0x85EBCA6Bu*(uint32_t)(long)(ffps*1000) ^ (m.flipOffset?0xA1B2C3D4u:0u));
@@ -3300,7 +3324,14 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // per-vertex COLOR_0 alpha must be NEUTRAL 1.0 (else static curTint[3] — 0 at cook phase 0 — ×  shaderFade = 0
             // = invisible, the "only one fog visible" bug). The shader owns the opacity for these.
             float fr=m.albedoFactor[0]*m.curTint[0], fg=m.albedoFactor[1]*m.curTint[1], fb=m.albedoFactor[2]*m.curTint[2];
-            float fa=(m.fadeAnim && m.fadeN>=2) ? 1.0f : m.curTint[3];
+            // When the RGBA TINTREPLAY owns the mesh's tint (it SUPERSEDES the alpha-only fade in every shader
+            // branch), its table is a per-channel RATIO to frame 0 (main.cpp divides f0 back out) and COLOR_0
+            // MUST keep the frame-0 bake (m.curTint) — that is the ratio·bake contract. The old unconditional
+            // fadeAnim→1.0 neutralization broke it: dust_02 (frame-0 alpha 0.1752, ratio table peaking 4.0)
+            // rendered ratio-only = ~5.7x too dense, clamping opaque mid-loop (plateau = "wrong tempo" + murky
+            // veil). Neutralize to 1.0 ONLY for the alpha-only fade path (its shader curve is ABSOLUTE).
+            bool tintOwnsAlpha = m.tintAnim && m.tintN >= 2 && m.tintFrames.size() >= (size_t)m.tintN*4 && m.tintLoop > 1e-4f;
+            float fa=(m.fadeAnim && m.fadeN>=2 && !tintOwnsAlpha) ? 1.0f : m.curTint[3];
             bool needCol = hasLm || fr!=1.f||fg!=1.f||fb!=1.f||fa!=1.f;
             if (needCol && nvc>0) {
                 vertCol.resize(nvc*4);

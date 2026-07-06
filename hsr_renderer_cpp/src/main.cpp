@@ -1885,6 +1885,11 @@ int main(int argc, char** argv) {
                         int mi=atoi(ln+7); size_t before=vkRenderer.gpuMeshes.size();
                         if (g_editor) g_editor->completeDome(mi, true);
                         snprintf(tmp,sizeof tmp,"sphere %d -> now %zu meshes (was %zu), status: %s\n", mi, vkRenderer.gpuMeshes.size(), before, g_editor?g_editor->cookStatus.c_str():"?"); out+=tmp; }
+                    else if (strncmp(ln, "slice=", 6) == 0) {   // TEST: axis-slice mesh mi through its AABB center (headless repro of the knife/slice path): slice=<mi>[,axis]
+                        int mi=-1, ax=0; sscanf(ln+6, "%d,%d", &mi, &ax); if (ax<0) ax=0; if (ax>2) ax=2;
+                        size_t before=vkRenderer.gpuMeshes.size();
+                        if (g_editor && mi>=0) g_editor->sliceMesh(mi, ax);
+                        snprintf(tmp,sizeof tmp,"slice %d axis %d -> now %zu meshes (was %zu), status: %s\n", mi, ax, vkRenderer.gpuMeshes.size(), before, g_editor?g_editor->cookStatus.c_str():"?"); out+=tmp; }
                     else if (strncmp(ln, "frame=", 6) == 0) {   // auto-frame the camera on mesh idx's world AABB (same as HSR_SOLO auto-frame)
                         int mi = atoi(ln + 6);
                         if (mi >= 0 && mi < (int)sceneMeshes->size() && mi < (int)vkRenderer.gpuMeshes.size()) {

@@ -759,47 +759,61 @@ inline std::vector<uint8_t> editFragUvMatrixReplay(const uint8_t* sd, uint32_t s
         else if (t.op==6){ if (wstr(w,3)=="time") timeIdx=(int)w[2]; }
         else if (t.op==11 && wstr(w,2).find("GLSL")!=std::string::npos) glsl=w[1];
         else if (t.op==22 && w[2]==32) tFloat=w[1];
-        else if (t.op==21 && w[2]==32) tInt=w[1]; }
+        else if (t.op==21 && w[2]==32 && (w.size()<4 || w[3]==1)) tInt=w[1]; }   // SIGNED int32 only (OpConvertFToS/SClamp require it)
     for (auto& t:insts){ auto&w=t.w; if (t.op==23 && w[2]==tFloat && w[3]==2) tV2=w[1]; else if (t.op==23 && w[2]==tFloat && w[3]==3) tV3=w[1]; else if (t.op==32) ptr[((uint64_t)w[2]<<32)|w[3]]=w[1]; }
-    for (auto& t:insts){ auto&w=t.w; if (t.op==43 && w[1]==tInt){ int32_t iv; memcpy(&iv,&w[3],4); intc[iv]=w[2]; } else if (t.op==43 && w[1]==tFloat){ float fv; memcpy(&fv,&w[3],4); fltc[fround(fv)]=w[2]; } }
+    for (auto& t:insts){ auto&w=t.w; if (t.op==43 && w[1]==tInt && tInt){ int32_t iv; memcpy(&iv,&w[3],4); intc[iv]=w[2]; } else if (t.op==43 && w[1]==tFloat){ float fv; memcpy(&fv,&w[3],4); fltc[fround(fv)]=w[2]; } }
     for (auto& kv:names) if (kv.second=="globalUniforms") gu=kv.first;
-    if (!tFloat||!tInt||!tV2||!glsl||!gu||timeIdx<0) return {};
+    if (!tFloat||!tV2||!glsl||!gu||timeIdx<0) return {};
     int sampIdx=-1; uint32_t coord=0;
     for (size_t k=0;k<insts.size();++k){ if (insts[k].op==87 && insts[k].w.size()>=5){ sampIdx=(int)k; coord=insts[k].w[4]; break; } }
     if (sampIdx<0) return {};
-    std::vector<Inst> newConsts,newTypes;
+    // ONE ordered stream (types/consts/private vars) — each def before use (the array type needs the length
+    // CONSTANT first, so the old separate newTypes-then-newConsts emission would forward-reference).
+    std::vector<Inst> newGlobals;
     auto nid=[&](){ return bound++; };
     auto fbits=[](float f){ uint32_t u; memcpy(&u,&f,4); return u; };
-    auto fconst=[&](float val)->uint32_t{ int64_t k=fround(val); auto it=fltc.find(k); if(it!=fltc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tFloat,id,fbits(val)}}); fltc[k]=id; return id; };
-    auto iconst=[&](int32_t val)->uint32_t{ auto it=intc.find(val); if(it!=intc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tInt,id,(uint32_t)val}}); intc[val]=id; return id; };
-    auto ptrOf=[&](uint32_t sc,uint32_t ty)->uint32_t{ uint64_t k=((uint64_t)sc<<32)|ty; auto it=ptr.find(k); if(it!=ptr.end())return it->second; uint32_t id=nid(); newTypes.push_back({32,{0,id,sc,ty}}); ptr[k]=id; return id; };
-    if (!tV3){ tV3=nid(); newTypes.push_back({23,{0,tV3,tFloat,3}}); }   // OpTypeVector float 3 (if absent)
-    const uint32_t GLSL_FRACT=10, GLSL_STEP=48;
+    auto fconst=[&](float val)->uint32_t{ int64_t k=fround(val); auto it=fltc.find(k); if(it!=fltc.end())return it->second; uint32_t id=nid(); newGlobals.push_back({43,{0,tFloat,id,fbits(val)}}); fltc[k]=id; return id; };
+    if (!tInt){ tInt=nid(); newGlobals.push_back({21,{0,tInt,32,1}}); }   // SIGNED int32 (create when the module lacks one)
+    auto iconst=[&](int32_t val)->uint32_t{ auto it=intc.find(val); if(it!=intc.end())return it->second; uint32_t id=nid(); newGlobals.push_back({43,{0,tInt,id,(uint32_t)val}}); intc[val]=id; return id; };
+    auto ptrOf=[&](uint32_t sc,uint32_t ty)->uint32_t{ uint64_t k=((uint64_t)sc<<32)|ty; auto it=ptr.find(k); if(it!=ptr.end())return it->second; uint32_t id=nid(); newGlobals.push_back({32,{0,id,sc,ty}}); ptr[k]=id; return id; };
+    if (!tV3){ tV3=nid(); newGlobals.push_back({23,{0,tV3,tFloat,3}}); }   // OpTypeVector float 3 (if absent)
+    const uint32_t GLSL_FRACT=10, GLSL_SCLAMP=45;
     if (loopSec<=1e-4f) loopSec=1.f;
     uint32_t c_invloop=fconst(1.0f/loopSec), c_N=fconst((float)N), c_one=fconst(1.0f), c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
     std::vector<uint32_t> row0(N), row1(N);   // per frame: row0=(a,b,c), row1=(d,e,f)
     for (int i=0;i<N;i++){
         uint32_t a=fconst(mats[(size_t)i*6+0]),b=fconst(mats[(size_t)i*6+1]),c=fconst(mats[(size_t)i*6+2]);
         uint32_t d=fconst(mats[(size_t)i*6+3]),e=fconst(mats[(size_t)i*6+4]),f=fconst(mats[(size_t)i*6+5]);
-        uint32_t r0=nid(); newConsts.push_back({0x2c,{0,tV3,r0,a,b,c}}); row0[i]=r0;
-        uint32_t r1=nid(); newConsts.push_back({0x2c,{0,tV3,r1,d,e,f}}); row1[i]=r1; }
-    uint32_t pt=nid(),t=nid(),tn=nid(),t01=nid(),fphase=nid();
+        uint32_t r0=nid(); newGlobals.push_back({0x2c,{0,tV3,r0,a,b,c}}); row0[i]=r0;
+        uint32_t r1=nid(); newGlobals.push_back({0x2c,{0,tV3,r1,d,e,f}}); row1[i]=r1; }
+    // CONSTANT-ARRAY replay (the zen-tree "device sticks" fix, same encoding as editFragTintReplay): the old
+    // emitter UNROLLED N step-select rows (~14N ALU words — dust's 151 frames ≈ 2100 fragment instructions)
+    // which desktop GPUs ran but the Quest driver executed as GARBAGE (stuck/wrong-tempo cards, garbage hues).
+    // Emit the SAME N keys VERBATIM as two OpConstantComposite vec3[N] Private arrays and do ONE dynamically-
+    // indexed load per row — frame-snap semantics identical, every key byte-exact, ~4N data words of growth.
+    uint32_t cLen=iconst(N), c_i0=iconst(0), c_iN1=iconst(N-1);
+    uint32_t tArr=nid(); newGlobals.push_back({28,{0,tArr,tV3,cLen}});                    // OpTypeArray vec3[N]
+    uint32_t arr0=nid();
+    { Inst a; a.op=0x2c; a.w.push_back(0); a.w.push_back(tArr); a.w.push_back(arr0);      // OpConstantComposite vec3[N]{row0...}
+      for (int i=0;i<N;i++) a.w.push_back(row0[i]); newGlobals.push_back(std::move(a)); }
+    uint32_t arr1=nid();
+    { Inst a; a.op=0x2c; a.w.push_back(0); a.w.push_back(tArr); a.w.push_back(arr1);
+      for (int i=0;i<N;i++) a.w.push_back(row1[i]); newGlobals.push_back(std::move(a)); }
+    uint32_t pArr=ptrOf(6,tArr);
+    uint32_t var0=nid(); newGlobals.push_back({59,{0,pArr,var0,6,arr0}});                 // OpVariable Private, initializer=keys
+    uint32_t var1=nid(); newGlobals.push_back({59,{0,pArr,var1,6,arr1}});
+    uint32_t pV3=ptrOf(6,tV3);
+    uint32_t pt=nid(),t=nid(),tn=nid(),t01=nid(),fphase=nid(),idxF=nid(),idxC=nid(),ac0=nid(),acc0=nid(),ac1=nid(),acc1=nid();
     std::vector<Inst> body = {
         {65,{0,pUf,pt,gu,c_time}}, {61,{0,tFloat,t,pt}},        // time
         {133,{0,tFloat,tn,t,c_invloop}},                        // time/loopSec
         {12,{0,tFloat,t01,glsl,GLSL_FRACT,tn}},                 // fract -> [0,1)
         {133,{0,tFloat,fphase,t01,c_N}},                        // *N -> [0,N)
+        {110,{0,tInt,idxF,fphase}},                             // OpConvertFToS
+        {12,{0,tInt,idxC,glsl,GLSL_SCLAMP,idxF,c_i0,c_iN1}},    // clamp [0,N-1]
+        {65,{0,pV3,ac0,var0,idxC}}, {61,{0,tV3,acc0,ac0}},      // row0 = M[idx].(a,b,c)  (frame-SNAP, exact key)
+        {65,{0,pV3,ac1,var1,idxC}}, {61,{0,tV3,acc1,ac1}},      // row1 = M[idx].(d,e,f)
     };
-    uint32_t acc0=row0[0], acc1=row1[0];                        // frame-SNAP select: acc = M[ floor(fphase) ]
-    for (int i=1;i<N;i++){ uint32_t c_i=fconst((float)i);
-        uint32_t w=nid(); body.push_back({12,{0,tFloat,w,glsl,GLSL_STEP,c_i,fphase}});   // step(i,fphase)
-        uint32_t d0=nid(); body.push_back({131,{0,tV3,d0,row0[i],acc0}});                // row0[i]-acc0
-        uint32_t s0=nid(); body.push_back({142,{0,tV3,s0,d0,w}});                         // *w
-        uint32_t n0=nid(); body.push_back({129,{0,tV3,n0,acc0,s0}}); acc0=n0;             // acc0 += (row0[i]-acc0)*w
-        uint32_t d1=nid(); body.push_back({131,{0,tV3,d1,row1[i],acc1}});
-        uint32_t s1=nid(); body.push_back({142,{0,tV3,s1,d1,w}});
-        uint32_t n1=nid(); body.push_back({129,{0,tV3,n1,acc1,s1}}); acc1=n1;
-    }
     uint32_t uvw=nid(); body.push_back({80,{0,tV3,uvw,coord,c_one}});   // vec3(coord.x, coord.y, 1.0)  (OpCompositeConstruct vec2+scalar)
     uint32_t ux=nid(); body.push_back({148,{0,tFloat,ux,acc0,uvw}});    // dot(row0, uvw) = a·u+b·v+c
     uint32_t uy=nid(); body.push_back({148,{0,tFloat,uy,acc1,uvw}});    // dot(row1, uvw) = d·u+e·v+f
@@ -807,8 +821,8 @@ inline std::vector<uint8_t> editFragUvMatrixReplay(const uint8_t* sd, uint32_t s
         const uint32_t GLSL_FMIN=37, GLSL_FMAX=40, GLSL_FCLAMP=43;
         uint32_t iu0=fconst(cellClamp[0]), iv0=fconst(cellClamp[1]), iu1=fconst(cellClamp[2]), iv1=fconst(cellClamp[3]);
         uint32_t ipu=fconst(cellClamp[4]), ipv=fconst(cellClamp[5]);
-        uint32_t cA=nid(); newConsts.push_back({0x2c,{0,tV3,cA,iu0,iv0,c_one}});   // vec3(umin,vmin,1)
-        uint32_t cB=nid(); newConsts.push_back({0x2c,{0,tV3,cB,iu1,iv1,c_one}});   // vec3(umax,vmax,1)
+        uint32_t cA=nid(); newGlobals.push_back({0x2c,{0,tV3,cA,iu0,iv0,c_one}});   // vec3(umin,vmin,1)
+        uint32_t cB=nid(); newGlobals.push_back({0x2c,{0,tV3,cB,iu1,iv1,c_one}});   // vec3(umax,vmax,1)
         uint32_t c1x=nid(); body.push_back({148,{0,tFloat,c1x,acc0,cA}});          // cell corner 1 = M·(umin,vmin)
         uint32_t c1y=nid(); body.push_back({148,{0,tFloat,c1y,acc1,cA}});
         uint32_t c2x=nid(); body.push_back({148,{0,tFloat,c2x,acc0,cB}});          // cell corner 2 = M·(umax,vmax)
@@ -834,7 +848,7 @@ inline std::vector<uint8_t> editFragUvMatrixReplay(const uint8_t* sd, uint32_t s
     uint32_t newUv=nid(); body.push_back({80,{0,tV2,newUv,uxf,uyf}});   // vec2(fract(ux),fract(uy))
     std::vector<Inst> out; bool addedG=false;
     for (size_t k=0;k<insts.size();++k){
-        if (!addedG && insts[k].op==54){ for(auto&t2:newTypes)out.push_back(t2); for(auto&c:newConsts)out.push_back(c); addedG=true; }
+        if (!addedG && insts[k].op==54){ for(auto&g:newGlobals)out.push_back(g); addedG=true; }
         if ((int)k==sampIdx){ for(auto&b:body) out.push_back(b); Inst s=insts[k]; s.w[4]=newUv; out.push_back(s); continue; }
         out.push_back(insts[k]);
     }
@@ -870,40 +884,49 @@ inline std::vector<uint8_t> editFragAlphaFade(const uint8_t* sd, uint32_t spvLen
     for (auto& t:insts){ auto&w=t.w; if (t.op==23 && w[2]==tFloat && w[3]==4) tV4=w[1]; else if (t.op==32) ptr[((uint64_t)w[2]<<32)|w[3]]=w[1]; }
     for (auto& t:insts){ auto&w=t.w; if (t.op==43 && w[1]==tInt){ int32_t iv; memcpy(&iv,&w[3],4); intc[iv]=w[2]; } else if (t.op==43 && w[1]==tFloat){ float fv; memcpy(&fv,&w[3],4); fltc[fround(fv)]=w[2]; } }
     for (auto& kv:names) if (kv.second=="globalUniforms") gu=kv.first;
-    if (!tFloat||!tInt||!glsl||!gu||timeIdx<0) return {};
+    if (!tFloat||!glsl||!gu||timeIdx<0) return {};
     // base-color sample = FIRST OpImageSampleImplicitLod (op 87); its vec4 result carries the alpha we fade.
     int sampIdx=-1; uint32_t sampRes=0;
     for (size_t k=0;k<insts.size();++k){ if (insts[k].op==87 && insts[k].w.size()>=5){ sampIdx=(int)k; sampRes=insts[k].w[2]; break; } }
     if (sampIdx<0 || !sampRes) return {};
-    std::vector<Inst> newConsts,newTypes;
+    std::vector<Inst> newGlobals;   // ONE ordered stream (types/consts/private vars) — each def before use
     auto nid=[&](){ return bound++; };
     auto fbits=[](float f){ uint32_t u; memcpy(&u,&f,4); return u; };
-    auto fconst=[&](float val)->uint32_t{ int64_t k=fround(val); auto it=fltc.find(k); if(it!=fltc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tFloat,id,fbits(val)}}); fltc[k]=id; return id; };
-    auto iconst=[&](int32_t val)->uint32_t{ auto it=intc.find(val); if(it!=intc.end())return it->second; uint32_t id=nid(); newConsts.push_back({43,{0,tInt,id,(uint32_t)val}}); intc[val]=id; return id; };
-    auto ptrOf=[&](uint32_t sc,uint32_t ty)->uint32_t{ uint64_t k=((uint64_t)sc<<32)|ty; auto it=ptr.find(k); if(it!=ptr.end())return it->second; uint32_t id=nid(); newTypes.push_back({32,{0,id,sc,ty}}); ptr[k]=id; return id; };
-    if (!tV4){ tV4=nid(); newTypes.push_back({23,{0,tV4,tFloat,4}}); }
-    const uint32_t GLSL_FRACT=10, GLSL_STEP=48;
+    auto fconst=[&](float val)->uint32_t{ int64_t k=fround(val); auto it=fltc.find(k); if(it!=fltc.end())return it->second; uint32_t id=nid(); newGlobals.push_back({43,{0,tFloat,id,fbits(val)}}); fltc[k]=id; return id; };
+    if (!tInt){ tInt=nid(); newGlobals.push_back({21,{0,tInt,32,1}}); }   // SIGNED int32 (create when the module lacks one)
+    auto iconst=[&](int32_t val)->uint32_t{ auto it=intc.find(val); if(it!=intc.end())return it->second; uint32_t id=nid(); newGlobals.push_back({43,{0,tInt,id,(uint32_t)val}}); intc[val]=id; return id; };
+    auto ptrOf=[&](uint32_t sc,uint32_t ty)->uint32_t{ uint64_t k=((uint64_t)sc<<32)|ty; auto it=ptr.find(k); if(it!=ptr.end())return it->second; uint32_t id=nid(); newGlobals.push_back({32,{0,id,sc,ty}}); ptr[k]=id; return id; };
+    if (!tV4){ tV4=nid(); newGlobals.push_back({23,{0,tV4,tFloat,4}}); }
+    const uint32_t GLSL_FRACT=10, GLSL_SCLAMP=45;
     if (loopSec<=1e-4f) loopSec=1.f;
     uint32_t c_invloop=fconst(1.0f/loopSec), c_N=fconst((float)N), c_one=fconst(1.0f), c_time=iconst(timeIdx), pUf=ptrOf(2,tFloat);
     std::vector<uint32_t> fc(N); for(int i=0;i<N;i++) fc[i]=fconst(fade[i]);
-    uint32_t pt=nid(),tt=nid(),tn=nid(),t01=nid(),fphase=nid();
+    // CONSTANT-ARRAY curve (same zen-tree "device sticks" encoding as editFragTintReplay/editFragUvMatrixReplay):
+    // the old unrolled step-select chain (~5N fragment ALU ops) is the encoding class the Quest driver executes
+    // as garbage on long curves. float[N] Private array + ONE dynamically-indexed load; keys byte-exact.
+    uint32_t cLen=iconst(N), c_i0=iconst(0), c_iN1=iconst(N-1);
+    uint32_t tArr=nid(); newGlobals.push_back({28,{0,tArr,tFloat,cLen}});               // OpTypeArray float[N]
+    uint32_t arrId=nid();
+    { Inst a; a.op=0x2c; a.w.push_back(0); a.w.push_back(tArr); a.w.push_back(arrId);   // OpConstantComposite float[N]{fade...}
+      for (int i=0;i<N;i++) a.w.push_back(fc[i]); newGlobals.push_back(std::move(a)); }
+    uint32_t pArr=ptrOf(6,tArr);
+    uint32_t var=nid(); newGlobals.push_back({59,{0,pArr,var,6,arrId}});                // OpVariable Private, initializer=curve
+    uint32_t pFl=ptrOf(6,tFloat);
+    uint32_t pt=nid(),tt=nid(),tn=nid(),t01=nid(),fphase=nid(),idxF=nid(),idxC=nid(),ac2=nid(),acc=nid();
     std::vector<Inst> pre = {
         {65,{0,pUf,pt,gu,c_time}}, {61,{0,tFloat,tt,pt}},       // time
         {133,{0,tFloat,tn,tt,c_invloop}},                       // time/loopSec
         {12,{0,tFloat,t01,glsl,GLSL_FRACT,tn}},                 // fract -> [0,1)
         {133,{0,tFloat,fphase,t01,c_N}},                        // *N -> [0,N)
+        {110,{0,tInt,idxF,fphase}},                             // OpConvertFToS
+        {12,{0,tInt,idxC,glsl,GLSL_SCLAMP,idxF,c_i0,c_iN1}},    // clamp [0,N-1]
+        {65,{0,pFl,ac2,var,idxC}},                              // OpAccessChain curve[idx]
+        {61,{0,tFloat,acc,ac2}},                                // OpLoad (the EXACT authored key, frame-SNAP)
     };
-    uint32_t acc=fc[0];                                          // frame-SNAP select: acc = fade[ floor(fphase) ]
-    for (int i=1;i<N;i++){ uint32_t c_i=fconst((float)i);
-        uint32_t w=nid(); pre.push_back({12,{0,tFloat,w,glsl,GLSL_STEP,c_i,fphase}});   // step(i,fphase)
-        uint32_t d=nid(); pre.push_back({131,{0,tFloat,d,fc[i],acc}});                  // fade[i]-acc
-        uint32_t s=nid(); pre.push_back({133,{0,tFloat,s,d,w}});                        // *w
-        uint32_t n=nid(); pre.push_back({129,{0,tFloat,n,acc,s}}); acc=n;               // acc += (fade[i]-acc)*w
-    }
     uint32_t v4=nid(), faded=nid();
     std::vector<Inst> out; bool addedG=false;
     for (size_t k=0;k<insts.size();++k){
-        if (!addedG && insts[k].op==54){ for(auto&t2:newTypes)out.push_back(t2); for(auto&c:newConsts)out.push_back(c); addedG=true; }
+        if (!addedG && insts[k].op==54){ for(auto&g:newGlobals)out.push_back(g); addedG=true; }
         if ((int)k==sampIdx){
             for(auto&b:pre) out.push_back(b);
             out.push_back(insts[k]);                                       // the base-color sample (result = sampRes)
