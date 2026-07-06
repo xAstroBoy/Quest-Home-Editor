@@ -50,6 +50,7 @@ public:
     std::vector<GChannel> gchannels;
     std::vector<GSampler> gsamplers;
     std::vector<SkinnedRec> skinned;
+    std::vector<float> nodePeriodv;   // per-node loop period = latest key among the node's OWN channels (lazy, see animate())
     std::vector<NodeAnimRec> nodeAnimRecs;
     // Re-anchor for animated "screen" skins authored away from their target (Rick&Morty TV: the
     // glTF puts the TV_Anim flipbook node by the WINDOW, libshell repositions it onto the TV at
@@ -764,11 +765,27 @@ public:
         if (!hasAnimation()) return;
         { static int rd=-1; if(rd<0){ rd=0; if(const char* r=std::getenv("HSR_REANCHOR")) sscanf(r,"%f,%f,%f",&reanchor[0],&reanchor[1],&reanchor[2]); } }
         if (animDuration > 0.0f) t = fmodf(t, animDuration);
+        // PER-NODE loop period (V79 sanim semantics: every track loops on ITS OWN length — the OPA
+        // sampleTrack/per-node-period rule). glTF samplers CLAMP past their last key, so a short Blender
+        // action inside a longer scene timeline PARKED for the remainder of every global loop (doctorwho
+        // Phonebox: 4s tumble in a 16.7s scene = 12.7s frozen, "it should be looping"). All channels of
+        // one node share the node's max end time so T/R/S stay in lockstep (the OPA loadSanim channel
+        // sync). Nodes whose channels span the full timeline are untouched. HSR_GLTF_GLOBALLOOP reverts.
+        static int gLoopGlobal = -1; if (gLoopGlobal<0) gLoopGlobal = std::getenv("HSR_GLTF_GLOBALLOOP")?1:0;
+        if (nodePeriodv.size() != gnodes.size()) {
+            nodePeriodv.assign(gnodes.size(), 0.f);
+            for (auto& ch : gchannels)
+                if (ch.node>=0 && (size_t)ch.node<gnodes.size() && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
+                    auto& tv = gsamplers[ch.sampler].times;
+                    if (!tv.empty() && tv.back() > nodePeriodv[ch.node]) nodePeriodv[ch.node] = tv.back(); }
+        }
         std::vector<GNode> cur = gnodes;
         for (auto& ch : gchannels) {
             if (ch.node<0 || (size_t)ch.node>=cur.size() || ch.sampler<0 || (size_t)ch.sampler>=gsamplers.size()) continue;
             float v[4]={0,0,0,1};
-            sampleSampler(gsamplers[ch.sampler], t, v);
+            float tc = t;
+            if (!gLoopGlobal){ float p = nodePeriodv[ch.node]; if (p > 1e-4f && p < animDuration - 1e-3f) tc = fmodf(t, p); }
+            sampleSampler(gsamplers[ch.sampler], tc, v);
             if (ch.path==0) { cur[ch.node].t[0]=v[0]; cur[ch.node].t[1]=v[1]; cur[ch.node].t[2]=v[2]; }
             else if (ch.path==1) { cur[ch.node].r[0]=v[0]; cur[ch.node].r[1]=v[1]; cur[ch.node].r[2]=v[2]; cur[ch.node].r[3]=v[3]; }
             else { cur[ch.node].s[0]=v[0]; cur[ch.node].s[1]=v[1]; cur[ch.node].s[2]=v[2]; }
@@ -921,7 +938,8 @@ public:
         for (size_t k = 0; k < ss->times.size(); ++k) for (int c = 0; c < 3; ++c) { float v = ss->vals[k*(size_t)ss->comps+c]; if(v<mn[c])mn[c]=v; if(v>mx[c])mx[c]=v; }
         const float* rest = &ss->vals[0];   // t=0 scale (clamped first key) = what's baked into the cooked geometry
         for (int c = 0; c < 3; ++c) { float r = (rest[c] != 0.f) ? rest[c] : 1.f; startScale[c] = mn[c] / r; endScale[c] = mx[c] / r; }
-        duration = animDuration > 0.f ? animDuration : (ss->times.back() - ss->times.front());
+        // the SCALE track's OWN length (per-node loop, like the rigid/translate extractors) — global only as fallback
+        duration = (ss->times.size()>=2 && ss->times.back() > 1e-4f) ? ss->times.back() : animDuration;
         return true;
     }
     // GENERAL node TRANSLATION port: sample the node's translation channel at N uniform frames over the loop, as OFFSETS
@@ -931,8 +949,14 @@ public:
     bool extractNodeTranslation(int meshIdx, int N, std::vector<float>& frameOffs, float& loopSec) const {
         int nodeIdx = -1; for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; break; }
         if (nodeIdx < 0 || N < 2 || nodeIdx >= (int)gnodes.size()) return false;
-        loopSec = animDuration;
-        if (loopSec <= 1e-4f){ for (auto& ch : gchannels) if (ch.node==nodeIdx && ch.path==0 && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){ auto& tv=gsamplers[ch.sampler].times; if(!tv.empty()) loopSec=tv.back(); } }
+        // PER-NODE loop period (any of the node's channels — T/R/S stay in lockstep), NOT the global
+        // animDuration: sampling a short action over the global timeline bakes the sampler-CLAMPED parked
+        // tail into the replay (doctorwho Phonebox: 4s tumble in a 16.7s scene = 12.7s frozen per loop on
+        // device, "should be looping"). Matches the rigid extractor's per-node clipDur + the OPA rule.
+        loopSec = 0.f;
+        for (auto& ch : gchannels) if (ch.node==nodeIdx && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
+            auto& tv=gsamplers[ch.sampler].times; if(!tv.empty() && tv.back()>loopSec) loopSec=tv.back(); }
+        if (loopSec <= 1e-4f) loopSec = animDuration;
         if (loopSec <= 1e-4f) return false;
         // Compute the node's full composed WORLD transform at time t (sample EVERY ancestor's T/R/S channel). The cook bakes
         // the geometry in WORLD space (md.positions x gm.model), so the offset MUST be the WORLD translation delta — using
