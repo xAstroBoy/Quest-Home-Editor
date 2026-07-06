@@ -68,7 +68,15 @@ Full walkthrough: **[Installation & Setup](../../wiki/Installation-and-Setup)** 
 - Dome/skybox tools, far-clip escape for huge vistas, walk-simulation mode with real collision.
 - **Blender round-trip**: export the env as glTF 2.0, edit it in Blender, re-import.
 - Timeline with scrub/pause that can **mirror to the headset live** (bridge).
+- **Drive the headset player from the desktop**: a live player gizmo you drag to teleport/rotate the player
+  on the Quest, with a **no-gravity** toggle (float up to inspect anything without falling) — via the
+  companion patcher below. **Install-only** re-installs an unchanged cook without re-cooking.
 - Sessions persist to `saved/<env>.hsledit`; cooks land in `cooked/`.
+
+**Companion device patcher** — [**vrshell-aio-patcher**](https://github.com/xAstroBoy/vrshell-aio-patcher)
+patches your Quest's VrShell (far-clip escape, moonjump/fly, no-gravity, live player teleport/rotate, an
+on-device control bridge) so the editor's live controls and headset mirror work. Source only; you build it
+against your own headset's VrShell.
 
 **Renderer (the ground truth)**
 - Vulkan replica of `libshell`'s HSR pipeline: per-material `MeshShellEnv`, reversed-Z,
