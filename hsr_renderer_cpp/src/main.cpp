@@ -1393,6 +1393,40 @@ int main(int argc, char** argv) {
                     em.vatOffsets.clear(); em.vatFrames = 0;   // rotation/sway -> getTime() Rodrigues shader, NOT VAT (vatBaker also ran on this node-anim mesh)
                 }
             } else if (gltf.extractNodeTranslation(meshIdx, 16, em.transFrames, em.transLoop)) {   // GENERAL node-translation replay (sliding screens) — port ANY translation, not the wrong pulse default
+                // ALIAS CHECK (official-bubbles instancers): a 64s track holding MANY 4-8s bubble-rise SAWTEETH
+                // cannot be represented by 16 waypoints — the linear replay collapses toward the path AVERAGE
+                // ("bubbles go in center instead of animating"; a single-time position probe can still match on a
+                // near-linear segment, which is how this slipped verification). Fine-sample the track and measure
+                // the replay error; a big deviation routes the mesh to the exact RIGID-HZANIM clip (ACL carries
+                // the full native keyframes — the cars/comet/phonebox device-proven path). HSR_NOTRANSALIAS reverts.
+                bool aliased = false;
+                if (!std::getenv("HSR_NOTRANSALIAS")) {
+                    std::vector<float> fine; float fl = 0.f;
+                    if (gltf.extractNodeTranslation(meshIdx, 128, fine, fl) && fine.size() >= 128*3) {
+                        float span = 0.f; for (float v : fine){ float a = std::fabs(v); if (a > span) span = a; }
+                        float maxe = 0.f;
+                        for (int i2 = 0; i2 < 128; i2++){
+                            float ph = (float)i2/128.f*16.f; int i0 = (int)ph; float fr = ph - (float)i0; int i1 = (i0+1)%16;
+                            for (int c = 0; c < 3; c++){
+                                float rep = em.transFrames[(size_t)i0*3+c]*(1.f-fr) + em.transFrames[(size_t)i1*3+c]*fr;
+                                float e2 = std::fabs(rep - fine[(size_t)i2*3+c]); if (e2 > maxe) maxe = e2; } }
+                        aliased = span > 0.5f && maxe > std::max(0.5f, 0.10f*span);
+                        if (aliased && std::getenv("HSR_VERBOSE"))
+                            fprintf(stderr, "[COOK] m%d node-translate ALIASED (replayErr=%.2fu of span %.2fu over %.1fs) -> RIGID-HZANIM exact\n", meshIdx, maxe, span, em.transLoop);
+                    }
+                }
+                if (aliased && std::getenv("HSR_HZANIM") && !std::getenv("HSR_NOGLTFRIGID")) {
+                    auto rg = gltf.extractNodeRigidHzAnim(meshIdx, /*requireRotation=*/false);
+                    if (rg.ok()) {
+                        em.hzJointPos=std::move(rg.jointPos); em.hzJointQuat=std::move(rg.jointQuat); em.hzJointScale=std::move(rg.jointScale);
+                        em.hzParents=std::move(rg.parents); em.hzBoneIdx=std::move(rg.boneIdx); em.hzBoneWgt=std::move(rg.boneWgt);
+                        em.hzTrsLocal=std::move(rg.trsLocal); em.hzRestPos=std::move(rg.restPos);
+                        em.hzJointCount=rg.jointCount; em.hzFrames=rg.frameCount; em.hzFps=rg.fps;
+                        em.transAnim=false; em.transFrames.clear(); em.transN=0;
+                        em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
+                        return;
+                    }
+                }
                 em.transAnim = true; em.transN = 16;
             } else if (!std::getenv("HSR_NOSCALE") && gltf.extractNodeScaleFrames(meshIdx, 16, em.scaleFrames, em.scaleLoop, em.scalePivot)) {
                 // GENERAL node-SCALE "breathe" replay (Erebor's 12 wisps, NON-UNIFORM per-axis) -> shadergen::SCALE getTime()

@@ -972,12 +972,13 @@ public:
         // over the global timeline bakes the sampler-CLAMPED parked tail into the replay (doctorwho Phonebox:
         // 2.33s tumble in a 16.7s scene = 14s frozen per loop, "should be looping"). STAGGER GUARD: a channel
         // that STARTS late is a segment of the global choreography — keep the GLOBAL loop (ensemble phasing).
-        loopSec = 0.f; float latestStart = 0.f;
+        loopSec = 0.f; float latestStart = 0.f, firstEnd = -1.f; bool multiPeriod = false;
         for (int n = nodeIdx, g = 0; n >= 0 && (size_t)n < gnodes.size() && g < 64; n = gnodes[n].parent, ++g)
             for (auto& ch : gchannels) if (ch.node==n && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
                 auto& tv=gsamplers[ch.sampler].times;
-                if (!tv.empty()){ if (tv.back()>loopSec) loopSec=tv.back(); if (tv.front()>latestStart) latestStart=tv.front(); } }
-        if (loopSec <= 1e-4f || latestStart > 0.05f) loopSec = animDuration;
+                if (!tv.empty()){ if (tv.back()>loopSec) loopSec=tv.back(); if (tv.front()>latestStart) latestStart=tv.front();
+                    if (firstEnd < 0.f) firstEnd = tv.back(); else if (std::fabs(tv.back()-firstEnd) > 0.1f) multiPeriod = true; } }
+        if (loopSec <= 1e-4f || latestStart > 0.05f || multiPeriod) loopSec = animDuration;
         if (loopSec <= 1e-4f) return false;
         // Compute the node's full composed WORLD transform at time t (sample EVERY ancestor's T/R/S channel). The cook bakes
         // the geometry in WORLD space (md.positions x gm.model), so the offset MUST be the WORLD translation delta — using
@@ -1073,16 +1074,17 @@ public:
         // PER-NODE clip duration = the latest key time among channels animating this node or any ancestor (the
         // node's own loop, matching the OPA per-node-period fix — sampling a short-period node over the global
         // clip aliases its motion). Falls back to the global animDuration when no channel is found.
-        float clipDur = 0.f, latestStart = 0.f;
+        float clipDur = 0.f, latestStart = 0.f, firstEnd = -1.f; bool multiPeriod = false;
         for (int n = node, g = 0; n >= 0 && (size_t)n < gnodes.size() && g < 64; n = gnodes[n].parent, ++g)
             for (auto& ch : gchannels)
                 if (ch.node == n && ch.sampler >= 0 && (size_t)ch.sampler < gsamplers.size()) {
                     auto& tv = gsamplers[ch.sampler].times;
-                    if (!tv.empty()){ if (tv.back() > clipDur) clipDur = tv.back(); if (tv.front() > latestStart) latestStart = tv.front(); }
+                    if (!tv.empty()){ if (tv.back() > clipDur) clipDur = tv.back(); if (tv.front() > latestStart) latestStart = tv.front();
+                        if (firstEnd < 0.f) firstEnd = tv.back(); else if (std::fabs(tv.back()-firstEnd) > 0.1f) multiPeriod = true; }
                 }
-        // STAGGER GUARD: a channel starting late is a segment of the global choreography (bubbles-style
-        // staggered launches) — keep the GLOBAL loop so the ensemble stays in phase.
-        if (clipDur <= 1e-4f || latestStart > 0.05f) clipDur = animDuration;
+        // STAGGER GUARD + MULTI-PERIOD chain (see extractHzAnim): late-start = global-choreography segment;
+        // distinct periods along the chain = a beat no single-period loop reproduces — bake the master timeline.
+        if (clipDur <= 1e-4f || latestStart > 0.05f || multiPeriod) clipDur = animDuration;
         if (clipDur <= 1e-4f) return e;
         // ~30fps native sampling, floor 64 (short clips), NO cap — FULL PORT (the old 256 "device clip size
         // limit" was a misdiagnosis — official whale clips are 240 KB and the device loads them fine).
@@ -1399,15 +1401,24 @@ public:
         // "bubbles cramming in one place" + "Instancer_8 ain't moving after cook"). STAGGER GUARD: a contributing
         // channel that STARTS late (>0.05s) is a segment of the global choreography, not a self-loop — keep the
         // GLOBAL duration so the ensemble phasing survives.
-        float clipDur = 0.f, latestStart = 0.f;
+        float clipDur = 0.f, latestStart = 0.f; bool multiPeriod = false;
         { std::vector<char> relN(gnodes.size(), 0);
           for (int j = 0; j < nj; ++j)
               for (int n = sk.joints[j], g = 0; n >= 0 && (size_t)n < gnodes.size() && g < 64; n = gnodes[n].parent, ++g) relN[n] = 1;
+          float firstEnd = -1.f;
           for (auto& ch : gchannels)
               if (ch.node>=0 && (size_t)ch.node<relN.size() && relN[ch.node]
                   && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){ auto& tv=gsamplers[ch.sampler].times;
-                  if (!tv.empty()){ if (tv.back()>clipDur) clipDur=tv.back(); if (tv.front()>latestStart) latestStart=tv.front(); } } }
-        if (clipDur <= 1e-4f || latestStart > 0.05f) clipDur = animDuration;
+                  if (!tv.empty()){ if (tv.back()>clipDur) clipDur=tv.back(); if (tv.front()>latestStart) latestStart=tv.front();
+                      if (firstEnd < 0.f) firstEnd = tv.back();
+                      else if (std::fabs(tv.back()-firstEnd) > 0.1f) multiPeriod = true; } } }
+        // MULTI-PERIOD skin (bubbles trails: each joint/bubble loops on its OWN channel length — the periods
+        // BEAT against each other, which is what SPREADS the trail). A single clip looping at max(period)
+        // resets EVERY bubble together each wrap = right after it they're all freshly spawned = "bubbles
+        // cramming in one place". No finite single loop reproduces an irrational-ratio beat — bake the FULL
+        // master timeline instead: inside it every joint wraps on its own period exactly like the preview
+        // (chTime), and the only artifact is one ensemble reshuffle per master loop (166.8s) instead of never.
+        if (clipDur <= 1e-4f || latestStart > 0.05f || multiPeriod) clipDur = animDuration;
         // NATIVE sampling density: the caller sizes `frames` off the GLOBAL timeline (166.8s x 30fps = 5004),
         // so a 16.7s self-contained clip was oversampled 10x (3MB ACL clips for 500 real keys). Not a cap —
         // 30/s IS the authored key rate; re-sample at the clip's OWN natural count when the caller overshoots.
@@ -1461,11 +1472,47 @@ public:
         // Shield's bind lands at ~(0,0,0) and skins OFF the droid. The clip keeps the real 0->1 scale (drives the pop).
         std::vector<GNode> bindNodes = gnodes;
         for (auto& g : bindNodes) for (int k=0;k<3;k++) if (g.s[k]<1e-3f && g.s[k]>-1e-3f) g.s[k]=1.0f;
+        // PER-JOINT IBM BIND (unofficial_bubbles fields "go in center"): the FILE's inverseBindMatrices can
+        // differ from the rebuilt node-hierarchy bind PER JOINT (Maya instancer rigs bake each bubble's offset
+        // into its IBM — measured up to 43u on 60/61 joints while joint 0 matched exactly, so the old
+        // joint0-only residual check saw nothing and the global fold couldn't represent it anyway). Shipping
+        // inv(nodeBind) as the inverse-bind then skinned every bubble toward its joint origin. FIX: when any
+        // joint's IBM deviates, derive the shipped bind from the IBMs themselves — bindWorld'_j = inv(IBM_j) —
+        // so the device's composed inverse-bind == IBM_j and skinning is EXACTLY the source math W_j(t)·IBM_j.
+        auto affInv = [](const float* m, float* o){   // affine 4x4 inverse (column-major)
+            float a=m[0],b=m[4],c=m[8], d=m[1],e2=m[5],f2=m[9], g2=m[2],h=m[6],i2=m[10];
+            float det=a*(e2*i2-f2*h)-b*(d*i2-f2*g2)+c*(d*h-e2*g2); float id=(std::fabs(det)>1e-12f)?1.f/det:0.f;
+            o[0]=(e2*i2-f2*h)*id; o[4]=(c*h-b*i2)*id; o[8]=(b*f2-c*e2)*id;
+            o[1]=(f2*g2-d*i2)*id; o[5]=(a*i2-c*g2)*id; o[9]=(c*d-a*f2)*id;
+            o[2]=(d*h-e2*g2)*id;  o[6]=(b*g2-a*h)*id;  o[10]=(a*e2-b*d)*id;
+            o[3]=o[7]=o[11]=0.f; o[15]=1.f;
+            o[12]=-(o[0]*m[12]+o[4]*m[13]+o[8]*m[14]);
+            o[13]=-(o[1]*m[12]+o[5]*m[13]+o[9]*m[14]);
+            o[14]=-(o[2]*m[12]+o[6]*m[13]+o[10]*m[14]); };
+        bool ibmBind = false; std::vector<float> ibmBW;   // per-joint bindWorld' = inv(IBM_j)
+        if (sk.ibm.size() >= (size_t)nj*16 && !std::getenv("HSR_NOIBMBIND")) {
+            float maxDev = 0.f;
+            for (int j = 0; j < nj; ++j) {
+                float bw[16]; worldM(bindNodes, sk.joints[j], bw);
+                float R[16]; mulM(bw, &sk.ibm[(size_t)j*16], R);
+                for (int k=0;k<16;k++){ float id=(k%5==0)?1.f:0.f; float dv=std::fabs(R[k]-id); if (dv>maxDev) maxDev=dv; }
+            }
+            if (maxDev > 1e-3f) {
+                ibmBind = true; ibmBW.resize((size_t)nj*16);
+                for (int j = 0; j < nj; ++j) affInv(&sk.ibm[(size_t)j*16], &ibmBW[(size_t)j*16]);
+                if (std::getenv("HSR_VERBOSE"))
+                    fprintf(stderr, "[HZIBM] mesh %d: PER-JOINT IBM bind (max node-bind deviation %.2f) — shipping inv(IBM) binds\n", meshIdx, maxDev);
+            }
+        }
         for (int j = 0; j < nj; ++j) {
             int n = sk.joints[j];
             int pj = hzHier ? parentJointOf(bindNodes, n) : -1;
             float lm[16];
-            if (hzHier && pj >= 0) localRelToParentJoint(bindNodes, n, sk.joints[pj], lm);   // LOCAL bind relative to parent JOINT
+            if (ibmBind) {
+                if (hzHier && pj >= 0) { float pinv[16]; affInv(&ibmBW[(size_t)pj*16], pinv); mulM(pinv, &ibmBW[(size_t)j*16], lm); }   // local = inv(B_parent)·B_j
+                else memcpy(lm, &ibmBW[(size_t)j*16], 64);
+            }
+            else if (hzHier && pj >= 0) localRelToParentJoint(bindNodes, n, sk.joints[pj], lm);   // LOCAL bind relative to parent JOINT
             else worldM(bindNodes, n, lm);                                                   // root: full world transform
             float q[4], t[3], s[3]; matTrs(lm, q, t, s);
             e.parents[j] = pj;
@@ -1481,7 +1528,7 @@ public:
         // s=1, mesh verts in giant cm-ish units, IBM carries the shrink) -> the cooked fish skinned HUGE.
         // Fold the residual R = bindWorld_j·IBM_j (a GLOBAL conversion, same for every joint) into the
         // REST VERTS: v' = R·v, so shippedSkin(t)·v' == sourceSkin(t)·v exactly.
-        if (sk.ibm.size() >= (size_t)nj*16) {
+        if (sk.ibm.size() >= (size_t)nj*16 && !ibmBind) {   // GLOBAL residual fold — superseded by the per-joint IBM bind above
             float bw[16]; worldM(bindNodes, sk.joints[0], bw);
             float R[16]; mulM(bw, &sk.ibm[0], R);
             float dev=0.f; for (int k=0;k<16;k++){ float id=(k%5==0)?1.f:0.f; float d=std::fabs(R[k]-id); if(d>dev)dev=d; }
