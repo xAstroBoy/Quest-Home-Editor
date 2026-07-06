@@ -114,6 +114,45 @@ struct Editor {
             closesocket(s);
         }).detach();
     }
+    // ── QUEST PLAYER CONTROL: live-track the headset player + drag it around (with gravity OFF so it
+    //    holds height instead of falling+resetting). Drives the AIO bridge: `nogravity`/`warp`/`rot`/`playerpos`.
+    bool   trackPlayer   = false;        // poll playerpos + show the player marker/gizmo in the viewport
+    bool   playerNoGrav  = false;        // "No gravity" toggle (mirrors the device `nogravity` flag)
+    bool   playerDrag    = false;        // dragging the player marker (XZ ground / height / yaw)
+    int    playerDragMode= 0;            // 0=XZ ground, 1=height (Y), 2=yaw
+    float  pdMx0=0, pdMy0=0, pdY0=0, pdYaw0=0;   // drag anchors (mouse + value at press)
+    float  gzPlayerC[2]={0,0}, gzPlayerUp[2]={0,0}, gzPlayerYawTip[2]={0,0}; bool gzPlayerVis=false;   // cached screen handles
+    float  questPlayerPos[3]  = {0,0,0}; // device player FEET (world)
+    float  questPlayerHead[3] = {0,0,0}; // device head/eye (world)
+    float  questPlayerYaw = 0.f;         // commanded facing yaw (radians)
+    int    questPlayerDev = -1;          // device nograv state readback (-1 unknown, 0/1)
+    double lastPlayerQueryMs = 0.0;
+    double lastPlayerSendMs  = 0.0;
+    // Poll the device player pose (`playerpos` -> "head=..x,y,z.. feet=..x,y,z.. nograv=N").
+    void pollQuestPlayer() {
+        std::thread([this]{
+            SOCKET s = socket(AF_INET, SOCK_STREAM, 0); if (s == INVALID_SOCKET) return;
+            hsrSockTimeoutMs(s, 300);
+            sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(27042); a.sin_addr.s_addr=inet_addr("127.0.0.1");
+            if (connect(s,(sockaddr*)&a,sizeof a)==0) {
+                const char* c="playerpos\n"; send(s,c,10,0);
+                char rb[512]; int n=recv(s,rb,sizeof rb-1,0);
+                if (n>0) { rb[n]=0;
+                    const char* pf=strstr(rb,"feet="); if (pf){ float x,y,z; if(sscanf(pf+5,"%f,%f,%f",&x,&y,&z)==3){ questPlayerPos[0]=x; questPlayerPos[1]=y; questPlayerPos[2]=z; } }
+                    const char* ph=strstr(rb,"head="); if (ph){ float x,y,z; if(sscanf(ph+5,"%f,%f,%f",&x,&y,&z)==3){ questPlayerHead[0]=x; questPlayerHead[1]=y; questPlayerHead[2]=z; } }
+                    const char* pn=strstr(rb,"nograv="); if (pn) questPlayerDev = atoi(pn+7);
+                }
+            }
+            closesocket(s);
+        }).detach();
+    }
+    // Send the device player to a world pos (gravity-defying when playerNoGrav) — `warp x y z [yaw]`.
+    void sendPlayerWarp(float x, float y, float z) {
+        char b[96]; snprintf(b,sizeof b,"warp %.3f %.3f %.3f %.4f", x,y,z, questPlayerYaw);
+        sendQuestCmd(b); questPlayerPos[0]=x; questPlayerPos[1]=y; questPlayerPos[2]=z;
+    }
+    void sendPlayerYaw(float yaw) { questPlayerYaw=yaw; char b[48]; snprintf(b,sizeof b,"rot %.4f", yaw); sendQuestCmd(b); }
+    void sendPlayerNoGravity(bool on) { playerNoGrav=on; sendQuestCmd(on?"nogravity 1":"nogravity 0"); }
     double nowMs() { return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     std::vector<MeshData>* sceneMeshes = nullptr;                                  // CPU geometry for Cook
     std::function<std::vector<float>(int,int,int&)> vatBaker;                      // V79 VAT bake hook
@@ -3406,7 +3445,11 @@ struct Editor {
             if (b==0 && in3D && exitHVis && !editExit && selItem>=0 && selItem<(int)items.size() && items[selItem].type==sitem::CHAIR) {   // chair exit handle (square drag; off when the gizmo edits it)
                 float dx=cx.in.mx-exitHS[0], dy=cx.in.my-exitHS[1]; if (dx*dx+dy*dy < 196.f*uiScale*uiScale) exitDrag=true;
             }
-            if (b == 0 && gzVisible && in3D && !exitDrag) {     // gizmo handle hit-test (cached screen positions)
+            if (b==0 && in3D && trackPlayer && gzPlayerVis && !exitDrag) {   // Quest player marker handles take priority when tracking
+                int ph = playerGizmoHit(cx.in.mx, cx.in.my);
+                if (ph>=0) { playerDrag=true; playerDragMode=ph; pdMx0=(float)cx.in.mx; pdMy0=(float)cx.in.my; pdY0=questPlayerPos[1]; pdYaw0=questPlayerYaw; }
+            }
+            if (b == 0 && gzVisible && in3D && !exitDrag && !playerDrag) {     // gizmo handle hit-test (cached screen positions)
                 int hit = gizmoHitTest(cx.in.mx, cx.in.my);
                 if (hit >= 0) {
                     if (sliceGizmoOn && selItem<0) { gizmoDrag=true; gizmoAxis=hit; gizmoSel.clear(); }          // dragging the SLICE PLANE (no undo capture needed)
@@ -3418,7 +3461,9 @@ struct Editor {
             if (b==0 && in3D && !gizmoDrag && !exitDrag && (cx.in.ctrl||cx.in.shift)) { boxSel=true; boxX0=(float)cx.in.mx; boxY0=(float)cx.in.my; }
         } else if (action == GLFW_RELEASE) {
             cx.in.down[b] = false; cx.in.released[b] = true;
+            bool wasPlayer = playerDrag; if (b==0) playerDrag=false;   // player-marker drag: consume the release (no mesh pick)
             bool wasExit = exitDrag; if (b==0) exitDrag=false;
+            if (b==0 && wasPlayer) return;   // don't fall through to gizmo/pick handling
             bool wasBox = (b==0)&&boxSel; if (b==0) boxSel=false;
             if (b == 0 && gizmoDrag) {
                 if (gizmoSel.empty() && !itemsBeforeDrag.empty()) { pushItemUndo(std::move(itemsBeforeDrag)); itemsBeforeDrag.clear(); }   // item drag -> item undo
@@ -3573,7 +3618,7 @@ struct Editor {
     int winW() const { int w=0,h=0; glfwGetWindowSize(win,&w,&h); return w; }
     int winH() const { int w=0,h=0; glfwGetWindowSize(win,&w,&h); return h; }
     // main gates camera/WASD on these
-    bool wantsMouse() const { return ctxOpen || knifeOn || cx.active!=0 || cx.kbFocus!=0 || gizmoDrag || exitDrag || boxSel || dragSplit!=0 || !inRect(rcViewport, cx.in.mx, cx.in.my); }
+    bool wantsMouse() const { return ctxOpen || knifeOn || cx.active!=0 || cx.kbFocus!=0 || gizmoDrag || exitDrag || playerDrag || boxSel || dragSplit!=0 || !inRect(rcViewport, cx.in.mx, cx.in.my); }
     bool wantsKeyboard() const { return cx.kbFocus != 0; }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -3651,7 +3696,9 @@ struct Editor {
             auto& it=items[selItem]; float planeY=it.pos[1]+it.exitPos[1], g[3];       // keep exitPos[1] (height = numeric box, drag/type)
             if (screenToGround(cx.in.mx,cx.in.my,planeY,g)) { it.exitPos[0]=g[0]-it.pos[0]; it.exitPos[2]=g[2]-it.pos[2]; }
         }
+        updatePlayerDrag();      // apply a live player-marker drag (before drawing so the marker follows the cursor)
         drawGizmo();
+        drawPlayerGizmo();       // live Quest player marker + drag handles (Track Player)
         if (boxSel) {   // rubber-band selection rectangle (Ctrl/Shift + left-drag)
             VkRect2D vp=rcViewport; dl.pushClip((float)vp.offset.x,(float)vp.offset.y,(float)vp.extent.width,(float)vp.extent.height);
             float x0=std::min(boxX0,(float)cx.in.mx), y0=std::min(boxY0,(float)cx.in.my), x1=std::max(boxX0,(float)cx.in.mx), y1=std::max(boxY0,(float)cx.in.my);
@@ -4415,6 +4462,44 @@ struct Editor {
           cx.checkbox(ui::hashId("gzAnim"), x, y, "Hide ANIMATED meshes (Ctrl+H)", ae);
           if (ae!=animEyeOn) toggleAnimatedEye(); }
         y+=rh+6*uiScale;
+        dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
+        // ── PLAYER (QUEST) — live-track the headset player + drag its marker to teleport it on-device. Turn
+        //    "No gravity" ON so the player HOLDS the dragged height instead of falling + resetting to spawn
+        //    (drives the AIO bridge: nogravity / warp / rot). Needs the patched vrshell + adb forward. ──
+        cx.label(x,y,w,rh,"Player (Quest)",th.text); y+=rh+2*uiScale;
+        { bool tp0=trackPlayer;
+          cx.checkbox(ui::hashId("plTrack"), x, y, "Track player  (live marker + drag)", trackPlayer); y+=rh;
+          if (trackPlayer!=tp0) {
+#ifdef _WIN32
+              if (trackPlayer) system("adb forward tcp:27042 tcp:27042 >nul 2>&1");
+#else
+              if (trackPlayer) system("adb forward tcp:27042 tcp:27042 >/dev/null 2>&1");
+#endif
+              if (trackPlayer) pollQuestPlayer();
+          }
+          bool ng0=playerNoGrav;
+          cx.checkbox(ui::hashId("plNoGrav"), x, y, "No gravity  (hold height, no fall/reset)", playerNoGrav); y+=rh;
+          if (playerNoGrav!=ng0) sendPlayerNoGravity(playerNoGrav);
+          char pb[96];
+          snprintf(pb,sizeof pb,"pos %.2f, %.2f, %.2f", questPlayerPos[0],questPlayerPos[1],questPlayerPos[2]);
+          cx.label(x,y,w,rh*0.9f,pb,th.textDim); y+=rh*0.9f;
+          snprintf(pb,sizeof pb,"yaw %.0f deg   device no-gravity: %s", questPlayerYaw*57.2958f,
+                   questPlayerDev<0?"?":(questPlayerDev?"ON":"off"));
+          cx.label(x,y,w,rh*0.9f,pb,th.textDim); y+=rh+2*uiScale;
+          float bw2=(w-8*uiScale)/2;
+          if (cx.button(ui::hashId("plToCam"), x, y, bw2, rh, "Teleport to camera")) {
+              questPlayerPos[0]=r->cam.pos[0]; questPlayerPos[1]=r->cam.pos[1]-1.6f; questPlayerPos[2]=r->cam.pos[2];   // feet ~1.6m below the eye
+              questPlayerYaw=r->cam.yaw; sendPlayerWarp(questPlayerPos[0],questPlayerPos[1],questPlayerPos[2]); sendPlayerYaw(questPlayerYaw);
+              if (!trackPlayer){ trackPlayer=true;
+#ifdef _WIN32
+                  system("adb forward tcp:27042 tcp:27042 >nul 2>&1");
+#else
+                  system("adb forward tcp:27042 tcp:27042 >/dev/null 2>&1");
+#endif
+              } }
+          if (cx.button(ui::hashId("plReset"), x+bw2+6*uiScale, y, bw2, rh, "Warp to spawn")) { sendPlayerWarp(0,0,0); }
+          y+=rh+6*uiScale;
+        }
         dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
         // ── LIGHTING — global light manipulation (multiplies every draw's color; live, persisted, ships in session) ──
         cx.label(x,y,w,rh,"Lighting  (global, live)",th.text); y+=rh+2*uiScale;
@@ -5440,6 +5525,70 @@ struct Editor {
         float dx=bx-ax,dy=by-ay,l2=dx*dx+dy*dy; if(l2<1e-6f) return std::hypot(px-ax,py-ay);
         float t=std::clamp(((px-ax)*dx+(py-ay)*dy)/l2,0.f,1.f);
         return std::hypot(px-(ax+t*dx), py-(ay+t*dy));
+    }
+    // ── QUEST PLAYER GIZMO: a live marker at the headset player's world pos with three drag handles —
+    //    center square = move on the GROUND plane (XZ), up-arrow = height (Y), yaw-arrow = facing. Dragging
+    //    drives the device over the bridge (`warp`/`rot`). Self-contained (own hit-test) so it never fights
+    //    the mesh/item gizmo. Needs the AIO bridge live (adb forward tcp:27042) + Track Player on.
+    int playerGizmoHit(float mx, float my) {
+        if (!gzPlayerVis) return -1;
+        float r2=13*uiScale*13*uiScale;
+        auto hitH=[&](const float* h){ float dx=mx-h[0], dy=my-h[1]; return dx*dx+dy*dy<=r2; };
+        if (hitH(gzPlayerYawTip)) return 2;   // yaw arrow first (sits at the rim)
+        if (hitH(gzPlayerUp))     return 1;   // height
+        if (hitH(gzPlayerC))      return 0;   // ground move (center)
+        return -1;
+    }
+    void drawPlayerGizmo() {
+        gzPlayerVis=false;
+        if (!trackPlayer) return;
+        // poll the device pose ~5 Hz while NOT dragging (dragging owns the position locally)
+        if (!playerDrag) { double now=nowMs(); if (now-lastPlayerQueryMs>200.0){ lastPlayerQueryMs=now; pollQuestPlayer(); } }
+        float feet[3]={questPlayerPos[0],questPlayerPos[1],questPlayerPos[2]};
+        float head=questPlayerHead[1]>feet[1]?questPlayerHead[1]:feet[1]+1.6f;   // stature line
+        float cs[2]; if(!worldToScreen(feet,cs[0],cs[1])) { return; }
+        gzPlayerC[0]=cs[0]; gzPlayerC[1]=cs[1];
+        dl.pushClip((float)rcViewport.offset.x,(float)rcViewport.offset.y,(float)rcViewport.extent.width,(float)rcViewport.extent.height);
+        uint32_t colBody = playerNoGrav ? ui::rgba(120,210,255) : ui::rgba(255,190,90);   // cyan when no-gravity, amber otherwise
+        // stature line feet->head
+        float hp[3]={feet[0],head,feet[2]}, hs[2];
+        if (worldToScreen(hp,hs[0],hs[1])) dl.line(cs[0],cs[1],hs[0],hs[1], ui::withA(colBody,180), 2.f);
+        // ground ring (radius ~0.4m in world) for depth
+        for (int s=0;s<24;s++){ float a0=s/24.f*6.2831853f,a1=(s+1)/24.f*6.2831853f;
+            float w0[3]={feet[0]+0.4f*std::cos(a0),feet[1],feet[2]+0.4f*std::sin(a0)};
+            float w1[3]={feet[0]+0.4f*std::cos(a1),feet[1],feet[2]+0.4f*std::sin(a1)};
+            float s0[2],s1[2]; if(worldToScreen(w0,s0[0],s0[1])&&worldToScreen(w1,s1[0],s1[1])) dl.line(s0[0],s0[1],s1[0],s1[1], ui::withA(colBody,150),1.5f); }
+        // facing arrow (yaw): device yaw 0 faces -Z (game convention); rotate around Y
+        float fwd[3]={ std::sin(questPlayerYaw)*0.9f, 0.f, -std::cos(questPlayerYaw)*0.9f };
+        float ft[3]={feet[0]+fwd[0],feet[1],feet[2]+fwd[2]}, fts[2];
+        bool yhot=(playerGizmoHit((float)cx.in.mx,(float)cx.in.my)==2)||(playerDrag&&playerDragMode==2);
+        if (worldToScreen(ft,fts[0],fts[1])) { gzPlayerYawTip[0]=fts[0]; gzPlayerYawTip[1]=fts[1];
+            dl.line(cs[0],cs[1],fts[0],fts[1], yhot?ui::rgba(255,235,80):ui::rgba(96,210,96), yhot?3.f:2.f);
+            float hs2=6*uiScale; dl.triangle(fts[0]-hs2,fts[1]+hs2, fts[0]+hs2,fts[1]+hs2, fts[0],fts[1]-hs2*1.4f, yhot?ui::rgba(255,235,80):ui::rgba(96,210,96)); }
+        // height handle (up) at head height
+        float up[3]={feet[0],head+0.3f,feet[2]}, ups[2];
+        bool uhot=(playerGizmoHit((float)cx.in.mx,(float)cx.in.my)==1)||(playerDrag&&playerDragMode==1);
+        if (worldToScreen(up,ups[0],ups[1])) { gzPlayerUp[0]=ups[0]; gzPlayerUp[1]=ups[1];
+            dl.line(hs[0],hs[1],ups[0],ups[1], uhot?ui::rgba(255,235,80):ui::rgba(80,130,245), uhot?3.f:2.f);
+            float hs2=6*uiScale; dl.rect(ups[0]-hs2,ups[1]-hs2,hs2*2,hs2*2, uhot?ui::rgba(255,235,80):ui::rgba(80,130,245)); }
+        // center (ground-move) square
+        bool chot=(playerGizmoHit((float)cx.in.mx,(float)cx.in.my)==0)||(playerDrag&&playerDragMode==0);
+        float cps=chot?7*uiScale:5*uiScale;
+        dl.rect(cs[0]-cps,cs[1]-cps,cps*2,cps*2, chot?ui::rgba(255,235,80):colBody);
+        dl.border(cs[0]-cps,cs[1]-cps,cps*2,cps*2, ui::rgba(20,20,20),1.5f);
+        cx.textAligned(cs[0]+cps+3, cs[1]-8*uiScale, 120*uiScale,16*uiScale, playerNoGrav?"PLAYER (no-gravity)":"PLAYER", colBody, 0);
+        gzPlayerVis=true;
+        dl.popClip();
+    }
+    // per-frame drag apply (called from the frame loop when playerDrag)
+    void updatePlayerDrag() {
+        if (!playerDrag || !trackPlayer || !cx.in.down[0]) return;
+        if (playerDragMode==0) { float g[3]; if (screenToGround((float)cx.in.mx,(float)cx.in.my,questPlayerPos[1],g)){ questPlayerPos[0]=g[0]; questPlayerPos[2]=g[2]; } }
+        else if (playerDragMode==1) { questPlayerPos[1] = pdY0 + (pdMy0-(float)cx.in.my)*0.02f; }          // drag up = higher
+        else if (playerDragMode==2) { questPlayerYaw = pdYaw0 + ((float)cx.in.mx-pdMx0)*0.01f; }            // drag right = turn
+        double now=nowMs(); if (now-lastPlayerSendMs>60.0){ lastPlayerSendMs=now;
+            if (playerDragMode==2) sendPlayerYaw(questPlayerYaw);
+            else sendPlayerWarp(questPlayerPos[0],questPlayerPos[1],questPlayerPos[2]); }
     }
     void drawGizmo() {
         gzVisible = false;
