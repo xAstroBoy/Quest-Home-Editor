@@ -933,9 +933,19 @@ inline std::string templateJson(const std::string& entities, const std::string& 
 // ScenePlatformComponent (the far-clip-plane config that drives the main-view projection) lives HERE in space.hstf,
 // as a sibling of the content-ref "Root" entity — NOT in content.hstf. Cooking it into content.hstf left it never
 // applied (far stayed at the shell default → distant geometry far-clipped = the "black dome"). farP<=0 disables.
-inline std::string spaceJson(CookRng& r, const std::string& name, const AssetKey3& contentRef, float farP) {
+inline std::string spaceJson(CookRng& r, const std::string& name, const AssetKey3& contentRef, float farP,
+                             const AssetKey3* hpiRef = nullptr) {
     std::string rootId = makeUuid(r);
     std::string contentEnt = std::string("{\"id\":\"") + rootId + "\",\"name\":\"" + name + "\",\"type\":" + refJson(contentRef) + ",\"deltas\":[],\"attributes\":[]}";
+    // HAVEN-EXACT: hpi entities (wall placements) live in a SEPARATE template, instantiated here as its OWN
+    // instance ("Shell Locators") — sibling of the content instance. In haven the hpi EnvironmentSystem query
+    // only picks up wall placements that arrive via this distinct instance; bundling them into content.hstf left
+    // them unregistered (never showed on device). [[project_hsr_wallplacement_localtransform]]
+    std::string hpiEnt, hpiRootId;
+    if (hpiRef) {
+        hpiRootId = makeUuid(r);
+        hpiEnt = std::string("{\"id\":\"") + hpiRootId + "\",\"name\":\"Shell Locators\",\"type\":" + refJson(*hpiRef) + ",\"deltas\":[],\"attributes\":[]}";
+    }
     std::string ent, rels;
     if (farP > 0.f) {
         // ⛔ DEVICE-VERIFIED STRUCTURE (official calming space.hstf, 2026-06-18) — the head-locked far-clip-plane fix.
@@ -948,8 +958,10 @@ inline std::string spaceJson(CookRng& r, const std::string& name, const AssetKey
         std::string sceneId = makeUuid(r);
         ent  = sceneEntityJson(sceneId, 0.1f, farP) + "," + contentEnt;   // Scene = entity[0] = root (its ScenePlatformComponent IS applied)
         rels = relChildOf(rootId, sceneId);                               // content-ref ChildOf Scene
+        if (hpiRef) { ent += "," + hpiEnt; rels += "," + relChildOf(hpiRootId, sceneId); }   // Shell Locators = 2nd instance under Scene
     } else {
         ent = contentEnt;
+        if (hpiRef) { ent += "," + hpiEnt; rels += (rels.empty()?"":",") + relChildOf(hpiRootId, rootId); }
     }
     return templateJson(ent, rels);
 }
@@ -3761,6 +3773,12 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     // ── editor-authored scene items -> the EXACT haven2025 component entities (spawn/chair/box/wall/hotspot).
     //    NAVMESH items are PhysX-cooked separately (below). Each becomes a child of Root. ──
     int userLocalSpawn = 0, sidx = 700000;
+    // HAVEN-EXACT: wall placements (hpi entities) accumulate into a SEPARATE template ("hpi_locators.hstf"),
+    // instantiated by space.hstf as its own "Shell Locators" instance — NOT inlined in content.hstf (which left
+    // them unregistered on device). HSR_WALLINLINE reverts to the old inline behavior for A/B testing.
+    std::string hpiEntities, hpiRels, hpiRootId;
+    const bool wallInline = std::getenv("HSR_WALLINLINE") != nullptr;
+    int wallRankCtr = 0;   // per-wall-placement propRank (0,1,2,...) so `pinwall <app> <rank>` addresses each wall
     for (const auto& si : sceneItems) {
         if (si.type == sitem::NAVMESH) continue;
         // SAFETY: a CHAIR's chair_location locator makes the HomeLocomotionSystem build a chair-button that DEREFERENCES
@@ -3777,11 +3795,21 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // at the spawn Y). The editor places/draws the spawn at FLOOR level, so raise the emitted Y by eye height (1.6,
         // the same constant the editor preview uses: eye = pos + 1.6) → the player's feet land on the placed floor.
         sitem::Item si2 = si; if (si.type == sitem::SPAWN) si2.pos[1] += 1.6f;
-        std::string ej = (si.type == sitem::HOTSPOT && iconOk) ? sitem::itemEntityJson(si2, sidx, refJson(icMeshK))
-                                                               : sitem::itemEntityJson(si2, sidx);
+        // HOTSPOT (visible dot) AND WALLPLACE (INVISIBLE placeholder mesh) both need the icon-mesh ref: the wall
+        // placement is dropped by the device without a MeshPlatformComponent (see scene_items.h WALLPLACE).
+        int wallRank = (si.type == sitem::WALLPLACE) ? wallRankCtr++ : 0;   // unique rank per wall placement
+        std::string ej = ((si.type == sitem::HOTSPOT || si.type == sitem::WALLPLACE) && iconOk)
+                             ? sitem::itemEntityJson(si2, sidx, refJson(icMeshK), wallRank)
+                             : sitem::itemEntityJson(si2, sidx);
         if (ej.empty()) continue;
         ++sidx;
-        entities += "," + ej; rels += "," + relChildOf(iid, rootId);
+        if (si.type == sitem::WALLPLACE && !wallInline) {
+            // -> the SEPARATE hpi_locators template (its own Root), instantiated as "Shell Locators" in space.hstf.
+            if (hpiRootId.empty()) { hpiRootId = sitem::uuid(990000); hpiEntities = rootEntityJson(hpiRootId); }
+            hpiEntities += "," + ej; hpiRels += (hpiRels.empty() ? std::string() : std::string(",")) + relChildOf(iid, hpiRootId);
+        } else {
+            entities += "," + ej; rels += "," + relChildOf(iid, rootId);
+        }
         // CHAIR: the chair-button NEEDS a "ChairIcon" CHILD carrying the stolen mesh (at the seat 0,0.25,0) or the
         // HomeLocomotionSystem update (sub_F78760) null-derefs the icon mesh and CRASHES. This is the recipe that makes
         // the chairs INTERACTABLE (DEVICE-PROVEN). The chair-button only warps you to the ChairIcon (no real sit).
@@ -3940,6 +3968,15 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     std::string pContent = MH + "/content.hstf/template", pSpace = MH + "/space.hstf/template";
     AssetKey3 contentK = keyForPath(pContent), spaceK = keyForPath(pSpace);
     std::string content = templateJson(entities, rels);
+    // HAVEN-EXACT hpi template: wall placements collected above go in their OWN template asset (hpi_locators.hstf),
+    // instantiated as a 2nd "Shell Locators" instance in space.hstf (see spaceJson). Empty -> no hpi instance.
+    AssetKey3 hpiK{}; bool haveHpi = !hpiEntities.empty();
+    if (haveHpi) {
+        std::string pHpi = MH + "/hpi_locators.hstf/template"; hpiK = keyForPath(pHpi);
+        std::string hpiTpl = templateJson(hpiEntities, hpiRels);
+        assets.push_back({ pHpi, TGT_TEMPLATE, jbytes(hpiTpl), hpiK });
+        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] hpi_locators.hstf -> separate template instance ('Shell Locators') for wall placements\n");
+    }
     // Far clip plane (ScenePlatformComponent v3) goes in space.hstf — vista-proven the shell only applies it there.
     // V79 envs ship NO ScenePlatformComponent, so on V205 they fall back to the shell's SMALL default far and
     // distant geometry clips (the cyberhome "far plane showing up"). We AUTO-SIZE the far to the scene's own
@@ -3952,7 +3989,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     float farP = 150000.0f;
     if (const char* fc = std::getenv("HSR_FARCLIP")) farP = (float)atof(fc);
     fprintf(stderr, "[EXPORT] farClippingPlane=%.0f (MAX every bake; set HSR_FARCLIP to override)\n", farP);
-    std::string space   = spaceJson(rng, "home_c25", contentK, farP);   // space display name = stock package (cosmetic)
+    std::string space   = spaceJson(rng, "home_c25", contentK, farP, haveHpi ? &hpiK : nullptr);   // space display name = stock package (cosmetic)
     auto shellcfg = jbytes(shellConfigJson(spaceK, locomotion));
     assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
     assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });

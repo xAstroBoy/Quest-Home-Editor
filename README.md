@@ -37,6 +37,11 @@ A GPU with **Vulkan** support is required on every OS (macOS via MoltenVK, which
 4. Put the headset on. Done — on a non-rooted Quest the port loads **in place of Haven 2025**
    (the original is backed up first; `--restore-haven` puts it back anytime).
 
+> ⚠️ **Give the home something to stand on.** A port needs **at least one collider** or the player
+> falls through the floor forever. Easiest: leave **Auto floor collision** on (Cook tab, default).
+> Otherwise place a **Navmesh** or **Box collider** (Scene tab → **+ Add**). If a cook would ship
+> **zero** collision, the editor warns you before it starts.
+
 Full walkthrough: **[Installation & Setup](../../wiki/Installation-and-Setup)** →
 **[Cooking a Home](../../wiki/Cooking-a-Home)**.
 

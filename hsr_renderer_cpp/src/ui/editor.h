@@ -129,10 +129,10 @@ struct Editor {
     bool   questPlayerFaceOk = false;    // face= was reported (env rendering)
     int    questPlayerDev = -1;          // device nograv state readback (-1 unknown, 0/1)
     // ── PERSISTENT player-control channel (the "gizmo laggy" fix): ONE kept-open socket + a worker thread.
-    //    The UI coalesces the latest warp/rot into pcSend; the worker streams it + polls playerpos over the
+    //    The UI queues warp/rot into pcQ (same-verb spam coalesces); the worker streams them + polls playerpos over the
     //    same socket at ~60 Hz = NO per-drag connect/recv round-trip. Reconnects if the socket drops. ──
     std::thread pcThread; std::atomic<bool> pcRun{false};
-    std::mutex  pcMx; std::string pcSend;   // latest command (overwrite = coalesce drag spam)
+    std::mutex  pcMx; std::vector<std::string> pcQ;   // pending commands; consecutive SAME-verb entries coalesce (drag spam)
     void ensureAdbForward() {
 #ifdef _WIN32
         system("adb forward tcp:27042 tcp:27042 >nul 2>&1");
@@ -140,7 +140,15 @@ struct Editor {
         system("adb forward tcp:27042 tcp:27042 >/dev/null 2>&1");
 #endif
     }
-    void pcQueue(const std::string& c){ std::lock_guard<std::mutex> l(pcMx); pcSend=c; }
+    // Queue a device command. Consecutive commands with the SAME verb (e.g. a burst of drag "warp"s or "rot"s)
+    // coalesce to the latest so a fast drag doesn't back up the socket; DISTINCT verbs (warp then rot, or
+    // nogravity then warp) are ALL preserved — that's the "teleport doesn't always work" fix: a Teleport-to-cam
+    // that queues warp+rot no longer has the rot clobber the warp before the worker sends it.
+    void pcQueue(const std::string& c){
+        std::lock_guard<std::mutex> l(pcMx);
+        auto verb=[](const std::string& s){ size_t sp=s.find(' '); return sp==std::string::npos? s : s.substr(0,sp); };
+        if (!pcQ.empty() && verb(pcQ.back())==verb(c)) pcQ.back()=c; else pcQ.push_back(c);
+    }
     static int pcRecvLine(SOCKET s, char* buf, int cap){ int n=0; char ch;
         while (n<cap-1){ int r=recv(s,&ch,1,0); if(r<=0) return n>0?n:-1; if(ch=='\n') break; buf[n++]=ch; } buf[n]=0; return n; }
     void parsePlayerpos(const char* rb){
@@ -160,9 +168,12 @@ struct Editor {
                         sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(27042); a.sin_addr.s_addr=inet_addr("127.0.0.1");
                         if (connect(s,(sockaddr*)&a,sizeof a)!=0){ closesocket(s); s=INVALID_SOCKET; } }
                     if (s==INVALID_SOCKET){ std::this_thread::sleep_for(std::chrono::milliseconds(300)); continue; } }
-                // 1) flush the latest queued command (coalesced)
-                std::string c; { std::lock_guard<std::mutex> l(pcMx); c.swap(pcSend); }
-                if (!c.empty()){ c+="\n"; if (send(s,c.c_str(),(int)c.size(),0)<=0 || pcRecvLine(s,rb,sizeof rb)<0){ closesocket(s); s=INVALID_SOCKET; continue; } }
+                // 1) flush ALL pending commands in order (distinct verbs preserved; same-verb spam pre-coalesced)
+                std::vector<std::string> batch; { std::lock_guard<std::mutex> l(pcMx); batch.swap(pcQ); }
+                bool sockDead=false;
+                for (auto& cmd : batch){ std::string c=cmd+"\n";
+                    if (send(s,c.c_str(),(int)c.size(),0)<=0 || pcRecvLine(s,rb,sizeof rb)<0){ closesocket(s); s=INVALID_SOCKET; sockDead=true; break; } }
+                if (sockDead) continue;
                 // 2) poll the pose ~6 Hz on the SAME socket
                 double now=nowMs(); if (now-lastPoll>160.0){ lastPoll=now;
                     if (send(s,"playerpos\n",10,0)<=0){ closesocket(s); s=INVALID_SOCKET; continue; }
@@ -3372,6 +3383,15 @@ struct Editor {
     bool autoSign = true, spoofHaven = true;
     bool cookAudio = true;             // DEFAULT ON: bake the env's background audio loop into the cooked APK. Toggle off = silent home.
     bool cookAutoFloor = true;         // DEFAULT ON: when NO Navmesh item exists, the cook generates a walkable floor (ColliderBox grid / disk). OFF = ship ZERO generated collision (the "invisible wall I never placed").
+    bool cookWarnOpen = false;         // pre-cook "no collision" confirmation modal is showing (blocks the frame's other input while up)
+    // A cook has collision the player can stand on IF: the auto-floor is on, OR the user placed a Navmesh (walkable
+    // mesh) or a Box collider. WITHOUT any of these the port ships zero collision — the player falls through forever
+    // and respawns at the void floor. This gates the pre-cook warning + is the truth the wiki/README point at.
+    bool envHasCollision() const {
+        if (cookAutoFloor) return true;
+        for (const auto& it : items) if (it.type == sitem::NAVMESH || it.type == sitem::BOXCOL) return true;
+        return false;
+    }
     bool previewAudio = true;          // DEFAULT ON: play the env's background loop HERE on the PC while previewing. Toggle off = mute desktop playback (drives g_audioMuted).
     bool solidCollision = true;        // DEFAULT ON: cook a REAL double-sided trimesh collider (floor+walls+columns, haven2025 SEBD format). Off = floor-only ColliderBox grid.
     bool prevSolidCol = true;          // tracks solidCollision so the navmesh gizmo re-bakes (walls appear/vanish in the preview) when it's toggled.
@@ -3710,6 +3730,10 @@ struct Editor {
         r->uiViewportRect = rcViewport;                         // the 3D scene scissors to the Viewport pane
         dl.begin(fbW, fbH, &font, uiDraw.whiteU, uiDraw.whiteV);
         cx.dl = &dl; cx.hot = 0;                                // hot recomputed each frame
+        // MODAL INPUT LOCK: while the pre-cook warning is up, park the mouse off-screen so NOTHING under the scrim
+        // hovers/clicks (immediate-mode widgets gate all interaction on hover). Restored just before the modal draws.
+        float savedMx=cx.in.mx, savedMy=cx.in.my;
+        if (cookWarnOpen) { cx.in.mx = cx.in.my = -1e5f; }
         // NOTE: do NOT fill the whole window — the 3D scene shows through rcViewport; each panel paints its
         // own opaque background and the layout tiles the rest, so the viewport pane stays the live 3D view.
         drawViewportOverlay();
@@ -3751,6 +3775,7 @@ struct Editor {
         drawSliceOverlay();                                     // slice gizmo: plane quad + LIVE glowing cut line
         drawKnifeOverlay();                                     // knife: the 2D stroke line while dragging
         drawKeybindsPanel();                                    // F1 overlay: every shortcut in one place
+        if (cookWarnOpen) { cx.in.mx=savedMx; cx.in.my=savedMy; drawCookWarn(); }   // restore mouse for the modal only
         cx.drawTooltip();                                       // deferred hover tooltips — drawn ABOVE everything
         cx.in.newFrame();                                       // consume per-frame input edges/deltas
     }
@@ -4072,6 +4097,36 @@ struct Editor {
     }
 
     void record(VkCommandBuffer cmd) { uiDraw.record(cmd, dl); }
+
+    // ── Pre-cook "no collision" warning modal. Fires from startCook() when envHasCollision()==false: no auto-floor,
+    //    no Navmesh, no Box collider = the port has nothing to stand on. Centered card over a dim scrim; the caller
+    //    parks the mouse off-screen so only THESE buttons are live. "Cook anyway" proceeds via startCookNow(). ──
+    void drawCookWarn() {
+        auto& th = cx.th; float W=(float)fbW, H=(float)fbH;
+        dl.rect(0,0,W,H, ui::rgba(0,0,0,150));                                   // dim everything behind
+        float bw = std::min(480.f*uiScale, W-40*uiScale), bh = 214.f*uiScale;
+        float bx = (W-bw)*0.5f, by = (H-bh)*0.5f, pad = 16.f*uiScale, rh = th.rowH;
+        dl.rect(bx,by,bw,bh, th.panelBg); dl.border(bx,by,bw,bh, th.border);
+        dl.rect(bx,by,bw,3*uiScale, ui::rgba(240,180,60));                       // amber warning stripe
+        float y = by + pad + 4*uiScale;
+        cx.textAligned(bx+pad, y, bw-2*pad, rh+2*uiScale, "No collision in this environment", ui::rgba(245,190,70), 0);
+        y += rh + 10*uiScale;
+        const char* lines[] = {
+            "Nothing to stand on: no Navmesh, no Box collider, and",
+            "Auto-floor collision is off. The player will fall through",
+            "the floor and respawn forever.",
+            "",
+            "Add a Navmesh or Box collider (Scene tab -> + Add), or turn",
+            "on \"Auto floor collision\" in the Cook tab.",
+        };
+        for (const char* ln : lines) { cx.textAligned(bx+pad, y, bw-2*pad, rh, ln, th.textDim, 0); y += rh*0.92f; }
+        float bwid = (bw-2*pad-10*uiScale)/2, bhh = rh+8*uiScale, byb = by+bh-pad-bhh;
+        if (cx.button(ui::hashId("cwcancel"), bx+pad, byb, bwid, bhh, "Cancel") || cx.in.keyRepeat[ui::KEY_ESCAPE])
+            cookWarnOpen=false;
+        if (cx.button(ui::hashId("cwgo"), bx+pad+bwid+10*uiScale, byb, bwid, bhh, "Cook anyway", true)) {
+            cookWarnOpen=false; startCookNow();
+        }
+    }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  SPACES
@@ -4517,8 +4572,10 @@ struct Editor {
               trackPlayer=true;
               questPlayerPos[0]=r->cam.pos[0]; questPlayerPos[1]=r->cam.pos[1]-1.6f; questPlayerPos[2]=r->cam.pos[2];   // feet ~1.6m below the eye
               questPlayerYaw=r->cam.yaw;                                           // device yaw == cam yaw (both: 0 faces -Z) -> player faces the camera dir
-              sendPlayerWarp(questPlayerPos[0],questPlayerPos[1],questPlayerPos[2]); sendPlayerYaw(questPlayerYaw); }
-          if (cx.button(ui::hashId("plReset"), x+bw2+6*uiScale, y, bw2, rh, "Warp to spawn")) { trackPlayer=true; questPlayerYaw=0.f; sendPlayerWarp(0,0,0); sendPlayerYaw(0.f); }
+              // ONE warp carrying the yaw — NO separate `rot`: rot re-teleports to the device's CURRENT pos, which
+              // is stale for a frame right after this warp and would yank the player back to where they were.
+              sendPlayerWarp(questPlayerPos[0],questPlayerPos[1],questPlayerPos[2]); }
+          if (cx.button(ui::hashId("plReset"), x+bw2+6*uiScale, y, bw2, rh, "Warp to spawn")) { trackPlayer=true; questPlayerYaw=0.f; sendPlayerWarp(0,0,0); }
           y+=rh+6*uiScale;
         }
         dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
@@ -6408,6 +6465,13 @@ struct Editor {
 #endif
     }
     void startCook() {
+        if (cooking.load()) return;
+        // PRE-COOK GUARD: no collision at all -> the port has no floor, the player falls forever. Warn (once) and let
+        // the user place a Navmesh/Box collider or turn on Auto-floor. "Cook anyway" (modal) bypasses via startCookNow().
+        if (!envHasCollision()) { cookWarnOpen = true; return; }
+        startCookNow();
+    }
+    void startCookNow() {
         if (cooking.load()) return;
         saveProject();   // AUTO-SAVE the session on cook — the user's edits (transforms/renames/hides/spawn points/colliders/skybox marks + cook config) are persisted to <env>.hsledit BEFORE cooking, so a cook never silently loses unsaved edits (they're already baked into the APK via the live state; this just keeps the on-disk session in sync).
         // BEFORE buildExportMeshes: the anim-extractor lambda gates the fog/river RIGID-HZANIM+UV path on
