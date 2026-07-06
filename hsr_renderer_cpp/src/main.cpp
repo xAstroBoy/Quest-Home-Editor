@@ -1302,6 +1302,14 @@ int main(int argc, char** argv) {
     // looping timeline so the playhead advances + the anims play/scrub (headless render uses real elapsed time, so
     // it's unaffected). OPA/V79 keep their real clip duration.
     float animDur = isOpa ? opa.animDuration() : (isV79 ? gltf.animDuration : 60.0f);
+    // COOKED (HSL) env with HZANIM clips: the hardcoded 60s timeline WRAPPED the playhead mid-clip for any
+    // clip longer than 60s (bubbles clusters = 166.8s choreography) — clip meshes snapped backwards ~3x per
+    // cycle and anything choreographed past t=60 NEVER played in the editor = "the cooked anim looks broken"
+    // while the DEVICE (real clock, per-clip fmod) plays it fine. Timeline = the LONGEST clip so one full
+    // pass shows everything; per-clip wrap inside sampleRendClip keeps shorter clips looping naturally.
+    if (!isOpa && !isV79) { float mx = 0.f;
+        for (auto& g : loader.animGroups) if (g.clip.acl) { float d = hzAclDuration(g.clip.acl); if (d > mx) mx = d; }
+        if (mx > 1e-3f) animDur = mx; }
     Editor editor;
     g_editor = &editor;            // expose to the GLFW input callbacks
     editor.r = &vkRenderer;             // bind the renderer up-front so Export works even when the UI is skipped (HSR_NOUI)

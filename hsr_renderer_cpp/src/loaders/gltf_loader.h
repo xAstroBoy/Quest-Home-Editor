@@ -50,7 +50,35 @@ public:
     std::vector<GChannel> gchannels;
     std::vector<GSampler> gsamplers;
     std::vector<SkinnedRec> skinned;
-    std::vector<float> nodePeriodv;   // per-node loop period = latest key among the node's OWN channels (lazy, see animate())
+    mutable std::vector<float> nodePeriodv;   // per-node loop period = latest key among the node's OWN channels (lazy)
+    // Build the per-node loop periods (V79 per-track semantics; 0 = no wrap). Shared by animate() AND every
+    // cook extractor so the BAKE samples channels exactly like the preview plays them — the bake used raw t,
+    // so a joint channel ending at 13.3s CLAMPED (froze) inside a 166.8s clip while the preview WRAPPED it
+    // (bubbles clusters: source keeps rotating, cook rotated once then froze = "not even close to the
+    // original rotation"). Late-start channels stay unwrapped (global-choreography segments).
+    void ensureNodePeriods() const {
+        if (nodePeriodv.size() == gnodes.size()) return;
+        nodePeriodv.assign(gnodes.size(), 0.f);
+        for (auto& ch : gchannels)
+            if (ch.node>=0 && (size_t)ch.node<gnodes.size() && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
+                auto& tv = gsamplers[ch.sampler].times;
+                if (!tv.empty() && tv.back() > nodePeriodv[ch.node]) nodePeriodv[ch.node] = tv.back(); }
+        for (auto& ch : gchannels)
+            if (ch.node>=0 && (size_t)ch.node<gnodes.size() && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
+                auto& tv = gsamplers[ch.sampler].times;
+                if (!tv.empty() && tv.front() > 0.05f) nodePeriodv[ch.node] = 0.f; }
+    }
+    // Per-node wrapped sample time: each node's channels loop on the node's OWN track length (lockstep T/R/S),
+    // exactly like the OPA sampleTrack rule. HSR_GLTF_GLOBALLOOP reverts to the single global wrap.
+    float chTime(int node, float t) const {
+        static int gLoopGlobal = -1; if (gLoopGlobal<0) gLoopGlobal = std::getenv("HSR_GLTF_GLOBALLOOP")?1:0;
+        if (gLoopGlobal) return t;
+        ensureNodePeriods();
+        if (node>=0 && (size_t)node<nodePeriodv.size()){
+            float p = nodePeriodv[node];
+            if (p > 1e-4f && p < animDuration - 1e-3f) return fmodf(t, p); }
+        return t;
+    }
     std::vector<NodeAnimRec> nodeAnimRecs;
     // Re-anchor for animated "screen" skins authored away from their target (Rick&Morty TV: the
     // glTF puts the TV_Anim flipbook node by the WINDOW, libshell repositions it onto the TV at
@@ -768,31 +796,13 @@ public:
         // PER-NODE loop period (V79 sanim semantics: every track loops on ITS OWN length — the OPA
         // sampleTrack/per-node-period rule). glTF samplers CLAMP past their last key, so a short Blender
         // action inside a longer scene timeline PARKED for the remainder of every global loop (doctorwho
-        // Phonebox: 4s tumble in a 16.7s scene = 12.7s frozen, "it should be looping"). All channels of
-        // one node share the node's max end time so T/R/S stay in lockstep (the OPA loadSanim channel
-        // sync). Nodes whose channels span the full timeline are untouched. HSR_GLTF_GLOBALLOOP reverts.
-        static int gLoopGlobal = -1; if (gLoopGlobal<0) gLoopGlobal = std::getenv("HSR_GLTF_GLOBALLOOP")?1:0;
-        if (nodePeriodv.size() != gnodes.size()) {
-            nodePeriodv.assign(gnodes.size(), 0.f);
-            for (auto& ch : gchannels)
-                if (ch.node>=0 && (size_t)ch.node<gnodes.size() && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
-                    auto& tv = gsamplers[ch.sampler].times;
-                    if (!tv.empty() && tv.back() > nodePeriodv[ch.node]) nodePeriodv[ch.node] = tv.back(); }
-            // STAGGER GUARD: any channel that STARTS late marks its node NO-WRAP (period 0 -> global clamp
-            // behavior) — it's a segment of the global choreography (staggered bubble launches), and wrapping
-            // it at its own end time would collapse the authored phase offsets.
-            for (auto& ch : gchannels)
-                if (ch.node>=0 && (size_t)ch.node<gnodes.size() && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
-                    auto& tv = gsamplers[ch.sampler].times;
-                    if (!tv.empty() && tv.front() > 0.05f) nodePeriodv[ch.node] = 0.f; }
-        }
+        // Phonebox: 4s tumble in a 16.7s scene = 12.7s frozen, "it should be looping"). chTime() shares the
+        // SAME rule with every cook extractor so the bake samples channels exactly like the preview plays them.
         std::vector<GNode> cur = gnodes;
         for (auto& ch : gchannels) {
             if (ch.node<0 || (size_t)ch.node>=cur.size() || ch.sampler<0 || (size_t)ch.sampler>=gsamplers.size()) continue;
             float v[4]={0,0,0,1};
-            float tc = t;
-            if (!gLoopGlobal){ float p = nodePeriodv[ch.node]; if (p > 1e-4f && p < animDuration - 1e-3f) tc = fmodf(t, p); }
-            sampleSampler(gsamplers[ch.sampler], tc, v);
+            sampleSampler(gsamplers[ch.sampler], chTime(ch.node, t), v);
             if (ch.path==0) { cur[ch.node].t[0]=v[0]; cur[ch.node].t[1]=v[1]; cur[ch.node].t[2]=v[2]; }
             else if (ch.path==1) { cur[ch.node].r[0]=v[0]; cur[ch.node].r[1]=v[1]; cur[ch.node].r[2]=v[2]; cur[ch.node].r[3]=v[3]; }
             else { cur[ch.node].s[0]=v[0]; cur[ch.node].s[1]=v[1]; cur[ch.node].s[2]=v[2]; }
@@ -981,7 +991,7 @@ public:
         std::function<void(int,float,float*)> worldAt=[&](int n,float t,float* out){
             float tt[3]={gnodes[n].t[0],gnodes[n].t[1],gnodes[n].t[2]}, q[4]={gnodes[n].r[0],gnodes[n].r[1],gnodes[n].r[2],gnodes[n].r[3]}, sc[3]={gnodes[n].s[0],gnodes[n].s[1],gnodes[n].s[2]};
             for (auto& ch : gchannels) if (ch.node==n && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
-                float o4[4]; sampleSampler(gsamplers[ch.sampler], t, o4);
+                float o4[4]; sampleSampler(gsamplers[ch.sampler], chTime(n, t), o4);   // per-node wrap = bake matches the preview (V79 per-track loop)
                 if (ch.path==0){ tt[0]=o4[0]; tt[1]=o4[1]; tt[2]=o4[2]; }
                 else if (ch.path==1){ q[0]=o4[0]; q[1]=o4[1]; q[2]=o4[2]; q[3]=o4[3]; }
                 else if (ch.path==2){ sc[0]=o4[0]; sc[1]=o4[1]; sc[2]=o4[2]; } }
@@ -1089,7 +1099,7 @@ public:
         std::function<void(int,float,float*)> worldAt = [&](int n, float t, float* out){
             float tt[3]={gnodes[n].t[0],gnodes[n].t[1],gnodes[n].t[2]}, q[4]={gnodes[n].r[0],gnodes[n].r[1],gnodes[n].r[2],gnodes[n].r[3]}, sc[3]={gnodes[n].s[0],gnodes[n].s[1],gnodes[n].s[2]};
             for (auto& ch : gchannels) if (ch.node==n && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
-                float o4[4]; sampleSampler(gsamplers[ch.sampler], t, o4);
+                float o4[4]; sampleSampler(gsamplers[ch.sampler], chTime(n, t), o4);   // per-node wrap = bake matches the preview (V79 per-track loop)
                 if (ch.path==0){ tt[0]=o4[0]; tt[1]=o4[1]; tt[2]=o4[2]; }
                 else if (ch.path==1){ q[0]=o4[0]; q[1]=o4[1]; q[2]=o4[2]; q[3]=o4[3]; }
                 else if (ch.path==2){ sc[0]=o4[0]; sc[1]=o4[1]; sc[2]=o4[2]; } }
@@ -1213,7 +1223,7 @@ public:
         std::function<void(int,float,float*)> worldAt = [&](int n, float t, float* out){
             float tt[3]={gnodes[n].t[0],gnodes[n].t[1],gnodes[n].t[2]}, q[4]={gnodes[n].r[0],gnodes[n].r[1],gnodes[n].r[2],gnodes[n].r[3]}, sc[3]={gnodes[n].s[0],gnodes[n].s[1],gnodes[n].s[2]};
             for (auto& ch : gchannels) if (ch.node==n && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
-                float o4[4]; sampleSampler(gsamplers[ch.sampler], t, o4);
+                float o4[4]; sampleSampler(gsamplers[ch.sampler], chTime(n, t), o4);   // per-node wrap = bake matches the preview (V79 per-track loop)
                 if (ch.path==0){ tt[0]=o4[0]; tt[1]=o4[1]; tt[2]=o4[2]; }
                 else if (ch.path==1){ q[0]=o4[0]; q[1]=o4[1]; q[2]=o4[2]; q[3]=o4[3]; }
                 else if (ch.path==2){ sc[0]=o4[0]; sc[1]=o4[1]; sc[2]=o4[2]; } }
@@ -1503,7 +1513,10 @@ public:
             std::vector<GNode> cur = gnodes;
             for (auto& ch : gchannels) {
                 if (ch.node<0||(size_t)ch.node>=cur.size()||ch.sampler<0||(size_t)ch.sampler>=gsamplers.size()) continue;
-                float val[4]={0,0,0,1}; sampleSampler(gsamplers[ch.sampler], t, val);
+                // chTime: each channel wraps at ITS node's own period — raw t CLAMPED short joint channels
+                // inside a long clip (bubbles: joints rotate 13.3s then froze for 150s while the preview
+                // kept them wrapping = "not even close to the original rotation"). Bake == preview now.
+                float val[4]={0,0,0,1}; sampleSampler(gsamplers[ch.sampler], chTime(ch.node, t), val);
                 if (ch.path==0){cur[ch.node].t[0]=val[0];cur[ch.node].t[1]=val[1];cur[ch.node].t[2]=val[2];}
                 else if (ch.path==1){cur[ch.node].r[0]=val[0];cur[ch.node].r[1]=val[1];cur[ch.node].r[2]=val[2];cur[ch.node].r[3]=val[3];}
                 else {cur[ch.node].s[0]=val[0];cur[ch.node].s[1]=val[1];cur[ch.node].s[2]=val[2];}

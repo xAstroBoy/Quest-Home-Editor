@@ -6265,6 +6265,11 @@ struct Editor {
             uint32_t b=(uint32_t)(si.navVerts.size()/3);
             float v[9]={t.ax,t.ay,t.az, t.bx,t.by,t.bz, t.cx,t.cy,t.cz}; for(float f:v) si.navVerts.push_back(f);
             si.navIdx.push_back(b); si.navIdx.push_back(b+1); si.navIdx.push_back(b+2);
+            // MESH COLLIDER items = DOUBLE-SIDED: PhysX trimesh collision is single-sided per winding, so a
+            // one-sided bake blocked from one side only ("only a side collidable, the roof is not") — append
+            // the reversed twin so both faces + the roof's underside block. (Walkable navmeshes stay single-
+            // sided: their reversed floor would block from below and doubles the SEBD for no gain.)
+            if (exactCollider){ si.navIdx.push_back(b); si.navIdx.push_back(b+2); si.navIdx.push_back(b+1); }
         }
     }
     // For each NAVMESH item, (re)bake its triangles so the cook has fresh world geometry.
@@ -6444,8 +6449,14 @@ struct Editor {
         if (V.size()<9 || I.size()<3){ for (int m:it.srcMeshes) if (m>=0&&m<(int)r->gpuMeshes.size()) drawAabbBox(r->gpuMeshes[m]); return; }
         float M[16]; itemTRS(it,M);   // apply the item's T·R·S (the gizmo edits this) so moving the gizmo moves the navmesh
         // Draw the FULL collision surface (was capped at 12000 tris -> a misleading "colander" of sparse triangles even
-        // though the cooked collider is solid). 120k keeps it solid-looking for big multi-mesh selections at editor FPS.
-        size_t ntri=I.size()/3, maxTri=120000, stride = ntri>maxTri ? ntri/maxTri : 1;
+        // though the cooked collider is solid). 120k keeps it solid-looking at editor FPS — but that budget is now
+        // SHARED across every visible NAVMESH item ("very laggy when there's lots of em": N colliders x 120k CPU-
+        // projected tris per frame melted the drawlist). The SELECTED item gets the full budget (inspect closely);
+        // unselected ones split the rest, min 3k each so shapes stay readable.
+        size_t nNav=0; for (auto& x : items) if (x.type==sitem::NAVMESH && x.navVerts.size()>=9) ++nNav;
+        bool isSel = (selItem>=0 && selItem<(int)items.size() && &items[(size_t)selItem]==&it);
+        size_t maxTri = isSel ? 120000 : std::max<size_t>(3000, 120000 / (nNav?nNav:1));
+        size_t ntri=I.size()/3, stride = ntri>maxTri ? ntri/maxTri : 1;
         uint32_t fillCol=ui::withA(col,60), edgeCol=ui::withA(col,180);   // FILLED translucent green surface + edges (haven2025 look)
         for (size_t t=0;t<ntri;t+=stride){
             uint32_t a=I[t*3],b=I[t*3+1],d=I[t*3+2];
