@@ -1885,6 +1885,18 @@ int main(int argc, char** argv) {
                         int mi=atoi(ln+7); size_t before=vkRenderer.gpuMeshes.size();
                         if (g_editor) g_editor->completeDome(mi, true);
                         snprintf(tmp,sizeof tmp,"sphere %d -> now %zu meshes (was %zu), status: %s\n", mi, vkRenderer.gpuMeshes.size(), before, g_editor?g_editor->cookStatus.c_str():"?"); out+=tmp; }
+                    else if (strncmp(ln, "uvdump=", 7) == 0) {   // DATA: first 8 verts' model pos + uv0 (crop/remap forensics): uvdump=<mi>
+                        int mi = atoi(ln+7);
+                        if (mi>=0 && mi<(int)sceneMeshes->size()) { const auto& md=(*sceneMeshes)[mi];
+                            size_t nv = md.positions.size()/3, nu = md.uvs.size()/2;
+                            snprintf(tmp,sizeof tmp,"[UVDUMP] mesh %d nv=%zu nuv=%zu\n", mi, nv, nu); out+=tmp;
+                            float umn=1e9f,umx=-1e9f,vmn=1e9f,vmx=-1e9f;
+                            for (size_t v=0;v<nu;v++){ float u=md.uvs[v*2],w2=md.uvs[v*2+1]; if(u<umn)umn=u; if(u>umx)umx=u; if(w2<vmn)vmn=w2; if(w2>vmx)vmx=w2; }
+                            snprintf(tmp,sizeof tmp,"  uvRange u[%.4f..%.4f] v[%.4f..%.4f]\n", umn,umx,vmn,vmx); out+=tmp;
+                            for (size_t v=0;v<nv && v<8;v++){
+                                snprintf(tmp,sizeof tmp,"  v%zu pos=(%.2f,%.2f,%.2f) uv=(%.4f,%.4f)\n", v,
+                                    md.positions[v*3],md.positions[v*3+1],md.positions[v*3+2],
+                                    v<nu?md.uvs[v*2]:-9.f, v<nu?md.uvs[v*2+1]:-9.f); out+=tmp; } } }
                     else if (strncmp(ln, "slice=", 6) == 0) {   // TEST: axis-slice mesh mi through its AABB center (headless repro of the knife/slice path): slice=<mi>[,axis]
                         int mi=-1, ax=0; sscanf(ln+6, "%d,%d", &mi, &ax); if (ax<0) ax=0; if (ax>2) ax=2;
                         size_t before=vkRenderer.gpuMeshes.size();
