@@ -86,7 +86,7 @@ inline std::string transformComp(const Item& it) {   // localRotation = EULER RA
 
 // Entity JSON for one item. `meshAssetJson` (for NAVMESH) = the cook-provided {"packageOrRemoteId":..} ref string
 // of the baked ColliderMesh; empty for the other types. Returns "" if the type needs an asset it wasn't given.
-inline std::string itemEntityJson(const Item& it, int idx, const std::string& meshAssetJson = "") {
+inline std::string itemEntityJson(const Item& it, int idx, const std::string& meshAssetJson = "", int wallRank = 0) {
     std::string comps, nm = it.name.empty() ? typeName(it.type) : it.name;
     switch (it.type) {
         case SPAWN:
@@ -134,9 +134,25 @@ inline std::string itemEntityJson(const Item& it, int idx, const std::string& me
                 + "," + transformComp(it);
             break;
         case WALLPLACE:
-            comps = comp("horizon::hpi::WallPlacementComponent", 1,
-                std::string("\"propRank\":0,\"propMaxWidth\":")+f(it.propW)+",\"propMaxHeight\":"+f(it.propH))
-                + "," + transformComp(it);
+            // HAVEN-EXACT recipe (haven2025 hpi_locators.hstf "wallPlacement_0N"): Transform FIRST, then the
+            // hpi WallPlacementComponent, then an INVISIBLE MeshPlatformComponent v11. ⛔ WITHOUT the mesh the
+            // device's hpi EnvironmentSystem (EnvironmentSystem__138859C) can't resolve the entity's
+            // LocalTransformComponent — it logs "Entity with WallPlacementComponent does not have
+            // LocalTransformComponent" and DROPS the placement (never registered). The mesh (isVisibleSelf:false)
+            // makes it a spatial/renderable entity that carries the transform the hpi system reads. Reuses the
+            // invisible icon-mesh ref the cook passes as meshAssetJson (any valid mesh works — it's not drawn).
+            // propRank = a UNIQUE per-wall index (0,1,2,...) so the vrshell app-to-wall mod can address each wall
+            // individually: `pinwall <app.component> <rank>` pins to the placement whose propRank == rank.
+            comps = transformComp(it)
+                + "," + comp("horizon::hpi::WallPlacementComponent", 1,
+                    std::string("\"propRank\":")+std::to_string(wallRank)+",\"propMaxWidth\":"+f(it.propW)+",\"propMaxHeight\":"+f(it.propH));
+            if (!meshAssetJson.empty()) {
+                // HSR_WALLVIS diagnostic: flip the placeholder mesh VISIBLE so we can confirm on-device whether the
+                // wall-placement entity instantiates+positions at all (registration) vs registers-but-invisible.
+                bool wpVis = std::getenv("HSR_WALLVIS") != nullptr;
+                comps += "," + comp("horizon::platform_api::MeshPlatformComponent", 11,
+                    std::string("\"mesh\":")+meshAssetJson+",\"isVisibleSelf\":"+(wpVis?"true":"false"));
+            }
             break;
         case HOTSPOT:
             // haven2025 "hotspot_dot" recipe: VISIBLE Mesh (the teleport dot) + LocomotionHotspot + a Layer30
