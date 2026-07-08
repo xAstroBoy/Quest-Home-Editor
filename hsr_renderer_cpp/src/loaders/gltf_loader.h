@@ -724,6 +724,17 @@ public:
                         md.alphaTest = matIsMask(matIdx);  // authored MASK -> opaque-pass depth-writing cutout (discard)
                         if (md.alphaTest) md.alphaCutoff = matAlphaCutoff(matIdx);
                         md.useBlend = !md.alphaTest && matIsBlend(matIdx);  // alpha-blend transparent materials
+                        // TEX-AUDIT provenance: the RAW authored mode + factor alpha, untouched by any heuristic.
+                        md.srcAlphaMode = 0; md.srcFactorA = 1.f;
+                        if (matIdx >= 0 && root.has("materials") && (size_t)matIdx < root["materials"].size()) {
+                            const auto& mm2 = root["materials"][matIdx];
+                            if (mm2.has("alphaMode")) { std::string am2 = mm2["alphaMode"].asString();
+                                md.srcAlphaMode = (am2=="BLEND") ? 2 : (am2=="MASK") ? 1 : 0; }
+                            if (mm2.has("pbrMetallicRoughness") && mm2["pbrMetallicRoughness"].has("baseColorFactor")) {
+                                const auto& f2 = mm2["pbrMetallicRoughness"]["baseColorFactor"];
+                                if (f2.size() >= 4) md.srcFactorA = (float)f2[3].asFloat();
+                            }
+                        } else md.srcAlphaMode = -1;
                         md.additive = md.useBlend && matIsEmissiveGlow(matIdx) && !matHasBaseTex(matIdx);  // emissive BLEND = additive glow ONLY for a textureLESS pure-Emission material; a textured BLEND (the SHIELD) keeps alpha-blend so its texture alpha = the transparency (additive discarded it = opaque purple dome)
                         md.doubleSided = matIsDoubleSided(matIdx);  // single-sided -> back-face cull
                         // This mesh's OWN base-color tint (glTF baseColorFactor; identity-white for a plain textured
@@ -826,6 +837,18 @@ public:
                 int jn = sk.joints[j];
                 jm[j] = mul((jn>=0&&(size_t)jn<world.size())?world[jn]:identity(), ibm);
             }
+            { static int jd=-1; if(jd<0) jd=std::getenv("HSR_JMDBG")?1:0;
+              if (jd && rec.skin==0) {
+                  fprintf(stderr,"[JMDBG] mesh%d t=%.3f jm0.c0=(%.3f,%.3f,%.3f) jm0.c1=(%.3f,%.3f,%.3f) jm0.t=(%.2f,%.2f,%.2f)\n",
+                      rec.meshIdx, t, jm[0].m[0],jm[0].m[1],jm[0].m[2], jm[0].m[4],jm[0].m[5],jm[0].m[6], jm[0].m[12],jm[0].m[13],jm[0].m[14]);
+                  fprintf(stderr,"[JMDBG]   vert1427 slots: j=(%d,%d,%d,%d) w=(%.3f,%.3f,%.3f,%.3f) base=(%.2f,%.2f,%.2f) out=(%.2f,%.2f,%.2f)\n",
+                      rec.jidx[1427*4],rec.jidx[1427*4+1],rec.jidx[1427*4+2],rec.jidx[1427*4+3],
+                      rec.jw[1427*4],rec.jw[1427*4+1],rec.jw[1427*4+2],rec.jw[1427*4+3],
+                      rec.basePos[1427*3],rec.basePos[1427*3+1],rec.basePos[1427*3+2],
+                      meshes[rec.meshIdx].positions.size()>1427*3+2?meshes[rec.meshIdx].positions[1427*3]:0.f,
+                      meshes[rec.meshIdx].positions.size()>1427*3+2?meshes[rec.meshIdx].positions[1427*3+1]:0.f,
+                      meshes[rec.meshIdx].positions.size()>1427*3+2?meshes[rec.meshIdx].positions[1427*3+2]:0.f);
+              } }
             auto& out = meshes[rec.meshIdx].positions;
             out.resize((size_t)rec.nv*3);
             for (u32 v=0; v<rec.nv; ++v) {
@@ -889,6 +912,94 @@ public:
         return off;
     }
 
+    // RATIONAL-LCM multi-period loop (the "reset is fucked up" harmonic-chain fix): distinct channel periods
+    // along a chain USED to force the GLOBAL master-timeline bake — but a non-integer master/period ratio then
+    // wraps each channel MID-CYCLE at the clip seam = a visible snap every master loop ON DEVICE (doctorwho
+    // Phonebox: 1.1667s+2.3333s channels in a 16.67s master = 16.67/2.333 = 7.14 cycles, seam snaps 29% deep;
+    // the real V79 runtime loops every track on its OWN length — no master reset, no snap). When the periods
+    // share a small RATIONAL LCM (2.3333s here: 2x1.1667 = 1x2.3333), bake THAT — every channel closes exactly
+    // at the clip end = seamless forever. Irrational beats (bubbles' spread trails) return 0 -> master bake.
+    float rationalLcmPeriod(const std::vector<float>& periods) const {
+        if (periods.size() < 2) return 0.f;
+        float pmax = 0.f; for (float p : periods) if (p > pmax) pmax = p;
+        if (pmax <= 1e-4f) return 0.f;
+        float cap = std::max(animDuration * 2.f, 60.f);
+        for (int n = 1; n <= 64; n++) {
+            float T = (float)n * pmax; if (T > cap) break;
+            bool ok = true;
+            for (float p : periods) { if (p <= 1e-4f) continue;
+                float r = T / p; float ri = floorf(r + 0.5f);
+                if (ri < 1.f || std::fabs(r - ri) > 0.01f * r) { ok = false; break; } }
+            if (ok) return T;
+        }
+        return 0.f;
+    }
+    // ── FLIPBOOK OBSERVED-SEQUENCE extraction (FLIP-VERIFY 2026-07-08): the collapsed spritesheet shader used
+    //    to ASSUME row-major cell order at flipFrames/animDuration fps — WRONG for most real sheets (Rick&Morty
+    //    TV: 23/100 frames matched; cube_maze torches: 0/64, each with its OWN phase stagger; zelda fires:
+    //    27 frames spread over the 60s GLOBAL timeline = 0.45fps instead of their own loop). Sample the SOURCE
+    //    animation over the mesh's OWN clip period and record WHICH cell is visible per frame — shipped as
+    //    per-frame 2x3 UV matrices (flipUVMats -> editFragUvMatrixReplay, the exact frame-snap replay). ──
+    bool flipbookCellSequence(int meshIdx, int cols, int rows, std::vector<float>& mats6, int& N, float& loopSec) {
+        mats6.clear(); N = 0; loopSec = 0.f;
+        if (meshIdx < 0 || (size_t)meshIdx >= meshes.size() || cols < 1 || rows < 1) return false;
+        // relevant node set: the skin's joints + their ancestors (spritesheet flipbooks are skinned), or the
+        // rigid anim node chain — same clip-period rules as extractHzAnim (stagger/multi-period -> global).
+        std::vector<char> relN(gnodes.size(), 0);
+        bool found = false;
+        for (auto& r : skinned) if (r.meshIdx == meshIdx && r.skin >= 0 && (size_t)r.skin < gskins.size()) {
+            for (int jn : gskins[r.skin].joints)
+                for (int n = jn, g = 0; n >= 0 && (size_t)n < gnodes.size() && g < 64; n = gnodes[n].parent, ++g) relN[n] = 1;
+            found = true; break;
+        }
+        if (!found) for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) {
+            for (int n = r.nodeIdx, g = 0; n >= 0 && (size_t)n < gnodes.size() && g < 64; n = gnodes[n].parent, ++g) relN[n] = 1;
+            found = true; break;
+        }
+        if (!found) return false;
+        float clipDur = 0.f, latestStart = 0.f, firstEnd = -1.f; bool multiPeriod = false; float keyRate = 0.f;   // NO 30fps floor (see extractNodeRigidHzAnim)
+        for (auto& ch : gchannels)
+            if (ch.node >= 0 && (size_t)ch.node < relN.size() && relN[ch.node]
+                && ch.sampler >= 0 && (size_t)ch.sampler < gsamplers.size()) { auto& tv = gsamplers[ch.sampler].times;
+                if (!tv.empty()){ if (tv.back() > clipDur) clipDur = tv.back(); if (tv.front() > latestStart) latestStart = tv.front();
+                    if (firstEnd < 0.f) firstEnd = tv.back(); else if (std::fabs(tv.back()-firstEnd) > 0.1f) multiPeriod = true;
+                    if (tv.size() >= 2 && tv.back()-tv.front() > 1e-4f) { float r2 = (float)(tv.size()-1)/(tv.back()-tv.front()); if (r2 > keyRate) keyRate = r2; } } }
+        if (keyRate > 240.f) keyRate = 240.f; if (keyRate < 1.f) keyRate = 30.f;
+        if (clipDur <= 1e-4f || latestStart > 0.05f || multiPeriod) clipDur = animDuration;
+        if (clipDur <= 1e-4f) return false;
+        int n2 = (int)(clipDur * keyRate + 0.5f); if (n2 < 2) n2 = 2; if (n2 > 4096) n2 = 4096;
+        const MeshData& md = meshes[meshIdx];
+        size_t nq = md.positions.size()/12;
+        if (nq < 2 || md.uvs.size() < nq*8) return false;
+        auto tA = [](const float* a, const float* b, const float* c){
+            float u[3]={b[0]-a[0],b[1]-a[1],b[2]-a[2]}, w[3]={c[0]-a[0],c[1]-a[1],c[2]-a[2]};
+            float cx=u[1]*w[2]-u[2]*w[1], cy=u[2]*w[0]-u[0]*w[2], cz=u[0]*w[1]-u[1]*w[0];
+            return 0.5f*sqrtf(cx*cx+cy*cy+cz*cz); };
+        mats6.reserve((size_t)n2*6);
+        bool varies = false; int cell0 = -1;
+        for (int i = 0; i < n2; i++) {
+            animate((float)(i + 0.5f) * clipDur / (float)n2);   // frame-window CENTER (the replay frame-snaps)
+            int best = -1; float bestA = -1.f;
+            for (size_t q = 0; q < nq; q++) {
+                const float* p0v=&md.positions[q*12]; const float* p1v=&md.positions[q*12+3];
+                const float* p2v=&md.positions[q*12+6]; const float* p3v=&md.positions[q*12+9];
+                float a = tA(p0v,p1v,p2v)+tA(p0v,p2v,p3v);
+                if (a > bestA) { bestA = a; best = (int)q; }
+            }
+            float u0=1e9f, v0=1e9f;
+            for (int c = 0; c < 4; c++) { float u=md.uvs[((size_t)best*4+c)*2], v=md.uvs[((size_t)best*4+c)*2+1];
+                if (u<u0) u0=u; if (v<v0) v0=v; }
+            int col = (int)(u0*cols + 0.5f); if (col < 0) col = 0; if (col >= cols) col = cols-1;
+            int row = (int)(v0*rows + 0.5f); if (row < 0) row = 0; if (row >= rows) row = rows-1;
+            if (cell0 < 0) cell0 = row*cols+col; else if (row*cols+col != cell0) varies = true;
+            mats6.push_back(1.f/(float)cols); mats6.push_back(0.f); mats6.push_back((float)col/(float)cols);
+            mats6.push_back(0.f); mats6.push_back(1.f/(float)rows); mats6.push_back((float)row/(float)rows);
+        }
+        animate(0.f);   // RESTORE the t=0 bake — later meshes in buildExportMeshes bake md.positions
+        if (!varies) { mats6.clear(); return false; }   // single-cell "flipbook" = static, no replay
+        N = n2; loopSec = clipDur;
+        return true;
+    }
     // ── HZANIM extraction: a skinned glTF mesh -> skeleton (hierarchical bind TRS) + per-vertex bones + the clip
     //    (per-joint LOCAL TRS sampled at `frames`). Feeds encodeHzSkel + hzAclEncode + the skinned RENDMESH. ──
     struct HzAnimExport {
@@ -910,16 +1021,20 @@ public:
     // True only if the node animation ACTUALLY changes the transform. Some V79 exports (Star Trek TNG bridge) bake a
     // 50-key CONSTANT T/R/S track onto EVERY object = "animated" but motionless; without this gate they all get a getTime
     // wisp PULSE shader -> the whole env "breathes"/moves on device. Returns false for constant (static) tracks.
+    // Walks the ANCESTOR chain like every extractor's worldAt does: a mesh whose motion comes ONLY from an animated
+    // parent (doctorwho's vortex torus: node0 has no channels, its parents pTorus1/group6 carry the T+R) previously
+    // failed this gate and cooked STATIC — the whole visible animation layer silently missing on device.
     bool nodeAnimMoves(int meshIdx) const {
         int nodeIdx = -1; for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; break; }
         if (nodeIdx < 0) return false;
-        for (auto& ch : gchannels) {
-            if (ch.node != nodeIdx || ch.sampler < 0 || (size_t)ch.sampler >= gsamplers.size()) continue;
-            const GSampler& s = gsamplers[ch.sampler]; int n = (int)s.times.size(); if (n < 2) continue;
-            for (int c = 0; c < s.comps; ++c) { float mn=1e30f, mx=-1e30f;
-                for (int k = 0; k < n; ++k){ float v=s.vals[(size_t)k*s.comps+c]; if(v<mn)mn=v; if(v>mx)mx=v; }
-                if (mx - mn > 1e-4f) return true; }   // some component actually moves
-        }
+        for (int nd = nodeIdx, g = 0; nd >= 0 && (size_t)nd < gnodes.size() && g < 64; nd = gnodes[nd].parent, ++g)
+            for (auto& ch : gchannels) {
+                if (ch.node != nd || ch.sampler < 0 || (size_t)ch.sampler >= gsamplers.size()) continue;
+                const GSampler& s = gsamplers[ch.sampler]; int n = (int)s.times.size(); if (n < 2) continue;
+                for (int c = 0; c < s.comps; ++c) { float mn=1e30f, mx=-1e30f;
+                    for (int k = 0; k < n; ++k){ float v=s.vals[(size_t)k*s.comps+c]; if(v<mn)mn=v; if(v>mx)mx=v; }
+                    if (mx - mn > 1e-4f) return true; }   // some component actually moves
+            }
         return false;
     }
     // Dump the V79 node's animation channels for a node-anim mesh (HSR_VERBOSE) — so we can replicate the wisp SCALE
@@ -973,12 +1088,16 @@ public:
         // 2.33s tumble in a 16.7s scene = 14s frozen per loop, "should be looping"). STAGGER GUARD: a channel
         // that STARTS late is a segment of the global choreography — keep the GLOBAL loop (ensemble phasing).
         loopSec = 0.f; float latestStart = 0.f, firstEnd = -1.f; bool multiPeriod = false;
+        std::vector<float> chainPeriods;
         for (int n = nodeIdx, g = 0; n >= 0 && (size_t)n < gnodes.size() && g < 64; n = gnodes[n].parent, ++g)
             for (auto& ch : gchannels) if (ch.node==n && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){
                 auto& tv=gsamplers[ch.sampler].times;
                 if (!tv.empty()){ if (tv.back()>loopSec) loopSec=tv.back(); if (tv.front()>latestStart) latestStart=tv.front();
-                    if (firstEnd < 0.f) firstEnd = tv.back(); else if (std::fabs(tv.back()-firstEnd) > 0.1f) multiPeriod = true; } }
-        if (loopSec <= 1e-4f || latestStart > 0.05f || multiPeriod) loopSec = animDuration;
+                    if (firstEnd < 0.f) firstEnd = tv.back(); else if (std::fabs(tv.back()-firstEnd) > 0.1f) multiPeriod = true;
+                    bool nw = true; for (float p : chainPeriods) if (std::fabs(p-tv.back()) <= 0.05f) { nw = false; break; }
+                    if (nw) chainPeriods.push_back(tv.back()); } }
+        if (loopSec <= 1e-4f || latestStart > 0.05f) loopSec = animDuration;
+        else if (multiPeriod) { float lcm = rationalLcmPeriod(chainPeriods); loopSec = (lcm > 1e-4f) ? lcm : animDuration; }   // harmonic chain -> seamless LCM loop (the reset-snap fix)
         if (loopSec <= 1e-4f) return false;
         // Compute the node's full composed WORLD transform at time t (sample EVERY ancestor's T/R/S channel). The cook bakes
         // the geometry in WORLD space (md.positions x gm.model), so the offset MUST be the WORLD translation delta — using
@@ -1074,21 +1193,37 @@ public:
         // PER-NODE clip duration = the latest key time among channels animating this node or any ancestor (the
         // node's own loop, matching the OPA per-node-period fix — sampling a short-period node over the global
         // clip aliases its motion). Falls back to the global animDuration when no channel is found.
-        float clipDur = 0.f, latestStart = 0.f, firstEnd = -1.f; bool multiPeriod = false;
+        float clipDur = 0.f, latestStart = 0.f, firstEnd = -1.f; bool multiPeriod = false; float srcKeyRate = 0.f;   // NO 30fps floor: grid-aligned bake at the source's OWN rate is exact at any rate (30-floor resampled 25/s rigs OFF-grid = corner-cut turns)
+        std::vector<float> chainPeriods;
         for (int n = node, g = 0; n >= 0 && (size_t)n < gnodes.size() && g < 64; n = gnodes[n].parent, ++g)
             for (auto& ch : gchannels)
                 if (ch.node == n && ch.sampler >= 0 && (size_t)ch.sampler < gsamplers.size()) {
                     auto& tv = gsamplers[ch.sampler].times;
                     if (!tv.empty()){ if (tv.back() > clipDur) clipDur = tv.back(); if (tv.front() > latestStart) latestStart = tv.front();
-                        if (firstEnd < 0.f) firstEnd = tv.back(); else if (std::fabs(tv.back()-firstEnd) > 0.1f) multiPeriod = true; }
+                        if (firstEnd < 0.f) firstEnd = tv.back(); else if (std::fabs(tv.back()-firstEnd) > 0.1f) multiPeriod = true;
+                        bool nw = true; for (float p : chainPeriods) if (std::fabs(p-tv.back()) <= 0.05f) { nw = false; break; }
+                        if (nw) chainPeriods.push_back(tv.back());
+                        if (tv.size() >= 2 && tv.back()-tv.front() > 1e-4f) {   // native key rate (Star Trek 60/s sawtooths — see extractHzAnim) + MIN-gap for non-uniform tracks
+                            float r = (float)(tv.size()-1)/(tv.back()-tv.front()); if (r > srcKeyRate) srcKeyRate = r;
+                            float mg = 1e9f; for (size_t kk = 1; kk < tv.size(); kk++){ float g = tv[kk]-tv[kk-1]; if (g > 1e-5f && g < mg) mg = g; }
+                            if (mg < 1e8f) { float r2 = 1.f/mg; if (r2 > 120.f) r2 = 120.f; if (r2 > srcKeyRate) srcKeyRate = r2; } } }
                 }
-        // STAGGER GUARD + MULTI-PERIOD chain (see extractHzAnim): late-start = global-choreography segment;
-        // distinct periods along the chain = a beat no single-period loop reproduces — bake the master timeline.
-        if (clipDur <= 1e-4f || latestStart > 0.05f || multiPeriod) clipDur = animDuration;
+        if (srcKeyRate > 240.f) srcKeyRate = 240.f; if (srcKeyRate < 1.f) srcKeyRate = 30.f;
+        // STAGGER GUARD (late-start = global-choreography segment -> master timeline). MULTI-PERIOD chain:
+        // try the RATIONAL LCM first (phonebox 1.1667+2.3333 -> 2.3333s, seamless forever — the "reset is
+        // fucked up" fix); only an irrational beat falls back to the master-timeline bake (one reshuffle/loop).
+        if (clipDur <= 1e-4f || latestStart > 0.05f) clipDur = animDuration;
+        else if (multiPeriod) { float lcm = rationalLcmPeriod(chainPeriods); clipDur = (lcm > 1e-4f) ? lcm : animDuration; }
         if (clipDur <= 1e-4f) return e;
-        // ~30fps native sampling, floor 64 (short clips), NO cap — FULL PORT (the old 256 "device clip size
-        // limit" was a misdiagnosis — official whale clips are 240 KB and the device loads them fine).
-        int NF = (int)(clipDur * 30.f + 0.5f); if (NF < 64) NF = 64;
+        // NATIVE key-rate sampling (min 30fps), floor 64 (short clips), NO cap — FULL PORT (the old 256 "device
+        // clip size limit" was a misdiagnosis — official whale clips are 240 KB and the device loads them fine).
+        // GRID-ALIGNED when dense: fps = the SOURCE key rate exactly (not NF/clipDur), so bake frame f lands ON
+        // source key f — the bake's frame-lerp IS the source's key-lerp (Star Trek streak teleports: an off-grid
+        // 61.2fps resample of the 60/s keys drifted through the teleport window = mid-lerp ghost frames).
+        int natNF = (int)(clipDur * srcKeyRate + 0.5f);
+        int NF; float bakeFps;
+        if (natNF >= 64) { NF = natNF; bakeFps = srcKeyRate; }
+        else             { NF = 64;    bakeFps = 64.f / clipDur; }
         // Full composed WORLD matrix of the node at time t (every ancestor's channels sampled) — same math as
         // extractNodeTranslation's worldAt (world-space so parent scale/rotation are honored).
         auto trsMat = [](const float* t, const float* r, const float* sc, float* mm){ float x=r[0],y=r[1],z=r[2],ww=r[3];
@@ -1125,7 +1260,7 @@ public:
         float o0[3]={0,0,0}, maxd=0.f, rotMaxd=0.f, sclMaxd=0.f, rs0[9]={0}, sc0[3]={1,1,1};
         for (int f = 0; f < NF; f++) {
             float* w = &mats[(size_t)f*16];
-            worldAt(node, clipDur*(float)f/(float)NF, w);
+            worldAt(node, (float)f/bakeFps, w);   // grid-aligned sample times (frame f = source key f when dense)
             // NORMALIZED 3x3 (scale stripped per column) — cyan's nodes carry a ~0.01 world scale, so the raw
             // rotation*scale Frobenius read 100x too small (63° looked like 0.0148) and every gear/mill/boat
             // failed the rotation gate. Column-normalizing measures the PURE rotation deviation; the stripped
@@ -1159,17 +1294,111 @@ public:
             return e;
         }
         const float* W0 = &mats[0];
+        // ── IDENTITY-BIND + RELATIVE clip M(f) = W(f)·inv(W0) (the mirror / non-uniform-scale fix, ANIM-VERIFY
+        //    2026-07-08): the old scheme (bind = matTrs(W0) with ONE uniform scale, clip = matTrs(W(f))) LOSES
+        //    W0's mirror (outerwilds planets: uniform NEGATIVE scale -51 — TRS can't represent a rotoinversion,
+        //    err up to 800u) and its non-uniform scale (sqgraveyard zeds S=(1.07,1.07,0.83): the HZAN:SKEL bind
+        //    carries one uniform scale -> ~0.37u distortion). M(f) is the node's RELATIVE motion — mirror and
+        //    static scale cancel in W(f)·inv(W0) exactly, so it IS clean TRS for any rigid node animation —
+        //    and restPos keeps the FULL W0 bake (mirror included):
+        //      device: vert = C(f)·invBind·rest = M(f)·I·(W0·base) = W(f)·base   (exact, any W0)
+        //    M(0)=I so the clip starts at identity (ACL-friendly small numbers; deltas, not world coords).
+        auto affInv44 = [](const float* m, float* o){   // affine 4x4 inverse (column-major)
+            float a=m[0],b=m[4],c=m[8], d=m[1],e2=m[5],f2=m[9], g2=m[2],h=m[6],i2=m[10];
+            float det=a*(e2*i2-f2*h)-b*(d*i2-f2*g2)+c*(d*h-e2*g2); float id=(std::fabs(det)>1e-12f)?1.f/det:0.f;
+            o[0]=(e2*i2-f2*h)*id; o[4]=(c*h-b*i2)*id; o[8]=(b*f2-c*e2)*id;
+            o[1]=(f2*g2-d*i2)*id; o[5]=(a*i2-c*g2)*id; o[9]=(c*d-a*f2)*id;
+            o[2]=(d*h-e2*g2)*id;  o[6]=(b*g2-a*h)*id;  o[10]=(a*e2-b*d)*id;
+            o[3]=o[7]=o[11]=0.f; o[15]=1.f;
+            o[12]=-(o[0]*m[12]+o[4]*m[13]+o[8]*m[14]);
+            o[13]=-(o[1]*m[12]+o[5]*m[13]+o[9]*m[14]);
+            o[14]=-(o[2]*m[12]+o[6]*m[13]+o[10]*m[14]); };
+        float invW0[16]; affInv44(W0, invW0);
+        auto mul44 = [](const float* a, const float* b, float* o){
+            for (int c=0;c<4;c++) for (int rr=0;rr<4;rr++) o[c*4+rr]=a[rr]*b[c*4]+a[4+rr]*b[c*4+1]+a[8+rr]*b[c*4+2]+a[12+rr]*b[c*4+3]; };
+        // ── SCHEME SELECTION: is W0 representable as a uniform-positive-scale TRS bind? If YES (the common
+        //    case), keep the DEVICE-PROVEN W0-bind + W(f) clip: matTrs(W(f)) decomposes T·R·S(f) cleanly, so
+        //    per-frame ANIMATED axis-aligned scale ports exactly (erebor's breathing wisps / tinyplanet fires —
+        //    the identity-bind scheme conjugates their scale through the rotation = SHEAR the TRS clip can't
+        //    carry, ANIM-VERIFY regressed them 0.14-0.46u). If NO (mirror or non-uniform static scale), use the
+        //    identity-bind path above. Neither scheme is universal — the selector picks per node.
         float w0q[4], w0t[3], w0s[3]; matTrs(W0, w0q, w0t, w0s);
-        float w0su = (w0s[0]+w0s[1]+w0s[2])/3.f;   // bind carries ONE uniform scale per joint (HZAN:SKEL format)
+        float w0su = (w0s[0]+w0s[1]+w0s[2])/3.f;
+        float w0det = W0[0]*(W0[5]*W0[10]-W0[6]*W0[9]) - W0[4]*(W0[1]*W0[10]-W0[2]*W0[9]) + W0[8]*(W0[1]*W0[6]-W0[2]*W0[5]);
+        bool bindClean = w0det > 0.f;
+        if (bindClean) for (int c = 0; c < 3; c++)
+            if (std::fabs(w0s[c]-w0su) > 1e-3f*std::max(std::fabs(w0su), 1e-3f)) { bindClean = false; break; }
+        if (bindClean) {   // orthogonality: recompose R·su and diff the 3x3 (a sheared W0 must NOT take this path)
+            float x=w0q[0],y=w0q[1],z=w0q[2],w=w0q[3];
+            float rc[9]={1-2*(y*y+z*z),2*(x*y+w*z),2*(x*z-w*y), 2*(x*y-w*z),1-2*(x*x+z*z),2*(y*z+w*x), 2*(x*z+w*y),2*(y*z-w*x),1-2*(x*x+y*y)};
+            for (int c=0;c<3 && bindClean;c++) for (int rr=0;rr<3;rr++)
+                if (std::fabs(rc[c*3+rr]*w0su - W0[c*4+rr]) > 1e-3f*std::max(std::fabs(w0su),1.f)) { bindClean = false; break; }
+        }
+        // variant 0 = W0-bind + W(f) clip (proven; needs a bind-representable W0)
+        // variant 1 = identity bind + RELATIVE M(f)=W(f)·inv(W0) clip + W0-baked rest (mirror/non-uniform W0)
+        // variant 2 = identity bind + RAW W(f) clip + LOCAL rest (tinyplanet fire1: non-uniform W0 AND animated
+        //             scale — inv(W0) conjugates the axis-aligned scale into SHEAR M(f) can't carry, while W(f)
+        //             itself IS clean TRS; ship it directly and keep the verts node-local: vert = W(f)·base exact)
+        int variant = bindClean ? 0 : 1;
+        if (!bindClean) {
+            auto shearOf = [&](bool useM) -> float {
+                float worst = 0.f; int cf[4] = {0, NF/3, (2*NF)/3, NF-1};
+                for (int ci = 0; ci < 4; ci++) {
+                    float M[16];
+                    if (useM) mul44(&mats[(size_t)cf[ci]*16], invW0, M); else memcpy(M, &mats[(size_t)cf[ci]*16], 64);
+                    float q[4], t[3], s[3]; matTrs(M, q, t, s);
+                    float x=q[0],y=q[1],z=q[2],w=q[3], rc[9]={1-2*(y*y+z*z),2*(x*y+w*z),2*(x*z-w*y), 2*(x*y-w*z),1-2*(x*x+z*z),2*(y*z+w*x), 2*(x*z+w*y),2*(y*z-w*x),1-2*(x*x+y*y)};
+                    for (int c=0;c<3;c++) for (int rr=0;rr<3;rr++){ float dv=std::fabs(rc[c*3+rr]*s[c]-M[c*4+rr]); if (dv>worst) worst=dv; }
+                }
+                return worst; };
+            float shM = shearOf(true);
+            if (shM > 1e-2f && shearOf(false) < shM) variant = 2;
+        }
         e.jointCount = 2; e.parents = {-1, 0};
-        e.jointPos   = {0,0,0, w0t[0],w0t[1],w0t[2]};
-        e.jointQuat  = {1,0,0,0, w0q[3],w0q[0],w0q[1],w0q[2]};   // (w,x,y,z) for HZAN:SKEL; matTrs q is (x,y,z,w)
-        e.jointScale = {1, (w0su>1e-4f||w0su<-1e-4f)?w0su:1.f};
+        if (variant == 0) {
+            e.jointPos   = {0,0,0, w0t[0],w0t[1],w0t[2]};
+            e.jointQuat  = {1,0,0,0, w0q[3],w0q[0],w0q[1],w0q[2]};   // (w,x,y,z) for HZAN:SKEL; matTrs q is (x,y,z,w)
+            e.jointScale = {1, (w0su>1e-4f||w0su<-1e-4f)?w0su:1.f};
+        } else {
+            e.jointPos   = {0,0,0, 0,0,0};
+            e.jointQuat  = {1,0,0,0, 1,0,0,0};   // both joints bind at IDENTITY -> device invBind = I
+            e.jointScale = {1, 1};
+        }
         e.trsLocal.resize((size_t)NF*2*10);
+        float decompErr = 0.f;   // TRS-representability residual of the mover clip (shear would show here)
         for (int f = 0; f < NF; f++) {
-            float q[4], t[3], s[3]; matTrs(&mats[(size_t)f*16], q, t, s);   // clip-local = the node's ACTUAL world matrix W(f) (ACL-clean vs bind W0)
+            float M[16];
+            if (variant == 1) mul44(&mats[(size_t)f*16], invW0, M); // clip = relative M(f) (mirror/non-uniform W0 cancelled)
+            else              memcpy(M, &mats[(size_t)f*16], 64);   // clip = W(f) directly (v0: invBind=inv(W0) cancels; v2: LOCAL rest)
+            float q[4], t[3], s[3]; matTrs(M, q, t, s);
             float* r = &e.trsLocal[(size_t)(f*2+0)*10]; r[0]=0;r[1]=0;r[2]=0;r[3]=1; r[4]=0;r[5]=0;r[6]=0; r[7]=1;r[8]=1;r[9]=1;   // joint0 = STATIC identity (no root motion to extract)
             float* p = &e.trsLocal[(size_t)(f*2+1)*10]; p[0]=q[0];p[1]=q[1];p[2]=q[2];p[3]=q[3]; p[4]=t[0];p[5]=t[1];p[6]=t[2]; p[7]=s[0];p[8]=s[1];p[9]=s[2];
+            float x=q[0],y=q[1],z=q[2],w=q[3], rc[9]={1-2*(y*y+z*z),2*(x*y+w*z),2*(x*z-w*y), 2*(x*y-w*z),1-2*(x*x+z*z),2*(y*z+w*x), 2*(x*z+w*y),2*(y*z-w*x),1-2*(x*x+y*y)};
+            for (int c=0;c<3;c++) for (int rr=0;rr<3;rr++){ float dv=std::fabs(rc[c*3+rr]*s[c]-M[c*4+rr]); if (dv>decompErr) decompErr=dv; }
+        }
+        if (decompErr > 1e-2f)
+            fprintf(stderr, "[GLTF-RIGID] mesh%d node%d WARN mover clip not clean TRS (shear residual %.4f, variant=%d) — motion will deviate\n", meshIdx, node, decompErr, variant);
+        // ONE-WAY PERIOD FIX ("reset is fucked up": drifting ensembles): a one-way clip ships WITHOUT the
+        // cooker's seam frame, so its device duration was (NF-1)/fps = ONE SOURCE FRAME SHORT of the real
+        // period — every loop the teleport fires 1/fps early and the mesh drifts out of phase against its
+        // siblings/source (shark_reef fish school: 33ms/loop). Append ONE frame sampled at the TRUE clip end
+        // (clipDur-ε — NOT clipDur, where per-node wrap would give the frame-0 pose = a backward-slide lerp)
+        // -> duration NF/fps = clipDur exactly. Cyclic clips are untouched (the cooker's appended frame-0 seam
+        // already lands their duration on clipDur).
+        {
+            float drift = 0.f;
+            const float* d0 = &e.trsLocal[10];                       // mover joint, frame 0
+            const float* dL = &e.trsLocal[((size_t)(NF-1)*2+1)*10];  // mover joint, last frame
+            for (int c = 4; c < 7; c++) { float d = d0[c]-dL[c]; if (d<0) d=-d; if (d>drift) drift=d; }
+            if (drift > 5.0f) {   // same threshold as the cooker's oneWay split
+                float M[16], W[16]; worldAt(node, clipDur - 1e-4f, W);
+                if (variant == 1) mul44(W, invW0, M); else memcpy(M, W, 64);
+                float q[4], t[3], s[3]; matTrs(M, q, t, s);
+                e.trsLocal.resize((size_t)(NF+1)*2*10);
+                float* r = &e.trsLocal[(size_t)(NF*2+0)*10]; r[0]=0;r[1]=0;r[2]=0;r[3]=1; r[4]=0;r[5]=0;r[6]=0; r[7]=1;r[8]=1;r[9]=1;
+                float* p = &e.trsLocal[(size_t)(NF*2+1)*10]; p[0]=q[0];p[1]=q[1];p[2]=q[2];p[3]=q[3]; p[4]=t[0];p[5]=t[1];p[6]=t[2]; p[7]=s[0];p[8]=s[1];p[9]=s[2];
+                NF += 1;
+            }
         }
         // QUATERNION HEMISPHERE CONTINUITY (the cyan "very shaky" fix): matTrs's per-frame quat sign is
         // arbitrary; a mill/gear spin crossing 180 deg flips polarity and the decoder's neighbor-lerp takes the
@@ -1179,17 +1408,20 @@ public:
             if (q[0]*p[0]+q[1]*p[1]+q[2]*p[2]+q[3]*p[3] < 0.f) { q[0]=-q[0]; q[1]=-q[1]; q[2]=-q[2]; q[3]=-q[3]; }
         }
         size_t nv = rec->basePos.size()/3;
-        e.restPos.resize(nv*3);   // verts WORLD-baked into the frame-0 rest (bind W0 → device invBind cancels it)
-        for (size_t v = 0; v < nv; v++) { const float* b = &rec->basePos[v*3]; float* o = &e.restPos[v*3];
-            o[0]=W0[0]*b[0]+W0[4]*b[1]+W0[8]*b[2]+W0[12];
-            o[1]=W0[1]*b[0]+W0[5]*b[1]+W0[9]*b[2]+W0[13];
-            o[2]=W0[2]*b[0]+W0[6]*b[1]+W0[10]*b[2]+W0[14]; }
+        if (variant == 2) e.restPos = rec->basePos;   // LOCAL rest: the raw W(f) clip carries the full placement (vert = W(f)·base)
+        else {
+            e.restPos.resize(nv*3);   // verts WORLD-baked into the frame-0 rest (FULL W0 incl. mirror/non-uniform scale)
+            for (size_t v = 0; v < nv; v++) { const float* b = &rec->basePos[v*3]; float* o = &e.restPos[v*3];
+                o[0]=W0[0]*b[0]+W0[4]*b[1]+W0[8]*b[2]+W0[12];
+                o[1]=W0[1]*b[0]+W0[5]*b[1]+W0[9]*b[2]+W0[13];
+                o[2]=W0[2]*b[0]+W0[6]*b[1]+W0[10]*b[2]+W0[14]; }
+        }
         e.boneIdx.assign(nv*4, 0); e.boneWgt.assign(nv*4, 0);
         for (size_t v = 0; v < nv; v++) { e.boneIdx[v*4]=1; e.boneWgt[v*4]=255; }   // weight every vert to the MOVING joint
-        e.frameCount = NF; e.fps = (float)NF / clipDur;   // NF frames over [0,clipDur); the cooker's loopWrap appends the seam frame for cyclic clips
+        e.frameCount = NF; e.fps = bakeFps;   // NF frames at the SOURCE key rate (grid-aligned); the cooker's loopWrap appends the seam frame for cyclic clips
         if (std::getenv("HSR_VERBOSE"))
-            fprintf(stderr, "[GLTF-RIGID] mesh%d node%d NF=%d dur=%.2fs travel=%.2f rotDev=%.2f sclDev=%.2f W0t=(%.1f,%.1f,%.1f)\n",
-                    meshIdx, node, NF, clipDur, maxd, rotMaxd, sclMaxd, w0t[0], w0t[1], w0t[2]);
+            fprintf(stderr, "[GLTF-RIGID] mesh%d node%d NF=%d fps=%.1f dur=%.2fs travel=%.2f rotDev=%.2f sclDev=%.2f bindClean=%d W0t=(%.1f,%.1f,%.1f) decompErr=%.4f\n",
+                    meshIdx, node, NF, bakeFps, clipDur, maxd, rotMaxd, sclMaxd, (int)bindClean, W0[12], W0[13], W0[14], decompErr);
         return e;
     }
     // ── COOK: EXACT per-frame QUATERNION rotation replay for a node-animated glTF mesh — the OPA
@@ -1243,15 +1475,25 @@ public:
             else { float S=sqrtf(1+r8-r0-r4)*2; q[3]=(r1-r3)/S; q[0]=(r6+r2)/S; q[1]=(r7+r5)/S; q[2]=0.25f*S; } };
         float W0[16]; worldAt(node, 0.f, W0);
         pivotOut[0]=W0[12]; pivotOut[1]=W0[13]; pivotOut[2]=W0[14];
-        float q0[4]; matQuat(W0, q0); float c0[4] = {-q0[0], -q0[1], -q0[2], q0[3]};   // conj(q0)
+        // RELATIVE rotation from M(f) = W(f)·inv(W0), NOT quat(W)·conj(quat(W0)): a MIRRORED node (uniform
+        // negative scale — outerwilds' planets/Interloper all ship S=-22..-56) has det(3x3)<0 and matQuat of
+        // it is garbage (a rotoinversion has no quaternion). The mirror CANCELS in W(f)·inv(W0), leaving the
+        // clean relative rotation. Identical result for positive-scale nodes (no regression; aurora lesson:
+        // still NO handedness flip anywhere).
+        float invW0r[16]; { const float* m=W0; float a=m[0],b=m[4],c=m[8], d=m[1],e2=m[5],f2=m[9], g2=m[2],h=m[6],i2=m[10];
+            float det=a*(e2*i2-f2*h)-b*(d*i2-f2*g2)+c*(d*h-e2*g2); float id=(std::fabs(det)>1e-12f)?1.f/det:0.f;
+            invW0r[0]=(e2*i2-f2*h)*id; invW0r[4]=(c*h-b*i2)*id; invW0r[8]=(b*f2-c*e2)*id;
+            invW0r[1]=(f2*g2-d*i2)*id; invW0r[5]=(a*i2-c*g2)*id; invW0r[9]=(c*d-a*f2)*id;
+            invW0r[2]=(d*h-e2*g2)*id;  invW0r[6]=(b*g2-a*h)*id;  invW0r[10]=(a*e2-b*d)*id;
+            invW0r[3]=invW0r[7]=invW0r[11]=0.f; invW0r[15]=1.f;
+            invW0r[12]=-(invW0r[0]*m[12]+invW0r[4]*m[13]+invW0r[8]*m[14]);
+            invW0r[13]=-(invW0r[1]*m[12]+invW0r[5]*m[13]+invW0r[9]*m[14]);
+            invW0r[14]=-(invW0r[2]*m[12]+invW0r[6]*m[13]+invW0r[10]*m[14]); }
         quats.resize((size_t)(N+1)*4); float bestMag = 0.f;
         for (int f = 0; f <= N; f++) {
             float W[16]; worldAt(node, clipDur*(float)f/(float)N, W);
-            float q[4]; matQuat(W, q); float r[4];   // rel = q * conj(q0) (xyzw) — NO handedness flip (the aurora lesson)
-            r[0]= q[3]*c0[0] + q[0]*c0[3] + q[1]*c0[2] - q[2]*c0[1];
-            r[1]= q[3]*c0[1] - q[0]*c0[2] + q[1]*c0[3] + q[2]*c0[0];
-            r[2]= q[3]*c0[2] + q[0]*c0[1] - q[1]*c0[0] + q[2]*c0[3];
-            r[3]= q[3]*c0[3] - q[0]*c0[0] - q[1]*c0[1] - q[2]*c0[2];
+            float M[16]; mulMat(W, invW0r, M);
+            float r[4]; matQuat(M, r);   // rel rotation (xyzw), mirror/static-scale cancelled
             if (f > 0) { float* p = &quats[(size_t)(f-1)*4];   // hemisphere continuity -> the shader nlerp takes the short arc
                 if (r[0]*p[0]+r[1]*p[1]+r[2]*p[2]+r[3]*p[3] < 0) { r[0]=-r[0]; r[1]=-r[1]; r[2]=-r[2]; r[3]=-r[3]; } }
             float* o = &quats[(size_t)f*4]; o[0]=r[0]; o[1]=r[1]; o[2]=r[2]; o[3]=r[3];
@@ -1401,7 +1643,8 @@ public:
         // "bubbles cramming in one place" + "Instancer_8 ain't moving after cook"). STAGGER GUARD: a contributing
         // channel that STARTS late (>0.05s) is a segment of the global choreography, not a self-loop — keep the
         // GLOBAL duration so the ensemble phasing survives.
-        float clipDur = 0.f, latestStart = 0.f; bool multiPeriod = false;
+        float clipDur = 0.f, latestStart = 0.f; bool multiPeriod = false; float srcKeyRate = 0.f;   // NO 30fps floor (see extractNodeRigidHzAnim)
+        std::vector<float> chainPeriods;
         { std::vector<char> relN(gnodes.size(), 0);
           for (int j = 0; j < nj; ++j)
               for (int n = sk.joints[j], g = 0; n >= 0 && (size_t)n < gnodes.size() && g < 64; n = gnodes[n].parent, ++g) relN[n] = 1;
@@ -1411,18 +1654,34 @@ public:
                   && ch.sampler>=0 && (size_t)ch.sampler<gsamplers.size()){ auto& tv=gsamplers[ch.sampler].times;
                   if (!tv.empty()){ if (tv.back()>clipDur) clipDur=tv.back(); if (tv.front()>latestStart) latestStart=tv.front();
                       if (firstEnd < 0.f) firstEnd = tv.back();
-                      else if (std::fabs(tv.back()-firstEnd) > 0.1f) multiPeriod = true; } } }
+                      else if (std::fabs(tv.back()-firstEnd) > 0.1f) multiPeriod = true;
+                      bool nw = true; for (float p : chainPeriods) if (std::fabs(p-tv.back()) <= 0.05f) { nw = false; break; }
+                      if (nw) chainPeriods.push_back(tv.back());
+                      // native key rate of the DENSEST contributing channel — the clip must be baked at
+                      // (at least) this rate or fast per-key motion aliases (see below). NON-UNIFORM tracks
+                      // (Blender key-optimized exports) hide sharp corner keys between the average-rate grid
+                      // (quiet_place: isolated 2.7u corner-cut spikes) — honor the MIN key gap too (<=120/s).
+                      if (tv.size() >= 2 && tv.back()-tv.front() > 1e-4f) {
+                          float r = (float)(tv.size()-1)/(tv.back()-tv.front()); if (r > srcKeyRate) srcKeyRate = r;
+                          float mg = 1e9f; for (size_t kk = 1; kk < tv.size(); kk++){ float g = tv[kk]-tv[kk-1]; if (g > 1e-5f && g < mg) mg = g; }
+                          if (mg < 1e8f) { float r2 = 1.f/mg; if (r2 > 120.f) r2 = 120.f; if (r2 > srcKeyRate) srcKeyRate = r2; } } } }
+          if (srcKeyRate > 240.f) srcKeyRate = 240.f; if (srcKeyRate < 1.f) srcKeyRate = 30.f; }   // sanity cap (badly-authored micro-key tracks)
         // MULTI-PERIOD skin (bubbles trails: each joint/bubble loops on its OWN channel length — the periods
-        // BEAT against each other, which is what SPREADS the trail). A single clip looping at max(period)
-        // resets EVERY bubble together each wrap = right after it they're all freshly spawned = "bubbles
-        // cramming in one place". No finite single loop reproduces an irrational-ratio beat — bake the FULL
-        // master timeline instead: inside it every joint wraps on its own period exactly like the preview
-        // (chTime), and the only artifact is one ensemble reshuffle per master loop (166.8s) instead of never.
-        if (clipDur <= 1e-4f || latestStart > 0.05f || multiPeriod) clipDur = animDuration;
-        // NATIVE sampling density: the caller sizes `frames` off the GLOBAL timeline (166.8s x 30fps = 5004),
-        // so a 16.7s self-contained clip was oversampled 10x (3MB ACL clips for 500 real keys). Not a cap —
-        // 30/s IS the authored key rate; re-sample at the clip's OWN natural count when the caller overshoots.
-        if ((float)frames > clipDur * 30.f * 1.5f) { int nf2 = (int)(clipDur * 30.f + 1.5f); if (nf2 >= 2) frames = nf2; }
+        // BEAT against each other, which is what SPREADS the trail). A HARMONIC chain (periods share a small
+        // rational LCM) bakes the LCM — every channel closes at the clip end = seamless forever (the "reset
+        // is fucked up" fix). An IRRATIONAL beat has no finite seamless loop — bake the FULL master timeline:
+        // inside it every joint wraps on its own period exactly like the preview (chTime), and the only
+        // artifact is one ensemble reshuffle per master loop (166.8s) instead of never.
+        if (clipDur <= 1e-4f || latestStart > 0.05f) clipDur = animDuration;
+        else if (multiPeriod) { float lcm = rationalLcmPeriod(chainPeriods); clipDur = (lcm > 1e-4f) ? lcm : animDuration; }
+        // NATIVE sampling density: bake the clip at the SOURCE'S OWN key rate (srcKeyRate, from the densest
+        // contributing channel), not a hardcoded 30/s. Both directions matter: the caller sizes `frames` off
+        // the GLOBAL timeline (166.8s x 30fps = 5004 — a 16.7s clip was oversampled 10x = 3MB ACL for 500
+        // real keys), AND the old fixed 30/s resample HALVED 60-key/s sources (Star Trek warp streaks: 50
+        // keys/0.83s SAWTOOTH per bone — the 26-frame bake lerped ACROSS each teleport wrap = streaks
+        // snapping mid-flight, ANIM-VERIFY err 50u of a 103u span). At the native rate the bake's lerp
+        // between frames IS the source's own lerp between keys — exact by construction.
+        { int nat = (int)(clipDur * srcKeyRate + 0.5f); if (nat < 2) nat = 2; frames = nat; }
         e.jointPos.resize(nj*3); e.jointQuat.resize(nj*4); e.jointScale.resize(nj); e.parents.resize(nj);
         // Joints can be parented through INTERMEDIATE non-joint nodes (rig groups): the glTF node's LOCAL transform is
         // then NOT relative to the parent JOINT, so storing it directly + dropping the broken parent link gives false
@@ -1547,16 +1806,19 @@ public:
         e.boneIdx.resize((size_t)rec->nv*4); e.boneWgt.resize((size_t)rec->nv*4);
         for (u32 v = 0; v < rec->nv; ++v) {
             float wsum=0; for (int c=0;c<4;c++) wsum += rec->jw[v*4+c];
-            for (int c = 0; c < 4; ++c) {
-                e.boneIdx[v*4+c] = rec->jidx[v*4+c];
-                float w = wsum > 1e-6f ? rec->jw[v*4+c]/wsum : (c==0?1.f:0.f);
-                int iw = (int)(w*255.0f + 0.5f); e.boneWgt[v*4+c] = (uint8_t)(iw<0?0:(iw>255?255:iw));
-            }
+            // SUM-PRESERVING u8 quantization (the zelda flag 0.4%-inflation fix): independent rounding of
+            // 0.5/0.5 gives 128+128=256 -> the device's Σ(w/255)·S·v scales the vert by 256/255 = a constant
+            // 6cm offset at |v|~11. Largest-remainder rounding keeps the total EXACTLY 255 (Σw = 1).
+            float wf[4]; for (int c = 0; c < 4; ++c) wf[c] = wsum > 1e-6f ? rec->jw[v*4+c]/wsum : (c==0?1.f:0.f);
+            int iw[4], tot = 0; float fr[4];
+            for (int c = 0; c < 4; ++c) { float x = wf[c]*255.f; iw[c] = (int)x; fr[c] = x - (float)iw[c]; tot += iw[c]; }
+            for (int rem = 255 - tot; rem > 0; --rem) { int b = 0; for (int c = 1; c < 4; ++c) if (fr[c] > fr[b]) b = c; iw[b]++; fr[b] = -1.f; }
+            for (int c = 0; c < 4; ++c) { e.boneIdx[v*4+c] = rec->jidx[v*4+c]; e.boneWgt[v*4+c] = (uint8_t)(iw[c]<0?0:(iw[c]>255?255:iw[c])); }
         }
-        e.frameCount = frames; e.fps = (float)frames / clipDur;
+        e.frameCount = frames; e.fps = srcKeyRate;   // GRID-ALIGNED: frame f sampled at f/keyRate = ON source key f (exact key-lerp)
         e.trsLocal.resize((size_t)frames*nj*10);
         for (int f = 0; f < frames; ++f) {
-            float t = (float)f / (float)frames * clipDur;
+            float t = (float)f / srcKeyRate;
             std::vector<GNode> cur = gnodes;
             for (auto& ch : gchannels) {
                 if (ch.node<0||(size_t)ch.node>=cur.size()||ch.sampler<0||(size_t)ch.sampler>=gsamplers.size()) continue;
@@ -1577,6 +1839,38 @@ public:
                 o[0]=q[0]; o[1]=q[1]; o[2]=q[2]; o[3]=q[3];             // quat xyzw (ACL)
                 o[4]=t[0]; o[5]=t[1]; o[6]=t[2];
                 o[7]=s[0]; o[8]=s[1]; o[9]=s[2];
+            }
+        }
+        // ONE-WAY PERIOD FIX (see extractNodeRigidHzAnim): a one-way skin ships without the cooker's seam
+        // frame -> device duration (frames-1)/fps = one source frame SHORT of the real period -> the teleport
+        // fires 1/fps early every loop and the mesh drifts against its siblings (shark_reef fish: 33ms/loop,
+        // the school dephases forever). Append one frame at the TRUE end (clipDur-ε) -> duration = clipDur.
+        {
+            float drift = 0.f;
+            for (int j = 0; j < nj; ++j) { const float* a0 = &e.trsLocal[(size_t)j*10]; const float* aL = &e.trsLocal[((size_t)(frames-1)*nj+j)*10];
+                for (int c = 4; c < 7; c++) { float d = a0[c]-aL[c]; if (d<0) d=-d; if (d>drift) drift=d; } }
+            if (drift > 5.0f) {
+                float t = clipDur - 1e-4f;
+                std::vector<GNode> cur = gnodes;
+                for (auto& ch : gchannels) {
+                    if (ch.node<0||(size_t)ch.node>=cur.size()||ch.sampler<0||(size_t)ch.sampler>=gsamplers.size()) continue;
+                    float val[4]={0,0,0,1}; sampleSampler(gsamplers[ch.sampler], chTime(ch.node, t), val);
+                    if (ch.path==0){cur[ch.node].t[0]=val[0];cur[ch.node].t[1]=val[1];cur[ch.node].t[2]=val[2];}
+                    else if (ch.path==1){cur[ch.node].r[0]=val[0];cur[ch.node].r[1]=val[1];cur[ch.node].r[2]=val[2];cur[ch.node].r[3]=val[3];}
+                    else {cur[ch.node].s[0]=val[0];cur[ch.node].s[1]=val[1];cur[ch.node].s[2]=val[2];}
+                }
+                e.trsLocal.resize((size_t)(frames+1)*nj*10);
+                for (int j = 0; j < nj; ++j) {
+                    int n = sk.joints[j]; float* o = &e.trsLocal[((size_t)frames*nj+j)*10];
+                    float lm[16];
+                    if (hzHier && e.parents[j] >= 0) localRelToParentJoint(cur, n, sk.joints[e.parents[j]], lm);
+                    else worldM(cur, n, lm);
+                    float q[4], t2[3], s[3]; matTrs(lm, q, t2, s);
+                    const float* pv = &e.trsLocal[((size_t)(frames-1)*nj+j)*10];   // hemisphere continuity vs previous frame
+                    if (q[0]*pv[0]+q[1]*pv[1]+q[2]*pv[2]+q[3]*pv[3] < 0.f) { q[0]=-q[0]; q[1]=-q[1]; q[2]=-q[2]; q[3]=-q[3]; }
+                    o[0]=q[0]; o[1]=q[1]; o[2]=q[2]; o[3]=q[3]; o[4]=t2[0]; o[5]=t2[1]; o[6]=t2[2]; o[7]=s[0]; o[8]=s[1]; o[9]=s[2];
+                }
+                frames += 1; e.frameCount = frames;
             }
         }
         // ── SINGLE-ROOT PORT: the device's SkinnedMesh build requires the skeleton to have EXACTLY ONE root joint
@@ -1683,6 +1977,173 @@ public:
                 e.jointScale[rj]=1.f;
                 if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[HZMODELLOCAL] mesh%d root j%d: verts->model-local + identity root bind (cull-bounds fix)\n",meshIdx,rj);
             }
+        }
+        // ── SELF-VALIDATION + FLAT-EXACT fallback (ANIM-VERIFY 2026-07-08): emulate the DEVICE's decode of the
+        //    final shipped tables (uniform-scale TRS binds composed+inverted, clip locals composed, weighted skin)
+        //    against the SOURCE skinning S_j(t)=W_j(t)·IBM_j at 4 bake frames. The hierarchical scheme is EXACT for
+        //    well-formed rigs, but an IBM with NON-UNIFORM scale or SHEAR (steam_void 'Bake': node-bind deviation
+        //    17.5 — Maya bakes sim transforms into IBMs) cannot round-trip through the pos/quat/uniform-scale bind
+        //    -> verts orbit off the source. When validation fails, REBUILD FLAT-EXACT: one synthetic identity root,
+        //    every source joint a child whose per-frame local IS its full skinning matrix S_j(t) (bind=identity ->
+        //    device plays S_j verbatim; model-local rest verts). HSR_NOFLATEXACT reverts.
+        if (!std::getenv("HSR_NOFLATEXACT") && frames >= 2) {
+            auto invAffV = [](const float* m, float* o){
+                float a00=m[0],a01=m[4],a02=m[8], a10=m[1],a11=m[5],a12=m[9], a20=m[2],a21=m[6],a22=m[10];
+                float det=a00*(a11*a22-a12*a21)-a01*(a10*a22-a12*a20)+a02*(a10*a21-a11*a20);
+                float id=(det>1e-12f||det<-1e-12f)?1.f/det:0.f;
+                float i00=(a11*a22-a12*a21)*id,i01=(a02*a21-a01*a22)*id,i02=(a01*a12-a02*a11)*id;
+                float i10=(a12*a20-a10*a22)*id,i11=(a00*a22-a02*a20)*id,i12=(a02*a10-a00*a12)*id;
+                float i20=(a10*a21-a11*a20)*id,i21=(a01*a20-a00*a21)*id,i22=(a00*a11-a01*a10)*id;
+                o[0]=i00;o[1]=i10;o[2]=i20;o[3]=0; o[4]=i01;o[5]=i11;o[6]=i21;o[7]=0; o[8]=i02;o[9]=i12;o[10]=i22;o[11]=0;
+                float tx=m[12],ty=m[13],tz=m[14];
+                o[12]=-(i00*tx+i01*ty+i02*tz); o[13]=-(i10*tx+i11*ty+i12*tz); o[14]=-(i20*tx+i21*ty+i22*tz); o[15]=1; };
+            u32 nvv = rec->nv; u32 probe[8]; for (int k=0;k<8;k++) probe[k]=(u32)((size_t)(nvv-1)*k/7);
+            // make sure a ZERO-WEIGHT vert (if any) is probed: the source pins those at basePos (animate's
+            // wsum guard) while the shipped tables force-bind them to joint 0 — invisible to spread probes
+            // when rare (steam_void 'Bake': the whale's zero-weight rim verts orbited with joint 0).
+            for (u32 v = 0; v < nvv; ++v) {
+                float ws = rec->jw[(size_t)v*4]+rec->jw[(size_t)v*4+1]+rec->jw[(size_t)v*4+2]+rec->jw[(size_t)v*4+3];
+                if (ws <= 1e-5f) { probe[7] = v; break; }   // same guard as animate()'s wsum>1e-5
+            }
+            // measure(): device-decode the CURRENT e.* tables at 4 bake frames and diff vs source skinning.
+            float spanE = 0.f;
+            auto measure = [&]() -> float {
+                int J = e.jointCount;
+                std::vector<float> sbw2((size_t)J*16), sinv2((size_t)J*16);
+                for (int j = 0; j < J; ++j) {
+                    float q[4]={e.jointQuat[j*4+1],e.jointQuat[j*4+2],e.jointQuat[j*4+3],e.jointQuat[j*4]};
+                    float s3[3]={e.jointScale[j],e.jointScale[j],e.jointScale[j]};
+                    float L[16]; trsM(&e.jointPos[j*3], q, s3, L);
+                    if (e.parents[j] >= 0) mulM(&sbw2[(size_t)e.parents[j]*16], L, &sbw2[(size_t)j*16]);
+                    else memcpy(&sbw2[(size_t)j*16], L, 64);
+                    invAffV(&sbw2[(size_t)j*16], &sinv2[(size_t)j*16]);
+                }
+                float maxE = 0.f, tp0[8*3]; spanE = 0.f;
+                int checkF[9] = {0, frames/8, frames/4, (3*frames)/8, frames/2, (5*frames)/8, (3*frames)/4, (7*frames)/8, frames-1};   // 9 frames (4 missed the horror ghost's mid-pose bind error)
+                for (int ci = 0; ci < 9; ++ci) {
+                    int f = checkF[ci]; float t = std::min((float)f / srcKeyRate, clipDur - 1e-4f);   // appended one-way end frame sits AT clipDur
+                    std::vector<float> cw((size_t)J*16), skn((size_t)J*16);
+                    for (int j = 0; j < J; ++j) {
+                        float* o = &e.trsLocal[((size_t)f*J+j)*10];
+                        float q[4]={o[0],o[1],o[2],o[3]}, s3[3]={o[7],o[8],o[9]};
+                        float L[16]; trsM(&o[4], q, s3, L);
+                        if (e.parents[j] >= 0) mulM(&cw[(size_t)e.parents[j]*16], L, &cw[(size_t)j*16]);
+                        else memcpy(&cw[(size_t)j*16], L, 64);
+                        mulM(&cw[(size_t)j*16], &sinv2[(size_t)j*16], &skn[(size_t)j*16]);
+                    }
+                    std::vector<GNode> cur = gnodes;
+                    for (auto& ch : gchannels) {
+                        if (ch.node<0||(size_t)ch.node>=cur.size()||ch.sampler<0||(size_t)ch.sampler>=gsamplers.size()) continue;
+                        float val[4]={0,0,0,1}; sampleSampler(gsamplers[ch.sampler], chTime(ch.node, t), val);
+                        if (ch.path==0){cur[ch.node].t[0]=val[0];cur[ch.node].t[1]=val[1];cur[ch.node].t[2]=val[2];}
+                        else if (ch.path==1){cur[ch.node].r[0]=val[0];cur[ch.node].r[1]=val[1];cur[ch.node].r[2]=val[2];cur[ch.node].r[3]=val[3];}
+                        else {cur[ch.node].s[0]=val[0];cur[ch.node].s[1]=val[1];cur[ch.node].s[2]=val[2];}
+                    }
+                    for (int k = 0; k < 8; ++k) {
+                        u32 v = probe[k];
+                        float sp[3]={0,0,0};   // shipped: e tables (boneWgt pre-normalized u8)
+                        const float* rp = &e.restPos[(size_t)v*3];
+                        for (int c = 0; c < 4; ++c) { float w = e.boneWgt[(size_t)v*4+c]/255.f; if (w<=0.f) continue;
+                            int j = e.boneIdx[(size_t)v*4+c]; if (j>=J) j=0; const float* S=&skn[(size_t)j*16];
+                            sp[0]+=w*(S[0]*rp[0]+S[4]*rp[1]+S[8]*rp[2]+S[12]);
+                            sp[1]+=w*(S[1]*rp[0]+S[5]*rp[1]+S[9]*rp[2]+S[13]);
+                            sp[2]+=w*(S[2]*rp[0]+S[6]*rp[1]+S[10]*rp[2]+S[14]); }
+                        float tp[3]={0,0,0}, wsum=0.f;   // truth: W_j(t)·IBM_j on basePos, weight-normalized
+                        const float* bp = &rec->basePos[(size_t)v*3];
+                        for (int c = 0; c < 4; ++c) { float w = rec->jw[(size_t)v*4+c]; if (w<=0.f) continue;
+                            int j = rec->jidx[(size_t)v*4+c]; if (j>=nj) continue;
+                            float Wn[16]; worldM(cur, sk.joints[j], Wn);
+                            float S[16];
+                            if (sk.ibm.size() >= (size_t)(j+1)*16) mulM(Wn, &sk.ibm[(size_t)j*16], S); else memcpy(S, Wn, 64);
+                            tp[0]+=w*(S[0]*bp[0]+S[4]*bp[1]+S[8]*bp[2]+S[12]);
+                            tp[1]+=w*(S[1]*bp[0]+S[5]*bp[1]+S[9]*bp[2]+S[13]);
+                            tp[2]+=w*(S[2]*bp[0]+S[6]*bp[1]+S[10]*bp[2]+S[14]); wsum+=w; }
+                        if (wsum>1e-5f){ tp[0]/=wsum; tp[1]/=wsum; tp[2]/=wsum; } else { tp[0]=bp[0]; tp[1]=bp[1]; tp[2]=bp[2]; }
+                        if (ci==0){ tp0[k*3]=tp[0]; tp0[k*3+1]=tp[1]; tp0[k*3+2]=tp[2]; }
+                        else { float sx=tp[0]-tp0[k*3],sy=tp[1]-tp0[k*3+1],sz=tp[2]-tp0[k*3+2];
+                               float s2=sqrtf(sx*sx+sy*sy+sz*sz); if (s2>spanE) spanE=s2; }
+                        float dx=sp[0]-tp[0],dy=sp[1]-tp[1],dz=sp[2]-tp[2];
+                        float e2=sqrtf(dx*dx+dy*dy+dz*dz); if (e2>maxE) maxE=e2;
+                    }
+                }
+                return maxE;
+            };
+            float maxE = measure();
+            if (maxE > std::max(0.02f, 0.02f*spanE) && nj + 1 <= 255) {   // u8 bone indices bound the flat scheme
+                fprintf(stderr, "[HZFLAT] mesh%d hierarchical tables DEVIATE from source skinning (maxErr=%.3f span=%.2f) -> FLAT-EXACT rebuild (identity binds, clip = full S_j(t))\n", meshIdx, maxE, spanE);
+                int nj2 = nj + 1;
+                e.jointCount = nj2;
+                e.parents.assign((size_t)nj2, 0); e.parents[0] = -1;
+                e.jointPos.assign((size_t)nj2*3, 0.f);
+                e.jointQuat.assign((size_t)nj2*4, 0.f); for (int j = 0; j < nj2; ++j) e.jointQuat[(size_t)j*4] = 1.f;   // wxyz identity
+                e.jointScale.assign((size_t)nj2, 1.f);
+                e.restPos = rec->basePos;   // raw model space (no folds; S_j carries everything)
+                for (u32 v = 0; v < nvv; ++v) {
+                    float ws = rec->jw[(size_t)v*4]+rec->jw[(size_t)v*4+1]+rec->jw[(size_t)v*4+2]+rec->jw[(size_t)v*4+3];
+                    if (ws <= 1e-5f) {   // ZERO/NEAR-ZERO-WEIGHT vert (same 1e-5 guard as animate): pinned at basePos — bind it to the
+                        for (int c = 0; c < 4; ++c) { e.boneIdx[(size_t)v*4+c] = 0; e.boneWgt[(size_t)v*4+c] = (uint8_t)(c==0?255:0); }   // synthetic STATIC identity root (exactly basePos, matches animate's wsum guard)
+                        continue;
+                    }
+                    int iw[4], tot = 0; float fr[4];   // sum-preserving u8 (Σ = 255 exactly; see the bind builder)
+                    for (int c = 0; c < 4; ++c) { float x = rec->jw[(size_t)v*4+c]/ws*255.f; iw[c] = (int)x; fr[c] = x - (float)iw[c]; tot += iw[c]; }
+                    for (int rem = 255 - tot; rem > 0; --rem) { int b = 0; for (int c = 1; c < 4; ++c) if (fr[c] > fr[b]) b = c; iw[b]++; fr[b] = -1.f; }
+                    for (int c = 0; c < 4; ++c) {
+                        int j = rec->jidx[(size_t)v*4+c]; e.boneIdx[(size_t)v*4+c] = (uint8_t)((j+1 < nj2) ? j+1 : 0);
+                        e.boneWgt[(size_t)v*4+c] = (uint8_t)(iw[c]<0?0:(iw[c]>255?255:iw[c]));
+                    }
+                }
+                e.trsLocal.assign((size_t)frames*nj2*10, 0.f);
+                float decompE = 0.f;
+                for (int f = 0; f < frames; ++f) {
+                    float t = std::min((float)f / srcKeyRate, clipDur - 1e-4f);   // appended one-way end frame sits AT clipDur
+                    std::vector<GNode> cur = gnodes;
+                    for (auto& ch : gchannels) {
+                        if (ch.node<0||(size_t)ch.node>=cur.size()||ch.sampler<0||(size_t)ch.sampler>=gsamplers.size()) continue;
+                        float val[4]={0,0,0,1}; sampleSampler(gsamplers[ch.sampler], chTime(ch.node, t), val);
+                        if (ch.path==0){cur[ch.node].t[0]=val[0];cur[ch.node].t[1]=val[1];cur[ch.node].t[2]=val[2];}
+                        else if (ch.path==1){cur[ch.node].r[0]=val[0];cur[ch.node].r[1]=val[1];cur[ch.node].r[2]=val[2];cur[ch.node].r[3]=val[3];}
+                        else {cur[ch.node].s[0]=val[0];cur[ch.node].s[1]=val[1];cur[ch.node].s[2]=val[2];}
+                    }
+                    { float* o = &e.trsLocal[((size_t)f*nj2)*10]; o[3]=1.f; o[7]=o[8]=o[9]=1.f; }   // joint0 identity
+                    for (int j = 0; j < nj; ++j) {
+                        float Wn[16]; worldM(cur, sk.joints[j], Wn);
+                        float S[16];
+                        if (sk.ibm.size() >= (size_t)(j+1)*16) mulM(Wn, &sk.ibm[(size_t)j*16], S); else memcpy(S, Wn, 64);
+                        float q[4], tt[3], s3[3]; matTrs(S, q, tt, s3);
+                        float* o = &e.trsLocal[((size_t)f*nj2 + j + 1)*10];
+                        o[0]=q[0];o[1]=q[1];o[2]=q[2];o[3]=q[3]; o[4]=tt[0];o[5]=tt[1];o[6]=tt[2]; o[7]=s3[0];o[8]=s3[1];o[9]=s3[2];
+                        float x=q[0],y=q[1],z=q[2],w=q[3], rc[9]={1-2*(y*y+z*z),2*(x*y+w*z),2*(x*z-w*y), 2*(x*y-w*z),1-2*(x*x+z*z),2*(y*z+w*x), 2*(x*z+w*y),2*(y*z-w*x),1-2*(x*x+y*y)};
+                        for (int c=0;c<3;c++) for (int rr=0;rr<3;rr++){ float dv=std::fabs(rc[c*3+rr]*s3[c]-S[c*4+rr]); if (dv>decompE) decompE=dv; }
+                    }
+                    // hemisphere continuity per joint (same rule as everywhere)
+                    if (f > 0) for (int j = 1; j < nj2; ++j) {
+                        float* q = &e.trsLocal[((size_t)f*nj2 + j)*10]; const float* p = &e.trsLocal[((size_t)(f-1)*nj2 + j)*10];
+                        if (q[0]*p[0]+q[1]*p[1]+q[2]*p[2]+q[3]*p[3] < 0.f) { q[0]=-q[0]; q[1]=-q[1]; q[2]=-q[2]; q[3]=-q[3]; }
+                    }
+                }
+                if (decompE > 1e-2f)
+                    fprintf(stderr, "[HZFLAT] mesh%d WARN S_j(t) not clean TRS (shear residual %.4f) — best-possible TRS approximation shipped\n", meshIdx, decompE);
+                float postE = measure();
+                fprintf(stderr, "[HZFLAT] mesh%d post-rebuild residual maxErr=%.4f (span=%.2f)\n", meshIdx, postE, spanE);
+                if (std::getenv("HSR_FLATDBG")) {   // joint-0 forensics: shipped clip local vs direct S at one frame
+                    int f = frames/3; float t = (float)f/srcKeyRate;
+                    std::vector<GNode> cur = gnodes;
+                    for (auto& ch : gchannels) {
+                        if (ch.node<0||(size_t)ch.node>=cur.size()||ch.sampler<0||(size_t)ch.sampler>=gsamplers.size()) continue;
+                        float val[4]={0,0,0,1}; sampleSampler(gsamplers[ch.sampler], chTime(ch.node, t), val);
+                        if (ch.path==0){cur[ch.node].t[0]=val[0];cur[ch.node].t[1]=val[1];cur[ch.node].t[2]=val[2];}
+                        else if (ch.path==1){cur[ch.node].r[0]=val[0];cur[ch.node].r[1]=val[1];cur[ch.node].r[2]=val[2];cur[ch.node].r[3]=val[3];}
+                        else {cur[ch.node].s[0]=val[0];cur[ch.node].s[1]=val[1];cur[ch.node].s[2]=val[2];}
+                    }
+                    float Wn[16]; worldM(cur, sk.joints[0], Wn);
+                    float S[16]; if (sk.ibm.size()>=16) mulM(Wn, &sk.ibm[0], S); else memcpy(S, Wn, 64);
+                    const float* o = &e.trsLocal[((size_t)f*nj2 + 1)*10];
+                    fprintf(stderr, "[FLATDBG] f=%d t=%.2f joint0: Wn.t=(%.2f,%.2f,%.2f) S.t=(%.2f,%.2f,%.2f) S.c0=(%.3f,%.3f,%.3f) clip.t=(%.2f,%.2f,%.2f) clip.q=(%.3f,%.3f,%.3f,%.3f) clip.s=(%.3f,%.3f,%.3f) ibm.t=(%.2f,%.2f,%.2f)\n",
+                            f, t, Wn[12],Wn[13],Wn[14], S[12],S[13],S[14], S[0],S[1],S[2], o[4],o[5],o[6], o[0],o[1],o[2],o[3], o[7],o[8],o[9],
+                            sk.ibm.size()>=16?sk.ibm[12]:0.f, sk.ibm.size()>=16?sk.ibm[13]:0.f, sk.ibm.size()>=16?sk.ibm[14]:0.f);
+                }
+            } else if (std::getenv("HSR_VERBOSE") && maxE > 0.001f)
+                fprintf(stderr, "[HZCHECK] mesh%d hierarchical tables OK (maxErr=%.4f span=%.2f)\n", meshIdx, maxE, spanE);
         }
         // (No geometry perturbation: the verifier reject was the ROOT.f0 marker encoding — an empty vector where the
         // device wants a u16 scalar — NOT the geometry. Positions are free; use the exact centered rest pose.)

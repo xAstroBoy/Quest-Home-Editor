@@ -199,6 +199,8 @@ struct Editor {
     std::vector<MeshData>* sceneMeshes = nullptr;                                  // CPU geometry for Cook
     std::function<std::vector<float>(int,int,int&)> vatBaker;                      // V79 VAT bake hook
     std::function<void(int,int,hslcook::ExportMesh&)> hzAnimExtractor;             // V79 HZANIM skeletal hook
+    std::function<std::string(int)> animSourceProbe;                               // ANIM-AUDIT: which SOURCE anim channels touch mesh i ("" = none) — per-format (main.cpp), INDEPENDENT of the cook extractors' gates so silent drops show up
+    std::function<bool(int,int,int,std::vector<float>&,int&,float&)> flipbookSequencer;   // FLIPBOOK observed cell order: (meshIdx, cols, rows) -> per-frame 2x3 UV mats + N + loopSec (the row-major @global-fps ASSUMPTION was wrong for TV/torches/fires)
     std::vector<uint8_t> bgOgg;                                                    // env background loop -> FMOD asset
     // ── BACKGROUND AUDIO cooker (view / REPLACE / ADD / export / revert) ─────────────────────────────────────
     // bgOgg = what the cook SHIPS (FMOD SND asset, auto-start loop entity at spawn). envOgg keeps the env's
@@ -5851,7 +5853,7 @@ struct Editor {
             if (r->isDeleted(i)) continue;   // editor DELETE: drop this mesh from the cooked home (non-destructive, persisted)
             const MeshData& md=(*sceneMeshes)[i]; const VkGpuMesh& gm=r->gpuMeshes[i];
             size_t nv=md.positions.size()/3; if (nv<3||md.indices.size()<3) continue;
-            ExportMesh em; em.name=md.name; em.positions.resize(nv*3);
+            ExportMesh em; em.name=md.name; em.srcMeshIdx=(int)i; em.positions.resize(nv*3);
             for (size_t v=0;v<nv;v++){ float p[3]={md.positions[v*3],md.positions[v*3+1],md.positions[v*3+2]},o[3]; xformPoint(gm.model,p,o); em.positions[v*3]=o[0]; em.positions[v*3+1]=o[1]; em.positions[v*3+2]=o[2]; }
             em.uvs=md.uvs; em.indices=md.indices; em.additive = md.additive;
             // FAITHFUL SpecIbl diffuse-irradiance bake (the renderer's uploadMesh bake at vk_renderer.h:677, ported to the
@@ -5919,7 +5921,16 @@ struct Editor {
                 em.flipbook=true; em.flipCols=fcols; em.flipRows=frows; em.blend=true;
                 em.flipFrames=fcols*frows;                                  // one cell per frame, the whole sheet
                 em.flipFps = (animDuration>0.f) ? (float)em.flipFrames/animDuration : 5.f;   // cycle the sheet over the source loop
-                fprintf(stderr,"[COOK] m%zu '%s' FLIPBOOK %dx%d (%d cells @ %.2ffps) -> auto-gen shader\n", i, md.name.c_str(), fcols, frows, em.flipFrames, em.flipFps);
+                // OBSERVED cell sequence (FLIP-VERIFY 2026-07-08): the row-major @global-fps grid assumption was
+                // WRONG for most sheets (TV 23/100 frames, cube_maze torches 0/64 with per-torch phase stagger,
+                // zelda fires at 0.45fps instead of their own loop). Replay the sequence the SOURCE actually
+                // plays — per-frame 2x3 UV mats over the mesh's OWN clip period (exact frame-snap replay path).
+                if (flipbookSequencer) { std::vector<float> fmats; int fN=0; float floop=0.f;
+                    if (flipbookSequencer((int)i, fcols, frows, fmats, fN, floop) && fN >= 2) {
+                        em.flipUVMats = std::move(fmats); em.flipN = fN; em.flipLoop = floop;
+                        fprintf(stderr,"[COOK] m%zu '%s' FLIPBOOK %dx%d OBSERVED sequence: %d frames over %.2fs (exact replay)\n", i, md.name.c_str(), fcols, frows, fN, floop);
+                    } else fprintf(stderr,"[COOK] m%zu '%s' FLIPBOOK %dx%d (%d cells @ %.2ffps, grid order — sequencer found no varying cell)\n", i, md.name.c_str(), fcols, frows, em.flipFrames, em.flipFps);
+                } else fprintf(stderr,"[COOK] m%zu '%s' FLIPBOOK %dx%d (%d cells @ %.2ffps) -> auto-gen shader\n", i, md.name.c_str(), fcols, frows, em.flipFrames, em.flipFps);
             }
             else { if (vatBaker){ int bnv=0; auto off=vatBaker((int)i,64,bnv); if(!off.empty()&&bnv==(int)nv){ em.vatOffsets=std::move(off); em.vatFrames=64; } }
                    if (hzAnimExtractor) hzAnimExtractor((int)i,64,em); }
@@ -5965,6 +5976,67 @@ struct Editor {
             // (it's still visible through the transparent leaf). The only real smooth+depth path is alpha-to-coverage.
             bool foliage2pass = em.alphaTest && em.hzJointCount > 0 && !em.blend && !em.additive && std::getenv("HSR_FOLIAGE_2PASS");
             hslcook::ExportMesh prepass; if (foliage2pass) prepass = em;   // copy BEFORE the move (keeps all skinning)
+            // ── ANIM-AUDIT: per-mesh SOURCE anim channels vs what the cook ACTUALLY ships. A mesh the source
+            //    animates but whose ExportMesh carries no anim representation is a SILENT DROP — the exact class of
+            //    bug the batch env audit greps for (`<< UNPORTED`). animSourceProbe is per-format and independent
+            //    of the extractor gates above, so a gate rejecting a mesh still shows as source-animated here.
+            if (animSourceProbe) {
+                std::string srcCh = animSourceProbe((int)i);
+                if (!srcCh.empty()) {
+                    const char* repr = em.hzFrames>1 ? "HZANIM" : !em.vatOffsets.empty() ? "VAT" :
+                                       em.rotReplay ? "ROTREPLAY" : em.rotAnim ? (em.rotOsc?"ROT-SWAY":"ROT-SPIN") :
+                                       em.transAnim ? "TRANSLATE" : em.scaleAnim ? "SCALE" :
+                                       em.uvScroll ? "UV-SCROLL" : !em.flipUVMats.empty() ? "UV-MATRIX" :
+                                       em.flipbook ? "FLIPBOOK" : em.poseAnim ? "POSEANIM" : em.pulse ? "PULSE" :
+                                       em.tintAnim ? "TINTREPLAY" : em.fadeAnim ? "FADE" : nullptr;
+                    std::string layered;   // secondary layers riding the main repr (partial drops stay visible)
+                    if (em.tintAnim && repr && strcmp(repr,"TINTREPLAY")!=0) layered += "+TINT";
+                    if (em.fadeAnim && repr && strcmp(repr,"FADE")!=0)       layered += "+FADE";
+                    bool constOnly = srcCh.find("(const)") != std::string::npos && srcCh.find(',') == std::string::npos;
+                    fprintf(stderr, "[ANIM-AUDIT] m%03zu '%s' src={%s} cooked=%s%s%s\n", i, md.name.c_str(),
+                            srcCh.c_str(), repr?repr:"STATIC", layered.c_str(),
+                            (!repr && !constOnly) ? "   << UNPORTED" : "");
+                }
+            }
+            // ── TEX-AUDIT (HSR_ANIMAUDIT runs): AUTHORED transparency vs what SHIPS. Compares the raw glTF
+            //    alphaMode/baseColorFactor.a (md.srcAlphaMode/srcFactorA, recorded before any heuristic) and the
+            //    SOURCE texture's alpha content against the ExportMesh class (blend/cutout/additive) + the SHIPPED
+            //    texture's alpha histogram + the shipped tint alpha. Every divergence class is flagged:
+            //      BLEND-DROPPED / MASK-DROPPED  = authored transparency ships opaque ("not ported at all")
+            //      ALPHA-LOST                    = transparent class shipped, but the texture's alpha got flattened
+            //      FACTOR-ALPHA-LOST             = material-level translucency (factor.a<1) not carried to the tint
+            //      SPURIOUS                      = authored OPAQUE ships transparent (sorting/visibility risk)
+            if (std::getenv("HSR_ANIMAUDIT") && md.srcAlphaMode >= 0) {
+                auto alphaStats = [](const std::vector<u8>& px, float& mn, float& pctVar, float& pctMid){
+                    mn = 1.f; size_t below = 0, mid = 0, n = px.size()/4;
+                    for (size_t p2 = 3; p2 < px.size(); p2 += 4) { u8 a = px[p2];
+                        if (a/255.f < mn) mn = a/255.f;
+                        if (a < 250) below++;
+                        if (a > 10 && a < 245) mid++; }
+                    pctVar = n ? 100.f*below/n : 0.f; pctMid = n ? 100.f*mid/n : 0.f; };
+                float sMn, sVar, sMid; alphaStats(md.texRGBA, sMn, sVar, sMid);      // SOURCE texture alpha
+                float dMn, dVar, dMid; alphaStats(em.rgba, dMn, dVar, dMid);          // SHIPPED texture alpha
+                float shipTintA = em.matTint[3] * em.curTint[3];
+                bool srcTransparent = md.srcAlphaMode == 2 || md.srcFactorA < 0.99f;
+                bool srcMask = md.srcAlphaMode == 1;
+                bool shipT = em.blend || em.additive, shipM = em.alphaTest;
+                std::string flags;
+                if (srcTransparent && !shipT && !shipM) {
+                    // authored BLEND with an all-opaque texture AND opaque factor = visually opaque — an
+                    // INTENTIONAL opaque reclass (King Kai), not a drop.
+                    if (!(md.srcAlphaMode == 2 && sVar < 0.5f && md.srcFactorA >= 0.99f)) flags += " <<BLEND-DROPPED";
+                }
+                if (srcMask && !shipM && !shipT) flags += " <<MASK-DROPPED";
+                if (!srcTransparent && !srcMask && (shipT || shipM) && md.srcAlphaMode == 0) flags += " <<SPURIOUS";
+                if ((shipT || shipM) && sVar >= 2.f && dVar < 0.5f) flags += " <<ALPHA-LOST";
+                if (md.srcFactorA < 0.99f && std::fabs(shipTintA - md.srcFactorA) > 0.05f && dVar < 2.f) flags += " <<FACTOR-ALPHA-LOST";
+                if (!flags.empty() || std::getenv("HSR_TEXAUDIT_ALL"))
+                    fprintf(stderr, "[TEX-AUDIT] m%03zu '%s' src{mode=%s factorA=%.2f texA:min=%.2f var%%=%.1f mid%%=%.1f} ship{%s%s%s cutoff=%.2f tintA=%.2f texA:min=%.2f var%%=%.1f}%s\n",
+                            i, md.name.c_str(), md.srcAlphaMode==2?"BLEND":md.srcAlphaMode==1?"MASK":"OPAQUE",
+                            md.srcFactorA, sMn, sVar, sMid,
+                            em.blend?"BLEND":"", em.alphaTest?"MASK":"", (!em.blend&&!em.alphaTest)?(em.additive?"ADDITIVE":"OPAQUE"):(em.additive?"+ADD":""),
+                            em.alphaCutoff, shipTintA, dMn, dVar, flags.c_str());
+            }
             ems.push_back(std::move(em));
             if (foliage2pass) {
                 prepass.depthPrepass = true; prepass.name += "_depthwr";

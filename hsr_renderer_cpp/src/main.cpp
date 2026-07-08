@@ -1334,6 +1334,18 @@ int main(int argc, char** argv) {
     // (ShellPoseAnimationComponent + unlitblend transparent material) renders + fades correctly. So VAT export is
     // OPT-IN ONLY (HSR_VAT) until the on-device VAT entity setup is reversed; the DEFAULT wisp port = poseAnim.
     if (isV79 && std::getenv("HSR_VAT")) editor.vatBaker = [&gltf](int meshIdx, int frames, int& nv){ return gltf.bakeVAT(meshIdx, frames, nv); };
+    // FLIPBOOK observed-sequence extractor (the row-major-order/global-fps assumption fix).
+    if (isV79) editor.flipbookSequencer = [&gltf](int meshIdx, int cols, int rows, std::vector<float>& mats, int& N, float& loop) {
+        return gltf.flipbookCellSequence(meshIdx, cols, rows, mats, N, loop);
+    };
+    // ANIM-AUDIT source probe (glTF): which source channels animate this mesh — independent of the cook gates.
+    if (isV79) editor.animSourceProbe = [&gltf](int meshIdx) -> std::string {
+        std::string s;
+        for (auto& r : gltf.skinned) if (r.meshIdx == meshIdx) { s += "skin,"; break; }
+        for (auto& r : gltf.nodeAnimRecs) if (r.meshIdx == meshIdx) { s += gltf.nodeAnimMoves(meshIdx) ? "nodeTRS," : "nodeTRS(const),"; break; }
+        if (!s.empty()) s.pop_back();
+        return s;
+    };
     if (isV79) editor.hzAnimExtractor = [&gltf](int meshIdx, int frames, hslcook::ExportMesh& em){   // HZANIM skeletal port
         // FLIPBOOK: an animated flat material (node-animated, no skin) -> route to the GPU flipbook shader (no skeleton).
         // HSR_FLIPGRID=CxR sets the spritesheet grid (default 11x11 from the template).
@@ -1373,8 +1385,32 @@ int main(int argc, char** argv) {
                 // rotation ramp (cyan gears: 63° in 8.3s, wraps on the gear symmetry) — the fit sees peak=63° and
                 // plays a one-sided rock. Replay the node's actual relative quats instead (same getTime shader as
                 // the aurora). Gentle slow ambient sways (foliage ±1-3°) keep the cheap fitted oscillate shader.
-                bool exact = rosc && !std::getenv("HSR_NOROTREPLAY")
-                           && (rper < 5.f || ramp > 0.15f || ramp < -0.15f);   // fast flicker OR >~8.6° swing
+                // FIT VALIDATION (the OW Interloper compound-spin fix, ANIM-VERIFY 2026-07-08): a node spinning
+                // INSIDE a rotating ancestor (own -Y 81.1s under the 333.3s skybox spin) composes a TIME-VARYING
+                // axis that no single-axis constant/cos fit can represent — the fitted spin verified 336u off on
+                // a 341u span. Sample the TRUE relative rotation (32 keys) and measure the fit's angular error;
+                // >~3.5° anywhere routes the mesh to the EXACT ROTREPLAY. HSR_NOROTFITCHECK reverts.
+                bool fitBad = false;
+                if (!std::getenv("HSR_NOROTFITCHECK")) {
+                    float piv2[3]; std::vector<float> q32; float loop2 = 0.f;
+                    if (gltf.cookExtractRotationReplay(meshIdx, 32, piv2, q32, loop2) && q32.size() >= 33*4 && loop2 > 1e-4f) {
+                        float maxAng = 0.f;
+                        for (int k = 0; k <= 32; k++) {
+                            float t2 = loop2 * (float)k/32.f;
+                            float ang = rosc ? 0.5f*ramp*(1.f - cosf(6.2831853f*t2/(rper>1e-4f?rper:loop2))) : rom*t2;
+                            float sh = sinf(ang*0.5f);
+                            float qa[4] = { rax[0]*sh, rax[1]*sh, rax[2]*sh, cosf(ang*0.5f) };
+                            const float* qr = &q32[(size_t)k*4];
+                            float d = fabsf(qa[0]*qr[0]+qa[1]*qr[1]+qa[2]*qr[2]+qa[3]*qr[3]); if (d > 1.f) d = 1.f;
+                            float ad = 2.f*acosf(d); if (ad > maxAng) maxAng = ad;
+                        }
+                        fitBad = maxAng > 0.06f;
+                        if (fitBad && std::getenv("HSR_VERBOSE"))
+                            fprintf(stderr, "[COOK] m%d rotation FIT INVALID (%.1fdeg dev vs true relative rotation) -> ROTREPLAY exact\n", meshIdx, maxAng*57.2958f);
+                    }
+                }
+                bool exact = (fitBad || (rosc && (rper < 5.f || ramp > 0.15f || ramp < -0.15f)))   // fast flicker OR >~8.6° swing OR invalid fit
+                           && !std::getenv("HSR_NOROTREPLAY");
                 if (exact) {
                     int RN = 128; if (const char* e2 = std::getenv("HSR_ROTKEYS")) { int c = atoi(e2); if (c >= 8) RN = c; }
                     float piv[3]; std::vector<float> quats; float loopSec = 0.f;
@@ -1410,7 +1446,12 @@ int main(int argc, char** argv) {
                             for (int c = 0; c < 3; c++){
                                 float rep = em.transFrames[(size_t)i0*3+c]*(1.f-fr) + em.transFrames[(size_t)i1*3+c]*fr;
                                 float e2 = std::fabs(rep - fine[(size_t)i2*3+c]); if (e2 > maxe) maxe = e2; } }
-                        aliased = span > 0.5f && maxe > std::max(0.5f, 0.10f*span);
+                        // Threshold was span>0.5 && err>max(0.5, 10%): the Star Trek sliding screens (span 0.43,
+                        // STEP-keyed — the 16-point LINEAR replay smears the steps, verify err 0.22 = half the
+                        // slide) and the bubbles ambient skyboxes (span 0.95-1.77, err up to 0.42) sat UNDER it
+                        // and shipped visibly wrong. Any track the 16-frame lerp can't reproduce within 10% (or
+                        // 5cm absolute) now rides the exact RIGID-HZANIM clip instead.
+                        aliased = span > 0.05f && maxe > std::max(0.05f, 0.10f*span);
                         if (aliased && std::getenv("HSR_VERBOSE"))
                             fprintf(stderr, "[COOK] m%d node-translate ALIASED (replayErr=%.2fu of span %.2fu over %.1fs) -> RIGID-HZANIM exact\n", meshIdx, maxe, span, em.transLoop);
                     }
@@ -1468,6 +1509,18 @@ int main(int argc, char** argv) {
     // switch as the loader's live VAT).
     if (isOpa && !std::getenv("HSR_NOVAT"))
         editor.vatBaker = [&opa](int meshIdx, int frames, int& nv){ return opa.bakeVAT(meshIdx, frames, nv); };
+    // ANIM-AUDIT source probe (OPA): which source anim data touches this mesh — from the loader's own record
+    // lists (animRecs/skinRecs/uvAnimRecs/tintRecs/vatRecs), NOT the cook extractors, so gate rejections show.
+    if (isOpa) editor.animSourceProbe = [&opa](int meshIdx) -> std::string {
+        std::string s;
+        for (auto& r : opa.skinRecs) if ((int)r.meshIdx == meshIdx) { s += r.clipIdx>=0 ? "skin," : "skin(noclip),"; break; }
+        if (opa.animNodeOf(meshIdx) >= 0) s += "nodeTRS,";
+        for (auto& r : opa.uvAnimRecs) if ((int)r.meshIdx == meshIdx) { s += "matUV,"; break; }
+        for (auto& r : opa.tintRecs)   if ((int)r.meshIdx == meshIdx) { s += "matTint,"; break; }
+        for (auto& r : opa.vatRecs)    if ((int)r.meshIdx == meshIdx) { s += "vat,"; break; }
+        if (!s.empty()) s.pop_back();
+        return s;
+    };
     if (isOpa && !std::getenv("HSR_NOROT")) {
         opa.cookExtractRotations(g_opaRot);
         opa.cookExtractUVScroll(g_opaUv);   // mat.sanim water/foam UV scrolls (continuous)
@@ -1809,6 +1862,250 @@ int main(int argc, char** argv) {
                                             // yet at cook time, so without this the cooked skinned verts collapse to a vertical streak
                                             // ("messed up on conversion" / spiky skin.opa). animate(0.f) bakes the t=0 bind pose into
                                             // md.positions (matches the glTF path above) -> correct STATIC geometry AND the bind verts the device re-skins from.
+        // HSR_ANIMAUDIT: audit-only pass — run buildExportMeshes (all anim extractors fire and every
+        // [ANIM-AUDIT] line prints) then exit WITHOUT baking/signing an APK. The 55-env batch sweep uses
+        // this: same classification code as a real cook, minutes instead of hours.
+        if (std::getenv("HSR_ANIMAUDIT")) {
+            editor.setenv_("HSR_HZANIM", editor.animSkinned ? "1" : "");   // same gate setup as exportAPKSync
+            auto ems = editor.buildExportMeshes();
+            // ── [ANIM-VERIFY]: per-ANIMATION numeric fidelity — emulate the DEVICE's replay math from the
+            //    baked tables the cook ships (HZANIM joint clip / TRANSLATE / ROTREPLAY / SPIN / SWAY / SCALE)
+            //    and diff predicted WORLD probe verts against the source ground truth (gltf.animate(t), the
+            //    same positions the desktop preview draws) at NT times across the loop. maxErr>tolerance =
+            //    the cooked data does NOT reproduce the source motion — the "trust no label" check.
+            if (isV79 && gltf.hasAnimation() && sceneMeshes && !std::getenv("HSR_NOANIMVERIFY")) {
+                struct Probe { size_t emIdx; int mi; const char* repr; float dur; std::vector<u32> vidx; std::vector<float> truth; };
+                std::vector<Probe> probes;
+                float longest = 0.f;
+                for (size_t e = 0; e < ems.size(); e++) {
+                    const auto& em = ems[e];
+                    if (em.srcMeshIdx < 0 || (size_t)em.srcMeshIdx >= sceneMeshes->size()) continue;
+                    const char* repr = nullptr; float dur = 0.f;
+                    if (em.hzFrames > 1 && em.hzFps > 0.f) { repr = "HZANIM";    dur = (float)em.hzFrames/em.hzFps; }
+                    else if (em.rotReplay)                  { repr = "ROTREPLAY"; dur = em.rotLoopSec; }
+                    else if (em.rotAnim && em.rotOsc)       { repr = "ROT-SWAY";  dur = em.rotPeriod; }
+                    else if (em.rotAnim)                    { repr = "ROT-SPIN";  dur = (em.rotOmega!=0.f) ? 6.2831853f/std::fabs(em.rotOmega) : 0.f; }
+                    else if (em.transAnim && em.transN>1)   { repr = "TRANSLATE"; dur = em.transLoop; }
+                    else if (em.scaleAnim && em.scaleN>1)   { repr = "SCALE";     dur = em.scaleLoop; }
+                    else continue;   // FLIPBOOK/UV/TINT/PULSE = material-space anims, no vertex-space truth to diff here
+                    if (dur <= 1e-4f) continue;
+                    const MeshData& md = (*sceneMeshes)[em.srcMeshIdx];
+                    size_t nv = md.positions.size()/3; if (nv < 3) continue;
+                    Probe p; p.emIdx = e; p.mi = em.srcMeshIdx; p.repr = repr; p.dur = dur;
+                    for (int k = 0; k < 8; k++) p.vidx.push_back((u32)((nv-1) * (size_t)k / 7));
+                    probes.push_back(std::move(p));
+                    if (dur > longest) longest = dur;
+                }
+                // 2.5 LOOPS ("reset is fucked up again"): sampling only [0,loop) never exercises the WRAP — the
+                // exact place loop-reset bugs live (seam frame, teleport duration, phase drift past the seam).
+                // CAPPED at animDuration: past it the PREVIEW master-fmods every channel back to 0 (an editor
+                // timeline artifact — the real V79 runtime loops each track on its OWN length forever), so
+                // truth-comparing beyond it flags faithful clips (shark_reef whale: exact through its own
+                // 15.97s wrap, "wrong" only after the 26.25s master reset the device correctly doesn't have).
+                const int NT = 83;
+                float tEnd = std::min(2.5f * longest, gltf.animDuration > 1e-3f ? gltf.animDuration - 1e-3f : 2.5f*longest);
+                for (int ti = 0; ti < NT && !probes.empty(); ti++) {
+                    float t = tEnd * (float)ti / (float)NT;
+                    gltf.animate(t);   // ground truth: the preview's own CPU pose (world space, chTime per-node wrap)
+                    for (auto& p : probes) {
+                        const MeshData& md = (*sceneMeshes)[p.mi];
+                        for (u32 vi : p.vidx) { p.truth.push_back(md.positions[vi*3]); p.truth.push_back(md.positions[vi*3+1]); p.truth.push_back(md.positions[vi*3+2]); }
+                    }
+                }
+                gltf.animate(0.f);   // restore the t=0 rest bake
+                // quat->3x3 (xyzw), TRS compose, rigid-TRS invert — the device-side math, reimplemented independently.
+                auto q2m = [](const float* q, float* m){ float x=q[0],y=q[1],z=q[2],w=q[3];
+                    m[0]=1-2*(y*y+z*z); m[1]=2*(x*y+w*z);   m[2]=2*(x*z-w*y);
+                    m[3]=2*(x*y-w*z);   m[4]=1-2*(x*x+z*z); m[5]=2*(y*z+w*x);
+                    m[6]=2*(x*z+w*y);   m[7]=2*(y*z-w*x);   m[8]=1-2*(x*x+y*y); };   // column-major 3x3 (col c = m[c*3..])
+                struct X { float r[9]; float t[3]; };   // affine: world = r*local + t
+                auto xmul = [](const X& a, const X& b){ X o;
+                    for (int c=0;c<3;c++) for (int r2=0;r2<3;r2++) o.r[c*3+r2] = a.r[r2]*b.r[c*3] + a.r[3+r2]*b.r[c*3+1] + a.r[6+r2]*b.r[c*3+2];
+                    for (int r2=0;r2<3;r2++) o.t[r2] = a.r[r2]*b.t[0] + a.r[3+r2]*b.t[1] + a.r[6+r2]*b.t[2] + a.t[r2];
+                    return o; };
+                auto xpt = [](const X& a, const float* p, float* o){ for (int r2=0;r2<3;r2++) o[r2] = a.r[r2]*p[0] + a.r[3+r2]*p[1] + a.r[6+r2]*p[2] + a.t[r2]; };
+                for (auto& p : probes) {
+                    const auto& em = ems[p.emIdx];
+                    // bind skeleton + inverse binds (HZANIM only)
+                    int J = em.hzJointCount;
+                    std::vector<X> invBind;
+                    if (p.repr[0]=='H') {
+                        std::vector<X> bind((size_t)J);
+                        for (int j = 0; j < J; j++) {
+                            float q[4] = { em.hzJointQuat[j*4+1], em.hzJointQuat[j*4+2], em.hzJointQuat[j*4+3], em.hzJointQuat[j*4+0] };   // stored (w,x,y,z) -> xyzw
+                            X l; q2m(q, l.r); float s = em.hzJointScale[j];
+                            for (int k = 0; k < 9; k++) l.r[k] *= s;
+                            l.t[0]=em.hzJointPos[j*3]; l.t[1]=em.hzJointPos[j*3+1]; l.t[2]=em.hzJointPos[j*3+2];
+                            bind[j] = (em.hzParents[j] >= 0) ? xmul(bind[em.hzParents[j]], l) : l;
+                        }
+                        invBind.resize((size_t)J);
+                        for (int j = 0; j < J; j++) { const X& b = bind[j]; X& iv = invBind[j];
+                            float s2[3]; for (int c=0;c<3;c++) s2[c] = b.r[c*3]*b.r[c*3] + b.r[c*3+1]*b.r[c*3+1] + b.r[c*3+2]*b.r[c*3+2];
+                            for (int c=0;c<3;c++) for (int r2=0;r2<3;r2++) iv.r[r2*3+c] = b.r[c*3+r2] / (s2[c] > 1e-12f ? s2[c] : 1.f);   // inv = S^-2 R^T per column scale
+                            float bt[3] = { -b.t[0], -b.t[1], -b.t[2] };
+                            for (int r2=0;r2<3;r2++) iv.t[r2] = iv.r[r2]*bt[0] + iv.r[3+r2]*bt[1] + iv.r[6+r2]*bt[2];
+                        }
+                    }
+                    // COOKER-FAITHFUL wrap emulation (HZANIM): the cook appends a seam frame (frame-0 copy) for
+                    // CYCLIC clips (endDrift<=5 on the joint translations) -> device duration NF/fps and the wrap
+                    // interpolates lastFrame->frame0; ONE-WAY clips ship plain -> duration (NF-1)/fps, instant
+                    // teleport at the wrap. Emulate exactly that so reset behavior is verified, not assumed.
+                    bool seam = true; float Ddev = p.dur;
+                    if (strcmp(p.repr,"HZANIM")==0 && em.hzFrames > 1) {
+                        int NF = em.hzFrames, J2 = em.hzJointCount;
+                        float drift = 0.f;
+                        const float* d0 = &em.hzTrsLocal[0];
+                        const float* dL = &em.hzTrsLocal[(size_t)(NF-1)*J2*10];
+                        for (int j = 0; j < J2; j++) for (int c = 4; c < 7; c++) { float d = d0[j*10+c]-dL[j*10+c]; if (d<0) d=-d; if (d>drift) drift=d; }
+                        seam = drift <= 5.0f;
+                        Ddev = seam ? (float)NF/em.hzFps : (float)(NF-1)/em.hzFps;
+                    }
+                    float maxErr = 0.f, span = 0.f, wrapWinErr = 0.f; float t0v[8*3];
+                    for (int ti = 0; ti < NT; ti++) {
+                        float t = tEnd * (float)ti / (float)NT;
+                        // ±1.5-frame WRAP WINDOW: the seam GLIDES over one frame-step while the source wraps
+                        // INSTANTLY (device-proven behavior for doors/discs) — a sample inside that window
+                        // reads as a huge error that isn't a defect. Measure it separately, don't flag it.
+                        bool inWrapWin = false; bool probeHidden[8] = {false,false,false,false,false,false,false,false};
+                        if (strcmp(p.repr,"HZANIM")==0 && em.hzFps > 0.f && Ddev > 1e-4f) {
+                            float ph = fmodf(t, Ddev); float w = 1.5f/em.hzFps;
+                            inWrapWin = (ph < w) || (ph > Ddev - w);
+                        }
+                        float pred[8*3];
+                        if (strcmp(p.repr,"HZANIM")==0) {   // HZANIM: interp joint LOCALS at t, compose, skin the probe verts
+                            int NF = em.hzFrames; float tt = fmodf(t, Ddev); float ff = tt * em.hzFps;
+                            int f0 = (int)ff; float fa = ff - (float)f0; if (f0 >= NF) f0 = NF-1;
+                            int f1 = f0+1;
+                            if (f1 >= NF) { if (seam) f1 = 0; else { f1 = NF-1; fa = 0.f; } }   // seam: interp last->frame0 (the appended copy); one-way: hold then teleport
+                            std::vector<X> world((size_t)J);
+                            for (int j = 0; j < J; j++) {
+                                const float* a = &em.hzTrsLocal[(size_t)(f0*J+j)*10];
+                                const float* b = &em.hzTrsLocal[(size_t)(f1*J+j)*10];
+                                float q[4]; float dot = a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3]; float sgn = dot < 0.f ? -1.f : 1.f;
+                                for (int k = 0; k < 4; k++) q[k] = a[k]*(1.f-fa) + b[k]*sgn*fa;
+                                float ql = sqrtf(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]); if (ql > 1e-8f) for (int k=0;k<4;k++) q[k] /= ql;
+                                X l; q2m(q, l.r);
+                                float sc[3] = { a[7]*(1.f-fa)+b[7]*fa, a[8]*(1.f-fa)+b[8]*fa, a[9]*(1.f-fa)+b[9]*fa };
+                                for (int c=0;c<3;c++) for (int r2=0;r2<3;r2++) l.r[c*3+r2] *= sc[c];
+                                l.t[0]=a[4]*(1.f-fa)+b[4]*fa; l.t[1]=a[5]*(1.f-fa)+b[5]*fa; l.t[2]=a[6]*(1.f-fa)+b[6]*fa;
+                                world[j] = (em.hzParents[j] >= 0) ? xmul(world[em.hzParents[j]], l) : l;
+                            }
+                            std::vector<X> skin((size_t)J);
+                            for (int j = 0; j < J; j++) skin[j] = xmul(world[j], invBind[j]);
+                            for (int k = 0; k < 8; k++) { u32 vi = p.vidx[k];
+                                const float* rp = (em.hzRestPos.size() >= ((size_t)vi+1)*3) ? &em.hzRestPos[vi*3] : &em.positions[vi*3];
+                                float acc[3] = {0,0,0};
+                                for (int w = 0; w < 4; w++) { float wgt = em.hzBoneWgt[vi*4+w] / 255.f; if (wgt <= 0.f) continue;
+                                    int j = em.hzBoneIdx[vi*4+w]; if (j >= J) j = 0;
+                                    float o[3]; xpt(skin[j], rp, o); for (int c=0;c<3;c++) acc[c] += o[c]*wgt; }
+                                pred[k*3]=acc[0]; pred[k*3+1]=acc[1]; pred[k*3+2]=acc[2];
+                                // SCALE-COLLAPSED probe = INVISIBLE part (respawn rigs teleport bones across the
+                                // map while scaled ~0.001 — quiet_place/horror/incredibles): a mid-teleport lerp
+                                // deviation of a millimeter dot isn't a visible defect; route to the hidden bucket.
+                                { int j = em.hzBoneIdx[vi*4]; if (j >= J) j = 0; const float* L = &em.hzTrsLocal[(size_t)(f0*J+j)*10];
+                                  if ((L[7]+L[8]+L[9])/3.f < 0.05f) probeHidden[k] = true; else probeHidden[k] = false; }
+                            }
+                        } else if (strcmp(p.repr,"TRANSLATE")==0) {   // TRANSLATE: baked t=0 verts + table offset (wrap-lerp)
+                            float ph = fmodf(t, p.dur) / p.dur * (float)em.transN; int f0 = (int)ph % em.transN; float fa = ph - floorf(ph); int f1 = (f0+1) % em.transN;
+                            float off[3]; for (int c=0;c<3;c++) off[c] = em.transFrames[(size_t)f0*3+c]*(1.f-fa) + em.transFrames[(size_t)f1*3+c]*fa;
+                            for (int k = 0; k < 8; k++) for (int c=0;c<3;c++) pred[k*3+c] = em.positions[p.vidx[k]*3+c] + off[c];
+                        } else if (strcmp(p.repr,"ROTREPLAY")==0) {   // ROTREPLAY: nlerp the (N+1) rel quats about the pivot
+                            float ph = fmodf(t, p.dur) / p.dur * (float)em.rotReplayN; int f0 = (int)ph; float fa = ph - (float)f0;
+                            const float* a = &em.rotQuats[(size_t)f0*4]; const float* b = &em.rotQuats[(size_t)(f0+1)*4];
+                            float q[4]; float dot = a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3]; float sgn = dot < 0.f ? -1.f : 1.f;
+                            for (int k = 0; k < 4; k++) q[k] = a[k]*(1.f-fa) + b[k]*sgn*fa;
+                            float ql = sqrtf(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]); if (ql > 1e-8f) for (int k=0;k<4;k++) q[k] /= ql;
+                            X R; q2m(q, R.r); R.t[0]=R.t[1]=R.t[2]=0.f;
+                            for (int k = 0; k < 8; k++) { float lp[3] = { em.positions[p.vidx[k]*3]-em.rotPivot[0], em.positions[p.vidx[k]*3+1]-em.rotPivot[1], em.positions[p.vidx[k]*3+2]-em.rotPivot[2] };
+                                float o[3]; xpt(R, lp, o); for (int c=0;c<3;c++) pred[k*3+c] = o[c] + em.rotPivot[c]; }
+                        } else if (strncmp(p.repr,"ROT-",4)==0) {   // ROT-SPIN / ROT-SWAY: Rodrigues about axis/pivot
+                            float ang = em.rotOsc ? 0.5f*em.rotAmp*(1.f - cosf(6.2831853f * t / em.rotPeriod)) : em.rotOmega * t;
+                            float ax[3] = { em.rotAxis[0], em.rotAxis[1], em.rotAxis[2] };
+                            float al = sqrtf(ax[0]*ax[0]+ax[1]*ax[1]+ax[2]*ax[2]); if (al > 1e-8f) { ax[0]/=al; ax[1]/=al; ax[2]/=al; }
+                            float s = sinf(ang), c = cosf(ang);
+                            for (int k = 0; k < 8; k++) { float lp[3] = { em.positions[p.vidx[k]*3]-em.rotPivot[0], em.positions[p.vidx[k]*3+1]-em.rotPivot[1], em.positions[p.vidx[k]*3+2]-em.rotPivot[2] };
+                                float d = ax[0]*lp[0]+ax[1]*lp[1]+ax[2]*lp[2];
+                                float cr[3] = { ax[1]*lp[2]-ax[2]*lp[1], ax[2]*lp[0]-ax[0]*lp[2], ax[0]*lp[1]-ax[1]*lp[0] };
+                                for (int c2=0;c2<3;c2++) pred[k*3+c2] = (lp[c2]*c + cr[c2]*s + ax[c2]*d*(1.f-c)) + em.rotPivot[c2]; }
+                        } else {   // SCALE: per-axis factor table about scalePivot
+                            float ph = fmodf(t, p.dur) / p.dur * (float)em.scaleN; int f0 = (int)ph % em.scaleN; float fa = ph - floorf(ph); int f1 = (f0+1) % em.scaleN;
+                            float fac[3]; for (int c=0;c<3;c++) fac[c] = em.scaleFrames[(size_t)f0*3+c]*(1.f-fa) + em.scaleFrames[(size_t)f1*3+c]*fa;
+                            for (int k = 0; k < 8; k++) for (int c=0;c<3;c++) pred[k*3+c] = (em.positions[p.vidx[k]*3+c]-em.scalePivot[c])*fac[c] + em.scalePivot[c];
+                        }
+                        const float* tr = &p.truth[(size_t)ti*8*3];
+                        if (ti == 0) memcpy(t0v, tr, sizeof t0v);
+                        for (int k = 0; k < 8*3; k += 3) {
+                            float dx=pred[k]-tr[k], dy=pred[k+1]-tr[k+1], dz=pred[k+2]-tr[k+2];
+                            float e2 = sqrtf(dx*dx+dy*dy+dz*dz);
+                            if (inWrapWin || probeHidden[k/3]) { if (e2 > wrapWinErr) wrapWinErr = e2; }
+                            else if (e2 > maxErr) maxErr = e2;
+                            float sx=tr[k]-t0v[k], sy=tr[k+1]-t0v[k+1], sz=tr[k+2]-t0v[k+2];
+                            float sp = sqrtf(sx*sx+sy*sy+sz*sz); if (sp > span) span = sp;
+                        }
+                        { static int dbg=-2; if (dbg==-2){ const char* d=std::getenv("HSR_AVDBG"); dbg = d?atoi(d):-1; }
+                          if (dbg == p.mi) for (int k = 0; k < 8; k++) {
+                              float dx=pred[k*3]-tr[k*3], dy=pred[k*3+1]-tr[k*3+1], dz=pred[k*3+2]-tr[k*3+2];
+                              float e2=sqrtf(dx*dx+dy*dy+dz*dz);
+                              if (e2 > 0.05f) fprintf(stderr, "[AVDBG] m%d t=%.3f probe%d vi=%u bone=%d wgt=%d pred=(%.2f,%.2f,%.2f) truth=(%.2f,%.2f,%.2f) err=%.2f\n",
+                                  p.mi, t, k, p.vidx[k], (int)em.hzBoneIdx[p.vidx[k]*4], (int)em.hzBoneWgt[p.vidx[k]*4],
+                                  pred[k*3],pred[k*3+1],pred[k*3+2], tr[k*3],tr[k*3+1],tr[k*3+2], e2); }
+                        }
+                    }
+                    float tol = std::max(0.05f, 0.05f * span);
+                    fprintf(stderr, "[ANIM-VERIFY] m%03d '%s' repr=%s J=%d dur=%.2fs wrap=%s Ddev=%.3f motionSpan=%.2f maxErr=%.3f wrapWinErr=%.3f %s\n",
+                            p.mi, ems[p.emIdx].name.c_str(), p.repr, ems[p.emIdx].hzJointCount, p.dur,
+                            strcmp(p.repr,"HZANIM")==0 ? (seam?"SEAM":"TELEPORT") : "shader", Ddev, span, maxErr, wrapWinErr, maxErr > tol ? "<< MISMATCH" : "OK");
+                }
+            }
+            // ── [FLIP-VERIFY]: spritesheet flipbook CELL-ORDER check. The device shader plays frame k at cell
+            //    (k%cols, floor(k/cols)) — row-major. The SOURCE toggles quads via armature scale; sample the
+            //    source at each frame time, find the visible (max-area) quad, and confirm its UV cell matches
+            //    the shader's k. A scrambled toggle order would pass every vertex diff but play garbage frames.
+            if (isV79 && sceneMeshes) {
+                for (auto& em : ems) {
+                    if (!em.flipbook || em.flipCols < 1 || em.flipRows < 1 || em.flipFps <= 0.f) continue;
+                    if (em.srcMeshIdx < 0 || (size_t)em.srcMeshIdx >= sceneMeshes->size()) continue;
+                    const MeshData& md = (*sceneMeshes)[em.srcMeshIdx];
+                    int cols = em.flipCols, rows = em.flipRows, nfr = em.flipFrames > 0 ? em.flipFrames : cols*rows;
+                    size_t nq = md.positions.size()/12;
+                    if (nq < 2 || md.uvs.size() < nq*8) continue;
+                    bool replay = em.flipN >= 2 && em.flipUVMats.size() >= (size_t)em.flipN*6 && em.flipLoop > 1e-4f;
+                    int nCheck = replay ? em.flipN : nfr;
+                    float fdur = replay ? em.flipLoop / (float)em.flipN : 1.f/em.flipFps;
+                    int bad = 0, checked = 0;
+                    for (int k = 0; k < nCheck; k++) {
+                        gltf.animate(((float)k + 0.5f) * fdur);
+                        int best = -1; float bestA = -1.f;
+                        for (size_t q = 0; q < nq; q++) {
+                            const float* p0v = &md.positions[q*12]; const float* p1v = &md.positions[q*12+3];
+                            const float* p2v = &md.positions[q*12+6]; const float* p3v = &md.positions[q*12+9];
+                            auto tA = [](const float* a, const float* b, const float* c){
+                                float u[3]={b[0]-a[0],b[1]-a[1],b[2]-a[2]}, w[3]={c[0]-a[0],c[1]-a[1],c[2]-a[2]};
+                                float cx=u[1]*w[2]-u[2]*w[1], cy=u[2]*w[0]-u[0]*w[2], cz=u[0]*w[1]-u[1]*w[0];
+                                return 0.5f*sqrtf(cx*cx+cy*cy+cz*cz); };
+                            float a = tA(p0v,p1v,p2v)+tA(p0v,p2v,p3v);
+                            if (a > bestA) { bestA = a; best = (int)q; }
+                        }
+                        if (best < 0) continue;
+                        float u0=1e9f, v0=1e9f;
+                        for (int c = 0; c < 4; c++) { float u=md.uvs[((size_t)best*4+c)*2], v=md.uvs[((size_t)best*4+c)*2+1];
+                            if (u<u0) u0=u; if (v<v0) v0=v; }
+                        int col = (int)(u0*cols + 0.5f), row = (int)(v0*rows + 0.5f);
+                        int expC, expR;
+                        if (replay) { expC = (int)(em.flipUVMats[(size_t)k*6+2]*cols + 0.5f); expR = (int)(em.flipUVMats[(size_t)k*6+5]*rows + 0.5f); }
+                        else        { expC = k % cols; expR = k / cols; }
+                        checked++;
+                        if (col != expC || row != expR) bad++;
+                    }
+                    gltf.animate(0.f);
+                    fprintf(stderr, "[FLIP-VERIFY] m%03d '%s' %dx%d %s %d frames over %.2fs: %d/%d frames match shipped cell sequence%s\n",
+                            em.srcMeshIdx, em.name.c_str(), cols, rows, replay ? "OBSERVED-replay" : "grid-order",
+                            nCheck, fdur*nCheck, checked-bad, checked, bad ? "   << ORDER MISMATCH" : "");
+                }
+            }
+            fprintf(stderr, "[ANIM-AUDIT] DONE %zu export meshes\n", ems.size());
+            return 0;
+        }
         editor.exportAPKSync();   // synchronous cook + auto-sign with a terminal progress bar
         if (std::getenv("HSR_EXPORT_QUIT")) return 0;
     }
@@ -2020,6 +2317,12 @@ int main(int argc, char** argv) {
                         snprintf(tmp,sizeof tmp,"[TEX] base=%dx%d(%d) normal=%dx%d(%d) orm=%dx%d(%d) emissive=%dx%d(%d) lightmap=%dx%d(%d)\n",
                             md.texW,md.texH,(int)md.hasTexture, md.normalW,md.normalH,(int)md.hasNormal, md.ormW,md.ormH,(int)md.hasOrm,
                             md.emissiveW,md.emissiveH,(int)md.hasEmissive, md.lmW,md.lmH,(int)md.hasLightmap); out += tmp;
+                        if (md.texRGBA.size() >= 4) {   // ALPHA CONTENT of the decoded base texture (TEX-AUDIT: is transparency actually IN the shipped data?)
+                            size_t n2 = md.texRGBA.size()/4, below = 0, mid = 0; int amn = 255;
+                            for (size_t p2 = 3; p2 < md.texRGBA.size(); p2 += 4) { int a2 = md.texRGBA[p2];
+                                if (a2 < amn) amn = a2; if (a2 < 250) below++; if (a2 > 10 && a2 < 245) mid++; }
+                            snprintf(tmp,sizeof tmp,"  baseAlpha: min=%d var%%=%.1f mid%%=%.1f\n", amn, 100.f*below/n2, 100.f*mid/n2); out += tmp;
+                        }
                         if (!md.ormTexName.empty()) { snprintf(tmp,sizeof tmp,"  ormTexName=%s (lightmap merge-group)\n", md.ormTexName.c_str()); out += tmp; }
                         // -- ANIMATION --
                         snprintf(tmp,sizeof tmp,"[ANIM] hasVat=%d vat=%ux%u(verts x frames) vatTrack=%.1f rate=%.3f timeOff=%.3f dynamicVerts=%d gltfMeshIdx=%d\n",

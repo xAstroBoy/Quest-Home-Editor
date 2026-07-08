@@ -1392,7 +1392,9 @@ public:
         // is GREYSCALE (luminance detail) and the device MULTIPLIES it by this entity tint. Feed it into curTint
         // -> push-constant[16..19] (honoured by the unlit/global shader: frag = texture * tint). Without it the
         // grey butterfly stayed white. Only when a real (non-white) tint exists and this isn't an editor overlay.
-        else if (md.tint[0]!=1.0f || md.tint[1]!=1.0f || md.tint[2]!=1.0f) {
+        else if ((md.tint[0]!=1.0f || md.tint[1]!=1.0f || md.tint[2]!=1.0f
+                 || (md.tint[3]>0.0f && md.tint[3]<1.0f))     // ALPHA-ONLY factor too (zelda lighthouse beam: baseColorFactor=(1,1,1,0.10) — RGB-only gate showed it OPAQUE in the preview as well as on device)
+                 && !(md.hasTexture && md.texW<=1 && md.texH<=1)) {   // UNTEXTURED (1x1 solid bake): the factor RGBA is ALREADY the texel (matSolidColor) — tinting again SQUARED it (riftdark fog a=0.5 previewed at 0.25)
             gm.curTint[0]=md.tint[0]; gm.curTint[1]=md.tint[1]; gm.curTint[2]=md.tint[2];
             gm.curTint[3]=(md.tint[3]>0.0f)?md.tint[3]:1.0f;
         }

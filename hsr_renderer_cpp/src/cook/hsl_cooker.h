@@ -1459,6 +1459,7 @@ inline std::vector<uint8_t> encodeHzSkel(const std::vector<HzJoint>& joints, con
 
 struct ExportMesh {
     std::string name;
+    int srcMeshIdx = -1;            // index into sceneMeshes this em was built from (ANIM-VERIFY ground-truth pairing)
     std::vector<float> positions;   // WORLD-space xyz*nVerts (editor pre-bakes the model matrix)
     std::vector<float> uvs;         // uv*nVerts (optional)
     std::vector<uint32_t> indices;  // triangle list
@@ -3335,7 +3336,17 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // FADED effect cards (fog/dust): the getTime flipbook shader REPLAYS the mat.sanim tint-alpha curve, so the
             // per-vertex COLOR_0 alpha must be NEUTRAL 1.0 (else static curTint[3] — 0 at cook phase 0 — ×  shaderFade = 0
             // = invisible, the "only one fog visible" bug). The shader owns the opacity for these.
-            float fr=m.albedoFactor[0]*m.curTint[0], fg=m.albedoFactor[1]*m.curTint[1], fb=m.albedoFactor[2]*m.curTint[2];
+            // + matTint = the glTF baseColorFactor (RGBA). It was carried on the ExportMesh but NEVER APPLIED —
+            // the preview multiplied it as a push-constant tint so the desktop looked right while the device
+            // rendered untinted/OPAQUE (zelda lighthouse beam: factor=(1,1,1,0.10) shipped alpha 1.0 = a solid
+            // yellow cone; clocktown water factor.a=0.78 shipped opaque). Fold it into the SAME COLOR_0 bake
+            // (base×COLOR0 in every unlit/skinned shader) — color AND alpha, single application on each side.
+            // TEXTURED meshes only: an UNTEXTURED material's 1x1 solid texel already IS the factor RGBA
+            // (matSolidColor) — folding again would square it (riftdark fog a=0.5 -> 0.25).
+            bool texturedFactor = !(m.w <= 1 && m.h <= 1);
+            float mtR = texturedFactor ? m.matTint[0] : 1.f, mtG = texturedFactor ? m.matTint[1] : 1.f, mtB = texturedFactor ? m.matTint[2] : 1.f;
+            float mtA = (texturedFactor && m.matTint[3] > 0.f) ? m.matTint[3] : 1.f;   // authored factor ALPHA (alpha-0 kept defensive-1 like the preview)
+            float fr=m.albedoFactor[0]*m.curTint[0]*mtR, fg=m.albedoFactor[1]*m.curTint[1]*mtG, fb=m.albedoFactor[2]*m.curTint[2]*mtB;
             // When the RGBA TINTREPLAY owns the mesh's tint (it SUPERSEDES the alpha-only fade in every shader
             // branch), its table is a per-channel RATIO to frame 0 (main.cpp divides f0 back out) and COLOR_0
             // MUST keep the frame-0 bake (m.curTint) — that is the ratio·bake contract. The old unconditional
@@ -3343,8 +3354,10 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // rendered ratio-only = ~5.7x too dense, clamping opaque mid-loop (plateau = "wrong tempo" + murky
             // veil). Neutralize to 1.0 ONLY for the alpha-only fade path (its shader curve is ABSOLUTE).
             bool tintOwnsAlpha = m.tintAnim && m.tintN >= 2 && m.tintFrames.size() >= (size_t)m.tintN*4 && m.tintLoop > 1e-4f;
-            float fa=(m.fadeAnim && m.fadeN>=2 && !tintOwnsAlpha) ? 1.0f : m.curTint[3];
+            float fa=((m.fadeAnim && m.fadeN>=2 && !tintOwnsAlpha) ? 1.0f : m.curTint[3]) * mtA;
             bool needCol = hasLm || fr!=1.f||fg!=1.f||fb!=1.f||fa!=1.f;
+            if ((mtR!=1.f||mtG!=1.f||mtB!=1.f||mtA!=1.f) && std::getenv("HSR_VERBOSE"))
+                fprintf(stderr, "[COOK] m%03zu '%s' baseColorFactor (%.2f,%.2f,%.2f,a=%.2f) -> COLOR_0 bake\n", i, m.name.c_str(), mtR, mtG, mtB, mtA);
             if (needCol && nvc>0) {
                 vertCol.resize(nvc*4);
                 // NO V-flip by default: A/B-proven on the stinson terrazzo (V79 OPA lightmap) — the flipped

@@ -254,6 +254,11 @@ struct MeshData {
     bool alphaTest = false;
     float alphaCutoff = 0.5f;   // AUTHORED 'alphatestthreshold' uniform (zen tree canopy = 0.25) — the V79
                                 // frag discards color.a < AlphaCutoff; hardcoding 0.5 ate its mid-alpha leaves
+    // TEX-AUDIT provenance: the RAW authored transparency (BEFORE any loader heuristic) so the cook audit can
+    // diff "what the author wrote" against "what ships". srcAlphaMode: glTF alphaMode string only —
+    // 0=OPAQUE 1=MASK 2=BLEND, -1=no material. srcFactorA = baseColorFactor alpha (1 when absent).
+    int   srcAlphaMode = -1;
+    float srcFactorA   = 1.f;
 
     // Editor overlay kind: normally these meshes are authored alongside render geometry but NOT
     // drawn (collision/navigation). The editor loads them as translucent flat-colour overlays so
