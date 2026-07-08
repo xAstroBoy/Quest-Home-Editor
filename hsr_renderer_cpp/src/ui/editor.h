@@ -272,8 +272,11 @@ struct Editor {
     std::vector<int> sel;          // the full selection set (multi-select); `selected` is its active member
     bool showLocal = false;
     bool inSel(int i) const { for (int s : sel) if (s==i) return true; return false; }
-    void selectOne(int i){ sel.clear(); if (i>=0) sel.push_back(i); selected=i; r->selectedMesh=i; selItems.clear(); }
-    void toggleSel(int i){ if (i<0) return; selItems.clear(); for (size_t k=0;k<sel.size();++k) if (sel[k]==i){ sel.erase(sel.begin()+k); selected = sel.empty()?-1:sel.back(); r->selectedMesh=selected; return; } sel.push_back(i); selected=i; r->selectedMesh=i; }
+    // Selecting a MESH must FULLY drop any scene-ITEM selection (the two are mutually exclusive: the gizmo/inspector
+    // test selItem>=0 first). Clearing only selItems while leaving the ACTIVE selItem set left a stale item bound, so
+    // a newly-clicked mesh "wouldn't sync" (gizmo/props stuck on the old item). Clear selItem too.
+    void selectOne(int i){ sel.clear(); if (i>=0) sel.push_back(i); selected=i; r->selectedMesh=i; selItems.clear(); selItem=-1; }
+    void toggleSel(int i){ if (i<0) return; selItems.clear(); selItem=-1; for (size_t k=0;k<sel.size();++k) if (sel[k]==i){ sel.erase(sel.begin()+k); selected = sel.empty()?-1:sel.back(); r->selectedMesh=selected; return; } sel.push_back(i); selected=i; r->selectedMesh=i; }
     void deselectAll(){ sel.clear(); selected=-1; r->selectedMesh=-1; }
 
     // ── mesh DELETE (toggle) — drop the selected mesh(es) from the render AND the cook (non-destructive: the mesh
@@ -3128,9 +3131,10 @@ struct Editor {
         std::string s; char b[640];
         s += "HSLEDIT 2\n";
         snprintf(b,sizeof b,"CAM %.4f %.4f %.4f %.5f %.5f\n", r->cam.pos[0],r->cam.pos[1],r->cam.pos[2], r->cam.yaw, r->cam.pitch); s+=b;
-        snprintf(b,sizeof b,"CFG %d %.3f %.3f %.3f %.1f %.4f %.0f %d %.0f %d %d %d %d %d %d\n",
+        snprintf(b,sizeof b,"CFG %d %.3f %.3f %.3f %.1f %.4f %.0f %d %.0f %d %d %d %d %d %d %d %.4f %.4f %.4f\n",
             cfgFog?1:0, cfgFogColor[0],cfgFogColor[1],cfgFogColor[2], cfgFogStart, cfgFogDensity, cfgFar,
-            skybox?1:0, skyboxDist, noCull?1:0, solidCollision?1:0, animSkinned?1:0, cookAudio?1:0, previewAudio?1:0, voxelSolid?1:0); s+=b;
+            skybox?1:0, skyboxDist, noCull?1:0, solidCollision?1:0, animSkinned?1:0, cookAudio?1:0, previewAudio?1:0, voxelSolid?1:0,
+            bgColorSet?1:0, bgColor[0], bgColor[1], bgColor[2]); s+=b;
         for(int i=0;i<(int)r->gpuMeshes.size();++i){ auto& gm=r->gpuMeshes[i];
             snprintf(b,sizeof b,"MESH %d %s %.5f %.5f %.5f %.6f %.6f %.6f %.6f %.5f %.5f %.5f %d\n", i, qstr(gm.name).c_str(),
                 gm.editT[0],gm.editT[1],gm.editT[2], gm.editR[0],gm.editR[1],gm.editR[2],gm.editR[3],
@@ -3227,7 +3231,7 @@ struct Editor {
             size_t e=all.find('\n',p); std::string line=all.substr(p, e==std::string::npos?std::string::npos:e-p); p=(e==std::string::npos)?all.size():e+1;
             auto t=tokenize(line); if(t.empty()) continue;
             if(t[0]=="CAM" && t.size()>=6){ r->cam.pos[0]=(float)atof(t[1].c_str()); r->cam.pos[1]=(float)atof(t[2].c_str()); r->cam.pos[2]=(float)atof(t[3].c_str()); r->cam.yaw=(float)atof(t[4].c_str()); r->cam.pitch=(float)atof(t[5].c_str()); }
-            else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; if(t.size()>=16) voxelSolid=atoi(t[15].c_str())!=0; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
+            else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; if(t.size()>=16) voxelSolid=atoi(t[15].c_str())!=0; if(t.size()>=20){ bgColorSet=atoi(t[16].c_str())!=0; bgColor[0]=(float)atof(t[17].c_str()); bgColor[1]=(float)atof(t[18].c_str()); bgColor[2]=(float)atof(t[19].c_str()); if(bgColorSet&&r){ r->clearRGB[0]=bgColor[0]; r->clearRGB[1]=bgColor[1]; r->clearRGB[2]=bgColor[2]; } } g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
             else if(t[0]=="MESH" && t.size()>=14 && !cooked){ int idx=atoi(t[1].c_str()); if(geomAuth && idx>=baseMeshCount) continue;   /* GEOM2 owns created meshes; compacted sidecar re-orders them = stale indices */ if(idx>=0&&idx<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[idx];
                 gm.name=t[2]; gm.editT[0]=(float)atof(t[3].c_str()); gm.editT[1]=(float)atof(t[4].c_str()); gm.editT[2]=(float)atof(t[5].c_str());
                 gm.editR[0]=(float)atof(t[6].c_str()); gm.editR[1]=(float)atof(t[7].c_str()); gm.editR[2]=(float)atof(t[8].c_str()); gm.editR[3]=(float)atof(t[9].c_str());
@@ -4526,6 +4530,30 @@ struct Editor {
     // The Meta-Component manager: per haven component type — colour swatch, EYE visibility toggle, count, + Add, Meta class.
     void drawScenePanel(float x, float y, float w){
         auto& th=cx.th; float rh=th.rowH;
+        // ── BACKGROUND COLOR ("the dark one"): recolor the DARK void behind everything (r->clearRGB). Live +
+        //    persisted. This is the pure viewport background — distinct from the "Skybox / Background" spawner
+        //    below (which builds a sky sphere / cooks a skybox). Drag R/G/B or pick a preset. ──
+        cx.label(x,y,w,rh,"Background color  (the dark void)",th.text); y+=rh+2*uiScale;
+        { float y0=y; float* bg = r ? r->clearRGB : bgColor;
+          cx.swatch(ui::hashId("bgsw"), x, y+2*uiScale, 40*uiScale, rh-4*uiScale, bg[0],bg[1],bg[2]);
+          char cc[40]; snprintf(cc,sizeof cc,"%.2f, %.2f, %.2f", bg[0],bg[1],bg[2]);
+          cx.textAligned(x+46*uiScale, y, w-46*uiScale, rh, cc, th.textDim, 0);
+          cx.tip(x,y0,w,rh,"The dark background behind the whole scene (the viewport clear color).\nDrag R/G/B or click a preset to recolor it live. Persisted in the session."); y+=rh+2*uiScale;
+          const char* chn[3]={"R","G","B"}; const uint32_t chc[3]={ui::rgba(220,70,70),ui::rgba(70,200,90),ui::rgba(80,140,235)};
+          for (int ci=0; ci<3; ci++){
+              cx.label(x+8*uiScale,y,18*uiScale,rh,chn[ci],th.textDim);
+              float sv=bg[ci];
+              if (cx.slider(ui::hashId(6500u+ci,11u), x+30*uiScale, y, w-90*uiScale, rh, sv, 0.f,1.f, chc[ci])) { if(r) r->clearRGB[ci]=sv; bgColor[ci]=sv; bgColorSet=true; }
+              char vb[16]; snprintf(vb,sizeof vb,"%.2f",bg[ci]); cx.textAligned(x+w-56*uiScale,y,52*uiScale,rh,vb,th.text,2);
+              y+=rh+2*uiScale;
+          }
+          struct BP{ const char* n; float r,g,b; };
+          static const BP bpre[]={{"Black",0,0,0},{"White",1,1,1},{"Grey",0.5f,0.5f,0.5f},{"Sky",0.35f,0.55f,0.9f},{"Night",0.02f,0.03f,0.06f},{"Sunset",0.95f,0.5f,0.25f}};
+          float bw=(w-5*4*uiScale)/6.f;
+          for (int p=0;p<6;p++){ float bx=x+p*(bw+4*uiScale);
+            if (cx.button(ui::hashId(6600u+p,11u), bx, y, bw, rh, bpre[p].n)) { for(int k=0;k<3;k++){ if(r) r->clearRGB[k]=(&bpre[p].r)[k]; bgColor[k]=(&bpre[p].r)[k]; } bgColorSet=true; } }
+          y+=rh+6*uiScale; }
+        dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
         // ── PREFABS: reusable assets - save a selection (right-click > Save as PREFAB), spawn copies
         //    here or by DRAGGING the .hsrprefab file into the window. Spawns land where you look. ──
         cx.label(x,y,w,rh,"Prefabs",th.text); y+=rh+2*uiScale;
@@ -4683,6 +4711,11 @@ struct Editor {
     }
     std::string skyColUI, skyImgUI;   // Scene-tab skybox field buffers (UI state only; the applied state lives in skyColor/skyImagePath)
     float skyPick[3] = {0.f,0.f,0.f};  // color-picker working RGB (mirrors skyColor when set; lets the sliders drag before "set")
+    // ── VIEWPORT BACKGROUND color ("the dark one"): the DARK void behind everything = the renderer clear color
+    //    (r->clearRGB, default black). This is the PURE editor background — NOT the skybox spawner (which builds a
+    //    sky sphere / cooks a SkyboxPlatformComponent). Live + persisted (CFG). bgColorSet=false -> keep default black.
+    float bgColor[3] = {0.f,0.f,0.f};
+    bool  bgColorSet = false;
 
     void drawProperties() {
         auto& th = cx.th; VkRect2D a = rcProps;

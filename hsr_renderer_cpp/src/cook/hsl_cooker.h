@@ -2747,13 +2747,48 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // vivid, and the coverage-preserving alpha mips keep leaf silhouettes from going blocky at range. The
         // skinned-CUTOUT path also chains TINTREPLAY (the zen tree's authentic green→cyan→pink canopy cycle).
         bool foliageBlend = useHz && m.alphaTest && !m.blend && !m.additive && !m.depthPrepass && std::getenv("HSR_FOLIAGE_BLEND");
+        // ── MOVING SOLID SILHOUETTE → DEPTH-WRITE CUTOUT (skinned/HZANIM). A MOVING transparent card (skinned
+        //    path) defaults to alpha BLEND = NO depth-write, so two of them can't occlude each other on device
+        //    (outerwilds: the orbiting planet billboards are all HZANIM blend cards → Interloper drew THROUGH
+        //    Brittle when it should be behind = "phasing thru, depth issue"). The static-mesh path already fixes
+        //    this by reclassifying BIMODAL / SOLID-BODY silhouettes to a depth-writing cutout; MOVING cards were
+        //    intentionally left BLEND to protect genuinely-soft transparents (the TRAIN, force-field glass, fog).
+        //    The right discriminator is the SAME as the static path: the TEXTURE'S ALPHA SHAPE. A hard-edged /
+        //    solid silhouette (round planet on a transparent bg: opaque core + negligible mid-alpha gradient)
+        //    MUST occlude; a soft-alpha card (real mid gradient, or an authored material FX) stays BLEND. So a
+        //    m.blend HZANIM card whose alpha is bimodal OR solid-bodied (and is NOT an additive glow or an
+        //    animated soft-FX card) gets the depth-writing skinned CUTOUT below. HSR_NOSOLIDSIL restores BLEND.
+        bool solidSilhouette = false;
+        if (useHz && m.blend && !m.additive && !m.alphaTest && !std::getenv("HSR_NOSOLIDSIL") && m.rgba.size() >= 4) {
+            bool softFx = m.tintAnim || m.fadeAnim || m.flipbook || m.uvScroll;   // animated soft FX card -> keep BLEND
+            if (!softFx) {
+                size_t nt = m.rgba.size()/4, opq=0, mid=0;
+                for (size_t k=3; k<m.rgba.size(); k+=4){ uint8_t a=m.rgba[k]; if (a>=230) opq++; if (a>=40 && a<=215) mid++; }
+                float opF = nt ? (float)opq/(float)nt : 0.f, midF = nt ? (float)mid/(float)nt : 1.f;
+                bool bimodal  = (midF < 0.05f) && (opF > 0.004f);       // hard-edged mask (no soft gradient)
+                bool solidBody= (opF > 0.25f) && (midF < 0.18f);        // solid body wearing an anti-aliased edge
+                // GIANT SOFT SHEET guard (a huge card with a real soft gradient = atmosphere/fog, not a diorama
+                // silhouette): keep it BLEND. Silhouette planet billboards are compact, so this never trips them.
+                float pmn[3]={1e30f,1e30f,1e30f}, pmx[3]={-1e30f,-1e30f,-1e30f};
+                for (size_t q=0; q+2<m.positions.size(); q+=3) for(int a=0;a<3;a++){ float p=m.positions[q+a]; if(p<pmn[a])pmn[a]=p; if(p>pmx[a])pmx[a]=p; }
+                float exX=pmx[0]-pmn[0], exZ=pmx[2]-pmn[2];
+                bool giantSoft = (exX > 300.f || exZ > 300.f) && midF > 0.05f;
+                solidSilhouette = (bimodal || solidBody) && !giantSoft;
+                if (solidSilhouette && std::getenv("HSR_VERBOSE"))
+                    fprintf(stderr, "[COOK] m%03zu '%s' MOVING SOLID SILHOUETTE opF=%.2f midF=%.2f -> depth-write CUTOUT\n", i, m.name.c_str(), opF, midF);
+            }
+        }
         std::vector<uint8_t> matl; std::string animatorComp; int meshArmIdx = -1;   // meshArmIdx: resolved skeleton (armature) index — shared by the shipped skeleton's joint names AND the rendmesh joint-id palette (device binds verts→joints by NAME, so both must match)
         if (useHz) {   // HZANIM: CURRENT-format skinned MATL (field7=shader) + HZAN:SKEL + ACL HZAN:ANIM + AnimatorPlatformComponent
             // BLEND skinned (the SHIELD) -> the transparent-flagged material (field2=2) so it alpha-blends in the
             // transparent pass; OPAQUE skinned (body) -> the plain butterflies template.
-            matl = std::getenv("HSR_HZMATTPL") ? matTpl : ((m.blend || foliageBlend) && matSkinB.size() >= 176 ? matSkinB : matSkin2);
+            // A MOVING SOLID SILHOUETTE (orbiting planet billboard) uses the OPAQUE skinned MATL so it DEPTH-WRITES
+            // + occludes (the cutout frag below discards its transparent bg). Genuinely-soft transparent cards keep
+            // the blend MATL.
+            matl = std::getenv("HSR_HZMATTPL") ? matTpl : (((m.blend || foliageBlend) && !solidSilhouette) && matSkinB.size() >= 176 ? matSkinB : matSkin2);
             // (Moving/skinned transparent cards e.g. the TRAIN stay ALPHA-BLEND — a hard alpha-cutoff cutout here
-            //  destroyed the train's soft transparency. Depth-write for MOVING cards is intentionally NOT forced.)
+            //  destroyed the train's soft transparency. Depth-write for MOVING cards is forced ONLY for solid
+            //  silhouettes (solidSilhouette, e.g. the outerwilds planet billboards) so they occlude correctly.)
             if (!std::getenv("HSR_HZMATTPL") && matl.size() >= 140) {
                 // field7 shader ref @48(pkg)/@56(ing)/@64(tgt) -> our env-local skinned shader; tgt @64 stays 0xA1767FE9 (murmur3"shader").
                 // BLEND skinned meshes (the omnidroid SHIELD = alphaMode BLEND) use unlitBLENDskinned so the device alpha-blends
@@ -2768,7 +2803,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // transparent, off place"). Use the BLEND skinned shader (unlitblendskinned, passes texture alpha)
                 // together with the luminance-alpha texture the additive branch already bakes (alpha = max(rgb)·a) →
                 // the bright beam feathers in over the sky and the dark atlas background drops out = a real glow.
-                AssetKey3 sk = ((m.blend || foliageBlend || m.additive) && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
+                AssetKey3 sk = ((m.blend || foliageBlend || m.additive) && !solidSilhouette && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
                 // SKINNED (blend OR opaque) + MaterialTint RGBA cycle (stinson zen tree: the SOURCE SHADER
                 // cycles the tint green→cyan→pink): chain TINTREPLAY onto the matching skinned frag. This
                 // covers the OPAQUE skinned meshes too (materialsplit_fill — the tree's opaque inner-canopy
@@ -2803,7 +2838,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // shadergen::CUTOUT edit the static path uses — it only touches the FRAGMENT, skinning untouched).
                 // Without it the opaque skinned pipeline drew the leaf textures' transparent gaps SOLID ("blocky").
                 // The texture keeps its REAL alpha for this path (see the skinnedOpaque force-255 exemption above).
-                if (m.alphaTest && !m.blend && !foliageBlend && !shadSkin.empty()) {
+                if (((m.alphaTest && !m.blend) || solidSilhouette) && !foliageBlend && !shadSkin.empty()) {
                     // A masked skin may ALSO carry a mat.sanim MaterialTint RGBA cycle (stinson zen tree:
                     // 8 skinned canopy layers pulse green→cyan→pink over 35s). Chain TINTREPLAY onto the
                     // CUTOUT frag so the skinned leaves recolor on-device (it only edits the fragment; the
@@ -2820,7 +2855,9 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     // AUTHORED discard threshold (the zen tree "not like leaves" fix): the V79 material carries
                     // 'alphatestthreshold' (tree canopy 0.25); the old hardcoded 0.5 discarded its mid-alpha leaf
                     // detail. Per-cutoff shader cache (c25/c50...) so different thresholds never collide.
-                    float aCut = (m.alphaCutoff > 0.f && m.alphaCutoff < 1.f) ? m.alphaCutoff : 0.5f;
+                    // solidSilhouette (planet billboard): LOW 0.12 discard — depth-writes the body but keeps the
+                    // soft atmosphere edge (a 0.5 cut would hard-clip the glow ring). Authored masks keep 0.5/authored.
+                    float aCut = (m.alphaTest && m.alphaCutoff > 0.f && m.alphaCutoff < 1.f) ? m.alphaCutoff : (solidSilhouette ? 0.12f : 0.5f);
                     int cutPct = (int)(aCut*100.f + 0.5f);
                     char cfn[96];
                     if (sctint) { uint32_t th = 0x811C9DC5u ^ (uint32_t)(long)(m.tintLoop*1000);

@@ -231,6 +231,23 @@ static void dropCb(GLFWwindow*, int count, const char** paths) {
     }
 }
 
+// Cheap drag-and-drop format sniff: is this a loadable environment? A Quest Home env APK ALWAYS ships
+// assets/scene.zip (every loader — glTF/OPA/scene — keys on it), and a Blender round-trip is a raw
+// .gltf/.glb. Anything else (e.g. a Unity game APK like Gallary.apk = libunity.so + data.unity3d, NO
+// scene.zip) can't be ported — reject it at drop time so the editor keeps the CURRENT env instead of
+// tearing the session down and crashing on a file it can't parse. (.hsrprefab is handled separately.)
+static bool looksLikeLoadableEnv(const std::string& path) {
+    auto endsCI = [&](const char* s){ size_t n = std::strlen(s); if (path.size() < n) return false;
+        for (size_t i=0;i<n;i++){ char a=path[path.size()-n+i], b=s[i];
+            if (a>='A'&&a<='Z') a=(char)(a-'A'+'a'); if (b>='A'&&b<='Z') b=(char)(b-'A'+'a'); if (a!=b) return false; } return true; };
+    if (endsCI(".gltf") || endsCI(".glb")) return true;   // plain Blender import (a raw model file, not an APK)
+    mz_zip_archive z; memset(&z, 0, sizeof z);
+    if (!mz_zip_reader_init_file(&z, path.c_str(), 0)) return false;   // not a zip/APK -> not an env
+    bool has = mz_zip_reader_locate_file(&z, "assets/scene.zip", nullptr, 0) >= 0;
+    mz_zip_reader_end(&z);
+    return has;
+}
+
 #ifdef _WIN32
 // ── In-window loading / drop-zone painter (GDI) ────────────────────────────────────────────────────
 // Paints directly onto the main (NO_API) window's HWND while the scene loads on a worker thread, or
@@ -993,8 +1010,27 @@ int main(int argc, char** argv) {
         loadOk = loadSceneCPU();
     }
     if (!loadOk) {
-        fprintf(stderr, "\n[MAIN] FATAL: scene load failed for %s\n", apkPath.c_str());
-        return 1;
+        fprintf(stderr, "\n[MAIN] scene load failed for %s\n", apkPath.c_str());
+        if (!interactive) return 1;   // headless/scripted modes: exit with an error, as before
+        // INTERACTIVE: NEVER take the whole editor down because one env failed to parse (a bad/unsupported
+        // APK dropped or passed on the command line). Return to the drop-zone and wait for a valid env — the
+        // window stays alive so the user can drop another environment. (looksLikeLoadableEnv rejects most bad
+        // drops earlier; this catches env-shaped APKs that still fail deeper in the loader.)
+        glfwSetWindowTitle(g_window, ("HSR Renderer - couldn't load " + envBaseName + " - drag an environment .apk here").c_str());
+        g_doReload = false; g_dropPath.clear();
+#ifdef _WIN32
+        HWND failHwnd = glfwGetWin32Window(g_window);
+#endif
+        while (!glfwWindowShouldClose(g_window) && !g_doReload) {
+#ifdef _WIN32
+            paintLoadSplash(failHwnd, nullptr, /*waitingForDrop=*/true);
+#endif
+            glfwWaitEventsTimeout(0.05);
+        }
+        if (!g_doReload || g_dropPath.empty()) { glfwDestroyWindow(g_window); glfwTerminate(); return 0; }
+        apkPath = g_dropPath; g_doReload = false; g_dropPath.clear();
+        envBaseName = apkPath; { size_t sl = envBaseName.find_last_of("/\\"); if (sl != std::string::npos) envBaseName = envBaseName.substr(sl + 1); }
+        continue;   // re-enter the load loop with the newly dropped env
     }
 
     // ── Step B: Init GLFW + Vulkan ─────────────────────────────
@@ -2630,9 +2666,17 @@ int main(int argc, char** argv) {
                 if (!std::getenv("HSR_NOUI") && editor.ready) editor.spawnPrefab(g_dropPath);
                 g_doReload = false; g_dropPath.clear();
             }
+            else if (!looksLikeLoadableEnv(g_dropPath)) {
+                // Not a Quest Home environment (e.g. a Unity game APK) — REJECT the drop and keep the current
+                // env loaded. Tearing down the session to load an unparseable file was the "crash on Gallary.apk".
+                std::string bn = g_dropPath; { size_t sl = bn.find_last_of("/\\"); if (sl != std::string::npos) bn = bn.substr(sl + 1); }
+                fprintf(stderr, "[DROP] rejected (not a Quest Home env APK, no assets/scene.zip): %s\n", g_dropPath.c_str());
+                if (!std::getenv("HSR_NOUI") && editor.ready)
+                    editor.setStatus("Can't load '" + bn + "' - not a Quest Home environment APK (no scene.zip).");
+                g_doReload = false; g_dropPath.clear();
+            }
             else if (interactive) { nextEnv = g_dropPath; g_doReload = false; g_dropPath.clear(); break; }
-            relaunchSelf(g_dropPath);
-            break;
+            else { relaunchSelf(g_dropPath); break; }
         }
         // Editor-driven swap (Cook panel: "Preview cooked (HSL)" / "Back to source") - same in-place reload.
         if (!editor.swapTo.empty()) {
