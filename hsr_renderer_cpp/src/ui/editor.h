@@ -2997,7 +2997,7 @@ struct Editor {
         else { float cp=std::cos(r->cam.pitch); float fwd[3]={std::sin(r->cam.yaw)*cp, std::sin(r->cam.pitch), -std::cos(r->cam.yaw)*cp};
                it.pos[0]=r->cam.pos[0]+fwd[0]*3.f; it.pos[1]=r->cam.pos[1]+fwd[1]*3.f; it.pos[2]=r->cam.pos[2]+fwd[2]*3.f; }  // 3 m ahead of the camera
         if (type==sitem::SPAWN||type==sitem::CHAIR||type==sitem::BOXCOL) dropToFloor(it.pos);   // land ground items ON the floor (not floating at overview-camera height)
-        deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; tab=TAB_OBJECT;
+        deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; tab=TAB_OBJECT; propScroll=0.f;   // reset scroll: the +Add buttons sit at the BOTTOM of the long Scene panel, so without this the new item's editor rendered scrolled off-screen ("had to switch tabs to see it")
     }
     // Create a Meta Component DERIVED from a mesh's world geometry (right-click -> Make ...). Each type is fitted to the
     // mesh so it's immediately solid/usable instead of a default placeholder you then hand-size.
@@ -3038,7 +3038,7 @@ struct Editor {
           case sitem::BOUNDARY:it.pos[1]=mn[1]; break;                                        // kill-floor plane at the mesh base
           default: break;                                                                    // HOTSPOT etc. -> mesh center
         }
-        deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; tab=TAB_OBJECT;
+        deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; tab=TAB_OBJECT; propScroll=0.f;
         setStatus(std::string("Created ")+sitem::typeName(type)+" from '"+r->gpuMeshes[meshIdx].name+"'");
     }
     void deleteSelItem() { if (selItem>=0 && selItem<(int)items.size()) { pushItemUndo(items); items.erase(items.begin()+selItem); selItem=-1; } }
@@ -3231,7 +3231,7 @@ struct Editor {
             size_t e=all.find('\n',p); std::string line=all.substr(p, e==std::string::npos?std::string::npos:e-p); p=(e==std::string::npos)?all.size():e+1;
             auto t=tokenize(line); if(t.empty()) continue;
             if(t[0]=="CAM" && t.size()>=6){ r->cam.pos[0]=(float)atof(t[1].c_str()); r->cam.pos[1]=(float)atof(t[2].c_str()); r->cam.pos[2]=(float)atof(t[3].c_str()); r->cam.yaw=(float)atof(t[4].c_str()); r->cam.pitch=(float)atof(t[5].c_str()); }
-            else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; if(t.size()>=16) voxelSolid=atoi(t[15].c_str())!=0; if(t.size()>=20){ bgColorSet=atoi(t[16].c_str())!=0; bgColor[0]=(float)atof(t[17].c_str()); bgColor[1]=(float)atof(t[18].c_str()); bgColor[2]=(float)atof(t[19].c_str()); if(bgColorSet&&r){ r->clearRGB[0]=bgColor[0]; r->clearRGB[1]=bgColor[1]; r->clearRGB[2]=bgColor[2]; } } g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
+            else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; /* t[15]=voxelSolid: NOT loaded — stays at the reverted default (false); old sessions saved 1 and would re-wall rooms */ if(t.size()>=20){ bgColorSet=atoi(t[16].c_str())!=0; bgColor[0]=(float)atof(t[17].c_str()); bgColor[1]=(float)atof(t[18].c_str()); bgColor[2]=(float)atof(t[19].c_str()); if(bgColorSet&&r){ r->clearRGB[0]=bgColor[0]; r->clearRGB[1]=bgColor[1]; r->clearRGB[2]=bgColor[2]; } } g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
             else if(t[0]=="MESH" && t.size()>=14 && !cooked){ int idx=atoi(t[1].c_str()); if(geomAuth && idx>=baseMeshCount) continue;   /* GEOM2 owns created meshes; compacted sidecar re-orders them = stale indices */ if(idx>=0&&idx<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[idx];
                 gm.name=t[2]; gm.editT[0]=(float)atof(t[3].c_str()); gm.editT[1]=(float)atof(t[4].c_str()); gm.editT[2]=(float)atof(t[5].c_str());
                 gm.editR[0]=(float)atof(t[6].c_str()); gm.editR[1]=(float)atof(t[7].c_str()); gm.editR[2]=(float)atof(t[8].c_str()); gm.editR[3]=(float)atof(t[9].c_str());
@@ -3405,10 +3405,11 @@ struct Editor {
     bool previewAudio = true;          // DEFAULT ON: play the env's background loop HERE on the PC while previewing. Toggle off = mute desktop playback (drives g_audioMuted).
     bool solidCollision = true;        // DEFAULT ON: cook a REAL double-sided trimesh collider (floor+walls+columns, haven2025 SEBD format). Off = floor-only ColliderBox grid.
     bool prevSolidCol = true;          // tracks solidCollision so the navmesh gizmo re-bakes (walls appear/vanish in the preview) when it's toggled.
-    bool voxelSolid = true;            // DEFAULT ON: ALSO rasterize each collider's tris into THICK all-orientation ColliderBoxes
-                                       // (voxelSolidBoxes) — the trimesh is paper-thin and the shell teleports the capsule to the
-                                       // tracked head (lean/step is never swept), so zero-thickness walls can't hold ("i keep
-                                       // clipping"); the voxel boxes give walls/ceilings/floors real VOLUME -> depenetration ejects.
+    bool voxelSolid = false;           // DEFAULT OFF (reverted): thick all-orientation voxel ColliderBoxes (voxelSolidBoxes)
+                                       // gave walls real VOLUME so a teleported head can't clip a paper-thin wall — BUT thickening
+                                       // every navmesh tri inward walled off room interiors ("not allowing me to walk inside rooms").
+                                       // Default collision = thin per-triangle floor boxes + wall slabs (walkable). Opt-in escape
+                                       // hatch for the thin-wall clip case; drives HSR_VOXSOLID in runCook.
     bool installAfterCook = true;      // DEFAULT ON: cook -> sign -> install to the headset. The installer auto-detects
                                        // adb root: ROOT -> install the UNSPOOFED own-package APK (+ auto-select it);
                                        // NO root -> back up the real haven2025, then install the haven2025 SPOOF.
@@ -4416,7 +4417,9 @@ struct Editor {
           for (int k=0;k<4;k++) if (cx.dragFloat(ui::hashId(6200u+(unsigned)k,7u), x+lw+k*(fw+2*uiScale), y, fw, rh2, qd[k], 0.01f)) ch=true;
           if (ch){ normalizeQuat(qd); quatToEuler(qd,it.rot); } y+=rh2+2*uiScale; }
         vecRowF("Scale", it.scale, 3, 0.01f, x, y, w);
-        y+=4*uiScale;
+        // Quick "zero all rotations": reset this item's euler (X/Y/Z) to 0 in one click.
+        if (cx.button(ui::hashId(8300u+(unsigned)selItem, 7u), x, y, 120*uiScale, rh, "Zero rotation")) { pushItemUndo(items); it.rot[0]=it.rot[1]=it.rot[2]=0.f; }
+        y+=rh+4*uiScale;
         switch (it.type){
           case sitem::SPAWN: { cx.checkbox(ui::hashId("spstart"), x, y, "allowStart (this is a player start)", it.allowStart); y+=rh;
                                cx.checkbox(ui::hashId("splocal"), x, y, "local (else: remote players)", it.isLocal); y+=rh; break; }
@@ -4779,6 +4782,16 @@ struct Editor {
         }
         if (cx.button(ui::hashId("focusx"), x+126*uiScale, y, 80*uiScale, th.rowH, "Focus")) focusMesh(gm);
         y += th.rowH+4*uiScale;
+        // Quick "zero all rotations" (rotation only — keeps position/scale) over the WHOLE selection, one undo step.
+        { std::string zl = sel.size()>1 ? ("Zero rotation ("+std::to_string(sel.size())+")") : std::string("Zero rotation");
+          if (cx.button(ui::hashId("zerorot"), x, y, 206*uiScale, th.rowH, zl.c_str())) {
+              std::vector<int> src = sel.empty()? std::vector<int>{selected} : sel, ms;
+              std::vector<Xform> bs, as;
+              for (int m : src){ if(m<0||m>=(int)r->gpuMeshes.size()) continue; auto& g2=r->gpuMeshes[m];
+                  ms.push_back(m); bs.push_back(captureX(g2)); g2.editR[0]=g2.editR[1]=g2.editR[2]=0.f; g2.editR[3]=1.f; recomputeModel(g2); as.push_back(captureX(g2)); }
+              if (!ms.empty()) pushUndo(ms, bs, as);
+          }
+          y += th.rowH+8*uiScale; }
         // PREFAB entry point right where a selected mesh's properties live (also: right-click > Save as
         // PREFAB, and the Scene tab's Prefabs section — the user could never find it buried in the old menu)
         { std::string pfl = sel.size()>1 ? ("Save as PREFAB ("+std::to_string(sel.size())+" meshes)") : std::string("Save as PREFAB");
@@ -5348,7 +5361,7 @@ struct Editor {
         y0=y; cx.checkbox(ui::hashId("solidcol"), x, y, "Solid wall collision (trimesh)", solidCollision);
         cx.tip(x,y0,w,th.rowH,"Cook a REAL double-sided triangle-mesh collider for the whole env -\nwalk on floors AND get blocked by walls/columns, enter rooms through\ndoorways (haven2025's cooked-PhysX SEBD format, device-verified).\nOFF = a floor-only ColliderBox grid (walkable but you phase walls)."); y+=th.rowH+6*uiScale;
         if (solidCollision != prevSolidCol) { prevSolidCol = solidCollision; bakeNavmeshes(items); }   // re-bake so the gizmo shows floor+walls (on) / floor-only (off)
-        // (thick voxel collision is ALWAYS ON — no toggle; HSR_NOVOXSOLID is the emergency escape hatch)
+        // (thick all-sides voxel collision is REVERTED to OFF — it walled off room interiors; HSR_VOXSOLID re-enables it)
         g_audioMuted.store(!previewAudio, std::memory_order_relaxed);   // bind the toggle to the live audio-callback mute flag
         y0=y; cx.checkbox(ui::hashId("skybox"), x, y, "Far backdrop -> skybox (escapes the 5000 far-clip dome)", skybox);
         cx.tip(x,y0,w,th.rowH,"Route distant geometry (centroid > the meters below) to the\nSkyboxPlatformComponent pass, which is EXEMPT from the shell's\nhard PortalStereoCamera far=5000 clip (the black dome locked to\nyour head). This is the ONLY way official homes/vistas show km-\ndistant scenery - they skybox it, they do NOT use a bigger far.\nThe backdrop becomes camera-locked (no walk-up parallax), which\nis imperceptible at km range. Near/mid geometry stays walkable."); y+=th.rowH+2*uiScale;
@@ -6224,7 +6237,7 @@ struct Editor {
         setenv_("HSR_NOAUTOFLOOR", cookAutoFloor ? "" : "1");   // Cook-tab toggle: OFF = no generated floor/walls at all
         setenv_("HSR_NAVTRIMESH", solidCollision ? "1" : "");  // real double-sided trimesh collider (haven2025 SEBD: 16-align manifest + 128-align RTree + count-shift); off -> ColliderBox grid
         setenv_("HSR_NAVSLOPE", "");                           // no forced slope: the bake's solidCollision path now keeps ALL faces natively incl. CEILINGS (the old "0" dropped the roof undersides -> jump-through)
-        setenv_("HSR_NOVOXSOLID", "");                         // thick all-sides voxel ColliderBoxes: ALWAYS ON (no toggle — "just fix"; thin walls can't hold a teleported head)
+        setenv_("HSR_VOXSOLID", voxelSolid ? "1" : "");        // thick all-sides voxel ColliderBoxes: OPT-IN, DEFAULT OFF (reverted — it walled off room interiors, "can't walk inside rooms"). Default collision = thin per-triangle floor+wall boxes (walkable). HSR_VOXSOLID re-enables for the thin-wall clip case.
         // HSL render config -> cook's ScenePlatformComponent (the SAME values the live preview applies = WYSIWYG)
         if (cfgFog) { char fc[64]; snprintf(fc,sizeof fc,"%.4f,%.4f,%.4f",cfgFogColor[0],cfgFogColor[1],cfgFogColor[2]); setenv_("HSR_FOGCOLOR",fc);
             char fs[24]; snprintf(fs,sizeof fs,"%.3f",cfgFogStart); setenv_("HSR_FOGSTART",fs);
@@ -6743,7 +6756,7 @@ struct Editor {
         else if (mode==1) it.name="Navmesh (smart)";
         else              it.name="Navmesh (flat)";
         bakeNavGeometry(it);
-        deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; showType[sitem::NAVMESH]=true; tab=TAB_OBJECT;
+        deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; showType[sitem::NAVMESH]=true; tab=TAB_OBJECT; propScroll=0.f;
     }
     // "Make this object a mesh collider": a ColliderMesh built from ONE mesh's exact triangles (a solid obstacle you
     // can't walk through — same haven component as a navmesh, just sourced from a single object). Right-click -> Add.
@@ -6760,7 +6773,7 @@ struct Editor {
         sitem::Item it; it.type=sitem::NAVMESH; it.navMode=2; it.srcMeshes={m};
         it.name="Collider ("+gm.name+")";
         bakeNavGeometry(it);
-        deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; showType[sitem::NAVMESH]=true; showMeshCol=true; tab=TAB_OBJECT;
+        deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; showType[sitem::NAVMESH]=true; showMeshCol=true; tab=TAB_OBJECT; propScroll=0.f;
         setStatus("Static mesh collider from '"+gm.name+"'");
     }
     bool isAnimCollider(int m) const { return std::find(animColliders.begin(),animColliders.end(),m)!=animColliders.end(); }

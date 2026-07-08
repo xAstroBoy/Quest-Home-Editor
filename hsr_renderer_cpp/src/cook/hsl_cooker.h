@@ -4051,13 +4051,14 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             std::string nid=sitem::uuid(sidx); entities += "," + sitem::itemEntityJson(bi, sidx); ++sidx;
             rels += "," + relChildOf(nid, rootId);
         };
-        // ── VOXEL-SOLID pass (DEFAULT ON, "i keep clipping" fix): THICK all-orientation ColliderBoxes rasterized
-        //    from the item's triangles, IN ADDITION to the trimesh/fallback below. The trimesh is exact but paper-
-        //    thin — the shell teleports the capsule to the tracked head (leaning/stepping is not swept), so a
-        //    zero-thickness wall can never hold once your head crosses its plane; the voxel boxes give every wall/
-        //    ceiling/floor real VOLUME so depenetration pushes you back out. Cell 0.5m (HSR_VOXCELL), budget 1200
-        //    boxes/item (HSR_VOXMAX, auto-coarsens). HSR_NOVOXSOLID reverts (editor "Solid voxel collision" toggle).
-        if (!std::getenv("HSR_NOVOXSOLID") && si.navIdx.size() >= 3) {
+        // ── VOXEL-SOLID pass (OPT-IN, HSR_VOXSOLID): THICK all-orientation ColliderBoxes rasterized from the item's
+        //    triangles, IN ADDITION to the trimesh/fallback below. It gives every wall/ceiling/floor real VOLUME
+        //    (0.5m cells) so a teleported/leaning head can't cross a paper-thin wall. ⚠ REVERTED to OFF by default:
+        //    thickening every navmesh triangle inward by half a cell WALLED OFF room interiors ("not allowing me to
+        //    walk inside rooms"). The default thin per-triangle floor boxes + thin wall slabs below are walkable.
+        //    Re-enable with HSR_VOXSOLID if you hit the thin-wall clipping case. Cell 0.5m (HSR_VOXCELL), budget
+        //    1200 boxes/item (HSR_VOXMAX, auto-coarsens).
+        if (std::getenv("HSR_VOXSOLID") && si.navIdx.size() >= 3) {
             prog(0.79f, "Voxelizing solid collision");
             float vcell = 0.5f; if (const char* e = std::getenv("HSR_VOXCELL")) { float c = (float)atof(e); if (c >= 0.1f) vcell = c; }
             int   vmax  = 1200; if (const char* e = std::getenv("HSR_VOXMAX"))  { int c = atoi(e); if (c >= 16) vmax = c; }
