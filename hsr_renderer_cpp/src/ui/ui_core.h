@@ -92,6 +92,31 @@ struct Context {
         textAligned(x,y,w,h,s, v?th.textSel:th.text, 1);
         return clicked;
     }
+    // Horizontal drag slider [lo,hi]. Click/drag the track sets the value; returns true while the value CHANGES.
+    // The filled portion is drawn in `fill` (0 = theme accent) so RGB sliders can tint themselves.
+    bool slider(uint32_t id,float x,float y,float w,float h,float& v,float lo,float hi,uint32_t fill=0){
+        bool hv=hover(x,y,w,h); if(hv){hot=id; if(in.pressed[0]) active=id;}
+        bool changed=false;
+        if(active==id && in.down[0]){
+            float t=(in.mx-x)/(w>1?w:1); if(t<0)t=0; if(t>1)t=1;
+            float nv=lo+t*(hi-lo); if(nv!=v){ v=nv; changed=true; }
+        }
+        if(active==id && in.released[0]) active=0;
+        float t=(hi>lo)?(v-lo)/(hi-lo):0.f; if(t<0)t=0; if(t>1)t=1;
+        dl->rect(x,y+h*0.5f-3,w,6, th.field); dl->border(x,y+h*0.5f-3,w,6,th.border);   // track
+        dl->rect(x,y+h*0.5f-3,w*t,6, fill?fill:th.accent);                              // fill
+        float kx=x+w*t; dl->rect(kx-4,y+h*0.5f-8,8,16, hv||active==id?th.textSel:th.text); dl->border(kx-4,y+h*0.5f-8,8,16,th.border);  // knob
+        return changed;
+    }
+    // Solid color swatch (click = returns true, for "make this the picked color" hooks). Draws a checker under it so
+    // near-black vs unset reads clearly. r/g/b are 0..1.
+    bool swatch(uint32_t id,float x,float y,float w,float h,float r,float g,float b){
+        bool hv=hover(x,y,w,h); if(hv){hot=id; if(in.pressed[0]) active=id;}
+        bool clicked=false; if(active==id&&in.released[0]){ if(hv)clicked=true; active=0; }
+        auto c8=[](float f){ int i=(int)(f*255.f+0.5f); return (uint32_t)(i<0?0:i>255?255:i); };
+        dl->rect(x,y,w,h, rgba((int)c8(r),(int)c8(g),(int)c8(b))); dl->border(x,y,w,h, hv?th.accent:th.border);
+        return clicked;
+    }
     bool checkbox(uint32_t id,float x,float y,const char* s,bool& v){
         float b=14.f, h=th.rowH;
         Font* fnt=mono?mono:font; float lw=b+8+(fnt?fnt->textWidth(s,(int)strlen(s)):320.f);   // full box+label width

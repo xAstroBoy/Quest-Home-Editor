@@ -1256,11 +1256,28 @@ public:
         // EXCLUSIVE endpoint [0, clipDur): the cooker's loopWrap already appends the seam frame (frame0 copy)
         // for cyclic clips — adding an inclusive endpoint HERE doubled it (two identical end frames = a 33ms
         // hold every loop, visible on the fast windmill). Open paths keep the intentional teleport wrap.
+        // CENTROID travel over the clip = the ORBIT detector. A mesh whose node ORIGIN barely moves (maxd~0)
+        // can still have its GEOMETRY sweep a huge arc if its centroid is OFFSET from the rotation pivot
+        // (Interloper: node origin at (0,0,0) but its blob centroid orbits the skybox pivot 340u). maxd can't
+        // see that, so the old gate mislabeled the orbiting comet a "big in-place spin" and dumped it to the
+        // getTime ROTREPLAY shader (renders the compound orbit+own-tumble WRONG on device — "2 directions").
+        // Use the CENTROID (not a far vertex): a dome SPINNING IN PLACE has far verts that sweep but a centroid
+        // that stays put (stays on ROTREPLAY, avoiding animator LOD judder); an ORBITER's centroid travels
+        // (routes to the device-proven RIGID-HZANIM comet path). W is affine so centroid(f)=W(f)·meanLocal.
+        float meanLocal[3]={0,0,0}; { size_t nvv=rec->basePos.size()/3;
+            if (nvv){ double s0=0,s1=0,s2=0; for (size_t v=0;v<nvv;v++){ s0+=rec->basePos[v*3]; s1+=rec->basePos[v*3+1]; s2+=rec->basePos[v*3+2]; }
+                      meanLocal[0]=(float)(s0/nvv); meanLocal[1]=(float)(s1/nvv); meanLocal[2]=(float)(s2/nvv); } }
+        float cen0[3]={0,0,0}, vertTravel=0.f;   // vertTravel = centroid travel (orbit magnitude)
         std::vector<float> mats((size_t)NF*16);
         float o0[3]={0,0,0}, maxd=0.f, rotMaxd=0.f, sclMaxd=0.f, rs0[9]={0}, sc0[3]={1,1,1};
         for (int f = 0; f < NF; f++) {
             float* w = &mats[(size_t)f*16];
             worldAt(node, (float)f/bakeFps, w);   // grid-aligned sample times (frame f = source key f when dense)
+            { float wp[3]={ w[0]*meanLocal[0]+w[4]*meanLocal[1]+w[8]*meanLocal[2]+w[12],
+                            w[1]*meanLocal[0]+w[5]*meanLocal[1]+w[9]*meanLocal[2]+w[13],
+                            w[2]*meanLocal[0]+w[6]*meanLocal[1]+w[10]*meanLocal[2]+w[14] };
+              if (f==0){ cen0[0]=wp[0]; cen0[1]=wp[1]; cen0[2]=wp[2]; }
+              else { float dx=wp[0]-cen0[0],dy=wp[1]-cen0[1],dz=wp[2]-cen0[2]; float d=sqrtf(dx*dx+dy*dy+dz*dz); if(d>vertTravel)vertTravel=d; } }
             // NORMALIZED 3x3 (scale stripped per column) — cyan's nodes carry a ~0.01 world scale, so the raw
             // rotation*scale Frobenius read 100x too small (63° looked like 0.0148) and every gear/mill/boat
             // failed the rotation gate. Column-normalizing measures the PURE rotation deviation; the stripped
@@ -1278,8 +1295,15 @@ public:
         // the two clocks share no phase, so cyan's gear SHADOW drifted against its gear. Small meshes (world
         // span < 50m) join the rigid/animator clock family; only BIG pure-rotation domes (OW skybox class)
         // keep the shader replay, where the animator's LOD judder is the greater evil.
+        // ORBIT = the centroid sweeps through space even though the node origin doesn't (vertTravel = centroid
+        // travel, large). Such a mesh MUST take the rigid clip (exact per-frame world matrix) — the getTime
+        // ROTREPLAY shader (single fixed pivot + a lone quat sequence) renders a compound orbit+own-tumble wrong
+        // on device. A dome spinning in place has centroid travel ~0 and stays on ROTREPLAY.
+        bool orbits = vertTravel > 2.0f;
+        // pureRotOk = a genuinely BIG IN-PLACE spinner (skybox dome): keep it on the ROTREPLAY shader to avoid
+        // the animator's LOD judder. Excludes orbiters (they go rigid) — that's the Interloper fix.
         bool pureRotOk = false;
-        if (maxd < 0.01f && (rotMaxd >= 0.02f || sclMaxd >= 0.05f)) {
+        if (maxd < 0.01f && !orbits && (rotMaxd >= 0.02f || sclMaxd >= 0.05f)) {
             float lever = 0.f;
             for (size_t v = 0; v + 2 < rec->basePos.size(); v += 3) {
                 float lx=rec->basePos[v], ly=rec->basePos[v+1], lz=rec->basePos[v+2];
@@ -1287,10 +1311,10 @@ public:
             float ws = sqrtf(mats[0]*mats[0]+mats[1]*mats[1]+mats[2]*mats[2]);   // W0 column-0 scale ~ node world scale
             pureRotOk = lever * (ws > 1e-8f ? ws : 1.f) < 50.f;
         }
-        if ((maxd < 0.01f && !pureRotOk) || (requireRotation && rotMaxd < 0.02f && sclMaxd < 0.05f)) {
+        if ((maxd < 0.01f && !pureRotOk && !orbits) || (requireRotation && rotMaxd < 0.02f && sclMaxd < 0.05f)) {
             if (std::getenv("HSR_VERBOSE"))
-                fprintf(stderr, "[GLTF-RIGID] mesh%d node%d REJECT travel=%.4f rotDev=%.4f sclDev=%.4f dur=%.2fs (needs T>=0.01 %s)\n",
-                        meshIdx, node, maxd, rotMaxd, sclMaxd, clipDur, requireRotation ? "AND (R>=0.02 or S>=0.05)" : "");
+                fprintf(stderr, "[GLTF-RIGID] mesh%d node%d REJECT travel=%.4f vertTravel=%.4f rotDev=%.4f sclDev=%.4f dur=%.2fs (needs T>=0.01 %s)\n",
+                        meshIdx, node, maxd, vertTravel, rotMaxd, sclMaxd, clipDur, requireRotation ? "AND (R>=0.02 or S>=0.05)" : "");
             return e;
         }
         const float* W0 = &mats[0];

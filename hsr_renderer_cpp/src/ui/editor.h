@@ -152,7 +152,11 @@ struct Editor {
     static int pcRecvLine(SOCKET s, char* buf, int cap){ int n=0; char ch;
         while (n<cap-1){ int r=recv(s,&ch,1,0); if(r<=0) return n>0?n:-1; if(ch=='\n') break; buf[n++]=ch; } buf[n]=0; return n; }
     void parsePlayerpos(const char* rb){
-        const char* pf=strstr(rb,"feet="); if (pf){ float x,y,z; if(sscanf(pf+5,"%f,%f,%f",&x,&y,&z)==3){ questPlayerPos[0]=x; questPlayerPos[1]=y; questPlayerPos[2]=z; } }
+        // DON'T clobber the feet position while the user is dragging the gizmo — the ~6Hz device readback lags
+        // the drag, so overwriting questPlayerPos every poll made the marker snap BACK to the device pos each
+        // 160ms = "the gizmo won't follow the cursor as I hold it". The drag is authoritative; on release the
+        // poll resumes tracking. (head/face/nograv still update — only the dragged feet pos is held.)
+        const char* pf=strstr(rb,"feet="); if (pf && !playerDrag){ float x,y,z; if(sscanf(pf+5,"%f,%f,%f",&x,&y,&z)==3){ questPlayerPos[0]=x; questPlayerPos[1]=y; questPlayerPos[2]=z; } }
         const char* ph=strstr(rb,"head="); if (ph){ float x,y,z; if(sscanf(ph+5,"%f,%f,%f",&x,&y,&z)==3){ questPlayerHead[0]=x; questPlayerHead[1]=y; questPlayerHead[2]=z; } }
         const char* pc=strstr(rb,"face="); if (pc){ float d; if(sscanf(pc+5,"%f",&d)==1){ questPlayerFace=d*0.0174533f; questPlayerFaceOk=true; } }
         const char* pn=strstr(rb,"nograv="); if (pn) questPlayerDev = atoi(pn+7);
@@ -3124,9 +3128,9 @@ struct Editor {
         std::string s; char b[640];
         s += "HSLEDIT 2\n";
         snprintf(b,sizeof b,"CAM %.4f %.4f %.4f %.5f %.5f\n", r->cam.pos[0],r->cam.pos[1],r->cam.pos[2], r->cam.yaw, r->cam.pitch); s+=b;
-        snprintf(b,sizeof b,"CFG %d %.3f %.3f %.3f %.1f %.4f %.0f %d %.0f %d %d %d %d %d\n",
+        snprintf(b,sizeof b,"CFG %d %.3f %.3f %.3f %.1f %.4f %.0f %d %.0f %d %d %d %d %d %d\n",
             cfgFog?1:0, cfgFogColor[0],cfgFogColor[1],cfgFogColor[2], cfgFogStart, cfgFogDensity, cfgFar,
-            skybox?1:0, skyboxDist, noCull?1:0, solidCollision?1:0, animSkinned?1:0, cookAudio?1:0, previewAudio?1:0); s+=b;
+            skybox?1:0, skyboxDist, noCull?1:0, solidCollision?1:0, animSkinned?1:0, cookAudio?1:0, previewAudio?1:0, voxelSolid?1:0); s+=b;
         for(int i=0;i<(int)r->gpuMeshes.size();++i){ auto& gm=r->gpuMeshes[i];
             snprintf(b,sizeof b,"MESH %d %s %.5f %.5f %.5f %.6f %.6f %.6f %.6f %.5f %.5f %.5f %d\n", i, qstr(gm.name).c_str(),
                 gm.editT[0],gm.editT[1],gm.editT[2], gm.editR[0],gm.editR[1],gm.editR[2],gm.editR[3],
@@ -3223,7 +3227,7 @@ struct Editor {
             size_t e=all.find('\n',p); std::string line=all.substr(p, e==std::string::npos?std::string::npos:e-p); p=(e==std::string::npos)?all.size():e+1;
             auto t=tokenize(line); if(t.empty()) continue;
             if(t[0]=="CAM" && t.size()>=6){ r->cam.pos[0]=(float)atof(t[1].c_str()); r->cam.pos[1]=(float)atof(t[2].c_str()); r->cam.pos[2]=(float)atof(t[3].c_str()); r->cam.yaw=(float)atof(t[4].c_str()); r->cam.pitch=(float)atof(t[5].c_str()); }
-            else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
+            else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; if(t.size()>=16) voxelSolid=atoi(t[15].c_str())!=0; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
             else if(t[0]=="MESH" && t.size()>=14 && !cooked){ int idx=atoi(t[1].c_str()); if(geomAuth && idx>=baseMeshCount) continue;   /* GEOM2 owns created meshes; compacted sidecar re-orders them = stale indices */ if(idx>=0&&idx<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[idx];
                 gm.name=t[2]; gm.editT[0]=(float)atof(t[3].c_str()); gm.editT[1]=(float)atof(t[4].c_str()); gm.editT[2]=(float)atof(t[5].c_str());
                 gm.editR[0]=(float)atof(t[6].c_str()); gm.editR[1]=(float)atof(t[7].c_str()); gm.editR[2]=(float)atof(t[8].c_str()); gm.editR[3]=(float)atof(t[9].c_str());
@@ -3397,6 +3401,10 @@ struct Editor {
     bool previewAudio = true;          // DEFAULT ON: play the env's background loop HERE on the PC while previewing. Toggle off = mute desktop playback (drives g_audioMuted).
     bool solidCollision = true;        // DEFAULT ON: cook a REAL double-sided trimesh collider (floor+walls+columns, haven2025 SEBD format). Off = floor-only ColliderBox grid.
     bool prevSolidCol = true;          // tracks solidCollision so the navmesh gizmo re-bakes (walls appear/vanish in the preview) when it's toggled.
+    bool voxelSolid = true;            // DEFAULT ON: ALSO rasterize each collider's tris into THICK all-orientation ColliderBoxes
+                                       // (voxelSolidBoxes) — the trimesh is paper-thin and the shell teleports the capsule to the
+                                       // tracked head (lean/step is never swept), so zero-thickness walls can't hold ("i keep
+                                       // clipping"); the voxel boxes give walls/ceilings/floors real VOLUME -> depenetration ejects.
     bool installAfterCook = true;      // DEFAULT ON: cook -> sign -> install to the headset. The installer auto-detects
                                        // adb root: ROOT -> install the UNSPOOFED own-package APK (+ auto-select it);
                                        // NO root -> back up the real haven2025, then install the haven2025 SPOOF.
@@ -4570,12 +4578,10 @@ struct Editor {
                    questPlayerDev<0?"?":(questPlayerDev?"ON":"off"));
           cx.label(x,y,w,rh*0.9f,pb,th.textDim); y+=rh+2*uiScale;
           float bw2=(w-8*uiScale)/2;
-          if (cx.button(ui::hashId("plToCam"), x, y, bw2, rh, "Teleport to camera")) {
+          if (cx.button(ui::hashId("plToCam"), x, y, bw2, rh, "Teleport to camera", true)) {
               trackPlayer=true;
               questPlayerPos[0]=r->cam.pos[0]; questPlayerPos[1]=r->cam.pos[1]-1.6f; questPlayerPos[2]=r->cam.pos[2];   // feet ~1.6m below the eye
-              questPlayerYaw=r->cam.yaw;                                           // device yaw == cam yaw (both: 0 faces -Z) -> player faces the camera dir
-              // ONE warp carrying the yaw — NO separate `rot`: rot re-teleports to the device's CURRENT pos, which
-              // is stale for a frame right after this warp and would yank the player back to where they were.
+              questPlayerYaw=r->cam.yaw;
               sendPlayerWarp(questPlayerPos[0],questPlayerPos[1],questPlayerPos[2]); }
           if (cx.button(ui::hashId("plReset"), x+bw2+6*uiScale, y, bw2, rh, "Warp to spawn")) { trackPlayer=true; questPlayerYaw=0.f; sendPlayerWarp(0,0,0); }
           y+=rh+6*uiScale;
@@ -4627,15 +4633,32 @@ struct Editor {
         y+=6*uiScale; dl.rect(x,y,w,1,th.splitLine); y+=8*uiScale;
         cx.label(x,y,w,rh,"Skybox / Background",th.text); y+=rh+2*uiScale;
         float y0;
-        // color: "r,g,b" 0..1 + Apply/Clear (Apply-on-button, not per-keystroke — setSkyColor logs + rebuilds preview)
-        if (skyColUI.empty() && skyColorSet()) { char b[48]; snprintf(b,sizeof b,"%.3f,%.3f,%.3f",skyColor[0],skyColor[1],skyColor[2]); skyColUI=b; }
-        y0=y; cx.label(x,y,86*uiScale,rh,"Color r,g,b",th.textDim);
-        cx.textField(ui::hashId("skycolf"), x+88*uiScale, y, w-88*uiScale-110*uiScale, rh, skyColUI);
-        if (cx.button(ui::hashId("skycolap"), x+w-108*uiScale, y, 52*uiScale, rh, "Apply", true)) {
-            float rr,gg,bb; if (sscanf(skyColUI.c_str(),"%f,%f,%f",&rr,&gg,&bb)==3) setSkyColor(rr,gg,bb);
-            else setStatus("Skybox color: type r,g,b in 0..1 (e.g. 0.35,0.55,0.9)"); }
-        if (cx.button(ui::hashId("skycolcl"), x+w-52*uiScale, y, 52*uiScale, rh, "Clear")) { clearSkyColor(); skyColUI.clear(); }
-        cx.tip(x,y0,w,rh,"Solid background/skybox color (0..1 floats). Previews as the\nviewport background AND cooks as a SkyboxPlatformComponent\nsolid-color texture. Env meshes are untouched."); y+=rh+4*uiScale;
+        // ── COLOR PICKER: live swatch + R/G/B sliders + presets. Editing ANY slider applies immediately
+        //    (setSkyColor drives the viewport clearRGB live + persists); the swatch previews the current pick.
+        //    skyPick holds the working color so the sliders have something to drag even before it's "set".
+        if (skyColorSet()) { skyPick[0]=skyColor[0]; skyPick[1]=skyColor[1]; skyPick[2]=skyColor[2]; }
+        y0=y; cx.label(x,y,86*uiScale,rh,"Color",th.textDim);
+        cx.swatch(ui::hashId("skysw"), x+88*uiScale, y+2*uiScale, 40*uiScale, rh-4*uiScale, skyPick[0],skyPick[1],skyPick[2]);
+        { char cc[40]; snprintf(cc,sizeof cc,"%.2f, %.2f, %.2f", skyPick[0],skyPick[1],skyPick[2]);
+          cx.textAligned(x+134*uiScale, y, w-134*uiScale, rh, skyColorSet()?cc:"(env's own sky)", th.textDim, 0); }
+        cx.tip(x,y0,w,rh,"Solid background/skybox color. Drag the R/G/B sliders (or a preset)\nto set it - previews live in the viewport AND cooks as a\nSkyboxPlatformComponent solid-color texture. Env meshes untouched."); y+=rh+2*uiScale;
+        const char* chn[3]={"R","G","B"}; const uint32_t chc[3]={ui::rgba(220,70,70),ui::rgba(70,200,90),ui::rgba(80,140,235)};
+        for (int ci=0; ci<3; ci++){
+            cx.label(x+8*uiScale,y,18*uiScale,rh,chn[ci],th.textDim);
+            float sv=skyPick[ci];
+            if (cx.slider(ui::hashId(6300u+ci,7u), x+30*uiScale, y, w-90*uiScale, rh, sv, 0.f,1.f, chc[ci])) { skyPick[ci]=sv; setSkyColor(skyPick[0],skyPick[1],skyPick[2]); }
+            char vb[16]; snprintf(vb,sizeof vb,"%.2f",skyPick[ci]); cx.textAligned(x+w-56*uiScale,y,52*uiScale,rh,vb,th.text,2);
+            y+=rh+2*uiScale;
+        }
+        // preset swatches (one click applies) + Clear
+        struct SP{ const char* n; float r,g,b; };
+        static const SP presets[]={{"Black",0,0,0},{"White",1,1,1},{"Grey",0.5f,0.5f,0.5f},{"Sky",0.35f,0.55f,0.9f},{"Night",0.02f,0.03f,0.06f},{"Sunset",0.95f,0.5f,0.25f}};
+        { float bw=(w-5*4*uiScale)/6.f; y0=y;
+          for (int p=0;p<6;p++){ float bx=x+p*(bw+4*uiScale);
+            if (cx.button(ui::hashId(6400u+p,7u), bx, y, bw, rh, presets[p].n)) { skyPick[0]=presets[p].r; skyPick[1]=presets[p].g; skyPick[2]=presets[p].b; setSkyColor(skyPick[0],skyPick[1],skyPick[2]); } }
+          cx.tip(x,y0,w,rh,"Quick presets. Black = a pure black void background (good for\nspace/theatre envs)."); y+=rh+4*uiScale; }
+        if (cx.button(ui::hashId("skycolcl"), x, y, 90*uiScale, rh, "Clear color")) { clearSkyColor(); }
+        y+=rh+4*uiScale;
         // image: path + Browse/Set/Clear (equirect panorama PNG/JPG -> inward sky sphere)
         y0=y; cx.label(x,y,86*uiScale,rh,"Image",th.textDim);
         cx.textField(ui::hashId("skyimgf"), x+88*uiScale, y, w-88*uiScale-110*uiScale, rh, skyImgUI);
@@ -4659,6 +4682,7 @@ struct Editor {
           cx.textAligned(x, y, w, rh*0.9f, cur.c_str(), th.textDim, 0); y+=rh; }
     }
     std::string skyColUI, skyImgUI;   // Scene-tab skybox field buffers (UI state only; the applied state lives in skyColor/skyImagePath)
+    float skyPick[3] = {0.f,0.f,0.f};  // color-picker working RGB (mirrors skyColor when set; lets the sliders drag before "set")
 
     void drawProperties() {
         auto& th = cx.th; VkRect2D a = rcProps;
@@ -5291,6 +5315,7 @@ struct Editor {
         y0=y; cx.checkbox(ui::hashId("solidcol"), x, y, "Solid wall collision (trimesh)", solidCollision);
         cx.tip(x,y0,w,th.rowH,"Cook a REAL double-sided triangle-mesh collider for the whole env -\nwalk on floors AND get blocked by walls/columns, enter rooms through\ndoorways (haven2025's cooked-PhysX SEBD format, device-verified).\nOFF = a floor-only ColliderBox grid (walkable but you phase walls)."); y+=th.rowH+6*uiScale;
         if (solidCollision != prevSolidCol) { prevSolidCol = solidCollision; bakeNavmeshes(items); }   // re-bake so the gizmo shows floor+walls (on) / floor-only (off)
+        // (thick voxel collision is ALWAYS ON — no toggle; HSR_NOVOXSOLID is the emergency escape hatch)
         g_audioMuted.store(!previewAudio, std::memory_order_relaxed);   // bind the toggle to the live audio-callback mute flag
         y0=y; cx.checkbox(ui::hashId("skybox"), x, y, "Far backdrop -> skybox (escapes the 5000 far-clip dome)", skybox);
         cx.tip(x,y0,w,th.rowH,"Route distant geometry (centroid > the meters below) to the\nSkyboxPlatformComponent pass, which is EXEMPT from the shell's\nhard PortalStereoCamera far=5000 clip (the black dome locked to\nyour head). This is the ONLY way official homes/vistas show km-\ndistant scenery - they skybox it, they do NOT use a bigger far.\nThe backdrop becomes camera-locked (no walk-up parallax), which\nis imperceptible at km range. Near/mid geometry stays walkable."); y+=th.rowH+2*uiScale;
@@ -6165,7 +6190,8 @@ struct Editor {
         setenv_("HSR_NOCULL", noCull ? "1" : "");         // scene-spanning bounds -> V205 never culls our meshes (V79-style draw-everything); fixes cooked-home clipping
         setenv_("HSR_NOAUTOFLOOR", cookAutoFloor ? "" : "1");   // Cook-tab toggle: OFF = no generated floor/walls at all
         setenv_("HSR_NAVTRIMESH", solidCollision ? "1" : "");  // real double-sided trimesh collider (haven2025 SEBD: 16-align manifest + 128-align RTree + count-shift); off -> ColliderBox grid
-        setenv_("HSR_NAVSLOPE", solidCollision ? "0" : "");    // trimesh: include EVERY face (walls+columns+floor) so the CCT capsule blocks horizontally, not just the floor
+        setenv_("HSR_NAVSLOPE", "");                           // no forced slope: the bake's solidCollision path now keeps ALL faces natively incl. CEILINGS (the old "0" dropped the roof undersides -> jump-through)
+        setenv_("HSR_NOVOXSOLID", "");                         // thick all-sides voxel ColliderBoxes: ALWAYS ON (no toggle — "just fix"; thin walls can't hold a teleported head)
         // HSL render config -> cook's ScenePlatformComponent (the SAME values the live preview applies = WYSIWYG)
         if (cfgFog) { char fc[64]; snprintf(fc,sizeof fc,"%.4f,%.4f,%.4f",cfgFogColor[0],cfgFogColor[1],cfgFogColor[2]); setenv_("HSR_FOGCOLOR",fc);
             char fs[24]; snprintf(fs,sizeof fs,"%.3f",cfgFogStart); setenv_("HSR_FOGSTART",fs);
@@ -6641,7 +6667,8 @@ struct Editor {
                 // walk floors, hit walls, enter rooms). Box fallback (toggle OFF): floor-only (0.05/0.15) since box walls
                 // made roof/air junk. navMode 2 = 0.05, navMode 1 = 0.15. HSR_NAVSLOPE overrides for diag.
                 float slopeMin = (si.navMode==2) ? 0.05f : 0.15f;
-                if (solidCollision) slopeMin = 0.0f;   // include the vertical walls (the trimesh handles them cleanly; boxes didn't)
+                if (solidCollision) slopeMin = -2.0f;  // ALL faces incl. CEILINGS/undersides ("protect ALL sides": the roof underside
+                                                       // must block from below too — the trimesh + voxel-solid boxes handle any orientation)
                 if (exactCollider)  slopeMin = -2.0f;  // exact solid obstacle: keep ALL faces (unit ny/nl >= -1 > -2 always) incl. patches
                 if(const char* e=std::getenv("HSR_NAVSLOPE")){ float s=(float)atof(e); if(s>=0.0f) slopeMin=s; }
                 float nl=std::sqrt(nx*nx+ny*ny+nz*nz); if(nl<1e-9f || ny/nl < slopeMin) continue;   // signed -> floor + walls, drop ceilings

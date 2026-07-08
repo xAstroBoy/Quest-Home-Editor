@@ -15,6 +15,7 @@
 #include <cmath>
 #include <string>
 #include <map>
+#include <unordered_set>                 // voxelSolidBoxes cell occupancy
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -784,6 +785,133 @@ inline std::string colliderGroundEntityJson(const std::string& id, const float p
 // are instead built by the device's OWN PhysX from `halfExtents` (NO cooked data at all — that's how haven2025's 44
 // invisible walls work), so they're always compatible. We approximate the walkable surface as a grid of axis-aligned
 // boxes (one per coarse cell, greedy-merged along X into runs) whose TOPS sit at the road height -> walkable everywhere.
+// ── VOXEL-SOLID collision ("i keep clipping": protect ALL sides) ─────────────────────────────────────────────
+// The trimesh collider is paper-thin: PhysX sweeps are one-sided AND the shell TELEPORTS the capsule to the
+// tracked head (physical lean/step is never swept), so once your head crosses a zero-thickness wall plane you
+// are through it — Minecraft-style single-quad walls can never hold. Voxel-solid rasterizes EVERY triangle
+// (any orientation — walls, ceilings, floors, undersides) into a cell occupancy grid and greedy-merges runs
+// into THICK axis-aligned ColliderBoxes (the always-device-compatible primitive): geometry gets real volume,
+// so depenetration pushes you back out even if you lean inside. Budget-capped: coarsens the cell until the
+// box count fits. Returns {cx,cy,cz,hx,hy,hz}.
+// EXACT triangle-vs-AABB overlap (Akenine-Möller SAT): 3 box axes + tri plane + 9 edge cross axes.
+// This is what makes the voxelization CONSERVATIVE — a cell is marked iff the triangle actually
+// touches it, and NO touched cell can ever be missed (point-sampling could skip cells on big tris).
+inline bool triBoxOverlap(const float bc[3], const float bh[3], const float* ta, const float* tb, const float* tc) {
+    float v0[3],v1[3],v2[3];
+    for (int k=0;k<3;k++){ v0[k]=ta[k]-bc[k]; v1[k]=tb[k]-bc[k]; v2[k]=tc[k]-bc[k]; }
+    // 1) box-axis tests
+    for (int k=0;k<3;k++){
+        float lo=std::min(v0[k],std::min(v1[k],v2[k])), hi=std::max(v0[k],std::max(v1[k],v2[k]));
+        if (lo > bh[k] || hi < -bh[k]) return false;
+    }
+    float e0[3],e1[3],e2[3];
+    for (int k=0;k<3;k++){ e0[k]=v1[k]-v0[k]; e1[k]=v2[k]-v1[k]; e2[k]=v0[k]-v2[k]; }
+    // 2) tri-plane test
+    float n[3]={ e0[1]*e1[2]-e0[2]*e1[1], e0[2]*e1[0]-e0[0]*e1[2], e0[0]*e1[1]-e0[1]*e1[0] };
+    { float d=-(n[0]*v0[0]+n[1]*v0[1]+n[2]*v0[2]);
+      float r=bh[0]*std::fabs(n[0])+bh[1]*std::fabs(n[1])+bh[2]*std::fabs(n[2]);
+      if (d > r || d < -r) return false; }
+    // 3) 9 cross-axis tests: axis = unit(k) x edge(e)
+    auto axisTest=[&](float a1,float a2, const float* pA,const float* pB, int i1,int i2, float fb1,float fb2)->bool{
+        float p0=a1*pA[i1]-a2*pA[i2], p1=a1*pB[i1]-a2*pB[i2];
+        float mnp=std::min(p0,p1), mxp=std::max(p0,p1);
+        float rad=fb1*bh[i1]+fb2*bh[i2];
+        return !(mnp > rad || mxp < -rad); };
+    const float* E[3]={e0,e1,e2}; const float* P[3][2]={{v0,v2},{v0,v2},{v0,v1}};   // the two verts whose projections differ per edge
+    for (int e=0;e<3;e++){
+        float fex=std::fabs(E[e][0]), fey=std::fabs(E[e][1]), fez=std::fabs(E[e][2]);
+        if (!axisTest( E[e][2],E[e][1], P[e][0],P[e][1], 1,2, fez,fey)) return false;   // X x edge
+        if (!axisTest(-E[e][2],-E[e][0], P[e][0],P[e][1], 0,2, fez,fex)) return false;  // Y x edge (sign folded into projection)
+        if (!axisTest( E[e][1],E[e][0], P[e][0],P[e][1], 0,1, fey,fex)) return false;   // Z x edge
+    }
+    return true;
+}
+inline std::vector<std::array<float,6>> voxelSolidBoxes(const std::vector<float>& V, const std::vector<uint32_t>& I,
+                                                        float cell0, int maxBoxes) {
+    std::vector<std::array<float,6>> boxes;
+    if (V.size() < 9 || I.size() < 3) return boxes;
+    float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f};
+    for (size_t i=0;i+2<V.size();i+=3) for(int k=0;k<3;k++){ mn[k]=std::min(mn[k],V[i+k]); mx[k]=std::max(mx[k],V[i+k]); }
+    if (mn[0] > mx[0]) return boxes;
+    // COVERAGE IS NON-NEGOTIABLE: the budget only ever COARSENS the cell; the merge NEVER truncates —
+    // a truncated set = uncovered triangles = clipping spots. If even the coarsest pass is over budget,
+    // ship the full set anyway (complete coverage beats the box budget).
+    float cellUsed = cell0;
+    for (float cell = cell0; ; cell *= 1.45f) {
+        cellUsed = cell;
+        boxes.clear();
+        const int  DIM = 1 << 20;
+        auto keyOf = [&](int ix,int iy,int iz)->uint64_t{ return ((uint64_t)(uint32_t)ix<<42)|((uint64_t)(uint32_t)iy<<21)|(uint64_t)(uint32_t)iz; };
+        std::unordered_set<uint64_t> occ; occ.reserve(4096);
+        bool tooFine = false;
+        for (size_t t=0; t+2<I.size() && !tooFine; t+=3) {
+            uint32_t a=I[t],b=I[t+1],c=I[t+2];
+            if ((size_t)a*3+2>=V.size()||(size_t)b*3+2>=V.size()||(size_t)c*3+2>=V.size()) continue;
+            const float* pa=&V[a*3]; const float* pb=&V[b*3]; const float* pc=&V[c*3];
+            // CONSERVATIVE rasterization: visit every cell in the tri's AABB and keep those the tri TOUCHES
+            // (exact SAT test) — cannot miss a cell for ANY triangle size/orientation.
+            float tmn[3], tmx[3];
+            for (int k=0;k<3;k++){ tmn[k]=std::min(pa[k],std::min(pb[k],pc[k])); tmx[k]=std::max(pa[k],std::max(pb[k],pc[k])); }
+            int c0[3], c1[3];
+            for (int k=0;k<3;k++){ c0[k]=(int)((tmn[k]-mn[k])/cell); c1[k]=(int)((tmx[k]-mn[k])/cell);
+                                   if (c0[k]<0) c0[k]=0; if (c1[k]>=DIM) c1[k]=DIM-1; }
+            const float bh[3] = { cell*0.5f+1e-4f, cell*0.5f+1e-4f, cell*0.5f+1e-4f };   // epsilon = boundary-touch counts
+            for (int iy=c0[1]; iy<=c1[1] && !tooFine; iy++)
+              for (int iz=c0[2]; iz<=c1[2] && !tooFine; iz++)
+                for (int ix=c0[0]; ix<=c1[0]; ix++) {
+                    uint64_t k=keyOf(ix,iy,iz); if (occ.count(k)) continue;
+                    float bc[3] = { mn[0]+((float)ix+0.5f)*cell, mn[1]+((float)iy+0.5f)*cell, mn[2]+((float)iz+0.5f)*cell };
+                    if (!triBoxOverlap(bc, bh, pa, pb, pc)) continue;
+                    occ.insert(k);
+                    if (occ.size() > 300000) { tooFine = true; break; }
+                }
+        }
+        if (tooFine) { if (cell >= 8.f) return boxes; continue; }   // way too many cells — coarsen (8m absolute cap)
+        if (occ.empty()) return boxes;
+        std::vector<uint64_t> cells(occ.begin(), occ.end());
+        std::sort(cells.begin(), cells.end());   // deterministic sweep order
+        std::unordered_set<uint64_t> used; used.reserve(cells.size());
+        auto has = [&](int ix,int iy,int iz){ if(ix<0||iy<0||iz<0) return false; uint64_t k=keyOf(ix,iy,iz); return occ.count(k)!=0 && used.count(k)==0; };
+        for (uint64_t k0 : cells) {
+            if (used.count(k0)) continue;
+            int ix=(int)(k0>>42), iy=(int)((k0>>21)&0x1FFFFF), iz=(int)(k0&0x1FFFFF);
+            // greedy 3D merge: run along Z, widen along X, then thicken along Y (whole-slab checks keep boxes exact)
+            int lz=1; while (has(ix,iy,iz+lz)) lz++;
+            int lx=1; { bool ok=true; while (ok) { for (int z2=0;z2<lz;z2++) if (!has(ix+lx,iy,iz+z2)) { ok=false; break; } if (ok) lx++; } }
+            int ly=1; { bool ok=true; while (ok) { for (int x2=0;x2<lx && ok;x2++) for (int z2=0;z2<lz;z2++) if (!has(ix+x2,iy+ly,iz+z2)) { ok=false; break; } if (ok) ly++; } }
+            for (int y2=0;y2<ly;y2++) for (int x2=0;x2<lx;x2++) for (int z2=0;z2<lz;z2++) used.insert(keyOf(ix+x2,iy+y2,iz+z2));
+            const float M = 0.01f;   // seam-sealing overlap
+            boxes.push_back({ mn[0]+((float)ix+lx*0.5f)*cell, mn[1]+((float)iy+ly*0.5f)*cell, mn[2]+((float)iz+lz*0.5f)*cell,
+                              lx*cell*0.5f+M, ly*cell*0.5f+M, lz*cell*0.5f+M });
+        }
+        if ((int)boxes.size() <= maxBoxes || cell >= 4.f) {     // fits, or coarsest sane cell: ship FULL coverage even over budget
+            // [VOX-VERIFY] PROOF of coverage (not intent): sample random points ON the triangles and confirm each
+            // one is inside at least one emitted box. Any miss = a potential clipping spot -> loud warning.
+            if (std::getenv("HSR_VERBOSE")) {
+                uint32_t seed = 0x9E3779B9u; auto rnd=[&]{ seed = seed*1664525u+1013904223u; return (float)(seed>>8)/(float)0xFFFFFF; };
+                int miss = 0; const int NPTS = 2000;
+                size_t ntri = I.size()/3;
+                for (int s2 = 0; s2 < NPTS; s2++) {
+                    size_t t = (size_t)(rnd()*(float)ntri); if (t >= ntri) t = ntri-1;
+                    uint32_t a=I[t*3],b=I[t*3+1],c=I[t*3+2];
+                    if ((size_t)a*3+2>=V.size()||(size_t)b*3+2>=V.size()||(size_t)c*3+2>=V.size()) continue;
+                    float u=rnd(), v=rnd(); if (u+v>1.f){ u=1.f-u; v=1.f-v; }
+                    float p[3]; for (int k=0;k<3;k++) p[k]=V[a*3+k]+u*(V[b*3+k]-V[a*3+k])+v*(V[c*3+k]-V[a*3+k]);
+                    bool in = false;
+                    for (const auto& bx : boxes)
+                        if (std::fabs(p[0]-bx[0])<=bx[3] && std::fabs(p[1]-bx[1])<=bx[4] && std::fabs(p[2]-bx[2])<=bx[5]) { in = true; break; }
+                    if (!in) miss++;
+                }
+                fprintf(stderr, miss ? "[VOX-VERIFY] ⚠ %d/%d surface samples OUTSIDE the boxes (cell %.2f, %zu boxes) — COVERAGE HOLE\n"
+                                     : "[VOX-VERIFY] %d/%d surface samples covered (cell %.2f, %zu boxes) — no clipping spots\n",
+                        miss ? miss : NPTS, NPTS, cellUsed, boxes.size());
+            }
+            return boxes;
+        }
+    }
+}
+// ── NAVMESH -> ColliderBox grid ───────────────────────────────────────────────────────────────────────────────────
+// (see voxelSolidBoxes above for the ALL-SIDES solid variant)
 inline std::vector<std::array<float,6>> navmeshToBoxes(const std::vector<float>& V, float cell, float thick, int maxBoxes) {
     std::vector<std::array<float,6>> boxes;           // {cx,cy,cz, hx,hy,hz}
     if (V.size() < 9) return boxes;
@@ -2123,7 +2251,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     // The old (skel,anim)-PAIR dedup re-emitted the identical 286KB anim once PER mesh -> N duplicate large async
     // loads -> device asset-loader RACE -> std::length_error crash-loop. Sharing the anim asset (1 copy, referenced
     // by every animator, like nuxd's prism_wave+motes) removes the duplicates.
-    struct AssetPoolEntry { std::vector<uint8_t> bytes; AssetKey3 key; };
+    struct AssetPoolEntry { std::vector<uint8_t> bytes; AssetKey3 key; std::vector<uint8_t> pairAnim; };  // pairAnim (skelPool only): the clip this shared skeleton is bound to — a skeleton is reused ONLY for the SAME clip
     std::vector<AssetPoolEntry> skelPool, animPool;
     std::string rootId = makeUuid(rng);
     std::string entities = rootEntityJson(rootId), rels;
@@ -2619,7 +2747,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // vivid, and the coverage-preserving alpha mips keep leaf silhouettes from going blocky at range. The
         // skinned-CUTOUT path also chains TINTREPLAY (the zen tree's authentic green→cyan→pink canopy cycle).
         bool foliageBlend = useHz && m.alphaTest && !m.blend && !m.additive && !m.depthPrepass && std::getenv("HSR_FOLIAGE_BLEND");
-        std::vector<uint8_t> matl; std::string animatorComp;
+        std::vector<uint8_t> matl; std::string animatorComp; int meshArmIdx = -1;   // meshArmIdx: resolved skeleton (armature) index — shared by the shipped skeleton's joint names AND the rendmesh joint-id palette (device binds verts→joints by NAME, so both must match)
         if (useHz) {   // HZANIM: CURRENT-format skinned MATL (field7=shader) + HZAN:SKEL + ACL HZAN:ANIM + AnimatorPlatformComponent
             // BLEND skinned (the SHIELD) -> the transparent-flagged material (field2=2) so it alpha-blends in the
             // transparent pass; OPAQUE skinned (body) -> the plain butterflies template.
@@ -2807,25 +2935,8 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             auto skelBytes = encodeHzSkel(joints);
             auto anim = std::move(hzAnimPre);   // reuse the clip pre-encoded above (size already checked vs the device signed-16 limit)
             if (!anim.empty()) {
-                // ── SKEL pool: each mesh's own bind skeleton (dedup byte-identical). ──
-                AssetKey3 skK{};
-                int sIdx = -1;
-                for (size_t r = 0; r < skelPool.size(); ++r) if (skelPool[r].bytes == skelBytes) { sIdx = (int)r; break; }
-                if (sIdx >= 0) skK = skelPool[sIdx].key;
-                else {
-                    char rb[96]; snprintf(rb, sizeof rb, "%s/armature%zu", MH.c_str(), skelPool.size());
-                    std::string pSkel = std::string(rb) + ".skel/skeleton";
-                    skK = keyForPath(pSkel); skK.tgt = 2292226755u;  // HZAN:SKEL FIXED type targetId (all official envs)
-                    // ⚠ CRASH FIX: the device animation registry keys skeletons by their INTERNAL name. encodeHzSkel defaults
-                    // every skel to "Skeleton_0", so an env with several distinct skeletons (lakesidepeak ships 7) registers
-                    // them all under the SAME name -> the registry's std::string key corrupts -> env-unload/Full-compaction
-                    // std::length_error crash-loop (nuxd/incredibles never hit it: they ship ONE skeleton_0). Give each its
-                    // own name. Dedup above stays byte-on-geometry (constant name), so byte-identical armatures still share.
-                    auto skelShip = encodeHzSkel(joints, "Skeleton_" + std::to_string(skelPool.size()));
-                    assets.push_back({ pSkel, skK.tgt, skelShip, skK, TYPE_HZAN, TYPE_SKEL });
-                    skelPool.push_back({ skelBytes, skK });
-                }
-                // ── ANIM pool: shared clip emitted ONCE (THE crash fix — no duplicate large async loads). ──
+                // ── ANIM pool: shared clip emitted ONCE (THE crash fix — no duplicate large async loads). Resolved
+                //    BEFORE the skeleton so the skeleton dedup can pair on it (see below). ──
                 AssetKey3 anK{};
                 int aIdx = -1;
                 for (size_t r = 0; r < animPool.size(); ++r) if (animPool[r].bytes == anim) { aIdx = (int)r; break; }
@@ -2851,6 +2962,35 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     }
                     assets.push_back({ pAnim, anK.tgt, animShip, anK, TYPE_HZAN, TYPE_ANIM });
                     animPool.push_back({ anim, anK });
+                }
+                // ── SKEL pool: share a bind skeleton across meshes ONLY when the CLIP also matches. Two meshes
+                //    with a byte-identical bind but DIFFERENT clips (doctorwho's two overlapping vortex toruses:
+                //    same W0 bind, but node0's motion ≠ node1's) must NOT share one skeleton asset — the device
+                //    binds each animator's clip to the shared runtime skeleton and they conflict, so ONE torus
+                //    froze at rest ("[0] not moving after cook"). Pairing the dedup on (skelBytes AND clip) gives
+                //    each distinct-clip mesh its own skeleton (unique "Skeleton_N" name); identical skel+clip
+                //    (split pieces / true duplicates) still share, and distinct-bind appliances are unaffected. ──
+                AssetKey3 skK{};
+                int sIdx = -1;
+                for (size_t r = 0; r < skelPool.size(); ++r) if (skelPool[r].bytes == skelBytes && skelPool[r].pairAnim == anim) { sIdx = (int)r; break; }
+                if (sIdx >= 0) { skK = skelPool[sIdx].key; meshArmIdx = sIdx; }   // shared skeleton (identical bind AND clip) — reuse its armature index -> matching joint names
+                else {
+                    meshArmIdx = (int)skelPool.size();
+                    char rb[96]; snprintf(rb, sizeof rb, "%s/armature%d", MH.c_str(), meshArmIdx);
+                    std::string pSkel = std::string(rb) + ".skel/skeleton";
+                    skK = keyForPath(pSkel); skK.tgt = 2292226755u;  // HZAN:SKEL FIXED type targetId (all official envs)
+                    // ⚠ CRASH FIX + FROZEN-MESH FIX: the device animation registry keys skeletons AND their JOINTS by NAME.
+                    // encodeHzSkel + the rendmesh palette used GENERIC "joint_%d"/"bounds_anchor_%d" for EVERY skeleton, so
+                    // two distinct skeletons (doctorwho's two overlapping vortex toruses: same bind, different clips) had
+                    // IDENTICAL joint-name hashes -> the device couldn't tell mesh0's joints from mesh1's -> mesh0 bound to
+                    // the wrong skeleton / lost the bind -> FROZE at rest (distinct skeleton ASSETS alone didn't fix it — the
+                    // joint NAMES collided). Uniquify every joint name by the armature index; the rendmesh palette below uses
+                    // the SAME meshArmIdx so vert->joint hashes still match. Shared skeletons (same bind+clip) reuse the index.
+                    for (int j = 0; j < m.hzJointCount; ++j) { char jn[24]; snprintf(jn, sizeof jn, "a%d_j%d", meshArmIdx, j); joints[j].name = jn; }
+                    if (!std::getenv("HSR_NOSKELANCHOR")) for (int k = 0; k < 6; ++k) { char nm[24]; snprintf(nm, sizeof nm, "a%d_ba%d", meshArmIdx, k); if (m.hzJointCount + k < (int)joints.size()) joints[m.hzJointCount + k].name = nm; }
+                    auto skelShip = encodeHzSkel(joints, "Skeleton_" + std::to_string(meshArmIdx));
+                    assets.push_back({ pSkel, skK.tgt, skelShip, skK, TYPE_HZAN, TYPE_SKEL });
+                    skelPool.push_back({ skelBytes, skK, anim });
                 }
                 animatorComp = animatorComponentJson(skK, anK);
             }
@@ -3259,12 +3399,16 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         }
         std::vector<uint32_t> jointIds;   // ROOT.f2 joint-binding table = murmur3(joint name) per skeleton joint (m###.skel order)
         if (useHz) {
-            for (int j = 0; j < m.hzJointCount; ++j) { char jn[24]; snprintf(jn, sizeof jn, "joint_%d", j); jointIds.push_back(murmur3_x86_32(jn, strlen(jn), 0)); }
+            // Joint names MUST match the shipped skeleton's names EXACTLY (device binds verts→joints by name-hash).
+            // Uniquified per armature index (meshArmIdx, set in the skeleton block) so two distinct skeletons never
+            // share joint-name hashes (the frozen-torus fix). Fallback to generic only if the skeleton block didn't run.
+            int ai = meshArmIdx;
+            for (int j = 0; j < m.hzJointCount; ++j) { char jn[24]; if (ai >= 0) snprintf(jn, sizeof jn, "a%d_j%d", ai, j); else snprintf(jn, sizeof jn, "joint_%d", j); jointIds.push_back(murmur3_x86_32(jn, strlen(jn), 0)); }
             // The cook appends 6 STATIC bounds-anchor joints (skel + clip, indices m.hzJointCount..+5) when !HSR_NOSKELANCHOR;
             // their ids MUST be in this palette table (same order/names as the skeleton joints) so the 6 bounds verts
             // (one per anchor, in encodeRendMeshParts) map to them. MUST match the nAnch gate + names above.
             if (!std::getenv("HSR_NOSKELANCHOR"))
-                for (int k = 0; k < 6; ++k) { char nm[20]; snprintf(nm, sizeof nm, "bounds_anchor_%d", k); jointIds.push_back(murmur3_x86_32(nm, strlen(nm), 0)); }
+                for (int k = 0; k < 6; ++k) { char nm[24]; if (ai >= 0) snprintf(nm, sizeof nm, "a%d_ba%d", ai, k); else snprintf(nm, sizeof nm, "bounds_anchor_%d", k); jointIds.push_back(murmur3_x86_32(nm, strlen(nm), 0)); }
         }
         std::vector<float> dbgPos; const std::vector<float>* staticPos = &m.positions;
         if (std::getenv("HSR_DROIDFRONT") && m.hzJointCount > 0) {   // diag: shrink+move the droid right in front of spawn (isolate position/cull vs mesh-reject)
@@ -3861,6 +4005,29 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     for (const auto& si : sceneItems) {
         if (std::getenv("HSR_NONAV")) break;   // diag: skip custom navmesh colliders (test Meta's realfloor in isolation)
         if (si.type != sitem::NAVMESH || si.navVerts.size()<9) continue;
+        auto emitBox=[&](const float c[3],const float he[3],const float* q){
+            sitem::Item bi; bi.type=sitem::BOXCOL; bi.name="NavBox";
+            bi.pos[0]=c[0];bi.pos[1]=c[1];bi.pos[2]=c[2];
+            bi.rot[0]=bi.rot[1]=bi.rot[2]=0.f; bi.scale[0]=bi.scale[1]=bi.scale[2]=1.f;
+            bi.half[0]=he[0];bi.half[1]=he[1];bi.half[2]=he[2];
+            if(q){bi.quat[0]=q[0];bi.quat[1]=q[1];bi.quat[2]=q[2];bi.quat[3]=q[3];}
+            std::string nid=sitem::uuid(sidx); entities += "," + sitem::itemEntityJson(bi, sidx); ++sidx;
+            rels += "," + relChildOf(nid, rootId);
+        };
+        // ── VOXEL-SOLID pass (DEFAULT ON, "i keep clipping" fix): THICK all-orientation ColliderBoxes rasterized
+        //    from the item's triangles, IN ADDITION to the trimesh/fallback below. The trimesh is exact but paper-
+        //    thin — the shell teleports the capsule to the tracked head (leaning/stepping is not swept), so a
+        //    zero-thickness wall can never hold once your head crosses its plane; the voxel boxes give every wall/
+        //    ceiling/floor real VOLUME so depenetration pushes you back out. Cell 0.5m (HSR_VOXCELL), budget 1200
+        //    boxes/item (HSR_VOXMAX, auto-coarsens). HSR_NOVOXSOLID reverts (editor "Solid voxel collision" toggle).
+        if (!std::getenv("HSR_NOVOXSOLID") && si.navIdx.size() >= 3) {
+            prog(0.79f, "Voxelizing solid collision");
+            float vcell = 0.5f; if (const char* e = std::getenv("HSR_VOXCELL")) { float c = (float)atof(e); if (c >= 0.1f) vcell = c; }
+            int   vmax  = 1200; if (const char* e = std::getenv("HSR_VOXMAX"))  { int c = atoi(e); if (c >= 16) vmax = c; }
+            auto vb = voxelSolidBoxes(si.navVerts, si.navIdx, vcell, vmax);
+            for (auto& b : vb) { float c[3]={b[0],b[1],b[2]}, he[3]={b[3],b[4],b[5]}; emitBox(c,he,nullptr); }
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] voxel-solid -> %zu THICK boxes (cell %.2fm, %zu tris) — all sides protected (walls/ceilings/floors have volume)\n", vb.size(), vcell, si.navIdx.size()/3);
+        }
         // DEFAULT: device-safe ColliderBox floor (always works — built from halfExtents, no serialized struct to mismatch).
         // The REAL trimesh (opt-in HSR_NAVTRIMESH) needs Meta's exact 4.1.64 PhysX libs OR the in-progress hand-roll —
         // public 4.1.2 either crashes (native stamp) or loads-but-falls-through (4.1.64 stamp, geometry mis-read). So boxes
@@ -3886,15 +4053,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         size_t ntri = si.navIdx.size()/3;
         int triCap = 15000; if(const char* e=std::getenv("HSR_NAVTRICAP")){ int c=atoi(e); if(c>0) triCap=c; }   // per-REAL-triangle = FULL coverage (no fall-through gaps); HSR_NAVTRICAP=3000 -> smoother-but-gappy averaged grid
         float inflate=0.02f; if(const char* e=std::getenv("HSR_NAVINFLATE")){ float c=(float)atof(e); inflate=c; }   // tiny peek above the surface (low = less bumpy)
-        auto emitBox=[&](const float c[3],const float he[3],const float* q){
-            sitem::Item bi; bi.type=sitem::BOXCOL; bi.name="NavBox";
-            bi.pos[0]=c[0];bi.pos[1]=c[1];bi.pos[2]=c[2];
-            bi.rot[0]=bi.rot[1]=bi.rot[2]=0.f; bi.scale[0]=bi.scale[1]=bi.scale[2]=1.f;
-            bi.half[0]=he[0];bi.half[1]=he[1];bi.half[2]=he[2];
-            if(q){bi.quat[0]=q[0];bi.quat[1]=q[1];bi.quat[2]=q[2];bi.quat[3]=q[3];}
-            std::string nid=sitem::uuid(sidx); entities += "," + sitem::itemEntityJson(bi, sidx); ++sidx;
-            rels += "," + relChildOf(nid, rootId);
-        };
+        // (emitBox is defined at the top of this loop — shared with the voxel-solid pass)
         bool tilted = ntri>=1 && (int)ntri<=triCap && !std::getenv("HSR_NAVGRID");
         size_t emitted=0;
         if (tilted) {
