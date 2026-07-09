@@ -282,6 +282,11 @@ public:
     VkSemaphore renderFinished = VK_NULL_HANDLE;
 
     std::vector<VkGpuMesh> gpuMeshes;
+    // SPLIT-PART TEXTURE SHARING: the mesh list (sceneMeshes) so uploadMesh can resolve a split part's
+    // MeshData.texShareSrc -> the source mesh it borrows its (identical, possibly 16MB) texture/lightmap
+    // buffers from, instead of every piece keeping its own copy (the split-crash OOM). Set by the editor
+    // after each load; null = no sharing (texShareSrc paths inert).
+    const std::vector<MeshData>* texShareList = nullptr;
     // Editor overlay visibility (navmesh / collision-walls). Toggled from the editor panel.
     bool showNavmesh = false;     // navmesh overlay — OFF by default (it's a flat gizmo over the floor); toggle in editor
     bool showCollision = false;   // ~85 wall/collision meshes — off by default, toggle on to wall-map
@@ -504,6 +509,14 @@ public:
         gm.local = md.transform;                           // authored TRS (editor outliner reads this)
         memcpy(gm.baseModel, gm.model, sizeof(gm.baseModel)); // edits are a delta applied on top of base
 
+        // SPLIT-PART TEXTURE SHARING: a piece from splitMeshParts leaves its texture/lightmap BYTE buffers
+        // empty and points texShareSrc at the source mesh it was carved from, so every one of up-to-256
+        // pieces doesn't keep its own copy of the source's (up to 16MB) textures = the "splitting the merged
+        // statue crashes" OOM. Read all texture + lightmap BYTES (and their dims/flags) from T = the resolved
+        // source. Non-split meshes have texShareSrc<0 -> T is md -> byte-identical to the old path.
+        const MeshData& T = (md.texShareSrc >= 0 && texShareList && (size_t)md.texShareSrc < texShareList->size())
+                          ? (*texShareList)[(size_t)md.texShareSrc] : md;
+
         // HSR_PERMAT: route this mesh to its material's OWN shader program (built lazily). -1 => global.
         // Editor overlays (navmesh/collision/spawn) MUST draw with the GLOBAL flat-colour shader so their
         // curTint (green/red/cyan) shows. A per-material program would draw the proxy's own material instead
@@ -647,18 +660,18 @@ public:
                         bool haveVC = !std::getenv("HSR_NOVCOL") && (size_t)i*4+3 < md.colors.size();
                         if (haveVC) { col[0]=md.colors[i*4]; col[1]=md.colors[i*4+1]; col[2]=md.colors[i*4+2]; col[3]=md.colors[i*4+3]; }
                         auto cl=[](float x){ x = x<0?0:(x>1?1:x); return (u8)(x*255.0f+0.5f); };
-                        if (md.bakeLightmapVtx && !md.lmRGBA.empty() && (size_t)i*2+1 < md.uvs2.size()) {
+                        if (md.bakeLightmapVtx && !T.lmRGBA.empty() && (size_t)i*2+1 < md.uvs2.size()) {
                             // TEXTURED ShellEnv shell: bake lightmap(uv1)·lightmappower into the vertex
                             // colour (the frag multiplies diffuse·vColor). lightmappower is the coloured
                             // neon/glow boost (concrete pink, floor warm). Bilinear sample, wrap UVs.
-                            int W=md.lmW, H=md.lmH;
+                            int W=T.lmW, H=T.lmH;
                             float lu=md.uvs2[i*2], lv=md.uvs2[i*2+1];
                             lu-=std::floor(lu); lv-=std::floor(lv);
                             float fx=lu*W-0.5f, fy=lv*H-0.5f;
                             int x0=(int)std::floor(fx), y0=(int)std::floor(fy);
                             float wx=fx-x0, wy=fy-y0;
                             auto px=[&](int x,int y,int c)->float{ x=x<0?0:(x>=W?W-1:x); y=y<0?0:(y>=H?H-1:y);
-                                return md.lmRGBA[((size_t)y*W+x)*4+c]/255.0f; };
+                                return T.lmRGBA[((size_t)y*W+x)*4+c]/255.0f; };
                             for (int c=0;c<3;++c){
                                 float a=px(x0,y0,c)*(1-wx)+px(x0+1,y0,c)*wx;
                                 float b=px(x0,y0+1,c)*(1-wx)+px(x0+1,y0+1,c)*wx;
@@ -865,7 +878,7 @@ public:
         // Prefer the DECODED RGBA path (mipmapped) for big textures that minify hard (prism_wave's
         // 2900x866 flame strip aliases into harsh wisps as a raw ASTC upload with no mips). Small ASTC
         // atlases keep the compressed fast path.
-        bool wantMip = !md.texRGBA.empty() && (md.texW >= 1024 || md.texH >= 1024);
+        bool wantMip = !T.texRGBA.empty() && (T.texW >= 1024 || T.texH >= 1024);
         // ── BASE-TEXTURE DEDUP ─────────────────────────────────────────────────────────────────────
         // Many envs reference ONE decoded sheet from dozens/hundreds of submeshes (storybook: ~60
         // River_MAT submeshes each carrying the same 4096x4096 RGBA). Uploading a fresh mipmapped
@@ -873,12 +886,12 @@ public:
         // black window (THE storybook white-screen). Key = content hash of the exact bytes uploaded;
         // identical textures share one VkImage/view (cache owns the handles; freed in cleanup()).
         {
-            bool astcPath = astcLdrSupported && !md.astcRaw.empty() && !wantMip;
+            bool astcPath = astcLdrSupported && !T.astcRaw.empty() && !wantMip;
             const u8* hd; size_t hn; u32 hmode;
-            if (astcPath)         { hd = md.astcRaw.data(); hn = md.astcRaw.size(); hmode = 2u | ((u32)md.astcBw<<8) | ((u32)md.astcBh<<16); }
-            else if (md.useBlend) { hd = md.texRGBA.data(); hn = md.texRGBA.size(); hmode = 1u; }
-            else                  { hd = md.texRGBA.data(); hn = md.texRGBA.size(); hmode = 0u; }
-            unsigned long long tk = texHash(hd, hn, md.texW, md.texH, hmode);
+            if (astcPath)         { hd = T.astcRaw.data(); hn = T.astcRaw.size(); hmode = 2u | ((u32)T.astcBw<<8) | ((u32)T.astcBh<<16); }
+            else if (md.useBlend) { hd = T.texRGBA.data(); hn = T.texRGBA.size(); hmode = 1u; }
+            else                  { hd = T.texRGBA.data(); hn = T.texRGBA.size(); hmode = 0u; }
+            unsigned long long tk = texHash(hd, hn, T.texW, T.texH, hmode);
             auto tit = texCache.find(tk);
             if (tit != texCache.end()) {
                 gm.texImage = tit->second.image; gm.texMem = tit->second.mem; gm.texView = tit->second.view;
@@ -886,15 +899,15 @@ public:
                 gm.texShared = true;
             } else {
                 if (astcPath) {
-                    texFmt = astcVkFormat(md.astcBw, md.astcBh);
-                    createTextureImageRaw(md.astcRaw.data(), (u32)md.astcRaw.size(),
-                                          md.texW, md.texH, texFmt, gm.texImage, gm.texMem);
+                    texFmt = astcVkFormat(T.astcBw, T.astcBh);
+                    createTextureImageRaw(T.astcRaw.data(), (u32)T.astcRaw.size(),
+                                          T.texW, T.texH, texFmt, gm.texImage, gm.texMem);
                 } else if (md.useBlend) {
                     // BLEND texture: alpha-weighted mips so transparent "garbage" RGB (e.g. dust's white α=0
                     // texels) can't bleed a bright halo onto the card silhouette at minified/grazing edges.
-                    createTextureImageAW(md.texRGBA.data(), md.texW, md.texH, gm.texImage, gm.texMem);
+                    createTextureImageAW(T.texRGBA.data(), T.texW, T.texH, gm.texImage, gm.texMem);
                 } else {
-                    createTextureImage(md.texRGBA.data(), md.texW, md.texH, gm.texImage, gm.texMem);
+                    createTextureImage(T.texRGBA.data(), T.texW, T.texH, gm.texImage, gm.texMem);
                 }
                 gm.texView = createImageView(gm.texImage, texFmt, lastTexMip);
                 texCache[tk] = { gm.texImage, gm.texMem, gm.texView, lastTexMip, texFmt };
@@ -904,36 +917,36 @@ public:
 
         // Per-material role textures (linear for normal/ORM, sRGB for lightmap). Bound to
         // the shader's named texture slots below. Fallbacks: flat-normal / white.
-        if (md.hasNormal && !md.normalRGBA.empty()) {
-            createTextureImage(md.normalRGBA.data(), md.normalW, md.normalH, gm.normalImage, gm.normalMem, VK_FORMAT_R8G8B8A8_UNORM);
+        if (T.hasNormal && !T.normalRGBA.empty()) {
+            createTextureImage(T.normalRGBA.data(), T.normalW, T.normalH, gm.normalImage, gm.normalMem, VK_FORMAT_R8G8B8A8_UNORM);
             gm.normalView = createImageView(gm.normalImage, VK_FORMAT_R8G8B8A8_UNORM);
         }
-        if (md.hasOrm && !md.ormRGBA.empty()) {
-            std::vector<u8> ormData = md.ormRGBA;
+        if (T.hasOrm && !T.ormRGBA.empty()) {
+            std::vector<u8> ormData = T.ormRGBA;
             if (const char* sw = std::getenv("HSR_MASKSWIZ")) {   // diagnostic channel remap: new RGBA = old[s0],old[s1],...
                 auto ci=[&](char c)->int{ c=(char)tolower((unsigned char)c); return c=='r'?0:c=='g'?1:c=='b'?2:c=='a'?3:0; };
                 std::string s = sw; while (s.size()<4) s+="rgba"[s.size()];
-                for (size_t i=0;i+3<ormData.size();i+=4) { u8 o[4]={md.ormRGBA[i],md.ormRGBA[i+1],md.ormRGBA[i+2],md.ormRGBA[i+3]};
+                for (size_t i=0;i+3<ormData.size();i+=4) { u8 o[4]={T.ormRGBA[i],T.ormRGBA[i+1],T.ormRGBA[i+2],T.ormRGBA[i+3]};
                     ormData[i]=o[ci(s[0])]; ormData[i+1]=o[ci(s[1])]; ormData[i+2]=o[ci(s[2])]; ormData[i+3]=o[ci(s[3])]; }
             }
-            createTextureImage(ormData.data(), md.ormW, md.ormH, gm.ormImage, gm.ormMem, VK_FORMAT_R8G8B8A8_UNORM);
+            createTextureImage(ormData.data(), T.ormW, T.ormH, gm.ormImage, gm.ormMem, VK_FORMAT_R8G8B8A8_UNORM);
             gm.ormView = createImageView(gm.ormImage, VK_FORMAT_R8G8B8A8_UNORM);
         }
-        if (md.hasEmissive && !md.emissiveRGBA.empty()) {
-            createTextureImage(md.emissiveRGBA.data(), md.emissiveW, md.emissiveH, gm.emissiveImage, gm.emissiveMem, VK_FORMAT_R8G8B8A8_SRGB);
+        if (T.hasEmissive && !T.emissiveRGBA.empty()) {
+            createTextureImage(T.emissiveRGBA.data(), T.emissiveW, T.emissiveH, gm.emissiveImage, gm.emissiveMem, VK_FORMAT_R8G8B8A8_SRGB);
             gm.emissiveView = createImageView(gm.emissiveImage, VK_FORMAT_R8G8B8A8_SRGB);
         }
-        if (md.hasLightmap && !md.lmRGBA.empty()) {
-            createTextureImage(md.lmRGBA.data(), md.lmW, md.lmH, gm.lmImage, gm.lmMem, VK_FORMAT_R8G8B8A8_SRGB);
+        if (T.hasLightmap && !T.lmRGBA.empty()) {
+            createTextureImage(T.lmRGBA.data(), T.lmW, T.lmH, gm.lmImage, gm.lmMem, VK_FORMAT_R8G8B8A8_SRGB);
             gm.lmView = createImageView(gm.lmImage, VK_FORMAT_R8G8B8A8_SRGB);
         }
-        if (md.hasVat && !md.vatRaw.empty()) {
+        if (T.hasVat && !T.vatRaw.empty()) {
             // Upload the half-float offset texture verbatim as R16G16B16A16_SFLOAT (verts x frames). The
             // vatunlit vertex shader texelFetches it: worldPosition = inPos + offset[vertexCol][frameRow].
-            createTextureImageRaw(md.vatRaw.data(), (u32)md.vatRaw.size(), md.vatW, md.vatH,
+            createTextureImageRaw(T.vatRaw.data(), (u32)T.vatRaw.size(), T.vatW, T.vatH,
                                   VK_FORMAT_R16G16B16A16_SFLOAT, gm.vatImage, gm.vatMem);
             gm.vatView = createImageView(gm.vatImage, VK_FORMAT_R16G16B16A16_SFLOAT);
-            if (std::getenv("HSR_VATDBG")) log("  VAT '%s' offsetTex %ux%u f16 bound", md.name.c_str(), md.vatW, md.vatH);
+            if (std::getenv("HSR_VATDBG")) log("  VAT '%s' offsetTex %ux%u f16 bound", md.name.c_str(), T.vatW, T.vatH);
         }
         // lightmappower applied IN-SHADER (tint*lmPow), faithful HDR order (not pre-baked+clamped) — for
         // BOTH the lightmap-sampler path (concrete shells) and the lightmap-as-base fallback (helmet/gem/loft_lamp).

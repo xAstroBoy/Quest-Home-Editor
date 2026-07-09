@@ -2675,6 +2675,15 @@ struct Editor {
             parts[c2].positions.clear(); parts[c2].uvs.clear(); parts[c2].uvs2.clear(); parts[c2].indices.clear();
             parts[c2].colors.clear(); parts[c2].uvs3.clear(); parts[c2].uvs4.clear();               // remapped below / dropped (stale copies would misalign)
             parts[c2].boneIndices.clear(); parts[c2].boneWeights.clear(); parts[c2].hasBones=false;
+            // TEXTURE SHARING: every piece shares the ONE source texture/lightmap. Copying the source's (up to
+            // 16MB) texRGBA + lightmap into each of up-to-256 pieces exploded memory = the split CRASH. FREE the
+            // per-part copies and point texShareSrc at the source (kept in sceneMeshes, soft-deleted below) — the
+            // renderer + cook read the bytes from there. dims/flags stay (copied) so uploadMesh sizes correctly.
+            parts[c2].texShareSrc = mi;
+            std::vector<u8>().swap(parts[c2].texRGBA);      std::vector<u8>().swap(parts[c2].astcRaw);
+            std::vector<u8>().swap(parts[c2].srcAstc);      std::vector<u8>().swap(parts[c2].normalRGBA);
+            std::vector<u8>().swap(parts[c2].ormRGBA);      std::vector<u8>().swap(parts[c2].emissiveRGBA);
+            std::vector<u8>().swap(parts[c2].lmRGBA);       std::vector<u8>().swap(parts[c2].vatRaw);
             /* parts KEEP the original name (the [idx] suffix in the outliner disambiguates) */ }
         for (size_t k=0;k+2<src.indices.size();k+=3){
             int c2 = compOf[find(weld[src.indices[k]])]; auto& pt=parts[c2]; auto& rm=remap[c2];
@@ -4417,6 +4426,13 @@ struct Editor {
           for (int k=0;k<4;k++) if (cx.dragFloat(ui::hashId(6200u+(unsigned)k,7u), x+lw+k*(fw+2*uiScale), y, fw, rh2, qd[k], 0.01f)) ch=true;
           if (ch){ normalizeQuat(qd); quatToEuler(qd,it.rot); } y+=rh2+2*uiScale; }
         vecRowF("Scale", it.scale, 3, 0.01f, x, y, w);
+        // UNIFORM scale: drag ONE field to shrink/grow all three axes at once (keeps the X:Y:Z ratio).
+        { float rh2=th.rowH, lw=78*uiScale, fw=w-lw-2*uiScale;
+          cx.label(x,y,lw,rh2,"Scale (all)",th.textDim);
+          float base=(it.scale[0]+it.scale[1]+it.scale[2])/3.f, uni=base;
+          if (cx.dragFloat(ui::hashId(6400u+(unsigned)selItem,7u), x+lw, y, fw, rh2, uni, 0.01f) && base>1e-6f){
+              float f=uni/base; if (f>1e-4f) for(int k=0;k<3;k++) it.scale[k]*=f; }
+          y+=rh2+2*uiScale; }
         // Quick "zero all rotations": reset this item's euler (X/Y/Z) to 0 in one click.
         if (cx.button(ui::hashId(8300u+(unsigned)selItem, 7u), x, y, 120*uiScale, rh, "Zero rotation")) { pushItemUndo(items); it.rot[0]=it.rot[1]=it.rot[2]=0.f; }
         y+=rh+4*uiScale;
@@ -4776,6 +4792,18 @@ struct Editor {
         vecRow(gm,"Rotation", e, 3, 0.5f, x, y, w, true);             // euler degrees
         vecRow(gm,"Quat", gm.editR, 4, 0.01f, x, y, w, false, true);  // raw quaternion X Y Z W (kept in sync)
         vecRow(gm,"Scale", gm.editS, 3, 0.01f, x, y, w);
+        // UNIFORM scale: drag ONE field to shrink/grow all three axes at once (keeps the X:Y:Z ratio).
+        // ("i can't shrink all 3 x y z scale in one go" — the per-axis Scale row needed three separate drags.)
+        { auto& th2=cx.th; float rh=th2.rowH, lw=70*uiScale, fw=w-lw-2*uiScale;
+          cx.label(x,y,lw,rh,"Scale (all)",th2.textDim);
+          float base=(gm.editS[0]+gm.editS[1]+gm.editS[2])/3.f, uni=base;
+          if (cx.dragFloat(ui::hashId("uniscale"), x+lw, y, fw, rh, uni, 0.01f) && base>1e-6f) {
+              float f=uni/base; if (f>1e-4f){
+                  if (!editing){ editing=true; editMesh=selected; editBefore=captureX(gm); }
+                  for(int k=0;k<3;k++) gm.editS[k]*=f; recomputeModel(gm); }
+          }
+          cx.tip(x,y,w,rh,"Drag to scale X, Y and Z together (uniform), keeping their ratio.\nUse the Scale row above to change a single axis.");
+          y+=rh+2*uiScale; }
         if (editing && cx.in.released[0]) endEdit(gm);
         if (cx.button(ui::hashId("resetx"), x, y, 120*uiScale, th.rowH, "Reset Transform")) {
             Xform b=captureX(gm); gm.editT[0]=gm.editT[1]=gm.editT[2]=0; gm.editR[0]=gm.editR[1]=gm.editR[2]=0; gm.editR[3]=1; gm.editS[0]=gm.editS[1]=gm.editS[2]=1; recomputeModel(gm); pushUndo(selected,b,captureX(gm));
@@ -5922,7 +5950,24 @@ struct Editor {
             // (user-confirmed). Deleted/removed items are already absent from sceneMeshes, so there's nothing to skip
             // here. (Was: `if (r->isHidden((int)i)) continue;` which wrongly dropped hidden geometry from the home.)
             if (r->isDeleted(i)) continue;   // editor DELETE: drop this mesh from the cooked home (non-destructive, persisted)
-            const MeshData& md=(*sceneMeshes)[i]; const VkGpuMesh& gm=r->gpuMeshes[i];
+            // SPLIT-PART TEXTURE SHARING: a piece from splitMeshParts left its texture buffers empty + points
+            // texShareSrc at the source mesh. Rebuild a texture-complete copy for the cook (transient, one at a
+            // time) so the cooked pieces keep their material — without re-duplicating the textures in memory.
+            const MeshData& mdRaw=(*sceneMeshes)[i];
+            MeshData mdShared; const MeshData* mdp=&mdRaw;
+            if (mdRaw.texShareSrc>=0 && (size_t)mdRaw.texShareSrc<sceneMeshes->size()){
+                const MeshData& s2=(*sceneMeshes)[(size_t)mdRaw.texShareSrc]; mdShared=mdRaw;
+                mdShared.texRGBA=s2.texRGBA; mdShared.texW=s2.texW; mdShared.texH=s2.texH; mdShared.hasTexture=s2.hasTexture;
+                mdShared.astcRaw=s2.astcRaw; mdShared.astcBw=s2.astcBw; mdShared.astcBh=s2.astcBh;
+                mdShared.srcAstc=s2.srcAstc; mdShared.srcAstcBw=s2.srcAstcBw; mdShared.srcAstcBh=s2.srcAstcBh; mdShared.srcAstcMips=s2.srcAstcMips;
+                mdShared.normalRGBA=s2.normalRGBA; mdShared.normalW=s2.normalW; mdShared.normalH=s2.normalH; mdShared.hasNormal=s2.hasNormal;
+                mdShared.ormRGBA=s2.ormRGBA; mdShared.ormW=s2.ormW; mdShared.ormH=s2.ormH; mdShared.hasOrm=s2.hasOrm; mdShared.ormTexName=s2.ormTexName;
+                mdShared.emissiveRGBA=s2.emissiveRGBA; mdShared.emissiveW=s2.emissiveW; mdShared.emissiveH=s2.emissiveH; mdShared.hasEmissive=s2.hasEmissive;
+                mdShared.lmRGBA=s2.lmRGBA; mdShared.lmW=s2.lmW; mdShared.lmH=s2.lmH; mdShared.hasLightmap=s2.hasLightmap;
+                mdShared.vatRaw=s2.vatRaw; mdShared.vatW=s2.vatW; mdShared.vatH=s2.vatH; mdShared.hasVat=s2.hasVat;
+                mdp=&mdShared;
+            }
+            const MeshData& md=*mdp; const VkGpuMesh& gm=r->gpuMeshes[i];
             size_t nv=md.positions.size()/3; if (nv<3||md.indices.size()<3) continue;
             ExportMesh em; em.name=md.name; em.srcMeshIdx=(int)i; em.positions.resize(nv*3);
             for (size_t v=0;v<nv;v++){ float p[3]={md.positions[v*3],md.positions[v*3+1],md.positions[v*3+2]},o[3]; xformPoint(gm.model,p,o); em.positions[v*3]=o[0]; em.positions[v*3+1]=o[1]; em.positions[v*3+2]=o[2]; }

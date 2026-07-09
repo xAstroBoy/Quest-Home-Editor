@@ -167,6 +167,11 @@ struct MeshData {
     std::vector<u8> texRGBA;
     u32 texW = 1, texH = 1;
     bool hasTexture = false;
+    // SPLIT-PART TEXTURE SHARING: >=0 = this mesh is a piece from splitMeshParts that BORROWS all its texture/
+    // lightmap byte buffers from sceneMeshes[texShareSrc] (the source it was carved from) instead of keeping its
+    // own copy — the renderer (VkRenderer::texShareList) and the cook resolve it. Prevents the up-to-256-pieces
+    // × 16MB-texture memory blow-up that crashed splitting a merged statue. -1 = normal self-owned textures.
+    int texShareSrc = -1;
     // Source ASTC mip chain (blocks only) + footprint for LOSSLESS cook pass-through of an unmodified base texture
     // (avoids the decode→re-encode double-compression that softens definition). Empty if not a plain KTX-ASTC.
     std::vector<u8> srcAstc; u32 srcAstcBw = 0, srcAstcBh = 0, srcAstcMips = 0;
