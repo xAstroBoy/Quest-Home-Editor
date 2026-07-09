@@ -1350,6 +1350,7 @@ int main(int argc, char** argv) {
     g_editor = &editor;            // expose to the GLFW input callbacks
     editor.r = &vkRenderer;             // bind the renderer up-front so Export works even when the UI is skipped (HSR_NOUI)
     editor.sceneMeshes = sceneMeshes;   // CPU geometry/textures for the "Export APK" cooker (parallel to gpuMeshes)
+    vkRenderer.texShareList = sceneMeshes;   // so uploadMesh can resolve a split part's texShareSrc -> the source mesh's shared textures
     editor.sourceEnvPath = sourceEnvPath;   // "Back to source" target for the in-place cook-preview swap
     editor.setEnvAudio(ogg);            // the env's background loop -> cooked as an auto-start FMOD SoundAsset (editor can REPLACE/ADD/export it)
     // (editor.audio binds in editor.init — BEFORE loadProject, so a session AUDIOOVR restarts the preview;
@@ -2210,6 +2211,11 @@ int main(int argc, char** argv) {
                     else if (strncmp(ln, "delmesh=", 8) == 0) {   // editor mesh DELETE toggle (drop from render + cook)
                         int mi=atoi(ln+8); if (mi>=0 && mi<(int)vkRenderer.gpuMeshes.size()) { vkRenderer.setDeleted(mi, !vkRenderer.isDeleted(mi));
                             snprintf(tmp,sizeof tmp,"mesh %d deleted=%d (deletedCount=%d)\n", mi, (int)vkRenderer.isDeleted(mi), vkRenderer.deletedCount()); out += tmp; } }
+                    else if (strncmp(ln, "split=", 6) == 0) {   // split a mesh into its connected pieces (same as the editor's Split into connected pieces)
+                        int mi=atoi(ln+6); size_t before=vkRenderer.gpuMeshes.size();
+                        editor.selectOne(mi);
+                        editor.forEachSelMesh([&](int m){ editor.splitMeshParts(m); });
+                        snprintf(tmp,sizeof tmp,"split %d -> %zu meshes (was %zu)\n", mi, vkRenderer.gpuMeshes.size(), before); out += tmp; }
                     else if (strncmp(ln, "dupmesh=", 8) == 0) {   // editor mesh DUPLICATE (clone + offset)
                         int mi=atoi(ln+8); size_t before=vkRenderer.gpuMeshes.size();
                         editor.selectOne(mi); editor.duplicateSelected();
