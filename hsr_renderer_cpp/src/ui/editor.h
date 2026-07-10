@@ -6587,17 +6587,39 @@ struct Editor {
     // Install an APK. uninstallFirst = overlay/spoof case: the existing package (Meta's Haven 2025) is signed with a
     // DIFFERENT certificate than our debug-signed spoof, so Android refuses an in-place update — it MUST be uninstalled
     // first. (The caller backs it up before allowing this.) Then best-effort select + relaunch.
+    // True if `pkg` is still installed for user 0 (used to tell a real uninstall from a no-op on a system app).
+    bool pkgInstalled(const std::string& ADB, const std::string& sel, const std::string& pkg) {
+        return adbCapture(ADB, sel, "shell pm path "+pkg).find("package:") != std::string::npos;
+    }
     bool installToDevice(const std::string& apkPath, const std::string& pkg, const std::function<void(float,const char*)>& progress, bool uninstallFirst=false, bool rooted=false) {
         auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
         std::string ADB=bs(adbPath()), AP=bs(apkPath), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         if (progress) progress(0.95f, "adb install");
-        if (uninstallFirst) runAdb(ADB, sel, "uninstall "+pkg);   // overlay: remove the differently-signed original UP FRONT (cert mismatch -> in-place update is impossible)
-        int rc = runAdb(ADB, sel, "install -r -d \""+AP+"\"");    // -d = allow version downgrade
-        if (rc!=0 && !uninstallFirst){ runAdb(ADB, sel, "uninstall "+pkg); rc = runAdb(ADB, sel, "install \""+AP+"\""); }   // own-package sig/version clash fallback
-        if (rc!=0) return false;
+        if (uninstallFirst) {
+            // Remove the differently-signed original UP FRONT (cert mismatch -> in-place update impossible). On SOME
+            // units haven2025 is a NON-removable SYSTEM app (firmware/region variance = "same model, some reject"):
+            // plain `uninstall` no-ops there, so ALSO do `pm uninstall -k --user 0` which disables/removes the update
+            // for user 0 WITHOUT root and lets our same-named APK install to /data, shadowing the system copy.
+            runAdb(ADB, sel, "uninstall "+pkg);
+            if (pkgInstalled(ADB, sel, pkg)) adbCapture(ADB, sel, "shell pm uninstall -k --user 0 "+pkg);   // system-app path (no root)
+        }
+        std::string ilog = adbCapture(ADB, sel, "install -r -d -g \""+AP+"\"");   // -d downgrade, -g grant perms
+        bool ok = ilog.find("Success") != std::string::npos;
+        if (!ok && uninstallFirst) {   // system-app couldn't be shadowed -> report the ACTUAL reason so the user knows why THIS unit failed
+            std::string first = ilog.substr(0, ilog.find_first_of("\r\n"));
+            setStatus("Install FAILED on this unit: "+ (first.empty()?std::string("(no adb output)"):first) +
+                      "  — Haven 2025 is likely a NON-removable SYSTEM app on this headset (varies by firmware/region). "
+                      "A rooted install (Rooted-System APK) or `pm uninstall --user 0` with a PC can clear it.");
+            return false;
+        }
+        if (!ok && !uninstallFirst){ runAdb(ADB, sel, "uninstall "+pkg); ok = adbCapture(ADB, sel, "install -g \""+AP+"\"").find("Success")!=std::string::npos; }   // own-package sig/version clash fallback
+        if (!ok) return false;
         if (progress) progress(0.98f, "select env");
-        // environment_selected = apk://pkg/assets/scene.zip (needs root/su; best-effort — else pick it in the headset).
+        // environment_selected = apk://pkg/assets/scene.zip. `su` only works rooted; UNROOTED devices ALSO get a plain
+        // (non-su) attempt — `oculuspreferences --setc` is allowed for the shell user on many builds, and where it
+        // isn't the shell keeps loading the SAME package we just replaced, so the port still shows in place.
         runAdb(ADB, sel, "shell su -c \"oculuspreferences --setc environment_selected apk://"+pkg+"/assets/scene.zip\"");
+        runAdb(ADB, sel, "shell oculuspreferences --setc environment_selected apk://"+pkg+"/assets/scene.zip");
         // Shell restart is an OPTION now (was forced): ROOTED headsets hot-swap the env via the
         // environment_selected IPC above, so killing vrshell there is redundant; UNROOTED headsets still
         // need the restart (nothing else makes the shell reload the replaced haven2025).
