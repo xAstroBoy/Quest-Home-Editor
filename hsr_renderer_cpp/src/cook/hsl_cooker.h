@@ -28,6 +28,7 @@
 #include "astcenc.h"   // ASTC ENCODE (full astcenc build) — RGBA8 -> ASTC blocks for RENDTXTR
 #include "miniz.h"     // ZIP read/write — scene.zip assembly + APK splice (already linked by the project)
 #include "cook/embedded_assets.h"   // STANDALONE: cooker templates + Nuxd donor files baked into the binary
+#include "cook/haven_stock_templates.h"  // stock haven2025 template closure (vista-compat for the unrooted footprint path)
 #include "cook/hzanim_acl.h"  // hzAclEncode (HZANIM ACL clip) — only the declaration; ACL lives in hzanim_acl.cpp
 #include "cook/cook_verify.h"  // cook-time FlatBuffer verifier (device's stock-flatbuffers structural check, schema from Meta assets)
 
@@ -216,7 +217,9 @@ inline std::vector<uint8_t> buildAsmh(const std::vector<AsmhEntry>& E) {
     //    the entry's pkg/ing/tgt; assets sharing a string MUST share the hash (keyForPath guarantees this). ──
     struct ME { uint64_t h; std::string s; };
     std::vector<ME> dirs, rels, subs;
-    auto addU = [](std::vector<ME>& v, uint64_t h, const std::string& s) { for (auto& m : v) if (m.s == s) return; v.push_back({ h, s }); };
+    // dedup by (hash,string) PAIR — the maps are hash->string, and "meta/home_c25" legitimately appears under
+    // TWO hashes (our FNV pkg for cooked assets + Meta's stock StringId on the vista-compat template entries).
+    auto addU = [](std::vector<ME>& v, uint64_t h, const std::string& s) { for (auto& m : v) if (m.h == h && m.s == s) return; v.push_back({ h, s }); };
     for (auto& e : E) { std::string bd, rp, sn; decomposePath(e.path, bd, rp, sn);
         addU(dirs, e.pkg, bd); addU(rels, e.ing, rp); addU(subs, (uint64_t)e.tgt, sn); }   // sub hash is u32
     int N = (int)E.size();
@@ -1147,6 +1150,26 @@ inline std::vector<uint8_t> patchAxml(const std::vector<uint8_t>& axml, const st
     return out;
 }
 
+// True if the AXML string pool contains `want` as a WHOLE pooled string (used to verify the
+// hsr_package_type VALUE flip footprint->combined actually took — a stray "footprint" pool entry
+// would make libshell's resolver set envIsFootprint=1 and re-pair a vista). IDA-proven gate:
+// EnvironmentManager resolver (libshell 0x10cb730) sets envIsFootprint = (hsr_package_type=="footprint")
+// EXACTLY, then `cbz w23` skips ALL vista assembly when it's 0 -> a "combined" env never renders a vista.
+inline bool axmlHasPooledString(const std::vector<uint8_t>& axml, const std::string& want) {
+    auto u16=[&](size_t o){ uint16_t v; memcpy(&v,&axml[o],2); return v; };
+    auto u32=[&](size_t o){ uint32_t v; memcpy(&v,&axml[o],4); return v; };
+    if (axml.size()<8 || u16(0)!=0x0003) return false;
+    size_t sp=8; if (u16(sp)!=0x0001) return false;
+    uint16_t sp_hdr=u16(sp+2); uint32_t strCount=u32(sp+8), flags=u32(sp+16), stringsStart=u32(sp+20);
+    bool utf8=(flags&0x100)!=0; size_t off0=sp+sp_hdr, sbase=sp+stringsStart;
+    for (uint32_t i=0;i<strCount;i++){ size_t p=sbase+u32(off0+i*4); std::string s;
+        if (utf8){ auto dl=[&](size_t q,size_t&nq){ uint32_t n=axml[q]; if(n&0x80){ n=((n&0x7f)<<8)|axml[q+1]; nq=q+2;} else nq=q+1; return n; };
+            size_t q; dl(p,q); uint32_t bl=dl(q,q); s.assign((const char*)&axml[q],bl); }
+        else { uint32_t l=u16(p); size_t q=p+2; if(l&0x8000){ l=((l&0x7fff)<<16)|u16(q); q+=2; } for(uint32_t c=0;c<l;c++) s+=(char)(u16(q+c*2)&0xff); }
+        if (s==want) return true; }
+    return false;
+}
+
 // Read the <manifest package="..."> attribute out of a binary AndroidManifest (AXML) — so the cook can use the
 // LOADED env's OWN package instead of a hardcoded one. Returns "" if not found.
 inline std::string readAxmlPackage(const std::vector<uint8_t>& axml) {
@@ -1265,6 +1288,17 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
             //    Flip ONLY that exact value string; exact=true leaves the package name + build_rule "footprint-haven2025..."
             //    untouched, so the haven SPOOF package name stays valid.
             data = patchAxml(data, "footprint", "combined", /*exact=*/true);
+            // HARD GUARD (make it IMPOSSIBLE for a cooked home to render a vista): the vista pairing is gated
+            // PURELY on hsr_package_type=="footprint" (IDA-proven, libshell EnvironmentManager resolver 0x10cb730:
+            // envIsFootprint = exact-compare vs "footprint"; then `cbz` skips ALL vista assembly when 0). If the
+            // flip somehow didn't take (future manifest change, a second "footprint" pool entry), a stray token
+            // would re-enable the vista. Assert it's gone; if not, hammer any residual whole-string "footprint".
+            if (axmlHasPooledString(data, "footprint")) {
+                fprintf(stderr, "[COOK] WARNING: hsr_package_type flip left a 'footprint' token -> forcing 'combined' (vista would else re-pair)\n");
+                data = patchAxml(data, "footprint", "combined", /*exact=*/true);
+            }
+            if (axmlHasPooledString(data, "footprint"))
+                fprintf(stderr, "[COOK] ERROR: manifest STILL has a standalone 'footprint' string -> device may pair a vista behind this home\n");
         }
         addFile(name, std::move(data));
     }
@@ -2315,6 +2349,10 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     }
     std::unordered_map<uint64_t, std::pair<AssetKey3, std::string>> texCache;  // rgba hash -> shared texture (split chunks share one)
     std::unordered_map<std::string, AssetKey3> rotShaders;  // rot shader filename -> shipped key (one per distinct period/dir Y-spin)
+    // [Z-AUDIT] which meshes ship a DEPTH-WRITING material (opaque/cutout MATL; 0 = transparent no-depth-write
+    // blend). Filled as each mesh's final MATL is chosen; the coplanar-overlap z-fight audit below the loop only
+    // needs to check depth-writing surfaces (blend never writes depth, so it can't z-fight — it can only sort wrong).
+    std::vector<uint8_t> zDepthWrite(meshesV.size(), 0);
     for (size_t i = 0; i < meshesV.size(); ++i) {
         if (progress && (i % 8 == 0 || i + 1 == meshesV.size())) { char sb[64]; snprintf(sb, sizeof sb, "Cooking mesh %zu/%zu", i+1, meshesV.size()); prog(0.05f + 0.70f*(float)i/(float)meshesV.size(), sb); }
         const ExportMesh& m = meshesV[i];
@@ -2779,12 +2817,14 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             }
         }
         std::vector<uint8_t> matl; std::string animatorComp; int meshArmIdx = -1;   // meshArmIdx: resolved skeleton (armature) index — shared by the shipped skeleton's joint names AND the rendmesh joint-id palette (device binds verts→joints by NAME, so both must match)
+        bool zBlend = false;   // [Z-AUDIT] final MATL is the transparent (no-depth-write) template — set at every matl assignment site below
         if (useHz) {   // HZANIM: CURRENT-format skinned MATL (field7=shader) + HZAN:SKEL + ACL HZAN:ANIM + AnimatorPlatformComponent
             // BLEND skinned (the SHIELD) -> the transparent-flagged material (field2=2) so it alpha-blends in the
             // transparent pass; OPAQUE skinned (body) -> the plain butterflies template.
             // A MOVING SOLID SILHOUETTE (orbiting planet billboard) uses the OPAQUE skinned MATL so it DEPTH-WRITES
             // + occludes (the cutout frag below discards its transparent bg). Genuinely-soft transparent cards keep
             // the blend MATL.
+            zBlend = !std::getenv("HSR_HZMATTPL") && ((m.blend || foliageBlend) && !solidSilhouette) && matSkinB.size() >= 176;
             matl = std::getenv("HSR_HZMATTPL") ? matTpl : (((m.blend || foliageBlend) && !solidSilhouette) && matSkinB.size() >= 176 ? matSkinB : matSkin2);
             // (Moving/skinned transparent cards e.g. the TRAIN stay ALPHA-BLEND — a hard alpha-cutoff cutout here
             //  destroyed the train's soft transparency. Depth-write for MOVING cards is forced ONLY for solid
@@ -3035,7 +3075,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // FAITHFUL wisp SCALE breathe: unlitblend material pointed at our getTime() vertex-scale shader.
             // Same interface as unlitblend (realdome_mat verbatim); only the field7 shader ref changes. The geometry
             // is centered + the entity sits at the centroid (below) so the shader's model-space scale pivots in place.
-            matl = matBlend;
+            matl = matBlend; zBlend = true;
             memcpy(matl.data() + 48,  &shaderPulseK.pkg, 8); memcpy(matl.data() + 56,  &shaderPulseK.ing, 8);  // field7 -> wispscale shader
             memcpy(matl.data() + 120, &texK.pkg, 8);         memcpy(matl.data() + 128, &texK.ing, 8);          // base tex
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' WISPSCALE (getTime vertex breathe)\n", i, m.name.c_str());
@@ -3086,7 +3126,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 }
                 if (!rbytes.empty()) { char rp[168]; snprintf(rp, sizeof rp, "%s/shaders/%s_%08x%s%s%s.surface/shader", MH.c_str(), pfx, h, rscroll ? "s" : "", rblend ? "_b" : "", meshFar ? "_dc" : "");
                     rotK = keyForPath(rp); assets.push_back({ rp, rotK.tgt, rbytes, rotK }); rotShaders[rfn] = rotK; } }
-            matl = rblend ? matBlend : matTpl;                          // blend base for transparent billboards, else opaque unlit
+            matl = rblend ? matBlend : matTpl; zBlend = rblend;                          // blend base for transparent billboards, else opaque unlit
             if (rotK.ing) { memcpy(matl.data() + 48, &rotK.pkg, 8); memcpy(matl.data() + 56, &rotK.ing, 8); }  // field7 -> rot shader (else static = safe fallback)
             memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);                  // base tex
             if (std::getenv("HSR_VERBOSE")) { if (m.rotReplay) fprintf(stderr, "[COOK] m%03zu '%s' ROTREPLAY %d keys loop=%.1fs axis=(%.2f,%.2f,%.2f) %s %s\n", i, m.name.c_str(), m.rotReplayN, m.rotLoopSec, m.rotAxis[0],m.rotAxis[1],m.rotAxis[2], rblend ? "BLEND" : "opaque", rotK.ing ? "" : "(MISSING -> static)");
@@ -3132,7 +3172,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     if (!tbytes.empty()) writeFileBytes(tfn, tbytes); }
                 if (!tbytes.empty()) { char tp[176]; snprintf(tp, sizeof tp, "%s/shaders/trans_%08x%s%s%s.surface/shader", MH.c_str(), h, usuf, tblend ? "_b" : "", meshFar ? "_dc" : "");
                     transK = keyForPath(tp); assets.push_back({ tp, transK.tgt, tbytes, transK }); rotShaders[tfn] = transK; } }
-            matl = tblend ? matBlend : matTpl;
+            matl = tblend ? matBlend : matTpl; zBlend = tblend;
             if (transK.ing) { memcpy(matl.data()+48,&transK.pkg,8); memcpy(matl.data()+56,&transK.ing,8); }   // field7 -> translate(+flipbook/scroll) shader
             memcpy(matl.data()+120,&texK.pkg,8); memcpy(matl.data()+128,&texK.ing,8);                          // base tex
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' TRANSLATE%s%s %d frames loop=%.2fs %s %s\n", i, m.name.c_str(), tflip?"+FLIPBOOK":(tscroll?"+UVSCROLL":""), tfade?"+FADE":"", m.transN, m.transLoop, tblend ? "BLEND" : "opaque", transK.ing ? "" : "(MISSING -> static)");
@@ -3157,7 +3197,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     if (!sbytes.empty()) writeFileBytes(sfn, sbytes); }
                 if (!sbytes.empty()) { char sp[176]; snprintf(sp, sizeof sp, "%s/shaders/scale_%08x%s%s.surface/shader", MH.c_str(), h, sblend ? "_b" : "", meshFar ? "_dc" : "");
                     scaleK = keyForPath(sp); assets.push_back({ sp, scaleK.tgt, sbytes, scaleK }); rotShaders[sfn] = scaleK; } }
-            matl = sblend ? matBlend : matTpl;
+            matl = sblend ? matBlend : matTpl; zBlend = sblend;
             if (scaleK.ing) { memcpy(matl.data()+48,&scaleK.pkg,8); memcpy(matl.data()+56,&scaleK.ing,8); }   // field7 -> scale shader
             memcpy(matl.data()+120,&texK.pkg,8); memcpy(matl.data()+128,&texK.ing,8);                          // base tex
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SCALE %d frames loop=%.2fs pivot=(%.2f,%.2f,%.2f) %s %s\n", i, m.name.c_str(), m.scaleN, m.scaleLoop, m.scalePivot[0],m.scalePivot[1],m.scalePivot[2], sblend ? "BLEND" : "opaque", scaleK.ing ? "" : "(MISSING -> static)");
@@ -3191,7 +3231,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 }
                 if (!ubytes.empty()) { char up[160]; snprintf(up, sizeof up, "%s/shaders/uvscroll_%08x%s%s.surface/shader", MH.c_str(), h, usuf, meshFar ? "_dc" : "");
                     uvK = keyForPath(up); assets.push_back({ up, uvK.tgt, ubytes, uvK }); rotShaders[ufn] = uvK; } }
-            matl = ublend ? matBlend : matTpl;   // foam/water uvscroll -> blend (luminance alpha) or opaque
+            matl = ublend ? matBlend : matTpl; zBlend = ublend;   // foam/water uvscroll -> blend (luminance alpha) or opaque
             if (uvK.ing) { memcpy(matl.data() + 48, &uvK.pkg, 8); memcpy(matl.data() + 56, &uvK.ing, 8); }   // field7 -> uvscroll shader
             memcpy(matl.data() + 120, &texK.pkg, 8); memcpy(matl.data() + 128, &texK.ing, 8);                  // base tex
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' UVSCROLL rate=(%.3f,%.3f)/s %s%s %s\n", i, m.name.c_str(), m.uvRate[0], m.uvRate[1], (m.additive&&m.uvScroll)?"BLEND(lum-foam) ":"", ublend ? "BLEND" : "opaque", uvK.ing ? "" : "(MISSING -> static)");
@@ -3202,6 +3242,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // @48/56/64 to the transparent+doubleSided VAT shader so the texture alpha FADES (vatunlitbasecolor
             // is opaque -> the V79 fade was lost). Opaque VAT meshes keep the baked-in vatunlitbasecolor ref.
             bool vatBlend = m.blend && haveVatBlend && !std::getenv("HSR_VATOPAQUE");   // HSR_VATOPAQUE: test plain shipped vatunlitbasecolor (isolate VAT-renders? from my custom blend shader)
+            zBlend = vatBlend;
             if (vatBlend) {
                 memcpy(matl.data() + 48, &vatBlendK.pkg, 8); memcpy(matl.data() + 56, &vatBlendK.ing, 8);
                 memcpy(matl.data() + 64, &vatBlendK.tgt, 4);
@@ -3219,7 +3260,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         } else if (m.flipbook && haveBlend && std::getenv("HSR_FLIPSTATIC")) {
             // DIAGNOSTIC: cook the flipbook as a PLAIN static unlit quad (NO generated shader) to isolate whether the
             // generated getTime flipbook shader is what breaks the device env render.
-            matl = matTpl; memcpy(matl.data()+120,&texK.pkg,8); memcpy(matl.data()+128,&texK.ing,8);
+            matl = matTpl; zBlend = false; memcpy(matl.data()+120,&texK.pkg,8); memcpy(matl.data()+128,&texK.ing,8);
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FLIPBOOK -> STATIC unlit (HSR_FLIPSTATIC, no gen shader)\n", i, m.name.c_str());
         } else if (m.flipbook && haveBlend) {
             // FLIPBOOK (sonic_schoolhouse 3x3, Rick&Morty animated TV 10x10): the overlapping cell-quads were collapsed
@@ -3264,7 +3305,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                     if(!fbytes.empty()) writeFileBytes(ffn,fbytes); }
                 if(!fbytes.empty()){ char fp2[176]; snprintf(fp2,sizeof fp2,"%s/shaders/flipbook_%08x%s%s%s%s%s%s.surface/shader", MH.c_str(), h, useReplay?"r":"", ffade?"a":"", ftint?"t":"", m.flipOffset?"o":"", fblend?"":"_op", meshFar?"_dc":"");
                     flipK=keyForPath(fp2); assets.push_back({fp2, flipK.tgt, fbytes, flipK}); rotShaders[ffn]=flipK; } }
-            matl = fblend ? matBlend : matTpl;
+            matl = fblend ? matBlend : matTpl; zBlend = fblend;
             if (flipK.ing){ memcpy(matl.data()+48,&flipK.pkg,8); memcpy(matl.data()+56,&flipK.ing,8); }   // field7 -> generated flipbook shader
             memcpy(matl.data()+120,&texK.pkg,8); memcpy(matl.data()+128,&texK.ing,8);                      // base tex -> the full spritesheet
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FLIPBOOK %dx%d %dframes @%.2ffps %s (auto-gen) %s\n", i, m.name.c_str(), fcols,frows,fframes,ffps, m.flipOffset?"OFFSET":"scale", flipK.ing?"":"(MISSING -> static)");
@@ -3341,13 +3382,21 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 // with a REAL soft-alpha gradient is atmosphere, not a diorama card — hard-cutting it makes clumpy
                 // fog with depth-writes. Hard-silhouette giants (bgMountains: midF≈0.01 bimodal) keep their cutout.
                 if ((exX > 300.f || exZ > 300.f) && midF > 0.05f) flatHorizontalDecal = true;
-                if (!flatHorizontalDecal && ((bimodal && hasOpaque) || solidBody)) {   // flat floor decals stay BLEND (no depth-write = no z-fight with the coplanar floor)
+                // AUTHORED MASK by NAME: a material named "...AlphaMask..." IS an authored alpha-mask (foliage/decal
+                // that MUST occlude), even though the V79 "_alpha" suffix routed it to blend. asgardswrath's
+                // FoliageDistance_AlphaMask cards are soft distance-blurred (midF~0.20 > the 0.18 solid-body cap) so
+                // the alpha-shape tests miss them -> they cooked as no-depth-write blend = "another depth issue"
+                // (they don't occlude + overlapping cards sort wrong). Trust the AUTHORED name and depth-write via the
+                // LOW-threshold cutout (0.12) so the soft foliage edge survives. Gated: has real opaque leaf content +
+                // not an animated soft-FX card + not a flat ground decal (so it can't catch a named soft fog sheet).
+                bool namedMask = (m.name.find("AlphaMask")!=std::string::npos) && hasOpaque && !animatedFx;
+                if (!flatHorizontalDecal && ((bimodal && hasOpaque) || solidBody || namedMask)) {   // flat floor decals stay BLEND (no depth-write = no z-fight with the coplanar floor)
                     cutoutOK = true;
                     isTreeCutout = true;   // LOW 0.12 discard: depth-writes + keeps any faint soft edge; for midF~0 it equals a 0.5 cut
                 }
-                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' blendcard opF=%.2f midF=%.2f -> %s\n", i, m.name.c_str(), opF, midF, cutoutOK?(bimodal?"CUTOUT(bimodal)":"CUTOUT(solid-body)"):"blend");
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' blendcard opF=%.2f midF=%.2f -> %s\n", i, m.name.c_str(), opF, midF, cutoutOK?(bimodal?"CUTOUT(bimodal)":namedMask?"CUTOUT(named-mask)":"CUTOUT(solid-body)"):"blend");
             }
-            matl = (m.blend && haveBlend && !cutoutOK) ? matBlend : matTpl;
+            matl = (m.blend && haveBlend && !cutoutOK) ? matBlend : matTpl; zBlend = (m.blend && haveBlend && !cutoutOK);
             if (cutoutOK) {   // CUTOUT = opaque MATL + alpha-test DISCARD shader -> DEPTH-WRITE: authored MASK scenery OCCLUDES (fixes back-overlays-front); discard cuts the hard mask. Double-sided handled by the cook's reversed-tri append.
                 AssetKey3 ck = (isTreeCutout && haveCutoutTree) ? shaderCutoutTreeK : shaderCutoutK;   // sparse tree cards -> low (0.12) threshold so the foliage survives the discard
                 // AUTHORED masked STATIC meshes: prefer the V79-TRANSPILED per-cutoff surface (tools/
@@ -3775,6 +3824,112 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             entities += "," + entityJson(mid, nm, hzPos, rot0, hzScl, meshK, { matK }, AssetKey3{0,0,0}, extraComp, 5, false, poseKv);
         }
         rels += (rels.empty() ? std::string() : std::string(",")) + relChildOf(mid, rootId);
+        zDepthWrite[i] = zBlend ? 0 : 1;   // [Z-AUDIT] input: this mesh's final MATL depth-writes
+    }
+    // ── [Z-AUDIT] Z-FIGHT detector — coplanar overlapping DEPTH-WRITING triangles ("make sure NOTHING has
+    //    z/depth fighting"). Z-fighting needs two depth-writing surfaces on (nearly) the SAME plane with real
+    //    AREA overlap; blend surfaces never write depth so they can't fight. Detector: hash every depth-writing
+    //    triangle by its quantized plane (unit normal ~0.9° + offset 5mm buckets), then inside each plane bucket
+    //    run an EXACT 2D triangle∩triangle clip (Sutherland–Hodgman) and flag pairs with intersection area
+    //    > 1cm². Edge-adjacent tiles of a flat floor intersect with ~zero area (filtered); the cook's own
+    //    intentional reversed-winding doubleSided twins are the same 3 positions (same mesh) and are skipped.
+    //    Pure REPORT (no behavior change): [Z-AUDIT] lines name both meshes + worst overlap so regressions from
+    //    depth-write reclassification (bimodal/solid-body/named-mask/solid-silhouette) surface at cook time.
+    {
+        struct ZT { int mesh; float p[9]; float uv[6]; bool hasUV; float mn[3], mx[3]; };
+        std::unordered_map<uint64_t, std::vector<ZT>> zb; zb.reserve(1u<<15);
+        size_t zTris = 0;
+        for (size_t i = 0; i < meshesV.size(); ++i) {
+            if (!zDepthWrite[i]) continue;
+            const auto& M = meshesV[i];
+            for (size_t k = 0; k + 2 < M.indices.size(); k += 3) {
+                uint32_t a=M.indices[k], b=M.indices[k+1], c=M.indices[k+2];
+                if ((size_t)a*3+2>=M.positions.size()||(size_t)b*3+2>=M.positions.size()||(size_t)c*3+2>=M.positions.size()) continue;
+                const float* pa=&M.positions[a*3]; const float* pb=&M.positions[b*3]; const float* pc=&M.positions[c*3];
+                float e1[3]={pb[0]-pa[0],pb[1]-pa[1],pb[2]-pa[2]}, e2[3]={pc[0]-pa[0],pc[1]-pa[1],pc[2]-pa[2]};
+                float n[3]={e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]};
+                float nl=std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]); if (nl < 1e-8f) continue;   // degenerate
+                n[0]/=nl; n[1]/=nl; n[2]/=nl;
+                int dom = (std::fabs(n[0])>std::fabs(n[1]) && std::fabs(n[0])>std::fabs(n[2])) ? 0 : (std::fabs(n[1])>std::fabs(n[2]) ? 1 : 2);
+                float d = n[0]*pa[0]+n[1]*pa[1]+n[2]*pa[2];
+                if (n[dom] < 0.f) { n[0]=-n[0]; n[1]=-n[1]; n[2]=-n[2]; d=-d; }   // canonical sign: reversed twins share a bucket
+                int qx=(int)std::lround(n[0]*64.f), qy=(int)std::lround(n[1]*64.f), qz=(int)std::lround(n[2]*64.f);
+                int qd=(int)std::lround(d/0.005f);
+                uint64_t key = ((uint64_t)(uint32_t)(qx+128)<<48)|((uint64_t)(uint32_t)(qy+128)<<40)|((uint64_t)(uint32_t)(qz+128)<<32)|(uint64_t)(uint32_t)qd;
+                ZT t; t.mesh=(int)i;
+                for (int q2=0;q2<3;q2++){ t.p[q2]=pa[q2]; t.p[3+q2]=pb[q2]; t.p[6+q2]=pc[q2];
+                    t.mn[q2]=std::min(pa[q2],std::min(pb[q2],pc[q2])); t.mx[q2]=std::max(pa[q2],std::max(pb[q2],pc[q2])); }
+                t.hasUV = M.uvs.size() >= (size_t)std::max({a,b,c})*2+2;
+                if (t.hasUV){ t.uv[0]=M.uvs[a*2]; t.uv[1]=M.uvs[a*2+1]; t.uv[2]=M.uvs[b*2]; t.uv[3]=M.uvs[b*2+1]; t.uv[4]=M.uvs[c*2]; t.uv[5]=M.uvs[c*2+1]; }
+                else { for (int q2=0;q2<6;q2++) t.uv[q2]=0.f; }
+                zb[key].push_back(t); ++zTris;
+            }
+        }
+        // exact 2D tri∩tri area (project onto the plane's two minor axes; Sutherland–Hodgman clip)
+        auto triClipArea=[&](const ZT& A, const ZT& B, int ax, int ay)->float{
+            float sub[16][2]; int nsub=3;
+            sub[0][0]=A.p[0+ax]; sub[0][1]=A.p[0+ay]; sub[1][0]=A.p[3+ax]; sub[1][1]=A.p[3+ay]; sub[2][0]=A.p[6+ax]; sub[2][1]=A.p[6+ay];
+            float clp[3][2]={{B.p[0+ax],B.p[0+ay]},{B.p[3+ax],B.p[3+ay]},{B.p[6+ax],B.p[6+ay]}};
+            float ccw=(clp[1][0]-clp[0][0])*(clp[2][1]-clp[0][1])-(clp[1][1]-clp[0][1])*(clp[2][0]-clp[0][0]);
+            if (ccw<0){ float t0=clp[1][0],t1=clp[1][1]; clp[1][0]=clp[2][0]; clp[1][1]=clp[2][1]; clp[2][0]=t0; clp[2][1]=t1; }
+            for (int e=0;e<3 && nsub>2;++e){
+                float x1=clp[e][0],y1=clp[e][1],x2=clp[(e+1)%3][0],y2=clp[(e+1)%3][1];
+                float out[16][2]; int nout=0;
+                for (int v=0;v<nsub;++v){
+                    float* P=sub[v]; float* Q=sub[(v+1)%nsub];
+                    float sp=(x2-x1)*(P[1]-y1)-(y2-y1)*(P[0]-x1);
+                    float sq=(x2-x1)*(Q[1]-y1)-(y2-y1)*(Q[0]-x1);
+                    if (sp>=0 && nout<16){ out[nout][0]=P[0]; out[nout][1]=P[1]; ++nout; }
+                    if (((sp>=0)!=(sq>=0)) && std::fabs(sp-sq)>1e-12f && nout<16){
+                        float t=sp/(sp-sq); out[nout][0]=P[0]+t*(Q[0]-P[0]); out[nout][1]=P[1]+t*(Q[1]-P[1]); ++nout; }
+                }
+                nsub=nout; for (int v=0;v<nout;++v){ sub[v][0]=out[v][0]; sub[v][1]=out[v][1]; }
+            }
+            if (nsub<3) return 0.f;
+            float area=0.f; for (int v=0;v<nsub;++v){ int w2=(v+1)%nsub; area += sub[v][0]*sub[w2][1]-sub[w2][0]*sub[v][1]; }
+            return std::fabs(area)*0.5f;
+        };
+        std::map<std::pair<int,int>, std::pair<int,float>> zPairs;   // (meshA<=meshB) -> {overlapping tri pairs, worst area}
+        for (auto& kv : zb) {
+            auto& v = kv.second;
+            if (v.size() < 2 || v.size() > 4000) continue;   // singleton / degenerate giant plane (cost guard)
+            // plane's two minor axes (dominant normal axis packed in the key's top byte sign choice — recompute)
+            int dom = 2; { int qx=(int)((kv.first>>48)&0xFF)-128, qy=(int)((kv.first>>40)&0xFF)-128, qz=(int)((kv.first>>32)&0xFF)-128;
+                           int axq=std::abs(qx), ayq=std::abs(qy), azq=std::abs(qz); dom = (axq>=ayq&&axq>=azq)?0:(ayq>=azq?1:2); }
+            int ax=(dom==0)?1:0, ay=(dom==2)?1:2;
+            for (size_t x=0; x<v.size(); ++x) for (size_t y=x+1; y<v.size(); ++y) {
+                const ZT& A=v[x]; const ZT& B=v[y];
+                bool aabb=true; for (int q2=0;q2<3;q2++) if (A.mn[q2]>B.mx[q2]+0.002f || B.mn[q2]>A.mx[q2]+0.002f){ aabb=false; break; }
+                if (!aabb) continue;
+                // EXACT duplicate / reversed doubleSided twin: all 3 positions match AND the matched vertices carry
+                // the SAME UV -> both rasterize the SAME texels at the same depth = INVISIBLE (stable), not a visible
+                // z-fight. Skip. A same-position pair with DIFFERENT UVs is a duplicated card with a different texture
+                // crop = a REAL visible risk -> falls through to the area check and gets reported.
+                {
+                    bool dup=true;
+                    for (int va=0; va<3 && dup; ++va){ bool hit=false;
+                        for (int vb=0; vb<3; ++vb){ float dx=A.p[va*3]-B.p[vb*3], dy=A.p[va*3+1]-B.p[vb*3+1], dz=A.p[va*3+2]-B.p[vb*3+2];
+                            if (dx*dx+dy*dy+dz*dz < 1e-8f){
+                                if (A.hasUV && B.hasUV){ float du=A.uv[va*2]-B.uv[vb*2], dv=A.uv[va*2+1]-B.uv[vb*2+1];
+                                    if (du*du+dv*dv >= 1e-8f) continue; }   // same pos, different UV -> not this vb; try others
+                                hit=true; break; } }
+                        if (!hit) dup=false; }
+                    if (dup) continue;
+                }
+                float area = triClipArea(A,B,ax,ay);
+                if (area > 1e-4f) {   // > 1cm² of genuine coplanar overlap = visible fighting risk
+                    auto pk = std::make_pair(std::min(A.mesh,B.mesh), std::max(A.mesh,B.mesh));
+                    auto& e = zPairs[pk]; e.first++; if (area > e.second) e.second = area;
+                }
+            }
+        }
+        if (zPairs.empty()) fprintf(stderr, "[Z-AUDIT] clean: no coplanar overlapping depth-writing triangles (%zu tris hashed across %zu planes)\n", zTris, zb.size());
+        else for (auto& kv : zPairs) {
+            const char* an = kv.first.first  < (int)meshesV.size() ? meshesV[kv.first.first ].name.c_str() : "?";
+            const char* bn = kv.first.second < (int)meshesV.size() ? meshesV[kv.first.second].name.c_str() : "?";
+            fprintf(stderr, "[Z-AUDIT] ⚠ Z-FIGHT RISK m%03d '%s' %s m%03d '%s': %d coplanar overlapping tri pair(s), worst %.1f cm^2\n",
+                kv.first.first, an, kv.first.first==kv.first.second?"WITHIN":"<->", kv.first.second, bn, kv.second.first, kv.second.second*1e4f);
+        }
     }
     if (rels.empty()) return {};
     if (whiteUsed) assets.push_back({ pWhite, whiteK.tgt, whiteTex, whiteK });
@@ -4203,6 +4358,20 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     auto shellcfg = jbytes(shellConfigJson(spaceK, locomotion));
     assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
     assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });
+    // ── VISTA-COMPAT stock templates (the "home gets rejected" fix — TheMysticle logcat 2026-07-10): on
+    //    UNROOTED devices the shell loads the haven2025 spoof as a FOOTPRINT and force-pairs a companion
+    //    VISTA (calming/focused — ITS config decides; the manifest "combined" flip only helps the rooted
+    //    env-select path). The vista's own templates (home_w_calming_lm.hstf etc.) nest stock home_c25
+    //    templates by Meta's STOCK StringId keys; the cook had replaced them all -> ErrorFileNotFound ->
+    //    "Load of asset package ended invalid" -> the shell rejected the WHOLE footprint+vista pair and
+    //    fell back to nuxd. Ship the stock TEMPLATE closure (27 JSON files, ~29KB compressed, NO stock
+    //    geometry: their mesh/texture refs stay absent = invisible + non-fatal, droid-proven) under the
+    //    ORIGINAL stock keys so ANY paired vista resolves. Bonus: stock spawn-point/locator templates are
+    //    real again, which the footprint path wants. HSR_NOVISTATPL disables for A/B.
+    if (!std::getenv("HSR_NOVISTATPL"))
+        for (auto& t : havenstock::templates())
+            assets.push_back({ std::string("meta/home_c25/") + t.first->relPath + "/template", TGT_TEMPLATE,
+                               t.second, AssetKey3{ havenstock::HOME_PKG, t.first->ing, TGT_TEMPLATE } });
     prog(0.80f, "Packaging scene.zip");
     auto sceneZip = assembleSceneZip(assets, shellcfg);
     if (outSceneZip) *outSceneZip = sceneZip;     // expose so the caller can splice extra (spoofed) APKs without re-cooking

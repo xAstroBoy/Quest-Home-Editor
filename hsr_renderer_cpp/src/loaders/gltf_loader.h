@@ -229,10 +229,12 @@ public:
         out[2]=m.m[2]*x+m.m[6]*y+m.m[10]*z+m.m[14];
     }
 
-    // JPEG -> RGBA via stb_image (skybox panoramas, e.g. hogwarts pano.jpg). A 20 MB equirect
-    // panorama can decode to a very large image; cap the longest side at 4096 (box-downsample) so
-    // the GPU upload stays sane while the sky still looks crisp on a sphere.
-    static bool decodeJPEG(const std::vector<u8>& jpg, std::vector<u8>& rgba, u32& outW, u32& outH) {
+    // Any stb_image-supported format -> RGBA: JPEG (skybox panoramas, e.g. hogwarts pano.jpg) AND the
+    // PNG variants our minimal decodePNG rejects — sub-8-bit palette (riftdark/riftlight 1-bit 1024²
+    // grid_plane_007.png shipped an UNTEXTURED floor), 16-bit, interlaced. A 20 MB equirect panorama
+    // can decode to a very large image; cap the longest side at 4096 (box-downsample) so the GPU
+    // upload stays sane while the sky still looks crisp on a sphere.
+    static bool decodeSTB(const std::vector<u8>& jpg, std::vector<u8>& rgba, u32& outW, u32& outH) {
         int w=0,h=0,comp=0;
         stbi_uc* px = stbi_load_from_memory(jpg.data(), (int)jpg.size(), &w, &h, &comp, 4);
         if (!px || w<=0 || h<=0) { if (px) stbi_image_free(px); return false; }
@@ -312,11 +314,12 @@ public:
                     if (!kd.empty()) {
                         // JPEG (skybox panoramas, e.g. hogwarts pano.jpg) via stb_image; PNG (Luigi's
                         // etc.) custom decoder; else KTX/ASTC. Try the likely one first, then fall back.
-                        if (isJpg) ok = decodeJPEG(kd, im.rgba, im.w, im.h);
+                        if (isJpg) ok = decodeSTB(kd, im.rgba, im.w, im.h);
                         if (!ok) {
-                            if (isPng) ok = decodePNG(kd, im.rgba, im.w, im.h) || decodeKtxBaseMip(kd, im.rgba, im.w, im.h);
+                            if (isPng) ok = decodePNG(kd, im.rgba, im.w, im.h) || decodeKtxBaseMip(kd, im.rgba, im.w, im.h)
+                                              || decodeSTB(kd, im.rgba, im.w, im.h);   // stb catches PNGs decodePNG can't (1-bit palette etc.)
                             else       ok = decodeKtxBaseMip(kd, im.rgba, im.w, im.h) || decodePNG(kd, im.rgba, im.w, im.h)
-                                              || decodeJPEG(kd, im.rgba, im.w, im.h);
+                                              || decodeSTB(kd, im.rgba, im.w, im.h);
                         }
                     }
                     im.ok=ok;

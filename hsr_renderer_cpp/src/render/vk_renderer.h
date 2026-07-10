@@ -1504,9 +1504,13 @@ public:
             for (size_t v2=0; v2+2 < md.positions.size(); v2+=3) for (int a2=0;a2<3;a2++){ float p=md.positions[v2+a2]; if(p<pmn[a2])pmn[a2]=p; if(p>pmx[a2])pmx[a2]=p; }
             float exX=pmx[0]-pmn[0], exY=pmx[1]-pmn[1], exZ=pmx[2]-pmn[2];
             flatHorizY = (exY < 0.20f*exX && exY < 0.20f*exZ); }
+          // AUTHORED MASK by NAME (mirrors the cook): a "...AlphaMask..." material is an authored alpha-mask that must
+          // OCCLUDE, even when soft (asgardswrath FoliageDistance_AlphaMask midF~0.20 misses the bimodal test) — depth-
+          // write it so the preview matches the device (fixes the foliage "depth issue"). Needs real opaque content.
+          bool namedMask = gm.name.find("AlphaMask")!=std::string::npos && taN>0 && (float)taOpq/(float)taN > 0.004f;
           if (!alphaTestFragSpirv.empty() && gm.progIdx < 0
               && gm.useBlend && !gm.alphaTest && !gm.additive && !gm.overlayKind && !computesAlpha && taN>0 && !flatHorizY
-              && (float)taMid/(float)taN < 0.05f && (float)taOpq/(float)taN > 0.004f) {   // BIMODAL (hard-edged) + has real opaque content
+              && ( ((float)taMid/(float)taN < 0.05f && (float)taOpq/(float)taN > 0.004f) || namedMask )) {   // BIMODAL (hard-edged) OR authored-named mask + has real opaque content
               gm.alphaTest = true; gm.useBlend = false;   // MAKEOPAQUE cutout: SOLID scenery depth-writes + discards its silhouette (OPA preview only)
           }
           log("  GPU mesh uploaded: [%zu] '%s' nVerts=%u nIdx=%u tex=%ux%u mdBlend=%d gmBlend=%d aTest=%d add=%d skinned=%d stride=%u uvOff=%u texA[%d/%.0f/%d] worldC=(%.2f,%.2f,%.2f)",

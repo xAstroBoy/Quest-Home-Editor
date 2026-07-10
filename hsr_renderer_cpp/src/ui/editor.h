@@ -3422,6 +3422,9 @@ struct Editor {
     bool installAfterCook = true;      // DEFAULT ON: cook -> sign -> install to the headset. The installer auto-detects
                                        // adb root: ROOT -> install the UNSPOOFED own-package APK (+ auto-select it);
                                        // NO root -> back up the real haven2025, then install the haven2025 SPOOF.
+    int shellRestart = 0;              // after-install vrshell restart (was FORCED, now an option): 0=Auto — restart only
+                                       // when UNROOTED (rooted headsets hot-swap via the environment_selected IPC, no kill
+                                       // needed); 1=Always; 2=Never. Cook-panel cycle button.
     std::string adbSerial, wifiIp;     // device serial ("" = default); wifiIp -> "adb connect" for wireless adb
     std::thread restoreThread; std::atomic<bool> restoring{false};   // "Restore original Haven 2025" button (runs off the UI thread)
     std::thread javaThread; std::atomic<int> javaState{0};           // proactive Java auto-install: 0=installing, 1=ready, 2=failed
@@ -5423,6 +5426,9 @@ struct Editor {
         // ── Install to headset (USB or Wi-Fi adb); the installer auto-detects root and picks spoofed vs unspoofed ──
         y0=y; cx.checkbox(ui::hashId("install"), x, y, "Install to headset after cook (auto)", installAfterCook);
         cx.tip(x,y0,w,th.rowH,"After cooking, install over adb. The installer detects root:\n  ROOT  -> install the UNSPOOFED APK + auto-select it.\n  NO root-> back up the real haven2025, install the SPOOF,\n           and relaunch the shell. The spoof REPLACES Haven 2025\n           in place (unrooted Quests can't switch envs).\nNeeds adb bundled beside the exe or on PATH."); y+=th.rowH+2*uiScale;
+        { y0=y; const char* srN[3] = { "Shell restart after install: AUTO (only if no root)", "Shell restart after install: ALWAYS", "Shell restart after install: NEVER" };
+          if (cx.button(ui::hashId("shellrestart"), x, y, w, th.rowH, srN[shellRestart%3])) shellRestart = (shellRestart+1)%3;
+          cx.tip(x,y0,w,th.rowH,"Whether to kill/relaunch vrshell after installing, so it picks up\nthe new env. ROOTED headsets hot-swap via the environment_selected\nIPC (no restart needed); UNROOTED ones need the restart (nothing\nelse reloads the replaced Haven 2025). Click to cycle."); y+=th.rowH+2*uiScale; }
         y0=y; cx.label(x,y,64*uiScale,th.rowH,"Wi-Fi IP",th.textDim);
         cx.textField(ui::hashId("wifiip"), x+66*uiScale, y, w-66*uiScale-70*uiScale, th.rowH, wifiIp);
         if (cx.button(ui::hashId("wificon"), x+w-68*uiScale, y, 66*uiScale, th.rowH, "Connect")) wifiConnect();
@@ -6234,13 +6240,13 @@ struct Editor {
             auto progress=[this](float f,const char* s){ setStage(f,s); };
             std::string msg="Install-only (scene unchanged — no re-cook): ";
             bool rooted=deviceIsRooted();
-            if (rooted && haveSys) { bool ok=installToDevice(sysApk, cookPkg, progress);
-                msg += ok? "installed "+sysApk+" ("+cookPkg+") + relaunched shell" : "install FAILED (adb/device?)"; }
+            if (rooted && haveSys) { bool ok=installToDevice(sysApk, cookPkg, progress, /*uninstallFirst=*/false, rooted);
+                msg += ok? "installed "+sysApk+" ("+cookPkg+") + selected (shell restart: "+shellRestartName()+")" : "install FAILED (adb/device?)"; }
             else if (haveSpoof) {
                 std::string bkp; HavenBkp hb=backupOriginalHaven(bkp);
                 if (hb==HB_FAILED) msg += "ABORTED: could NOT back up the original Haven 2025 (left untouched).";
-                else { bool ok=installToDevice(spoofApk, HAVEN_PKG(), progress, /*uninstallFirst=*/true);
-                    msg += ok? "installed the SPOOF ("+spoofApk+") + relaunched shell" : "spoof install FAILED (try the Rooted-System APK)."; }
+                else { bool ok=installToDevice(spoofApk, HAVEN_PKG(), progress, /*uninstallFirst=*/true, rooted);
+                    msg += ok? "installed the SPOOF ("+spoofApk+") (shell restart: "+std::string(shellRestartName())+")" : "spoof install FAILED (try the Rooted-System APK)."; }
             } else msg += rooted? "no Rooted-System APK found (cook with a rooted device, or use the spoof)." : "no spoof APK found (enable the spoof toggle + cook once).";
             setStatus(msg); setStage(1.f,"Done"); cooking.store(false);
         });
@@ -6327,8 +6333,8 @@ struct Editor {
             progress(0.9f, "detect root");
             bool rooted = deviceIsRooted();
             if (rooted && !finalSystem.empty()) {
-                bool inst = installToDevice(finalSystem, pkg, progress);
-                msg += inst ? "  || ROOT -> installed UNSPOOFED ("+pkg+") + auto-selected + relaunched shell" : "  || install FAILED (adb/device?)";
+                bool inst = installToDevice(finalSystem, pkg, progress, /*uninstallFirst=*/false, rooted);
+                msg += inst ? "  || ROOT -> installed UNSPOOFED ("+pkg+") + auto-selected (shell restart: "+std::string(shellRestartName())+")" : "  || install FAILED (adb/device?)";
             } else if (!finalSpoof.empty()) {
                 // SAFE ORDER: back up the ORIGINAL Haven 2025 first; THEN (cert mismatch) uninstall it; THEN install the
                 // spoof. Only uninstall if the backup succeeded (or there was nothing installed to back up).
@@ -6337,8 +6343,8 @@ struct Editor {
                     msg += "  || ABORTED: could NOT back up the original Haven 2025, so it was left UNTOUCHED (your original is safe). Check the device/storage and retry, or use the Rooted-System APK.";
                 } else {
                     setStatus("Replacing Haven 2025: it's signed with Meta's certificate (not ours), so the ORIGINAL is uninstalled first (backup kept in "+havenBackupDir()+"). Restore anytime: --restore-haven.");
-                    bool inst = installToDevice(finalSpoof, HAVEN_PKG(), progress, /*uninstallFirst=*/true);
-                    msg += inst ? ("  || no root -> "+std::string(hb==HB_OK?("backed up Haven 2025 ("+havenBackupDir()+"), "):"")+"uninstalled the original + installed the SPOOF + relaunched shell. It loads where Haven 2025 does (unrooted can't switch envs); set Haven 2025 as your home if it isn't already. Restore: --restore-haven.")
+                    bool inst = installToDevice(finalSpoof, HAVEN_PKG(), progress, /*uninstallFirst=*/true, rooted);
+                    msg += inst ? ("  || no root -> "+std::string(hb==HB_OK?("backed up Haven 2025 ("+havenBackupDir()+"), "):"")+"uninstalled the original + installed the SPOOF (shell restart: "+std::string(shellRestartName())+"). It loads where Haven 2025 does (unrooted can't switch envs); set Haven 2025 as your home if it isn't already. Restore: --restore-haven.")
                                 : "  || spoof install FAILED (adb/device? Haven 2025 may be a non-removable system app - try the Rooted-System APK). Restore the original with --restore-haven if needed.";
                 }
             } else {
@@ -6494,7 +6500,9 @@ struct Editor {
         std::vector<std::string> apks = havenBackupApks();
         if (apks.empty()) { setStatus("No Haven 2025 backup found in "+havenBackupDir()+" - nothing to restore (a backup is made automatically the first time you install a spoof)."); return; }
         std::string log; bool ok = installHavenBackup(ADB, sel, apks, log);
-        if (ok) relaunchShell(ADB, sel);
+        // restore has NO environment_selected IPC to piggyback on — the restart IS how the restored
+        // original shows up — so honor only an explicit "Never" here.
+        if (ok && shellRestart != 2) relaunchShell(ADB, sel);
         std::string first = log.substr(0, log.find_first_of("\r\n"));
         setStatus(ok ? ("Restored the ORIGINAL Haven 2025 ("+std::to_string(apks.size())+" apk"+std::string(apks.size()>1?"s":"")+") + relaunched shell.")
                      : ("Restore FAILED: "+(first.empty()?std::string("is the headset connected? (adb devices)"):first)+"  Backup kept in "+havenBackupDir()+"."));
@@ -6527,7 +6535,7 @@ struct Editor {
     // Install an APK. uninstallFirst = overlay/spoof case: the existing package (Meta's Haven 2025) is signed with a
     // DIFFERENT certificate than our debug-signed spoof, so Android refuses an in-place update — it MUST be uninstalled
     // first. (The caller backs it up before allowing this.) Then best-effort select + relaunch.
-    bool installToDevice(const std::string& apkPath, const std::string& pkg, const std::function<void(float,const char*)>& progress, bool uninstallFirst=false) {
+    bool installToDevice(const std::string& apkPath, const std::string& pkg, const std::function<void(float,const char*)>& progress, bool uninstallFirst=false, bool rooted=false) {
         auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
         std::string ADB=bs(adbPath()), AP=bs(apkPath), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         if (progress) progress(0.95f, "adb install");
@@ -6538,10 +6546,16 @@ struct Editor {
         if (progress) progress(0.98f, "select env");
         // environment_selected = apk://pkg/assets/scene.zip (needs root/su; best-effort — else pick it in the headset).
         runAdb(ADB, sel, "shell su -c \"oculuspreferences --setc environment_selected apk://"+pkg+"/assets/scene.zip\"");
-        if (progress) progress(0.99f, "relaunch shell");
-        relaunchShell(ADB, sel);
+        // Shell restart is an OPTION now (was forced): ROOTED headsets hot-swap the env via the
+        // environment_selected IPC above, so killing vrshell there is redundant; UNROOTED headsets still
+        // need the restart (nothing else makes the shell reload the replaced haven2025).
+        if (shellRestart==1 || (shellRestart==0 && !rooted)) {
+            if (progress) progress(0.99f, "relaunch shell");
+            relaunchShell(ADB, sel);
+        }
         return true;
     }
+    const char* shellRestartName() const { return shellRestart==1 ? "Always" : shellRestart==2 ? "Never" : "Auto"; }
     // Make the running shell pick up the freshly-installed env: kill its EXACT pid so it relaunches.
     // ⚠ `am force-stop` does NOT reload the home, and a broad `pkill vrshell` reboots the headset — so target the
     // exact com.oculus.vrshell pid only. Best-effort: su first (rooted), then a plain kill (works if adb shell has it).
