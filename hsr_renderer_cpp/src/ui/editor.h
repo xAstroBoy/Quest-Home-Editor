@@ -6596,33 +6596,31 @@ struct Editor {
         std::string ADB=bs(adbPath()), AP=bs(apkPath), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         if (progress) progress(0.95f, "adb install");
         if (uninstallFirst) {
-            // Remove the differently-signed original UP FRONT (cert mismatch -> in-place update impossible). On SOME
-            // units haven2025 is a NON-removable SYSTEM app (firmware/region variance = "same model, some reject"):
-            // plain `uninstall` no-ops there, so ALSO do `pm uninstall -k --user 0` which disables/removes the update
-            // for user 0 WITHOUT root and lets our same-named APK install to /data, shadowing the system copy.
+            // haven2025 is a store app on every Quest -> always uninstallable. Remove the differently-signed original
+            // UP FRONT (cert mismatch -> in-place update impossible). --user 0 as a belt in case a plain uninstall
+            // leaves a per-user remnant.
             runAdb(ADB, sel, "uninstall "+pkg);
-            if (pkgInstalled(ADB, sel, pkg)) adbCapture(ADB, sel, "shell pm uninstall -k --user 0 "+pkg);   // system-app path (no root)
+            if (pkgInstalled(ADB, sel, pkg)) adbCapture(ADB, sel, "shell pm uninstall --user 0 "+pkg);
         }
         std::string ilog = adbCapture(ADB, sel, "install -r -d -g \""+AP+"\"");   // -d downgrade, -g grant perms
         bool ok = ilog.find("Success") != std::string::npos;
-        if (!ok && uninstallFirst) {   // system-app couldn't be shadowed -> report the ACTUAL reason so the user knows why THIS unit failed
+        if (!ok && uninstallFirst) {   // report the ACTUAL adb reason so the user knows why THIS unit failed
             std::string first = ilog.substr(0, ilog.find_first_of("\r\n"));
-            setStatus("Install FAILED on this unit: "+ (first.empty()?std::string("(no adb output)"):first) +
-                      "  — Haven 2025 is likely a NON-removable SYSTEM app on this headset (varies by firmware/region). "
-                      "A rooted install (Rooted-System APK) or `pm uninstall --user 0` with a PC can clear it.");
+            setStatus("Install FAILED on this unit: " + (first.empty()?std::string("(no adb output — device/storage?)"):first));
             return false;
         }
         if (!ok && !uninstallFirst){ runAdb(ADB, sel, "uninstall "+pkg); ok = adbCapture(ADB, sel, "install -g \""+AP+"\"").find("Success")!=std::string::npos; }   // own-package sig/version clash fallback
         if (!ok) return false;
         if (progress) progress(0.98f, "select env");
-        // environment_selected = apk://pkg/assets/scene.zip. `su` only works rooted; UNROOTED devices ALSO get a plain
-        // (non-su) attempt — `oculuspreferences --setc` is allowed for the shell user on many builds, and where it
-        // isn't the shell keeps loading the SAME package we just replaced, so the port still shows in place.
-        runAdb(ADB, sel, "shell su -c \"oculuspreferences --setc environment_selected apk://"+pkg+"/assets/scene.zip\"");
-        runAdb(ADB, sel, "shell oculuspreferences --setc environment_selected apk://"+pkg+"/assets/scene.zip");
-        // Shell restart is an OPTION now (was forced): ROOTED headsets hot-swap the env via the
-        // environment_selected IPC above, so killing vrshell there is redundant; UNROOTED headsets still
-        // need the restart (nothing else makes the shell reload the replaced haven2025).
+        // Set the home to this package. DEVICE-PROVEN reality: the shell reads environment_selected from the ROOT-ONLY
+        // oculuspreferences prefs DB — `settings put secure environment_selected` writes a SEPARATE copy the shell
+        // IGNORES (verified: secure=X, DB=Y -> shell loads Y), and the PreferencesService binder no-ops for shell.
+        // So a real env-SELECT needs root. UNROOTED users don't select here at all: the SPOOF replaces the content of
+        // the already-selected haven2025 (the shell loads that package = our content), so no pref write is needed —
+        // the port shows wherever Haven 2025 does. (Rooted own-package installs DO select via su below.)
+        runAdb(ADB, sel, "shell su -c \"oculuspreferences --setc environment_selected apk://"+pkg+"/assets/scene.zip\"");   // rooted only
+        // Shell restart is an OPTION (Auto=only unrooted / Always / Never). UNROOTED needs it (nothing else reloads the
+        // replaced haven2025); the reload is `am force-stop` (kill is denied to uid 2000) — see relaunchShell.
         if (shellRestart==1 || (shellRestart==0 && !rooted)) {
             if (progress) progress(0.99f, "relaunch shell");
             relaunchShell(ADB, sel);
@@ -6640,10 +6638,13 @@ struct Editor {
         std::string pids = adbCapture(ADB, sel, "shell pidof com.oculus.vrshell");
         std::string pid; for (char c : pids) { if (c=='\r'||c=='\n') break; pid.push_back(c); }   // 1st line = space-sep pids of the exact pkg
         while (!pid.empty() && (pid.back()==' '||pid.back()=='\t')) pid.pop_back();
-        // Plain `kill` — NO su needed; adb shell can kill the vrshell pid on the Quest. (Was gated behind su +
-        // skipped on rooted "Auto", so it silently did nothing = "the restarter doesn't work".)
-        if (!pid.empty()) runAdb(ADB, sel, "shell kill "+pid);
-        else runAdb(ADB, sel, "shell am force-stop com.oculus.vrshell");   // pid lookup failed -> AM restart (also no-root)
+        // DEVICE-PROVEN (uid 2000 shell): `adb shell kill <vrshell pid>` FAILS with "Operation not permitted"
+        // (vrshell runs as a different uid), so a plain kill silently does nothing on a retail/unrooted Quest.
+        // `am force-stop com.oculus.vrshell` is the reliable NO-ROOT reload — the ActivityManager allows the shell
+        // user to force-stop, and Android relaunches the home, which re-reads environment_selected. Use it always;
+        // a rooted su-kill of the exact pid is a cleaner bonus when available.
+        if (!pid.empty()) runAdb(ADB, sel, "shell su -c \"kill "+pid+"\"");   // rooted (best-effort, cleaner)
+        runAdb(ADB, sel, "shell am force-stop com.oculus.vrshell");           // universal no-root reload
     }
     // ── Blender round-trip ──────────────────────────────────────────────────────────────────────────────────────
     // Modern full-Explorer FOLDER picker (IFileOpenDialog + FOS_PICKFOLDERS). Returns "" on cancel / non-Windows.
