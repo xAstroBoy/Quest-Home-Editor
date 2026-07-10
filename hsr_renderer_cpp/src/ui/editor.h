@@ -2971,6 +2971,7 @@ struct Editor {
         } return ui::rgba(220,220,220);
     }
     bool addMenuOpen = false; float addMenuX = 0, addMenuY = 0;
+    bool langMenuOpen = false; float langBtnX=0, langBtnY=0, langBtnW=0, langBtnH=0, langMenuW=0, langMenuH=0;   // language dropdown (GitHub #10)
     // Raycast straight DOWN through the scene and snap pos.y onto the floor beneath it, so a freshly-added ground
     // item (spawn/chair/box) lands ON the floor — not floating at the height an overview camera happened to be.
     void dropToFloor(float pos[3]){
@@ -3462,9 +3463,30 @@ struct Editor {
         if (l<0 || l>=i18n::LANG_COUNT || l==i18n::g_lang) return;
         i18n::g_lang = l; saveLangPref();
         reloadUIFont(baseFontPx * uiScale); uiDraw.reloadFont();   // re-bake with/without the CJK glyph set, re-upload the atlas
-        setStatus(std::string("UI language: ") + i18n::langMenuName(l));
+        setStatus(std::string("UI language: ") + i18n::langName(l));
     }
     void cycleLanguage() { setLanguage((i18n::g_lang + 1) % i18n::LANG_COUNT); }
+    bool insideLangMenu(float mx, float my) const {
+        if (!langMenuOpen) return false;
+        return mx >= langBtnX && my >= langBtnY && mx < langBtnX + langMenuW && my < langBtnY + langBtnH + langMenuH;
+    }
+    // Dropdown listing every language (native name), drawn on top at frame end. Click one to switch.
+    void drawLangMenu() {
+        if (!langMenuOpen) return;
+        auto& th = cx.th; size_t n; auto* L = i18n::langs(n);
+        float rh = th.rowH + 2*uiScale, pad = 4*uiScale;
+        float w = langBtnW; for (size_t i=0;i<n;i++){ float lw=dl.textW(L[i].name)+24*uiScale; if(lw>w)w=lw; }
+        langMenuW = w; langMenuH = n*rh + 2*pad;
+        float x = langBtnX, y = langBtnY + langBtnH;
+        dl.rect(x, y, w, langMenuH, th.panelBg); dl.border(x, y, w, langMenuH, th.accent);
+        for (size_t i=0;i<n;i++) {
+            float ry = y + pad + i*rh; bool cur = ((int)i==i18n::g_lang);
+            bool hv = cx.hover(x, ry, w, rh);
+            if (cur) dl.rect(x, ry, w, rh, th.rowSel); else if (hv) dl.rect(x, ry, w, rh, th.rowHover);
+            cx.textAligned(x+10*uiScale, ry, w-14*uiScale, rh, L[i].name, cur?th.textSel:th.text, 0);
+            if (hv && cx.in.pressed[0]) { langMenuOpen=false; setLanguage((int)i); }
+        }
+    }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  INIT / SHUTDOWN
@@ -3526,10 +3548,10 @@ struct Editor {
         int b = button==GLFW_MOUSE_BUTTON_LEFT?0 : button==GLFW_MOUSE_BUTTON_RIGHT?1 : button==GLFW_MOUSE_BUTTON_MIDDLE?2 : -1;
         if (b < 0) return;
         cx.in.shift = (mods&GLFW_MOD_SHIFT)!=0; cx.in.ctrl=(mods&GLFW_MOD_CONTROL)!=0; cx.in.alt=(mods&GLFW_MOD_ALT)!=0;
-        if (b == 0 && (ctxOpen || addMenuOpen)) {               // an open popup owns the mouse
-            if (action == GLFW_PRESS) { cx.in.down[0]=true; cx.in.pressed[0]=true; cx.in.pressX[0]=cx.in.mx; cx.in.pressY[0]=cx.in.my; popupAtePress=true; if (!insideCtx(cx.in.mx,cx.in.my)) { ctxOpen=false; addMenuOpen=false; } }
+        if (b == 0 && (ctxOpen || addMenuOpen || langMenuOpen)) {   // an open popup owns the mouse
+            if (action == GLFW_PRESS) { cx.in.down[0]=true; cx.in.pressed[0]=true; cx.in.pressX[0]=cx.in.mx; cx.in.pressY[0]=cx.in.my; popupAtePress=true; if (!insideCtx(cx.in.mx,cx.in.my) && !insideLangMenu(cx.in.mx,cx.in.my)) { ctxOpen=false; addMenuOpen=false; langMenuOpen=false; } }
             else { cx.in.down[0]=false; cx.in.released[0]=true; }
-            return;                                             // (item action is performed in drawContextMenu / drawAddMenu)
+            return;                                             // (item action is performed in drawContextMenu / drawAddMenu / drawLangMenu)
         }
         if (knifeOn && b == 0 && action == GLFW_PRESS && inRect(rcViewport, cx.in.mx, cx.in.my)) {
             knifeA[0]=(float)cx.in.mx; knifeA[1]=(float)cx.in.my; knifeDrag=true;   // KNIFE stroke start
@@ -3824,6 +3846,7 @@ struct Editor {
         drawKnifeOverlay();                                     // knife: the 2D stroke line while dragging
         drawKeybindsPanel();                                    // F1 overlay: every shortcut in one place
         if (cookWarnOpen) { cx.in.mx=savedMx; cx.in.my=savedMy; drawCookWarn(); }   // restore mouse for the modal only
+        drawLangMenu();                                         // language dropdown (on top of the UI, under tooltips)
         cx.drawTooltip();                                       // deferred hover tooltips — drawn ABOVE everything
         cx.in.newFrame();                                       // consume per-frame input edges/deltas
     }
@@ -4188,11 +4211,11 @@ struct Editor {
         const char* menus[] = {"File","Edit","Object","View"};
         float mx = 220*uiScale;
         for (auto m : menus) { float w = dl.textW(i18n::tr(m))+18*uiScale; cx.button(ui::hashId(m), mx, 3*uiScale, w, h-6*uiScale, m); mx += w+2*uiScale; }
-        // language selector (GitHub #10): click to cycle English <-> 中文; persisted + re-bakes the CJK font atlas
-        { const char* ll = i18n::langLabel(i18n::g_lang); float w = dl.textW(ll)+22*uiScale; if (w < 46*uiScale) w = 46*uiScale;
-          float lx = mx + 10*uiScale;
-          if (cx.button(ui::hashId("hdrlang"), lx, 3*uiScale, w, h-6*uiScale, ll)) cycleLanguage();
-          cx.tip(lx, 3*uiScale, w, h-6*uiScale, "UI language"); }
+        // language selector (GitHub #10): click for a dropdown of all languages; persisted + re-bakes the atlas
+        { const char* ll = i18n::langName(i18n::g_lang); float w = dl.textW(ll)+26*uiScale; if (w < 64*uiScale) w = 64*uiScale;
+          float lx = mx + 10*uiScale; langBtnX=lx; langBtnY=3*uiScale; langBtnW=w; langBtnH=h-6*uiScale;
+          if (cx.button(ui::hashId("hdrlang"), lx, langBtnY, w, langBtnH, ll)) { langMenuOpen=!langMenuOpen; ctxOpen=false; addMenuOpen=false; }
+          cx.tip(lx, langBtnY, w, langBtnH, "UI language"); }
         // right side: Save / Load (persist the session) + Cook quick-button + progress
         float bw = 96*uiScale, bh = h-8*uiScale, bx = W - bw - pad;
         if (cooking) { cx.progressBar(bx-150*uiScale, 4*uiScale, 150*uiScale+bw, bh, cookProg.load(), stageStr().c_str()); }

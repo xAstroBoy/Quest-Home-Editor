@@ -23,14 +23,17 @@ struct Font {
     float ascent = 0.f, descent = 0.f, lineGap = 0.f, lineHeight = 0.f;
     bool  ok = false;
 
-    // extraCps + cjkTtf = the exact non-ASCII codepoints the active language needs, baked from a CJK-capable font
-    // (Inter/Segoe have no CJK glyphs). Empty -> ASCII-only (English), the original 1024² atlas.
+    // extraCps = the exact non-ASCII codepoints the active languages need. Each is baked from the FIRST font in
+    // [main, fallbacks...] that actually has a glyph for it — so Latin-Extended accents / Cyrillic come from the
+    // main font, CJK Han from YaHei, Kana from a JP font, Hangul from Malgun, Arabic from Segoe/Arial, etc.
+    // Empty -> ASCII-only (English), the original 1024² atlas.
     bool loadBytes(const std::vector<uint8_t>& ttf, float px, int aw = 1024, int ah = 1024,
-                   const std::vector<unsigned>* extraCps = nullptr, const std::vector<uint8_t>* cjkTtf = nullptr) {
+                   const std::vector<unsigned>* extraCps = nullptr,
+                   const std::vector<std::vector<uint8_t>>* fallbacks = nullptr) {
         if (ttf.size() < 4) return false;
         ext.clear();
-        bool wantExt = extraCps && !extraCps->empty() && cjkTtf && cjkTtf->size() > 4;
-        if (wantExt) { aw = 2048; ah = 2048; }   // room for a few hundred CJK glyphs alongside ASCII
+        bool wantExt = extraCps && !extraCps->empty();
+        if (wantExt) { aw = 2048; ah = 2048; }   // room for all script glyphs alongside ASCII
         pixelHeight = px; atlasW = aw; atlasH = ah;
         pixels.assign((size_t)aw * ah, 0);
         stbtt_pack_context pc;
@@ -38,14 +41,27 @@ struct Font {
         stbtt_PackSetOversampling(&pc, 2, 2);   // crisp Latin at the base UI size
         int r = stbtt_PackFontRange(&pc, ttf.data(), 0, px, 32, 224, glyphs);
         if (wantExt) {
-            stbtt_PackSetOversampling(&pc, 1, 1);   // CJK is dense — 1x keeps the atlas small
-            std::vector<int> cps(extraCps->begin(), extraCps->end());
-            std::vector<stbtt_packedchar> pk(cps.size());
-            stbtt_pack_range rng{};
-            rng.font_size = px; rng.first_unicode_codepoint_in_range = 0;
-            rng.array_of_unicode_codepoints = cps.data(); rng.num_chars = (int)cps.size(); rng.chardata_for_range = pk.data();
-            if (stbtt_PackFontRanges(&pc, cjkTtf->data(), 0, &rng, 1))
-                for (size_t i = 0; i < cps.size(); ++i) ext[(unsigned)cps[i]] = pk[i];
+            // font list: main first, then each fallback. Init a fontinfo per font for glyph-coverage queries.
+            std::vector<const std::vector<uint8_t>*> fonts; fonts.push_back(&ttf);
+            if (fallbacks) for (auto& f : *fallbacks) if (f.size() > 4) fonts.push_back(&f);
+            std::vector<stbtt_fontinfo> fi(fonts.size()); std::vector<char> fiok(fonts.size(), 0);
+            for (size_t i = 0; i < fonts.size(); ++i)
+                fiok[i] = stbtt_InitFont(&fi[i], fonts[i]->data(), stbtt_GetFontOffsetForIndex(fonts[i]->data(), 0)) ? 1 : 0;
+            // assign each codepoint to the first font that has a glyph for it
+            std::vector<std::vector<int>> groups(fonts.size());
+            for (unsigned cp : *extraCps)
+                for (size_t i = 0; i < fonts.size(); ++i)
+                    if (fiok[i] && stbtt_FindGlyphIndex(&fi[i], (int)cp)) { groups[i].push_back((int)cp); break; }
+            stbtt_PackSetOversampling(&pc, 1, 1);   // dense scripts — 1x keeps the atlas small
+            for (size_t i = 0; i < fonts.size(); ++i) {
+                if (groups[i].empty()) continue;
+                std::vector<stbtt_packedchar> pk(groups[i].size());
+                stbtt_pack_range rng{};
+                rng.font_size = px; rng.first_unicode_codepoint_in_range = 0;
+                rng.array_of_unicode_codepoints = groups[i].data(); rng.num_chars = (int)groups[i].size(); rng.chardata_for_range = pk.data();
+                if (stbtt_PackFontRanges(&pc, fonts[i]->data(), 0, &rng, 1))
+                    for (size_t k = 0; k < groups[i].size(); ++k) ext[(unsigned)groups[i][k]] = pk[k];
+            }
         }
         stbtt_PackEnd(&pc);
         if (!r) return false;
@@ -99,28 +115,33 @@ inline bool firstReadable(const char* const* list, int count, std::vector<uint8_
     for (int i = 0; i < count; ++i) if (readFile(list[i], out)) return true;
     return false;
 }
-// A CJK-capable system font (Inter/Segoe have no CJK glyphs), for baking the extra codepoints a non-EN UI needs.
-inline bool loadCJKFont(std::vector<uint8_t>& out) {
-    static const char* cjk[] = {
+// System fonts covering the non-Latin scripts the translations use (Inter/Segoe have Latin+Cyrillic but no CJK
+// / limited Arabic). Loaded as a fallback CHAIN; loadBytes picks per-codepoint the first font that has the glyph.
+// Order = broad coverage first (Segoe/Arial: Cyrillic/Greek/Arabic), then Korean, Japanese, Chinese.
+inline void loadFallbackFonts(std::vector<std::vector<uint8_t>>& out) {
+    static const char* fonts[] = {
 #ifdef _WIN32
-        "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyh.ttf", "C:/Windows/Fonts/simsun.ttc",
-        "C:/Windows/Fonts/simhei.ttf", "C:/Windows/Fonts/Deng.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",   // Latin-ext, Cyrillic, Greek, Arabic (broad)
+        "C:/Windows/Fonts/arial.ttf",     // Arabic + broad fallback
+        "C:/Windows/Fonts/malgun.ttf",    // Korean (Hangul)
+        "C:/Windows/Fonts/YuGothM.ttc", "C:/Windows/Fonts/meiryo.ttc", "C:/Windows/Fonts/msgothic.ttc",   // Japanese (Kana)
+        "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simsun.ttc",   // Chinese (Han)
 #elif defined(__APPLE__)
-        "/System/Library/Fonts/PingFang.ttc", "/System/Library/Fonts/STHeiti Light.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/SFArabic.ttf", "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",   // Korean
+        "/System/Library/Fonts/Hiragino Sans GB.ttc", "/System/Library/Fonts/PingFang.ttc",   // JP/CN
 #else
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",   // covers CN/JP/KR in one
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-        "/usr/share/fonts/truetype/arphic/uming.ttc",
 #endif
     };
-    // exe-relative bundled CJK font first (packaged builds may ship one)
+    // exe-relative bundled fallbacks first (packaged builds may ship a Noto)
     if (!AppConfig::s_exeDir.empty()) {
-        const char* rel[] = { "fonts/NotoSansCJK.ttc", "fonts/msyh.ttc", "third_party/fonts/NotoSansCJK.ttc" };
-        for (const char* r : rel) { std::string p = AppConfig::s_exeDir + "/" + r; if (readFile(p.c_str(), out)) return true; }
+        const char* rel[] = { "fonts/NotoSansCJK.ttc", "fonts/NotoSans.ttf", "third_party/fonts/NotoSansCJK.ttc" };
+        for (const char* r : rel) { std::vector<uint8_t> b; std::string p = AppConfig::s_exeDir + "/" + r; if (readFile(p.c_str(), b)) out.push_back(std::move(b)); }
     }
-    return firstReadable(cjk, (int)(sizeof(cjk)/sizeof(cjk[0])), out);
+    for (const char* p : fonts) { std::vector<uint8_t> b; if (readFile(p, b)) out.push_back(std::move(b)); }
 }
 
 inline bool loadUIFont(Font& f, float px, bool mono = false, const std::vector<unsigned>* extraCps = nullptr) {
@@ -170,11 +191,12 @@ inline bool loadUIFont(Font& f, float px, bool mono = false, const std::vector<u
         fprintf(stderr, "[UI] FATAL-ish: no UI font found (bundled fonts missing AND no system fallback) — the editor UI cannot draw text\n");
         return false;
     }
-    std::vector<uint8_t> cjk;
+    std::vector<std::vector<uint8_t>> fallbacks;
     if (extraCps && !extraCps->empty()) {
-        if (!loadCJKFont(cjk)) fprintf(stderr, "[UI] no CJK font found — non-Latin UI will show '?' for translated glyphs\n");
+        loadFallbackFonts(fallbacks);
+        if (fallbacks.empty()) fprintf(stderr, "[UI] no script-fallback fonts found — some non-Latin glyphs may show '?'\n");
     }
-    return f.loadBytes(ttf, px, 1024, 1024, extraCps, cjk.empty() ? nullptr : &cjk);
+    return f.loadBytes(ttf, px, 1024, 1024, extraCps, fallbacks.empty() ? nullptr : &fallbacks);
 }
 
 } // namespace ui
