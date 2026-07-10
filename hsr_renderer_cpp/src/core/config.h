@@ -117,8 +117,9 @@ struct AppConfig {
     void autoDetect() {
         if (buildTools.empty())   buildTools  = detectBuildTools();
         if (keystore.empty())     keystore    = firstExisting({ "cooker/debug.keystore", "debug.keystore" });
-        if (cookShellApk.empty()) cookShellApk = firstExisting({
-            "Envs To check/v203 Ufficial Envs/Nuxd.apk", "cooker/Nuxd.apk", "Nuxd.apk" });
+        // cookShellApk is legacy: the Nuxd donor + manifest are EMBEDDED in the binary now (the cook is standalone),
+        // so no Nuxd.apk needs to exist on disk. Left empty unless the user explicitly points at one (HSR_COOK_SHELL).
+        // (Previously this probed a repo-relative dev path "Envs To check/..." that doesn't exist for end users.)
         std::error_code ec; std::filesystem::create_directories(cookOutDir, ec);
     }
 

@@ -19,7 +19,7 @@ static std::vector<uint8_t> readFile(const char* p) {
 // forces the part splitter. Validated separately with the python decoders.
 static int exportTest(int argc, char** argv) {
     using namespace hslcook;
-    std::string nuxd  = argc > 2 ? argv[2] : "Envs To check/v203 Ufficial Envs/Nuxd.apk";
+    std::string nuxd  = argc > 2 ? argv[2] : "Nuxd.apk";
     std::string out   = argc > 3 ? argv[3] : "cooker/out/export_test_unsigned.apk";
     std::string shdir = argc > 4 ? argv[4] : "cooker/shaders";
     auto rd = [](const std::string& p){ std::vector<uint8_t> b; FILE* f=fopen(p.c_str(),"rb"); if(!f) return b;
@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
     using namespace hslcook;
     if (argc > 1 && std::string(argv[1]) == "--export-test") return exportTest(argc, argv);
     if (argc > 1 && std::string(argv[1]) == "--remanifest") return remanifest(argc, argv);
-    std::string nuxd  = argc > 1 ? argv[1] : "Envs To check/v203 Ufficial Envs/Nuxd.apk";
+    std::string nuxd  = argc > 1 ? argv[1] : "Nuxd.apk";
     std::string out   = argc > 2 ? argv[2] : "cooker/out/myhome_cpp_unsigned.apk";
     std::string shdir = argc > 3 ? argv[3] : "cooker/shaders";
 
