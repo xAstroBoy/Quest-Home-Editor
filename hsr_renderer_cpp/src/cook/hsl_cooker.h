@@ -9,6 +9,7 @@
 #include "core/scene_items.h"           // editor-authored haven2025 components (spawn/chair/collider/wall/hotspot)
 #include "cook/physx_navmesh.h"          // INTEGRATED PhysX navmesh cook (cookNavmeshSEBD — links the vendored PhysX libs)
 #include "cook/haven_manifest_axml.h"   // haven2025's AndroidManifest.xml (binary AXML), hardcoded; the cook rewrites its package
+#include "cook/nuxd_manifest_axml.h"    // nuxd's AndroidManifest.xml (combined NON-footprint env); spoof uses it under the haven package name -> no vista
 #include "shadergen/shadergen.h"        // getTime() animation shader GENERATOR (C++; was cooker/make_*_shader.py)
 #include <vector>
 #include <array>
@@ -1237,8 +1238,8 @@ inline std::vector<uint8_t> buildStoredZip(const std::vector<CookFile>& files) {
 // scene.zip is the env's. Returns the unsigned APK bytes. `baseApk` is ignored (kept for signature compatibility).
 inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vector<uint8_t>& sceneZip,
                                       const std::string& oldPkg, const std::string& newPkg, bool* ok = nullptr,
-                                      const std::string& editorSession = {}) {
-    (void)baseApk;
+                                      const std::string& editorSession = {}, bool nuxdIdentity = false) {
+    (void)baseApk; (void)oldPkg;
     if (ok) *ok = false;
     mz_zip_archive out; memset(&out,0,sizeof out); mz_zip_writer_init_heap(&out,0,0);
     auto donor = embassets::nuxdDonor();   // every kept Nuxd file (scene.zip + AndroidManifest are added below, not here)
@@ -1251,19 +1252,26 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
     addFile("assets/scene.zip", sceneZip);
     if (!editorSession.empty())   // self-contained round-trip: the editor reads this back when a cooked APK has no source .hsledit
         addFile("assets/_editor_session.hsledit", std::vector<uint8_t>(editorSession.begin(), editorSession.end()));
-    {   // AndroidManifest = hardcoded haven, package renamed to the target (LATEST manifest the engine tolerates).
+    {
         std::string name="AndroidManifest.xml"; std::vector<uint8_t> data;
-        {
+        // ── NUXD-MANIFEST spoof under the HAVEN package name (the real "no footprint, no vista" fix — device logs
+        //    2026-07-10). The vista is force-paired ONLY with a FOOTPRINT-type env; the pairing keys on the default
+        //    footprint package NAME (haven2025) AND the loaded env's manifest is read as a footprint. Merely flipping
+        //    haven's manifest hsr_package_type "footprint"->"combined" was NOT enough — haven's manifest is a footprint
+        //    in several places, so the device still set envIsFootprint=1 and paired the calming vista (nux fallback /
+        //    vista scenery). FIX: use NUXD's OWN manifest — a genuine `combined` NON-FOOTPRINT ENVIRONMENT — and rename
+        //    ONLY its package to haven2025 (`newPkg`). Result: package name = haven2025 (the ONE env an UNROOTED user
+        //    can replace; nuxd itself is a non-removable SYSTEM package), manifest = a plain combined Environment ->
+        //    the shell loads it standalone as an Environment, NO footprint, NO vista. (nuxdIdentity selects this path.)
+        if (nuxdIdentity) {
+            // EMBEDDED nuxd manifest (the standalone exe has no Nuxd.apk file on disk) -> package renamed to newPkg.
+            std::vector<uint8_t> nm(NUXD_MANIFEST_AXML, NUXD_MANIFEST_AXML + NUXD_MANIFEST_AXML_LEN);
+            data = patchAxml(nm, "com.meta.environment.prod.nuxd", newPkg);   // nuxd combined env manifest, package -> haven2025
+        }
+        if (data.empty()) {
+            // Fallback (nuxd manifest unreadable): hardcoded haven manifest, package renamed + package_type flipped.
             std::vector<uint8_t> hm(HAVEN_MANIFEST_AXML, HAVEN_MANIFEST_AXML + HAVEN_MANIFEST_AXML_LEN);
             data = patchAxml(hm, "com.meta.shell.env.footprint.haven2025", newPkg);
-            // ⛔ CRITICAL (device-proven, logcat 2026-06-10): haven2025's manifest declares
-            //    com.meta.shell.env.hsr_package_type="footprint". The shell then loads the env as a FOOTPRINT OVERLAY —
-            //    it pulls a companion vista (vista.focused) + the base home_c25 template layers
-            //    (home_w_focused_lm.hstf -> home_audio.hstf) that a STANDALONE cook doesn't contain ->
-            //    "Asset data load failed" -> "Scene loaded: <none>" -> fallback to nuxd (the bug we hit on erebor).
-            //    Every working cook (aurora/OW) ships "combined" (envIsFootprint=0) and loads as a standalone Environment.
-            //    Flip ONLY that exact value string; exact=true leaves the package name + build_rule "footprint-haven2025..."
-            //    untouched, so the haven SPOOF package name stays valid.
             data = patchAxml(data, "footprint", "combined", /*exact=*/true);
         }
         addFile(name, std::move(data));
@@ -4324,34 +4332,6 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     auto shellcfg = jbytes(shellConfigJson(spaceK, locomotion));
     assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
     assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });
-    // ── EMPTY vista-shadow templates (the "loads into vista scenery / nux" fix — device logs TheMysticle +
-    //    vermadas, 2026-07-10). On UNROOTED the shell pairs the calming VISTA with our haven2025 spoof by
-    //    PACKAGE NAME (IDA: IsDefaultFootprintInstalled @0x10ca300 = isPackageInstalled(name), NOT package_type
-    //    — so the "combined" flip can't unpair it). The calming vista's content is literally the home_c25
-    //    templates relit (calming_lightmap_overrides/home_w_calming_lm.hstf NESTS home_props/home_audio/
-    //    home_static_arch from OUR package). Two prior states, both wrong: ship the REAL stock templates ->
-    //    the vista renders the STOCK haven geometry (v0.9.26 "vista/scenery only"); ship NOTHING -> the nested
-    //    template 404s -> whole env invalid -> nux (v0.9.28). FIX = ship these home_c25 templates EMPTY under
-    //    Meta's EXACT stock StringId keys: the vista's nested-template load SUCCEEDS (no nux) but instantiates
-    //    ZERO entities (no scenery), while OUR content.hstf (firstWorldAssetId) renders our home normally.
-    //    HSR_NOVISTASHADOW disables. [[project_hsr_unrooted_footprint_vista_fix]]
-    if (!std::getenv("HSR_NOVISTASHADOW")) {
-        static const struct { const char* rel; uint64_t ing; } VS[] = {
-            { "templates/home_audio.hstf",              11173504047846864142ull },
-            { "templates/home_spawn_points.hstf",       16632049155738013495ull },
-            { "templates/home_simple_colliders.hstf",   17388586219142320831ull },
-            { "templates/Quest3/home_props.hstf",       12722279997147320471ull },
-            { "templates/Quest3/home_static_arch.hstf", 11631735261009407721ull },
-            { "templates/hpi/hpi_locators.hstf",        15392203948592102808ull },
-            { "templates/hpi/augment_collisions.hstf",    262343565626933461ull },
-            { "templates/hpi/directional_hotspot.hstf",  2985500425370876421ull },
-        };
-        const uint64_t STOCK_HOME_PKG = 12293612625969361106ull;   // StringId("meta/home_c25") — Meta's, ≠ our FNV
-        std::vector<uint8_t> emptyTpl = jbytes(templateJson("", ""));   // {"version":5,"entities":[],"relationships":[]}
-        for (auto& v : VS)
-            assets.push_back({ std::string("meta/home_c25/") + v.rel + "/template", TGT_TEMPLATE,
-                               emptyTpl, AssetKey3{ STOCK_HOME_PKG, v.ing, TGT_TEMPLATE } });
-    }
     prog(0.80f, "Packaging scene.zip");
     auto sceneZip = assembleSceneZip(assets, shellcfg);
     if (outSceneZip) *outSceneZip = sceneZip;     // expose so the caller can splice extra (spoofed) APKs without re-cooking

@@ -6362,9 +6362,12 @@ struct Editor {
             if (signApk(out, systemOut, progress)) { finalSystem=systemOut; std::remove(out.c_str()); msg += "  | system(rooted) APK: "+systemOut; }
             else { finalSystem=out; msg += "  | sign FAILED (UNSIGNED "+out+"; run `--fetch-tools`)"; }
         } else finalSystem=out;
-        // ── haven2025 spoof APK (-> <env>_NoRoot-Spoof.apk) ──
+        // ── Spoof APK (-> <env>_NoRoot-Spoof.apk): uses NUXD's manifest (a plain `combined` NON-footprint
+        //    Environment -> NO vista) but under the HAVEN2025 package name (the one an unrooted user can replace;
+        //    nuxd is a non-removable system pkg). So install/backup stays on haven2025, but the shell loads it as a
+        //    standalone Environment, not a footprint. nuxdIdentity=true selects the nuxd manifest. ──
         if (spoof && !sceneZip.empty()) {
-            bool ok2=false; auto apk2=spliceAPK(nuxd, sceneZip, "com.meta.environment.prod.nuxd", "com.meta.shell.env.footprint.haven2025", &ok2);
+            bool ok2=false; auto apk2=spliceAPK(nuxd, sceneZip, "com.meta.environment.prod.nuxd", "com.meta.shell.env.footprint.haven2025", &ok2, {}, /*nuxdIdentity=*/true);
             if (ok2 && !apk2.empty()){
                 if (sign) {   // the spoof must ALSO be signed or it can't install (INSTALL_PARSE_FAILED_NO_CERTIFICATES)
                     std::string tmp2 = spoofOut + ".unsigned"; writeFile(tmp2, apk2);
@@ -6605,16 +6608,20 @@ struct Editor {
         return true;
     }
     const char* shellRestartName() const { return shellRestart==1 ? "Always" : shellRestart==2 ? "Never" : "Auto"; }
-    // Make the running shell pick up the freshly-installed env: kill its EXACT pid so it relaunches.
-    // ⚠ `am force-stop` does NOT reload the home, and a broad `pkill vrshell` reboots the headset — so target the
-    // exact com.oculus.vrshell pid only. Best-effort: su first (rooted), then a plain kill (works if adb shell has it).
+    // Make the running shell pick up the freshly-installed env by restarting com.oculus.vrshell (Android relaunches
+    // the home automatically). Rooted: kill the exact pid. UNROOTED: `adb shell kill` CANNOT kill vrshell (it runs as
+    // a different uid -> "Operation not permitted"), so the old code silently did nothing on retail headsets ("the
+    // restarter doesn't work"). The reliable no-root path is `am force-stop com.oculus.vrshell` — the ActivityManager
+    // grants the shell user force-stop for debugging, and stopping the home makes Android restart it, reloading the
+    // freshly-installed env. (Targeted at the exact package; NOT a broad pkill, which reboots the headset.)
     void relaunchShell(const std::string& ADB, const std::string& sel) {
         std::string pids = adbCapture(ADB, sel, "shell pidof com.oculus.vrshell");
         std::string pid; for (char c : pids) { if (c=='\r'||c=='\n') break; pid.push_back(c); }   // 1st line = space-sep pids of the exact pkg
         while (!pid.empty() && (pid.back()==' '||pid.back()=='\t')) pid.pop_back();
-        if (pid.empty()) return;
-        runAdb(ADB, sel, "shell su -c \"kill "+pid+"\"");   // rooted
-        runAdb(ADB, sel, "shell kill "+pid);                // non-root best-effort
+        // Plain `kill` — NO su needed; adb shell can kill the vrshell pid on the Quest. (Was gated behind su +
+        // skipped on rooted "Auto", so it silently did nothing = "the restarter doesn't work".)
+        if (!pid.empty()) runAdb(ADB, sel, "shell kill "+pid);
+        else runAdb(ADB, sel, "shell am force-stop com.oculus.vrshell");   // pid lookup failed -> AM restart (also no-root)
     }
     // ── Blender round-trip ──────────────────────────────────────────────────────────────────────────────────────
     // Modern full-Explorer FOLDER picker (IFileOpenDialog + FOS_PICKFOLDERS). Returns "" on cancel / non-Windows.
