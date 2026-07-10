@@ -4324,6 +4324,34 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     auto shellcfg = jbytes(shellConfigJson(spaceK, locomotion));
     assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
     assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });
+    // ── EMPTY vista-shadow templates (the "loads into vista scenery / nux" fix — device logs TheMysticle +
+    //    vermadas, 2026-07-10). On UNROOTED the shell pairs the calming VISTA with our haven2025 spoof by
+    //    PACKAGE NAME (IDA: IsDefaultFootprintInstalled @0x10ca300 = isPackageInstalled(name), NOT package_type
+    //    — so the "combined" flip can't unpair it). The calming vista's content is literally the home_c25
+    //    templates relit (calming_lightmap_overrides/home_w_calming_lm.hstf NESTS home_props/home_audio/
+    //    home_static_arch from OUR package). Two prior states, both wrong: ship the REAL stock templates ->
+    //    the vista renders the STOCK haven geometry (v0.9.26 "vista/scenery only"); ship NOTHING -> the nested
+    //    template 404s -> whole env invalid -> nux (v0.9.28). FIX = ship these home_c25 templates EMPTY under
+    //    Meta's EXACT stock StringId keys: the vista's nested-template load SUCCEEDS (no nux) but instantiates
+    //    ZERO entities (no scenery), while OUR content.hstf (firstWorldAssetId) renders our home normally.
+    //    HSR_NOVISTASHADOW disables. [[project_hsr_unrooted_footprint_vista_fix]]
+    if (!std::getenv("HSR_NOVISTASHADOW")) {
+        static const struct { const char* rel; uint64_t ing; } VS[] = {
+            { "templates/home_audio.hstf",              11173504047846864142ull },
+            { "templates/home_spawn_points.hstf",       16632049155738013495ull },
+            { "templates/home_simple_colliders.hstf",   17388586219142320831ull },
+            { "templates/Quest3/home_props.hstf",       12722279997147320471ull },
+            { "templates/Quest3/home_static_arch.hstf", 11631735261009407721ull },
+            { "templates/hpi/hpi_locators.hstf",        15392203948592102808ull },
+            { "templates/hpi/augment_collisions.hstf",    262343565626933461ull },
+            { "templates/hpi/directional_hotspot.hstf",  2985500425370876421ull },
+        };
+        const uint64_t STOCK_HOME_PKG = 12293612625969361106ull;   // StringId("meta/home_c25") — Meta's, ≠ our FNV
+        std::vector<uint8_t> emptyTpl = jbytes(templateJson("", ""));   // {"version":5,"entities":[],"relationships":[]}
+        for (auto& v : VS)
+            assets.push_back({ std::string("meta/home_c25/") + v.rel + "/template", TGT_TEMPLATE,
+                               emptyTpl, AssetKey3{ STOCK_HOME_PKG, v.ing, TGT_TEMPLATE } });
+    }
     prog(0.80f, "Packaging scene.zip");
     auto sceneZip = assembleSceneZip(assets, shellcfg);
     if (outSceneZip) *outSceneZip = sceneZip;     // expose so the caller can splice extra (spoofed) APKs without re-cooking
