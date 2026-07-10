@@ -40,6 +40,7 @@ struct AppConfig {
     // ── app ──
     float       uiScale  = 0.f;   // 0 = auto (monitor content scale)
     bool        audio    = true;
+    int         lang     = 0;     // UI language (i18n::Lang: 0=English, 1=Chinese) — GitHub #10
 
     // The directory the EXE lives in (set by the app at startup). The build-tools AND the auto-generated debug
     // keystore can live right next to the exe, so a machine with NO Android SDK installed just needs the signing
@@ -147,6 +148,7 @@ struct AppConfig {
         fprintf(f, "keyPass      = %s\n", keyPass.c_str());
         fprintf(f, "uiScale      = %g\n", uiScale);
         fprintf(f, "audio        = %d\n", audio ? 1 : 0);
+        fprintf(f, "lang         = %d\n", lang);
         fclose(f);
     }
 
@@ -167,5 +169,6 @@ private:
         else if (k == "keyPass")      keyPass = v;
         else if (k == "uiScale")      uiScale = (float)atof(v.c_str());
         else if (k == "audio")        audio = (v != "0");
+        else if (k == "lang")         lang = atoi(v.c_str());
     }
 };

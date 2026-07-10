@@ -67,6 +67,7 @@ struct Context {
     bool inClip(float x,float y) const { VkRect2D c=dl->cur(); return x>=c.offset.x&&y>=c.offset.y&&x<c.offset.x+(int)c.extent.width&&y<c.offset.y+(int)c.extent.height; }
     bool hover(float x,float y,float w,float h) const { return in.mx>=x&&in.my>=y&&in.mx<x+w&&in.my<y+h && inClip(in.mx,in.my); }
     void textAligned(float x,float y,float w,float h,const char* s,uint32_t col,int align=0,Font* f=nullptr){ // 0=L 1=C 2=R
+        s = i18n::tr(s);   // ── i18n funnel: every label/button/tab/etc. auto-translates by its English source (GitHub #10) ──
         Font* of=dl->font; if(f) dl->font=f;
         float tw=dl->textW(s); float tx = align==1 ? x+(w-tw)*0.5f : align==2 ? x+w-tw-4 : x+4;
         float ty = y+(h-(dl->font->ascent-dl->font->descent))*0.5f;
@@ -118,6 +119,7 @@ struct Context {
         return clicked;
     }
     bool checkbox(uint32_t id,float x,float y,const char* s,bool& v){
+        s = i18n::tr(s);   // translate before measuring so the hitbox/label width match (textAligned re-tr is idempotent)
         float b=14.f, h=th.rowH;
         Font* fnt=mono?mono:font; float lw=b+8+(fnt?fnt->textWidth(s,(int)strlen(s)):320.f);   // full box+label width
         bool hv=hover(x,y,lw,h);                                  // the WHOLE row toggles (not just the tiny box)
@@ -282,7 +284,7 @@ struct Context {
     // ── deferred tooltips ── call tip() right after a widget (same rect); call drawTooltip() ONCE at the very end
     // of the frame (after every panel/popup, with all clips popped) so the box renders on top and isn't clipped.
     std::string ttText; float ttX=0, ttY=0; bool ttShow=false;
-    void tip(float x,float y,float w,float h,const char* s){ if(s && *s && hover(x,y,w,h)){ ttText=s; ttX=in.mx; ttY=in.my; ttShow=true; } }
+    void tip(float x,float y,float w,float h,const char* s){ if(s && *s && hover(x,y,w,h)){ ttText=i18n::tr(s); ttX=in.mx; ttY=in.my; ttShow=true; } }
     void drawTooltip(){
         if(!ttShow){ return; }
         ttShow=false;                                   // consume; re-armed next frame while still hovering

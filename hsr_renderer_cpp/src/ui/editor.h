@@ -3446,6 +3446,26 @@ struct Editor {
     float cfgFogDensity = 0.015f;     // distance-fog density
     float cfgFar = 150000.f;          // ScenePlatformComponent farClippingPlane (device extends from its 5000m default)
 
+    // ── i18n (GitHub #10): UI language + CJK-aware font atlas ────────────────────────────────────────────────
+    std::vector<unsigned> langCps;   // non-ASCII codepoints the active language needs (empty for English)
+    // Bake the UI font at `px`, including exactly the CJK glyphs the active language uses (English = ASCII-only).
+    void reloadUIFont(float px) {
+        langCps.clear();
+        if (i18n::g_lang != i18n::EN) i18n::collectExtraCodepoints(langCps);
+        loadUIFont(font, px, false, langCps.empty() ? nullptr : &langCps);
+        mono = font;   // one shared atlas — a stale mono copy would index the re-baked atlas with old UVs
+    }
+    static std::string langCfgPath() { return AppConfig::exeRel("hsr_ui_lang.txt"); }
+    void loadLangPref() { FILE* f=fopen(langCfgPath().c_str(),"r"); if(!f) return; int l=0; if(fscanf(f,"%d",&l)==1 && l>=0 && l<i18n::LANG_COUNT) i18n::g_lang=l; fclose(f); }
+    void saveLangPref() { FILE* f=fopen(langCfgPath().c_str(),"w"); if(!f) return; fprintf(f,"%d\n", i18n::g_lang); fclose(f); }
+    void setLanguage(int l) {
+        if (l<0 || l>=i18n::LANG_COUNT || l==i18n::g_lang) return;
+        i18n::g_lang = l; saveLangPref();
+        reloadUIFont(baseFontPx * uiScale); uiDraw.reloadFont();   // re-bake with/without the CJK glyph set, re-upload the atlas
+        setStatus(std::string("UI language: ") + i18n::langMenuName(l));
+    }
+    void cycleLanguage() { setLanguage((i18n::g_lang + 1) % i18n::LANG_COUNT); }
+
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  INIT / SHUTDOWN
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -3454,7 +3474,8 @@ struct Editor {
         animOverride = animOver; animScrub = animSc; animDuration = animDur;
         float xs = 1.f, ys = 1.f; glfwGetWindowContentScale(window, &xs, &ys);
         dpiScale = (xs > 0.5f) ? xs : 1.f; uiScale = dpiScale;
-        loadUIFont(font, baseFontPx * uiScale, false);
+        loadLangPref();                                  // restore the saved UI language BEFORE the first font bake (CJK atlas)
+        reloadUIFont(baseFontPx * uiScale);
         mono = font;   // the UI pipeline binds ONE atlas (the main font); "mono" MUST share it or its glyph UVs index garbage
         uiDraw.init(r, &font);
         cx.font = &font; cx.mono = &font;
@@ -3718,7 +3739,7 @@ struct Editor {
         timelineH = baseTimelineH*uiScale;
         int px = (int)(baseFontPx*uiScale + 0.5f);
         if (px >= 8 && px != (int)(font.pixelHeight + 0.5f)) {
-            loadUIFont(font, (float)px, false); uiDraw.reloadFont();
+            reloadUIFont((float)px); uiDraw.reloadFont();
             mono = font;   // keep "mono" on the SAME re-baked atlas — a stale copy indexes the new atlas
                            // with the OLD glyph UVs = the garbled component-class rows in the Scene tab
         }
@@ -4166,7 +4187,12 @@ struct Editor {
         // menu strip (visual; functional menus land in cleanup phase)
         const char* menus[] = {"File","Edit","Object","View"};
         float mx = 220*uiScale;
-        for (auto m : menus) { float w = dl.textW(m)+18*uiScale; cx.button(ui::hashId(m), mx, 3*uiScale, w, h-6*uiScale, m); mx += w+2*uiScale; }
+        for (auto m : menus) { float w = dl.textW(i18n::tr(m))+18*uiScale; cx.button(ui::hashId(m), mx, 3*uiScale, w, h-6*uiScale, m); mx += w+2*uiScale; }
+        // language selector (GitHub #10): click to cycle English <-> 中文; persisted + re-bakes the CJK font atlas
+        { const char* ll = i18n::langLabel(i18n::g_lang); float w = dl.textW(ll)+22*uiScale; if (w < 46*uiScale) w = 46*uiScale;
+          float lx = mx + 10*uiScale;
+          if (cx.button(ui::hashId("hdrlang"), lx, 3*uiScale, w, h-6*uiScale, ll)) cycleLanguage();
+          cx.tip(lx, 3*uiScale, w, h-6*uiScale, "UI language"); }
         // right side: Save / Load (persist the session) + Cook quick-button + progress
         float bw = 96*uiScale, bh = h-8*uiScale, bx = W - bw - pad;
         if (cooking) { cx.progressBar(bx-150*uiScale, 4*uiScale, 150*uiScale+bw, bh, cookProg.load(), stageStr().c_str()); }

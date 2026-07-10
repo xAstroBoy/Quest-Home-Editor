@@ -92,9 +92,10 @@ struct DrawList {
     float text(float x, float y, const char* s, uint32_t col) {
         if (!font || !s) return x;
         float px = x, py = y + font->ascent;
-        for (; *s; ++s) {
-            unsigned c=(unsigned char)*s; if (c<32) { if(c=='\t'){px+=font->advance(' ')*4;} continue; }
-            if (c>=127) c='?';                              // map non-ASCII (UTF-8 multi-byte) to '?' — atlas is ASCII, avoids garbage
+        const char* p = s;
+        while (*p) {
+            unsigned c = i18n::utf8Next(p);                 // UTF-8 decode (CJK translations) — atlas has ASCII + baked CJK glyphs
+            if (c < 32) { if (c=='\t') px += font->advance(' ')*4; continue; }
             stbtt_aligned_quad q; font->quad(c, &px, &py, &q);
             Vtx v[4]={{q.x0,q.y0,q.s0,q.t0,col},{q.x1,q.y0,q.s1,q.t0,col},{q.x1,q.y1,q.s1,q.t1,col},{q.x0,q.y1,q.s0,q.t1,col}};
             static const uint16_t id[6]={0,1,2,0,2,3}; prim(v,4,id,6);
