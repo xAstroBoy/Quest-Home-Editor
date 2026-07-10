@@ -28,7 +28,6 @@
 #include "astcenc.h"   // ASTC ENCODE (full astcenc build) — RGBA8 -> ASTC blocks for RENDTXTR
 #include "miniz.h"     // ZIP read/write — scene.zip assembly + APK splice (already linked by the project)
 #include "cook/embedded_assets.h"   // STANDALONE: cooker templates + Nuxd donor files baked into the binary
-#include "cook/haven_stock_templates.h"  // stock haven2025 template closure (vista-compat for the unrooted footprint path)
 #include "cook/hzanim_acl.h"  // hzAclEncode (HZANIM ACL clip) — only the declaration; ACL lives in hzanim_acl.cpp
 #include "cook/cook_verify.h"  // cook-time FlatBuffer verifier (device's stock-flatbuffers structural check, schema from Meta assets)
 
@@ -217,9 +216,7 @@ inline std::vector<uint8_t> buildAsmh(const std::vector<AsmhEntry>& E) {
     //    the entry's pkg/ing/tgt; assets sharing a string MUST share the hash (keyForPath guarantees this). ──
     struct ME { uint64_t h; std::string s; };
     std::vector<ME> dirs, rels, subs;
-    // dedup by (hash,string) PAIR — the maps are hash->string, and "meta/home_c25" legitimately appears under
-    // TWO hashes (our FNV pkg for cooked assets + Meta's stock StringId on the vista-compat template entries).
-    auto addU = [](std::vector<ME>& v, uint64_t h, const std::string& s) { for (auto& m : v) if (m.h == h && m.s == s) return; v.push_back({ h, s }); };
+    auto addU = [](std::vector<ME>& v, uint64_t h, const std::string& s) { for (auto& m : v) if (m.s == s) return; v.push_back({ h, s }); };
     for (auto& e : E) { std::string bd, rp, sn; decomposePath(e.path, bd, rp, sn);
         addU(dirs, e.pkg, bd); addU(rels, e.ing, rp); addU(subs, (uint64_t)e.tgt, sn); }   // sub hash is u32
     int N = (int)E.size();
@@ -1150,26 +1147,6 @@ inline std::vector<uint8_t> patchAxml(const std::vector<uint8_t>& axml, const st
     return out;
 }
 
-// True if the AXML string pool contains `want` as a WHOLE pooled string (used to verify the
-// hsr_package_type VALUE flip footprint->combined actually took — a stray "footprint" pool entry
-// would make libshell's resolver set envIsFootprint=1 and re-pair a vista). IDA-proven gate:
-// EnvironmentManager resolver (libshell 0x10cb730) sets envIsFootprint = (hsr_package_type=="footprint")
-// EXACTLY, then `cbz w23` skips ALL vista assembly when it's 0 -> a "combined" env never renders a vista.
-inline bool axmlHasPooledString(const std::vector<uint8_t>& axml, const std::string& want) {
-    auto u16=[&](size_t o){ uint16_t v; memcpy(&v,&axml[o],2); return v; };
-    auto u32=[&](size_t o){ uint32_t v; memcpy(&v,&axml[o],4); return v; };
-    if (axml.size()<8 || u16(0)!=0x0003) return false;
-    size_t sp=8; if (u16(sp)!=0x0001) return false;
-    uint16_t sp_hdr=u16(sp+2); uint32_t strCount=u32(sp+8), flags=u32(sp+16), stringsStart=u32(sp+20);
-    bool utf8=(flags&0x100)!=0; size_t off0=sp+sp_hdr, sbase=sp+stringsStart;
-    for (uint32_t i=0;i<strCount;i++){ size_t p=sbase+u32(off0+i*4); std::string s;
-        if (utf8){ auto dl=[&](size_t q,size_t&nq){ uint32_t n=axml[q]; if(n&0x80){ n=((n&0x7f)<<8)|axml[q+1]; nq=q+2;} else nq=q+1; return n; };
-            size_t q; dl(p,q); uint32_t bl=dl(q,q); s.assign((const char*)&axml[q],bl); }
-        else { uint32_t l=u16(p); size_t q=p+2; if(l&0x8000){ l=((l&0x7fff)<<16)|u16(q); q+=2; } for(uint32_t c=0;c<l;c++) s+=(char)(u16(q+c*2)&0xff); }
-        if (s==want) return true; }
-    return false;
-}
-
 // Read the <manifest package="..."> attribute out of a binary AndroidManifest (AXML) — so the cook can use the
 // LOADED env's OWN package instead of a hardcoded one. Returns "" if not found.
 inline std::string readAxmlPackage(const std::vector<uint8_t>& axml) {
@@ -1288,17 +1265,6 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
             //    Flip ONLY that exact value string; exact=true leaves the package name + build_rule "footprint-haven2025..."
             //    untouched, so the haven SPOOF package name stays valid.
             data = patchAxml(data, "footprint", "combined", /*exact=*/true);
-            // HARD GUARD (make it IMPOSSIBLE for a cooked home to render a vista): the vista pairing is gated
-            // PURELY on hsr_package_type=="footprint" (IDA-proven, libshell EnvironmentManager resolver 0x10cb730:
-            // envIsFootprint = exact-compare vs "footprint"; then `cbz` skips ALL vista assembly when 0). If the
-            // flip somehow didn't take (future manifest change, a second "footprint" pool entry), a stray token
-            // would re-enable the vista. Assert it's gone; if not, hammer any residual whole-string "footprint".
-            if (axmlHasPooledString(data, "footprint")) {
-                fprintf(stderr, "[COOK] WARNING: hsr_package_type flip left a 'footprint' token -> forcing 'combined' (vista would else re-pair)\n");
-                data = patchAxml(data, "footprint", "combined", /*exact=*/true);
-            }
-            if (axmlHasPooledString(data, "footprint"))
-                fprintf(stderr, "[COOK] ERROR: manifest STILL has a standalone 'footprint' string -> device may pair a vista behind this home\n");
         }
         addFile(name, std::move(data));
     }
@@ -4358,20 +4324,6 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     auto shellcfg = jbytes(shellConfigJson(spaceK, locomotion));
     assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
     assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });
-    // ── VISTA-COMPAT stock templates (the "home gets rejected" fix — TheMysticle logcat 2026-07-10): on
-    //    UNROOTED devices the shell loads the haven2025 spoof as a FOOTPRINT and force-pairs a companion
-    //    VISTA (calming/focused — ITS config decides; the manifest "combined" flip only helps the rooted
-    //    env-select path). The vista's own templates (home_w_calming_lm.hstf etc.) nest stock home_c25
-    //    templates by Meta's STOCK StringId keys; the cook had replaced them all -> ErrorFileNotFound ->
-    //    "Load of asset package ended invalid" -> the shell rejected the WHOLE footprint+vista pair and
-    //    fell back to nuxd. Ship the stock TEMPLATE closure (27 JSON files, ~29KB compressed, NO stock
-    //    geometry: their mesh/texture refs stay absent = invisible + non-fatal, droid-proven) under the
-    //    ORIGINAL stock keys so ANY paired vista resolves. Bonus: stock spawn-point/locator templates are
-    //    real again, which the footprint path wants. HSR_NOVISTATPL disables for A/B.
-    if (!std::getenv("HSR_NOVISTATPL"))
-        for (auto& t : havenstock::templates())
-            assets.push_back({ std::string("meta/home_c25/") + t.first->relPath + "/template", TGT_TEMPLATE,
-                               t.second, AssetKey3{ havenstock::HOME_PKG, t.first->ing, TGT_TEMPLATE } });
     prog(0.80f, "Packaging scene.zip");
     auto sceneZip = assembleSceneZip(assets, shellcfg);
     if (outSceneZip) *outSceneZip = sceneZip;     // expose so the caller can splice extra (spoofed) APKs without re-cooking
