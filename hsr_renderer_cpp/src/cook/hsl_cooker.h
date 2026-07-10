@@ -1264,9 +1264,10 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
         //    can replace; nuxd itself is a non-removable SYSTEM package), manifest = a plain combined Environment ->
         //    the shell loads it standalone as an Environment, NO footprint, NO vista. (nuxdIdentity selects this path.)
         if (nuxdIdentity) {
-            // EMBEDDED nuxd manifest (the standalone exe has no Nuxd.apk file on disk) -> package renamed to newPkg.
-            std::vector<uint8_t> nm(NUXD_MANIFEST_AXML, NUXD_MANIFEST_AXML + NUXD_MANIFEST_AXML_LEN);
-            data = patchAxml(nm, "com.meta.environment.prod.nuxd", newPkg);   // nuxd combined env manifest, package -> haven2025
+            // HARDCODED nuxd combined-env manifest with the package name ALREADY rewritten to haven2025 offline
+            // (cooker/gen_haven_combined_manifest.py). Used verbatim — no runtime AXML surgery. newPkg is ignored.
+            (void)newPkg;
+            data.assign(NUXD_MANIFEST_AXML, NUXD_MANIFEST_AXML + NUXD_MANIFEST_AXML_LEN);
         }
         if (data.empty()) {
             // Fallback (nuxd manifest unreadable): hardcoded haven manifest, package renamed + package_type flipped.
