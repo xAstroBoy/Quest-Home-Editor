@@ -1,9 +1,13 @@
 name: release
 
-# NOTE: GitHub Actions is not enabled on this repository (it costs money on this account),
-# so this workflow is DORMANT — it won't run as-is. It's committed as a ready-to-go scaffold:
-# enable Actions (or fork the repo), then push a `v*` tag (or run it manually) to build the
-# renderer for Windows + Linux + macOS and attach the binaries to the matching GitHub release.
+# Builds the renderer/editor for Windows + Linux + macOS on every `v*` tag and ATTACHES the binaries
+# to the matching GitHub release (softprops/action-gh-release below).
+#
+# ⚠ Runs are currently blocked by an ACCOUNT-level billing lock ("your account is locked due to a
+# billing issue") — this affects Actions even on this PUBLIC repo. Once the GitHub billing is resolved,
+# re-run this workflow (or push a new `v*` tag) and the Linux + macOS + Windows binaries appear on the
+# release automatically. Until then, Linux/macOS users build from source: hsr_renderer_cpp/build_linux.sh
+# (or see README "Building from source").
 #
 # PhysX is OFF in CI (it's a vendored Windows-only .lib); the cooker uses the device-compatible
 # ColliderBox grid, so a PhysX-free build is fully functional.
