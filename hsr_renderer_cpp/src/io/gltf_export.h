@@ -47,6 +47,14 @@ inline bool writePng(const std::string& path, const uint8_t* rgba, int w, int h)
 
 // JSON string escaper (mesh names can carry odd chars)
 inline std::string jesc(const std::string& s){ std::string o; for(char c:s){ if(c=='"'||c=='\\'){o.push_back('\\');o.push_back(c);} else if((unsigned char)c<0x20){char b[8];snprintf(b,sizeof b,"\\u%04x",c);o+=b;} else o.push_back(c);} return o; }
+// glTF resource URIs MUST be percent-encoded (RFC 3986): a raw space/‘#’/etc. makes a NON-conformant .gltf
+// that Blender & other importers reject and that breaks on round-trip. Encode everything except the RFC-3986
+// unreserved set + '/' (path separator). The file on disk keeps its raw name; the encoded URI decodes back to it.
+inline std::string urlEncode(const std::string& s){ std::string o; char b[4];
+    for(unsigned char c : s){
+        if((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='-'||c=='_'||c=='.'||c=='~'||c=='/') o.push_back((char)c);
+        else { snprintf(b,sizeof b,"%%%02X",c); o+=b; }
+    } return o; }
 
 // pad the binary blob to a 4-byte boundary (glTF accessors require alignment)
 inline void pad4(std::vector<uint8_t>& b){ while (b.size() & 3) b.push_back(0); }
@@ -74,7 +82,7 @@ inline bool exportEnv(const std::vector<MeshData>& meshes, const std::string& ou
     auto addImage = [&](const std::vector<uint8_t>& rgba, int w, int h, const std::string& fname)->int{
         if (rgba.size() < (size_t)w*h*4) return -1;
         if (!writePng((fs::path(outDir)/"textures"/fname).string(), rgba.data(), w, h)) return -1;
-        if (img) aImages += ","; aImages += "{\"uri\":\"textures/" + jesc(fname) + "\"}";
+        if (img) aImages += ","; aImages += "{\"uri\":\"textures/" + urlEncode(fname) + "\"}";
         int ii = img++;
         if (tex) aTextures += ","; aTextures += "{\"source\":" + std::to_string(ii) + "}";
         return tex++;   // return TEXTURE index
@@ -167,7 +175,7 @@ inline bool exportEnv(const std::vector<MeshData>& meshes, const std::string& ou
     if (tex) gltf += "\"textures\":["+aTextures+"],\"images\":["+aImages+"],";
     gltf += "\"accessors\":["+aAccessors+"],";
     gltf += "\"bufferViews\":["+aBufferViews+"],";
-    gltf += "\"buffers\":[{\"uri\":\""+jesc(envName)+".bin\",\"byteLength\":"+std::to_string(bin.size())+"}]}";
+    gltf += "\"buffers\":[{\"uri\":\""+urlEncode(envName)+".bin\",\"byteLength\":"+std::to_string(bin.size())+"}]}";
 
     { FILE* f=fopen((fs::path(outDir)/(envName+".bin")).string().c_str(),"wb"); if(!f)return false; if(!bin.empty())fwrite(bin.data(),1,bin.size(),f); fclose(f); }
     { FILE* f=fopen((fs::path(outDir)/(envName+".gltf")).string().c_str(),"wb"); if(!f)return false; fwrite(gltf.data(),1,gltf.size(),f); fclose(f); }
@@ -292,7 +300,7 @@ inline bool exportEnvFull(const std::vector<hslcook::ExportMesh>& meshes, const 
     auto addImage=[&](const std::vector<uint8_t>& rgba,uint32_t w,uint32_t h,const std::string& fn)->int{
         if(rgba.size()<(size_t)w*h*4||w==0||h==0) return -1;
         if(!writePng((fs::path(outDir)/"textures"/fn).string(),rgba.data(),(int)w,(int)h)) return -1;
-        Jimg.push_back("{\"uri\":\"textures/"+jesc(fn)+"\"}"); Jtex.push_back("{\"source\":"+std::to_string((int)Jimg.size()-1)+"}"); return (int)Jtex.size()-1; };
+        Jimg.push_back("{\"uri\":\"textures/"+urlEncode(fn)+"\"}"); Jtex.push_back("{\"source\":"+std::to_string((int)Jimg.size()-1)+"}"); return (int)Jtex.size()-1; };
 
     for (size_t mi=0; mi<meshes.size(); ++mi) {
         const hslcook::ExportMesh& m = meshes[mi];
@@ -482,7 +490,7 @@ inline bool exportEnvFull(const std::vector<hslcook::ExportMesh>& meshes, const 
     if(!Jtex.empty()) gltf+="\"textures\":["+join(Jtex)+"],\"images\":["+join(Jimg)+"],";
     gltf+="\"accessors\":["+join(Jacc)+"],";
     gltf+="\"bufferViews\":["+join(Jbv)+"],";
-    gltf+="\"buffers\":[{\"uri\":\""+jesc(envName)+".bin\",\"byteLength\":"+std::to_string(bin.size())+"}]}";
+    gltf+="\"buffers\":[{\"uri\":\""+urlEncode(envName)+".bin\",\"byteLength\":"+std::to_string(bin.size())+"}]}";
 
     { FILE* f=fopen((fs::path(outDir)/(envName+".bin")).string().c_str(),"wb"); if(!f)return false; if(!bin.empty())fwrite(bin.data(),1,bin.size(),f); fclose(f); }
     { FILE* f=fopen((fs::path(outDir)/(envName+".gltf")).string().c_str(),"wb"); if(!f)return false; fwrite(gltf.data(),1,gltf.size(),f); fclose(f); }

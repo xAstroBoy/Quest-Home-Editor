@@ -26,9 +26,37 @@ inline std::vector<uint8_t> readFile(const std::string& p){
 }
 inline int b64v(char c){ if(c>='A'&&c<='Z')return c-'A'; if(c>='a'&&c<='z')return c-'a'+26; if(c>='0'&&c<='9')return c-'0'+52; if(c=='+')return 62; if(c=='/')return 63; return -1; }
 inline std::vector<uint8_t> b64decode(const std::string& s){ std::vector<uint8_t> o; int val=0,bits=-8; for(char c:s){ if(c=='=')break; int d=b64v(c); if(d<0)continue; val=(val<<6)+d; bits+=6; if(bits>=0){ o.push_back((uint8_t)((val>>bits)&0xFF)); bits-=8; } } return o; }
+// glTF URIs are PERCENT-ENCODED per the spec (RFC 3986): a space is "%20", etc. Blender and every
+// conformant exporter encode them, so a model named "My Home" writes uri "My%20Home.bin". Decode before
+// hitting the filesystem (the old code fed "My%20Home.bin" straight to open() -> file-not-found -> the
+// whole .gltf "refused" to load). Also decode '+' as a literal '+' (glTF does NOT use form-encoding).
+inline std::string percentDecode(const std::string& s){
+    std::string o; o.reserve(s.size());
+    auto hex=[](char c)->int{ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return -1; };
+    for(size_t i=0;i<s.size();++i){
+        if(s[i]=='%' && i+2<s.size()){ int h=hex(s[i+1]),l=hex(s[i+2]); if(h>=0&&l>=0){ o.push_back((char)((h<<4)|l)); i+=2; continue; } }
+        o.push_back(s[i]);
+    }
+    return o;
+}
+// Resolve an external glTF resource robustly: try the percent-DECODED path, then the RAW uri (in case a
+// non-conformant exporter — like our own older export — wrote a literal space), then the decoded BASENAME
+// in `dir` (handles a .gltf moved without its subfolder layout). Empty only if none exist.
+inline std::vector<uint8_t> readExternal(const std::string& uri, const std::string& dir){
+    namespace fs=std::filesystem; std::error_code ec;
+    std::string dec=percentDecode(uri);
+    for(const std::string& cand : { dec, uri }){
+        auto p=(fs::path(dir)/cand);
+        if(fs::exists(p,ec)){ auto b=readFile(p.string()); if(!b.empty()) return b; }
+    }
+    // last resort: just the filename (decoded) directly under dir
+    std::string base=fs::path(dec).filename().string();
+    if(!base.empty()){ auto p=fs::path(dir)/base; if(fs::exists(p,ec)){ auto b=readFile(p.string()); if(!b.empty()) return b; } }
+    return {};
+}
 inline std::vector<uint8_t> loadBuffer(const std::string& uri, const std::string& dir){
     if (uri.rfind("data:",0)==0){ size_t c=uri.find("base64,"); return c!=std::string::npos ? b64decode(uri.substr(c+7)) : std::vector<uint8_t>(); }
-    return readFile((std::filesystem::path(dir)/uri).string());
+    return readExternal(uri, dir);
 }
 
 // Returns true if the file is a plain glTF 2.0 (NOT a V79 .gltf.ovrscene, which gltf_loader.h handles).
@@ -116,7 +144,7 @@ inline bool importEnv(const std::string& gltfPath, std::vector<MeshData>& out, s
         const auto& im=IM[imgIdx]; std::vector<uint8_t> bytes;
         if(im.has("uri")){ std::string uri=im["uri"].asString();
             if(uri.rfind("data:",0)==0){ size_t c=uri.find("base64,"); if(c!=std::string::npos)bytes=b64decode(uri.substr(c+7)); }
-            else bytes=readFile((fs::path(dir)/uri).string()); }
+            else bytes=readExternal(uri, dir); }   // percent-decode + fallbacks (see readExternal)
         else if(im.has("bufferView")){ const auto& bv=BV[(size_t)im["bufferView"].asInt()]; int buf=(int)bv["buffer"].asInt();
             size_t off=bv.has("byteOffset")?(size_t)bv["byteOffset"].asInt():0; size_t len=(size_t)bv["byteLength"].asInt();
             if(buf>=0&&buf<(int)buffers.size()&&off+len<=buffers[buf].size()) bytes.assign(buffers[buf].begin()+off, buffers[buf].begin()+off+len); }
@@ -188,11 +216,28 @@ inline bool importEnv(const std::string& gltfPath, std::vector<MeshData>& out, s
                       : (mesh.has("name")?mesh["name"].asString():("imported_"+std::to_string(mi)));
             size_t nv=pos.size()/3; md.positions.resize(nv*3);
             for(size_t v=0;v<nv;++v){ float x=pos[v*3],y=pos[v*3+1],z=pos[v*3+2]; applyX(X,x,y,z); md.positions[v*3]=x; md.positions[v*3+1]=y; md.positions[v*3+2]=z; }
-            if(at.has("TEXCOORD_0")){ int c=0; readF((int)at["TEXCOORD_0"].asInt(), md.uvs, c); }
+            // ATTRIBUTE-COUNT SAFETY: a primitive's TEXCOORD_0/COLOR_0 accessor can legally (or through a buggy
+            // exporter) have a DIFFERENT count than POSITION. The old code indexed these buffers by POSITION's
+            // vertex count nv -> out-of-bounds read = CRASH on re-import of some .gltf/.glb. Size every per-vertex
+            // array to EXACTLY nv, sourcing only in-range elements and padding the rest.
+            if(at.has("TEXCOORD_0")){ std::vector<float> uv; int c=0; if(readF((int)at["TEXCOORD_0"].asInt(), uv, c) && c>=2){
+                md.uvs.assign(nv*2, 0.f);
+                for(size_t v=0;v<nv;++v){ size_t s=(size_t)v*c; if(s+1<uv.size()){ md.uvs[v*2]=uv[s]; md.uvs[v*2+1]=uv[s+1]; } } } }
             if(at.has("COLOR_0")){ std::vector<float> col; int c=0; if(readF((int)at["COLOR_0"].asInt(), col, c) && c>0){
-                md.colors.resize(nv*4); for(size_t v=0;v<nv;++v) for(int k=0;k<4;k++){ float cv=(k<c)?col[v*c+k]:1.0f; md.colors[v*4+k]=(uint8_t)std::lround(std::fmin(1.f,std::fmax(0.f,cv))*255.f); } } }
+                md.colors.assign(nv*4, 255);
+                for(size_t v=0;v<nv;++v) for(int k=0;k<4;k++){ size_t idx=(size_t)v*c+(size_t)k;
+                    float cv=(k<c && idx<col.size())?col[idx]:(k<3?0.f:1.f); md.colors[v*4+k]=(uint8_t)std::lround(std::fmin(1.f,std::fmax(0.f,cv))*255.f); } } }
             if(pr.has("indices")){ readIdx((int)pr["indices"].asInt(), md.indices); }
             if(md.indices.empty()){ md.indices.resize(nv); for(size_t v=0;v<nv;++v)md.indices[v]=(uint32_t)v; }
+            else {
+                // DROP any triangle referencing an out-of-range vertex (indices >= vertexCount -> OOB vertex fetch
+                // downstream in the renderer/cook = crash/garbage). Keep only whole in-range triangles.
+                std::vector<uint32_t> good; good.reserve(md.indices.size());
+                for(size_t t=0;t+2<md.indices.size();t+=3){ uint32_t a=md.indices[t],b2=md.indices[t+1],cc=md.indices[t+2];
+                    if(a<nv&&b2<nv&&cc<nv){ good.push_back(a); good.push_back(b2); good.push_back(cc); } }
+                md.indices.swap(good);
+            }
+            if(md.indices.size()<3) continue;   // no usable geometry -> skip (don't ship an empty mesh)
             md.nVerts=(u32)nv; md.nIdx=(u32)md.indices.size();
             if(pr.has("material")){ int img=matBaseImage((int)pr["material"].asInt());
                 if(img>=0){ std::vector<uint8_t> rgba; int w=0,h=0; if(loadImage(img,rgba,w,h)){ md.texRGBA=std::move(rgba); md.texW=(u32)w; md.texH=(u32)h; md.hasTexture=true; } } }
