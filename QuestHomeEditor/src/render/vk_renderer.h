@@ -2076,7 +2076,16 @@ private:
         // is installed (issue #4 - "worked last time" = before a Vulkan SDK/loader update). Only added
         // when the loader actually advertises it, so Windows/Linux and pre-1.3.216 loaders are untouched.
         VkInstanceCreateFlags instFlags = 0;
-        {
+        // Portability enumeration is a MoltenVK (macOS) opt-in. On Windows/Linux the real ICDs are CONFORMANT and
+        // enumerate by default; enabling the ENUMERATE_PORTABILITY flag there is at best pointless and on some
+        // NVIDIA-Linux loader combos makes vkEnumeratePhysicalDevices return 0 ("No Vulkan-capable GPU" on an RTX).
+        // So: macOS only, with an HSR_PORTABILITY=1 escape hatch for software Vulkan (lavapipe) on Linux/Windows.
+#ifdef __APPLE__
+        bool wantPortability = true;
+#else
+        bool wantPortability = std::getenv("HSR_PORTABILITY") != nullptr;
+#endif
+        if (wantPortability) {
             u32 na = 0; vkEnumerateInstanceExtensionProperties(nullptr, &na, nullptr);
             std::vector<VkExtensionProperties> avail(na);
             if (na) vkEnumerateInstanceExtensionProperties(nullptr, &na, avail.data());
@@ -2084,7 +2093,7 @@ private:
                 if (!strcmp(e.extensionName, "VK_KHR_portability_enumeration")) {
                     extensions.push_back("VK_KHR_portability_enumeration");
                     instFlags |= 0x00000001;   // VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
-                    log("  Portability (MoltenVK) instance enumeration enabled");
+                    log("  Portability instance enumeration enabled (MoltenVK / software Vulkan)");
                     break;
                 }
         }
@@ -2138,7 +2147,19 @@ private:
     bool pickPhysicalDevice() {
         u32 count = 0;
         vkEnumeratePhysicalDevices(instance, &count, nullptr);
-        if (count == 0) { log("FATAL: No Vulkan-capable GPU found"); return false; }
+        if (count == 0) {
+            log("FATAL: No Vulkan-capable GPU found - the loader enumerated 0 physical devices.");
+#if defined(__APPLE__)
+            log("  macOS: install MoltenVK (brew install molten-vk); keep libMoltenVK.dylib beside the app.");
+#elif defined(_WIN32)
+            log("  Windows: update your GPU driver (it ships the Vulkan ICD).");
+#else
+            log("  Linux: install your GPU's Vulkan driver + loader. NVIDIA: the proprietary driver + 'vulkan-loader'/");
+            log("         'libvulkan1'. AMD/Intel: 'mesa-vulkan-drivers' ('vulkan-radeon'/'vulkan-intel'). Verify: vulkaninfo.");
+            log("         If vulkaninfo lists your GPU but this doesn't, try:  HSR_PORTABILITY=1 <app>  (or update the loader).");
+#endif
+            return false;
+        }
         std::vector<VkPhysicalDevice> devices(count);
         vkEnumeratePhysicalDevices(instance, &count, devices.data());
 
