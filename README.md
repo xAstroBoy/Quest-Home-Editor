@@ -189,6 +189,14 @@ cmake --build build --target questhomeeditor
 - **[📖 Wiki](../../wiki)** — user guide, cook walkthrough, and the [Contributing +
   reverse-engineering](../../wiki/How-to-Contribute) guides.
 
+## Credits
+
+- **[@TheMysticle](https://github.com/TheMysticle) (Oliwier Krawczyk)** — Linux build support (Makefile /
+  build script / Docker), the **NVIDIA Vulkan `-13` pipeline fix** (multiview guard — also helps NVIDIA on
+  Windows), Linux font fallbacks, and CLI `--help` ([#14](../../pull/14)).
+
+Want to be here? See **[How to Contribute](../../wiki/How-to-Contribute)**.
+
 ## License
 
 Research / educational use. All Meta content (environments, `libshell`, Haven 2025) belongs to Meta;
