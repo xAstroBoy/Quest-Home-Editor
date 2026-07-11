@@ -1322,14 +1322,19 @@ inline std::vector<uint8_t> assembleSceneZip(std::vector<CookAsset>& assets,
 // resolver decides. It is a REAL loadable environment (space.hstf Scene entity + a 0-entity content
 // template), so the shell does NOT reject it to nux — reject fires only on a MISSING referenced asset,
 // and this references nothing. [[project_hsr_unrooted_footprint_vista_fix]]
-// The EMPTY scene.zip: a real, loadable scene (space.hstf Scene entity + a 0-entity content template) that
-// references nothing → the shell parses it fine (no missing-asset reject) but instantiates ZERO entities.
+// The EMPTY scene.zip: a real, loadable scene (space.hstf Scene entity + a content template with ONE Root
+// entity) that renders nothing. ⛔ The content template must NOT be 0-entity: a top-level firstWorldAsset
+// content.hstf with zero entities makes TemplateAssetHandler::postInitAsset return ErrorUnexpected → the whole
+// env rejects to nuxd (device diag 2026-07-11: 'meta/empty_vista@content.hstf:template ... ErrorUnexpected').
+// A single Root entity (identity TransformPlatformComponent, NO mesh) is the minimum every real env ships and
+// instantiates to nothing visible. [[project_hsr_unrooted_footprint_vista_fix]]
 inline std::vector<uint8_t> emptyVistaSceneZip() {
     CookRng rng(0x1157A0EDULL);                                  // deterministic → byte-stable rebuilds
     const std::string MH = "meta/empty_vista";
     std::string pContent = MH + "/content.hstf/template", pSpace = MH + "/space.hstf/template";
     AssetKey3 contentK = keyForPath(pContent), spaceK = keyForPath(pSpace);
-    std::string content = templateJson("", "");                 // ZERO entities, ZERO relationships
+    std::string rootId  = makeUuid(rng);
+    std::string content = templateJson(rootEntityJson(rootId), "");   // ONE Root entity (no mesh) — valid, renders nothing
     std::string space   = spaceJson(rng, "empty_vista", contentK, 150000.0f);   // Scene entity (clip/fog) + content-ref
     std::vector<CookAsset> assets;
     assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
@@ -4417,10 +4422,14 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             { "templates/hpi/directional_hotspot.hstf",  2985500425370876421ull },
         };
         const uint64_t STOCK_HOME_PKG = 12293612625969361106ull;   // StringId("meta/home_c25") — Meta's, ≠ our FNV
-        std::vector<uint8_t> emptyTpl = jbytes(templateJson("", ""));   // {"version":5,"entities":[],"relationships":[]}
-        for (auto& v : VS)
+        // ONE Root entity each (NOT 0-entity): a template with zero entities fails TemplateAssetHandler::
+        // postInitAsset (ErrorUnexpected) → env rejects. A Root-only template instantiates one empty transform
+        // (no props/arch) = the vista draws nothing, but the nested-template load SUCCEEDS.
+        for (auto& v : VS) {
+            std::string tpl = templateJson(rootEntityJson(makeUuid(rng)), "");
             assets.push_back({ std::string("meta/home_c25/") + v.rel + "/template", TGT_TEMPLATE,
-                               emptyTpl, AssetKey3{ STOCK_HOME_PKG, v.ing, TGT_TEMPLATE } });
+                               jbytes(tpl), AssetKey3{ STOCK_HOME_PKG, v.ing, TGT_TEMPLATE } });
+        }
     }
     ctrace("floor/navmesh done; packaging scene.zip");
     prog(0.80f, "Packaging scene.zip");
