@@ -3413,11 +3413,12 @@ struct Editor {
     bool autoSign = true, spoofHaven = true;
     bool cookAudio = true;             // DEFAULT ON: bake the env's background audio loop into the cooked APK. Toggle off = silent home.
     bool cookAutoFloor = true;         // DEFAULT ON: when NO Navmesh item exists, the cook generates a walkable floor (ColliderBox grid / disk). OFF = ship ZERO generated collision (the "invisible wall I never placed").
-    bool spoofFootprint = true;        // DEFAULT ON: ship the spoof as a FOOTPRINT (hsr_package_type="footprint") so the
-                                       // shell pairs a companion vista — which killVistas then fills with an INVISIBLE
-                                       // (empty) vista. OFF = the old `combined` spoof (envIsFootprint=0, no vista paired,
-                                       // the v0.9.32 fix). Footprint is the native home type; combined is the fallback if
-                                       // vista-neutralize can't run on a device. [[project_hsr_unrooted_footprint_vista_fix]]
+    bool spoofFootprint = false;       // DEFAULT OFF = COMBINED spoof (nuxd manifest, hsr_package_type="combined") →
+                                       // envIsFootprint=0 → the resolver drops the vista entirely (vista='') → NO vista
+                                       // loads → NO vista interference (no black, no empty-vista fragility). The simplest,
+                                       // most robust default. ON = FOOTPRINT spoof (pairs a companion vista that killVistas
+                                       // fills with an inert empty vista) — only needed if a device insists on scenery.
+                                       // [[project_hsr_unrooted_footprint_vista_fix]]
     bool autoFixVistas = true;         // DEFAULT ON: when a Quest connects, auto-detect a BROKEN vista (one that
                                        // rejects on load → home drops to nuxd) from the recent logcat and re-neutralize
                                        // it with the current (fixed) invisible vista — no manual button press needed.
