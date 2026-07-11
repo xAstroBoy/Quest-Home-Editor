@@ -5649,8 +5649,15 @@ struct Editor {
                 restoring.store(true);
                 restoreThread = std::thread([this]{ restoreHaven(); restoring.store(false); });
             }
-            cx.tip(x,y0,w,th.rowH,"Reinstall the ORIGINAL Haven 2025 from the auto-backup\n(folder \"Haven2025_Backup\" beside the exe) + relaunch the shell.\nUse this to undo a spoof install."); y += th.rowH+8*uiScale;
-        } else if (restoring.load()) { cx.label(x,y,w,th.rowH,"Restoring Haven 2025...",th.textDim); y += th.rowH+8*uiScale; }
+            cx.tip(x,y0,w,th.rowH,"Reinstall the ORIGINAL Haven 2025 from the auto-backup\n(folder \"Haven2025_Backup\" beside the exe) + relaunch the shell.\nUse this to undo a spoof install."); y += th.rowH+3*uiScale;
+            // Manual uninstall: rip out whatever Haven 2025 is on the headset (your spoof, or a different Meta version).
+            y0=y; if (cx.button(ui::hashId("uninsthaven"), x, y, w, th.rowH, "Uninstall Haven 2025 (remove the spoof)")) {
+                if (restoreThread.joinable()) restoreThread.join();
+                restoring.store(true);
+                restoreThread = std::thread([this]{ uninstallHaven(); restoring.store(false); });
+            }
+            cx.tip(x,y0,w,th.rowH,"Uninstall whatever Haven 2025 is installed on the headset (your spoof,\nor a different Meta version) - no root needed, if it's a store app.\nDetects the installed version first. Then \"Restore original Haven 2025\"\nputs Meta's back, or just re-cook + install."); y += th.rowH+8*uiScale;
+        } else if (restoring.load()) { cx.label(x,y,w,th.rowH,"Working on Haven 2025...",th.textDim); y += th.rowH+8*uiScale; }
         // PREVIEW THE COOK IN-PLACE: swap this SAME window to the freshest cooked APK, rendered the
         // HSL/V203 way (the closest desktop match of the device) - and swap BACK to the source, no restart ever.
         if (!busy) {
@@ -6761,6 +6768,23 @@ struct Editor {
         return HB_OK;
     }
     // RESTORE the original Haven 2025 from the backup (button + --restore-haven CLI share installHavenBackup).
+    // MANUAL uninstall: rip out whatever Haven 2025 is installed (spoof or a different Meta version). No root needed
+    // if it's a store/updatable app; a non-removable SYSTEM install can only be disabled (needs root to fully remove).
+    void uninstallHaven() {
+        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial), pkg = HAVEN_PKG();
+        if (!adbWorks(true)) { setStatus("adb not found - open the Logcat tab (it auto-downloads adb), or Browse for it."); return; }
+        std::string prev = pkgVersion(ADB, sel, pkg);
+        if (prev.empty()) { setStatus("Haven 2025 ("+pkg+") is not installed - nothing to uninstall."); return; }
+        setStatus("Uninstalling Haven 2025 ("+pkg+", version "+prev+")...");
+        runAdb(ADB, sel, "uninstall "+pkg);
+        if (pkgInstalled(ADB, sel, pkg)) adbCapture(ADB, sel, "shell pm uninstall --user 0 "+pkg);
+        if (pkgInstalled(ADB, sel, pkg)) adbCapture(ADB, sel, "shell cmd package uninstall --user 0 "+pkg);
+        bool gone = !pkgInstalled(ADB, sel, pkg);
+        relaunchShell(ADB, sel);
+        setStatus(gone ? "Uninstalled Haven 2025 (was version "+prev+"). Re-cook + install, or Restore original Haven 2025."
+                       : "Couldn't fully remove Haven 2025 - it's a non-removable SYSTEM app on this headset (needs root). It's been disabled for the user where possible.");
+    }
     void restoreHaven() {
         auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
@@ -6806,16 +6830,33 @@ struct Editor {
     bool pkgInstalled(const std::string& ADB, const std::string& sel, const std::string& pkg) {
         return adbCapture(ADB, sel, "shell pm path "+pkg).find("package:") != std::string::npos;
     }
+    // versionCode (+versionName) of an installed package, "" if not installed. Parses the FULL `dumpsys package`
+    // in C++ (no on-device `| grep` — that pipe would run in Windows cmd, not the device shell).
+    std::string pkgVersion(const std::string& ADB, const std::string& sel, const std::string& pkg) {
+        std::string d = adbCapture(ADB, sel, "shell dumpsys package "+pkg);
+        if (d.find("versionCode=")==std::string::npos && d.find("Unable to find")!=std::string::npos) return "";
+        auto grab=[&](const char* key)->std::string{ size_t p=d.find(key); if(p==std::string::npos) return ""; p+=strlen(key);
+            std::string v; while(p<d.size() && d[p]!=' '&&d[p]!='\r'&&d[p]!='\n'&&d[p]!='\t') v+=d[p++]; return v; };
+        std::string vc=grab("versionCode="), vn=grab("versionName=");
+        if (vc.empty() && vn.empty()) return "";
+        return vc.empty()? vn : (vc + (vn.empty()?"":(" / "+vn)));
+    }
     bool installToDevice(const std::string& apkPath, const std::string& pkg, const std::function<void(float,const char*)>& progress, bool uninstallFirst=false, bool rooted=false) {
         auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
         std::string ADB=bs(adbPath()), AP=bs(apkPath), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         if (progress) progress(0.95f, "adb install");
         if (uninstallFirst) {
-            // haven2025 is a store app on every Quest -> always uninstallable. Remove the differently-signed original
-            // UP FRONT (cert mismatch -> in-place update impossible). --user 0 as a belt in case a plain uninstall
-            // leaves a per-user remnant.
-            runAdb(ADB, sel, "uninstall "+pkg);
-            if (pkgInstalled(ADB, sel, pkg)) adbCapture(ADB, sel, "shell pm uninstall --user 0 "+pkg);
+            // The spoof is signed with OUR cert, not Meta's -> an in-place update over ANY existing (differently-signed)
+            // Haven 2025 is impossible. DETECT whatever version is installed and remove it up front for a clean install.
+            std::string prev = pkgVersion(ADB, sel, pkg);
+            if (!prev.empty()) {
+                if (progress) progress(0.95f, "removing existing Haven 2025");
+                setStatus("Detected an installed "+pkg+" (version "+prev+") - uninstalling it so the spoof installs cleanly.");
+                runAdb(ADB, sel, "uninstall "+pkg);                                                        // store/updatable app
+                if (pkgInstalled(ADB, sel, pkg)) adbCapture(ADB, sel, "shell pm uninstall --user 0 "+pkg); // per-user remnant / disable-update
+                if (pkgInstalled(ADB, sel, pkg)) adbCapture(ADB, sel, "shell cmd package uninstall --user 0 "+pkg); // newer API fallback
+                // if STILL installed here it's a non-removable SYSTEM app -> the install below fails and we report it.
+            }
         }
         std::string ilog = adbCapture(ADB, sel, "install -r -d -g \""+AP+"\"");   // -d downgrade, -g grant perms
         bool ok = ilog.find("Success") != std::string::npos;
