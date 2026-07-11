@@ -27,7 +27,7 @@ all:
 
 editor:
 	@cmake -S QuestHomeEditor -B $(BUILD_DIR) $(GENERATOR) $(CMAKE_FLAGS)
-	@cmake --build $(BUILD_DIR) --target hsr_renderer -j$(NPROC)
+	@cmake --build $(BUILD_DIR) --target questhomeeditor -j$(NPROC)
 
 cooker:
 	@cmake -S QuestHomeEditor -B $(BUILD_DIR) $(GENERATOR) $(CMAKE_FLAGS)
@@ -45,8 +45,8 @@ appimage: all
 	@mkdir -p AppDir/usr/bin/fonts
 	@cp "$(BUILD_DIR)/Quest Home Editor" AppDir/usr/bin/
 	@cp -r QuestHomeEditor/third_party/fonts/* AppDir/usr/bin/fonts/
-	@cp QuestHomeEditor/app.png AppDir/hsr_renderer.png
-	@printf "[Desktop Entry]\nType=Application\nName=Quest Home Editor\nExec=hsr_renderer\nIcon=hsr_renderer\nCategories=Graphics;\n" > AppDir/hsr_renderer.desktop
+	@cp QuestHomeEditor/app.png AppDir/questhomeeditor.png
+	@printf "[Desktop Entry]\nType=Application\nName=Quest Home Editor\nExec=questhomeeditor\nIcon=questhomeeditor\nCategories=Graphics;\n" > AppDir/questhomeeditor.desktop
 	@printf "#!/bin/sh\nHERE=\"\$$(dirname \"\$$(readlink -f \"\$$0\")\")\"\nexec \"\$$HERE/usr/bin/Quest Home Editor\" \"\$$@\"\n" > AppDir/AppRun
 	@chmod +x AppDir/AppRun
 	@if [ ! -x ./appimagetool ]; then \
