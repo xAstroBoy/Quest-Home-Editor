@@ -354,6 +354,7 @@ public:
     VkCullModeFlags singleSidedCull = VK_CULL_MODE_BACK_BIT;  // env HSR_CULLMODE=front overrides (testing)
     bool framebufferResized = false;           // set by GLFW resize callback
     bool astcLdrSupported = false;             // GPU native ASTC_LDR decode
+    bool multiviewSupported = false;           // GPU supports VK_KHR_multiview (the skinned shaders declare MultiView)
     bool shaderFloat16Supported = false;       // GPU supports SPIR-V Float16 (Haven PBR shaders)
     int selectedMesh = -1;                     // Tab to cycle, -1=none
     int soloMesh = -1;                          // if >=0, draw ONLY this mesh index (debug, env HSR_SOLO)
@@ -2218,7 +2219,8 @@ private:
         vkGetPhysicalDeviceFeatures2(physicalDevice, &q2);
 
         static VkPhysicalDeviceVulkan11Features v11 = {}; v11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
-        v11.multiview = VK_TRUE;
+        multiviewSupported = (v11q.multiview == VK_TRUE);   // the skinned shaders declare MultiView — enable it (and the multiview render pass) only when the GPU actually supports it, else old GPUs hang creating the mismatched pipeline
+        v11.multiview = v11q.multiview;
         v11.storageBuffer16BitAccess = v11q.storageBuffer16BitAccess;
         v11.uniformAndStorageBuffer16BitAccess = v11q.uniformAndStorageBuffer16BitAccess;
         v11.storagePushConstant16 = v11q.storagePushConstant16;
@@ -2722,7 +2724,11 @@ public:
 #ifdef __ANDROID__
         createInfo.pNext = &mv;
 #else
-        if (std::getenv("HSR_MULTIVIEW")) createInfo.pNext = &mv;
+        // Desktop: the render pass MUST match the device + the skinned shaders' MultiView capability.
+        // Use multiview iff the GPU supports it (default) — a device/renderpass mismatch -13s on modern
+        // drivers but HANGS vkCreateGraphicsPipelines on some older GPUs. HSR_NO_MULTIVIEW forces it off
+        // (workaround for the rare driver that -13s WITH multiview, e.g. some NVIDIA Linux setups).
+        if (multiviewSupported && !std::getenv("HSR_NO_MULTIVIEW")) createInfo.pNext = &mv;
 #endif
 
         vkCreateRenderPass(device, &createInfo, nullptr, &renderPass);
