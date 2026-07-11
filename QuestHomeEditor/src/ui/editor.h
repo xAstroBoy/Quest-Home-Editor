@@ -5569,7 +5569,8 @@ struct Editor {
         else y+=4*uiScale;
         // ── HSL render config (distance fog + far clip): WYSIWYG — the preview applies the SAME values the cook ships ──
         y0=y; cx.checkbox(ui::hashId("cfgfog"), x, y, "Distance fog (preview + cook)", cfgFog);
-        cx.tip(x,y0,w,th.rowH,"Emit a ScenePlatformComponent distance fog AND show it live in the\npreview. Tune by eye; the preview matches what ships on device."); y+=th.rowH+2*uiScale;
+        cx.tip(x,y0,w,th.rowH,"Emit a ScenePlatformComponent distance fog AND show it live in the\npreview. Tune by eye; the preview closely approximates the device
+(confirm on the headset)."); y+=th.rowH+2*uiScale;
         if (cfgFog) {
             char fb[48];
             y0=y; cx.label(x,y,150*uiScale,th.rowH,"  fog color r,g,b",th.textDim);
@@ -5633,7 +5634,7 @@ struct Editor {
             cx.tip(x,y0,w,th.rowH,"Reinstall the ORIGINAL Haven 2025 from the auto-backup\n(folder \"Haven2025_Backup\" beside the exe) + relaunch the shell.\nUse this to undo a spoof install."); y += th.rowH+8*uiScale;
         } else if (restoring.load()) { cx.label(x,y,w,th.rowH,"Restoring Haven 2025...",th.textDim); y += th.rowH+8*uiScale; }
         // PREVIEW THE COOK IN-PLACE: swap this SAME window to the freshest cooked APK, rendered the
-        // HSL/V203 way (exactly what the device gets) - and swap BACK to the source, no restart ever.
+        // HSL/V203 way (the closest desktop match of the device) - and swap BACK to the source, no restart ever.
         if (!busy) {
             std::string newest; std::filesystem::file_time_type newestT{};
             std::error_code ec;
@@ -5647,7 +5648,7 @@ struct Editor {
                 std::string bn = newest; size_t sl = bn.find_last_of("/\\"); if (sl != std::string::npos) bn = bn.substr(sl+1);
                 y0=y; if (cx.button(ui::hashId("cookprev"), x, y, w, th.rowH+2*uiScale, ("Preview cooked (HSL): "+bn).c_str(), true))
                     swapTo = newest;   // main swaps the scene IN THIS WINDOW (no new process)
-                cx.tip(x,y0,w,th.rowH+2*uiScale,"Reload THIS window with the newest cooked APK, rendered the\nHSL/V203 way (exactly what the device gets). 'Back to source'\nthen returns to this env - no restart, same window.");
+                cx.tip(x,y0,w,th.rowH+2*uiScale,"Reload THIS window with the newest cooked APK, rendered the\nHSL/V203 way (the closest desktop match of the device). 'Back to source'\nthen returns to this env - no restart, same window.");
                 y += th.rowH+8*uiScale;
             }
             if (onCooked) {

@@ -65,7 +65,7 @@ If a cooked home doesn't show up (the headset stays on Haven 2025 / the default)
      `LoadEntry not found`, `package type not supported`, `MeshDefinition::fix …`, …).
 4. Click **`Export`** → it writes a self-contained report (device model/OS, selected env, the load
    log, and a one-line verdict) and reveals it. **Attach that file** when you report the issue on
-   [Discord / Issues](#community) — it pinpoints the cause.
+   [Discord](https://discord.gg/cXnc4pQz7A) or [Issues](../../issues) — it pinpoints the cause.
 
 `Filter` cycles the view **Env-load ↔ vrshell ↔ EVERYTHING**; the tool column can be **dragged wider
 (up to 75%)** and **docked left or right** by dragging the grip on the tab strip (Photoshop-style).
@@ -120,8 +120,9 @@ Vendored deps (Vulkan headers, volk, miniz, miniaudio, stb, ACL/RTM) are in-tree
 GLFW, astc-encoder and Opus. No Vulkan SDK needed (volk loads at runtime). PhysX is off by default.
 
 ```bash
-# Windows (MSVC + Ninja)         # from QuestHomeEditor/
-build_hsr.bat
+# Windows (from an "x64 Native Tools for VS" prompt)
+cmake -S QuestHomeEditor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target questhomeeditor
 
 # Linux
 sudo apt-get install -y cmake ninja-build libvulkan-dev \
@@ -161,9 +162,14 @@ cmake --build build --target questhomeeditor
 
 ## Community
 
-- **[Wiki](../../wiki)** — user guide + internals.
-- **[Issues](../../issues)** — bugs & requests welcome; crash reports: attach `_crash.txt`
-  (written next to the exe on every crash, all platforms).
+- **[💬 Discord](https://discord.gg/cXnc4pQz7A)** — the fastest place for help, questions, screenshots,
+  and sharing ports. Start here.
+- **[🗣️ GitHub Discussions](../../discussions)** — Q&A, show-and-tell, and ideas that aren't a bug yet.
+- **[🐛 Issues](../../issues)** — **only** two kinds are accepted (blank issues are off): a **cook /
+  device / libshell bug** (attach the home file + a screenshot circling the problem + the Logcat
+  **Export** / `_crash.txt`) or an **editor QOL** improvement. Everything else → Discord / Discussions.
+- **[📖 Wiki](../../wiki)** — user guide, cook walkthrough, and the [Contributing +
+  reverse-engineering](../../wiki/How-to-Contribute) guides.
 
 ## License
 
