@@ -188,9 +188,10 @@ endif()
 # Same hsl_cooker.h the editor's "Export APK" uses; this CLI driver validates the format pipeline.
 # hzanim_acl.cpp defines hzAclEncode() — exportSceneAPK() calls it for skinned-anim (HZAN) clips, so it MUST be
 # linked here too (the hsr_renderer target already compiles it). Without it: LNK2019 unresolved hzAclEncode.
-add_executable(hsl_cook src/cook/_ckcook.cpp src/cook/hzanim_acl.cpp src/cook/physx_navmesh.cpp src/cook/embedded_assets.cpp)
+add_executable(hsl_cook src/cook/_ckcook.cpp src/cook/hzanim_acl.cpp src/cook/physx_navmesh.cpp src/cook/embedded_assets.cpp src/impl/stb_image_impl.c)
 target_include_directories(hsl_cook PRIVATE
     "${MINIZ_DIR}"
+    "${STB_DIR}"                                      # stb_image.h — headless --cookglb glTF import
     "${astcenc_SOURCE_DIR}/Source"
     "${CMAKE_SOURCE_DIR}"
     "${CMAKE_SOURCE_DIR}/src"

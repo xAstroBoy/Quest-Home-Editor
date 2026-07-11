@@ -131,6 +131,17 @@ inline bool importEnv(const std::string& gltfPath, std::vector<MeshData>& out, s
         if(!root.has("textures"))return -1; const auto& T=root["textures"]; if(ti<0||ti>=(int)T.size())return -1;
         if(!T[ti].has("source"))return -1; return (int)T[ti]["source"].asInt();
     };
+    // FALLBACK BLANK MATERIAL: a primitive with NO baseColorTexture (or a texture that fails to decode)
+    // must still ship a valid texture — else the renderer/cook hits the textureless path, which on some
+    // GPUs/drivers HANGS the upload (the "application unresponsive" on drag-in). Take the material's solid
+    // baseColorFactor RGBA (default opaque white). Mirrors gltf_loader.h's matSolidColor for the V79 path.
+    auto matSolidColorFactor=[&](int mi, uint8_t out[4]){
+        out[0]=out[1]=out[2]=out[3]=255;
+        if(mi<0||!root.has("materials"))return; const auto& M=root["materials"]; if(mi>=(int)M.size())return;
+        const auto& m=M[mi]; if(!m.has("pbrMetallicRoughness"))return; const auto& pbr=m["pbrMetallicRoughness"];
+        if(!pbr.has("baseColorFactor"))return; const auto& f=pbr["baseColorFactor"];
+        for(int k=0;k<4&&k<(int)f.size();++k){ float v=(float)f[k].asFloat(); out[k]=(uint8_t)std::lround(std::fmin(1.f,std::fmax(0.f,v))*255.f); }
+    };
 
     // per-mesh world matrix from the first node referencing it (exporter writes one node per mesh)
     auto trs=[&](const tinyjson::Value& n)->std::array<float,16>{
@@ -185,6 +196,16 @@ inline bool importEnv(const std::string& gltfPath, std::vector<MeshData>& out, s
             md.nVerts=(u32)nv; md.nIdx=(u32)md.indices.size();
             if(pr.has("material")){ int img=matBaseImage((int)pr["material"].asInt());
                 if(img>=0){ std::vector<uint8_t> rgba; int w=0,h=0; if(loadImage(img,rgba,w,h)){ md.texRGBA=std::move(rgba); md.texW=(u32)w; md.texH=(u32)h; md.hasTexture=true; } } }
+            // No (or failed) texture -> synthesize a 4x4 SOLID baseColorFactor texel so every mesh ALWAYS
+            // has a valid texture. Prevents the textureless-upload hang and keeps solid-color materials the
+            // right color (white if the material has no factor).
+            if(!md.hasTexture){
+                uint8_t c[4]={255,255,255,255};
+                if(pr.has("material")) matSolidColorFactor((int)pr["material"].asInt(), c);
+                md.texW=md.texH=4; md.texRGBA.assign((size_t)md.texW*md.texH*4, 0);
+                for(size_t k=0;k<md.texRGBA.size();k+=4){ md.texRGBA[k]=c[0]; md.texRGBA[k+1]=c[1]; md.texRGBA[k+2]=c[2]; md.texRGBA[k+3]=c[3]; }
+                md.hasTexture=true;
+            }
             out.push_back(std::move(md)); objCounter++;
         }
     }

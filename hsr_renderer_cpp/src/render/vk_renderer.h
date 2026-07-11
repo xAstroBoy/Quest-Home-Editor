@@ -3801,6 +3801,8 @@ public:
 
     void createTextureImage(const u8* rgba, u32 w, u32 h, VkImage& image, VkDeviceMemory& mem,
                             VkFormat fmt = VK_FORMAT_R8G8B8A8_SRGB) {
+        static const u8 s_white[4] = {255,255,255,255};
+        if (!rgba || w < 1 || h < 1) { w = h = 1; rgba = s_white; }   // GUARD: empty/0-dim upload -> 1x1 white (prevents the log2(0) huge-miplevels hang below)
         VkDeviceSize imgSize = (VkDeviceSize)w * h * 4;
 
         VkBuffer stagingBuf;
@@ -3811,13 +3813,16 @@ public:
 
         void* data;
         vkMapMemory(device, stagingMem, 0, imgSize, 0, &data);
-        memcpy(data, rgba, (size_t)imgSize);
+        if (rgba && imgSize) memcpy(data, rgba, (size_t)imgSize);
         vkUnmapMemory(device, stagingMem);
 
         // Mipmaps: a high-res texture (e.g. prism_wave's 2900x866 flame strip) minified onto a small/thin
         // surface aliases hard without mips -> harsh "exploded" wisps. Generate a full mip chain so the
         // high-frequency detail averages into a smooth gradient (libshell-faithful: it uses mipped samplers).
-        u32 mipLevels = 1u + (u32)std::floor(std::log2((float)std::max(w, h)));
+        // GUARD: clamp the dimension to >=1 before log2 — a 0-dim (textureless) upload made std::log2(0)=-inf
+        // and (u32)floor(-inf) = a garbage/huge mipLevels -> generateMipmaps looped ~forever = the drag-in
+        // hang on some drivers. (The glb importer now also synthesizes a solid fallback, so w/h are never 0.)
+        u32 mipLevels = 1u + (u32)std::floor(std::log2((float)std::max(1u, std::max(w, h))));
         lastTexMip = mipLevels;
         createImage(w, h, fmt, VK_IMAGE_TILING_OPTIMAL,
                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -3863,7 +3868,8 @@ public:
     // fully-opaque texture (a≡255) this equals the plain box filter, so it's safe/identical there too.
     void createTextureImageAW(const u8* rgba, u32 w, u32 h, VkImage& image, VkDeviceMemory& mem,
                               VkFormat fmt = VK_FORMAT_R8G8B8A8_SRGB) {
-        u32 mipLevels = 1u + (u32)std::floor(std::log2((float)std::max(w, h)));
+        if (!rgba || w < 1 || h < 1) { w = h = 1; static const u8 wpx[4] = {255,255,255,255}; rgba = wpx; }  // GUARD: empty/0-dim -> 1x1 white (see createTextureImage; prevents the log2(0) huge-miplevels hang)
+        u32 mipLevels = 1u + (u32)std::floor(std::log2((float)std::max(1u, std::max(w, h))));
         lastTexMip = mipLevels;
         std::vector<std::vector<u8>> lv(mipLevels);
         std::vector<u32> lw(mipLevels), lh(mipLevels);

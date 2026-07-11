@@ -5,9 +5,11 @@
 // asset is generated here. This is the same code path the editor's "Export APK" calls.
 //   usage: hsl_cook [Nuxd.apk] [out.apk] [shadersDir]
 #include "cook/hsl_cooker.h"
+#include "io/gltf_import.h"     // headless --cookglb repro: raw .glb/.gltf import -> exportSceneAPK
 #include <cstdio>
 #include <vector>
 #include <string>
+#include <chrono>
 
 static std::vector<uint8_t> readFile(const char* p) {
     FILE* f = fopen(p, "rb"); if (!f) return {};
@@ -78,10 +80,54 @@ static int remanifest(int argc, char** argv) {
     return 0;
 }
 
+// --cookglb <in.glb> [nuxd.apk] [out.apk] — HEADLESS repro of the editor's drag-in cook: import the raw glTF/glb
+// exactly like the editor (gltfimport::importEnv), feed geometry-only ExportMeshes to exportSceneAPK, and time every
+// stage (HSR_COOKTRACE=1 auto-on). The LAST [COOKTRACE] line before a freeze names the hanging stage. This mirrors the
+// geometry path that stalls on load ("application unresponsive") without needing the Vulkan editor window.
+static int cookGlb(int argc, char** argv) {
+    using namespace hslcook;
+    if (argc < 3) { fprintf(stderr, "usage: hsl_cook --cookglb <in.glb> [nuxd.apk] [out.apk]\n"); return 2; }
+    std::string in = argv[2];
+    std::string nuxd = argc > 3 ? argv[3] : "Nuxd.apk";
+    std::string out  = argc > 4 ? argv[4] : "cooker/out/cookglb_unsigned.apk";
+#ifdef _WIN32
+    _putenv_s("HSR_COOKTRACE", "1");
+#else
+    setenv("HSR_COOKTRACE", "1", 1);
+#endif
+    auto t0 = std::chrono::steady_clock::now();
+    auto lap = [&](const char* s){ double dt = std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+        fprintf(stderr, "[CImport] %8.2fs  %s\n", dt, s); fflush(stderr); };
+    lap("importing glb");
+    std::vector<MeshData> meshes;
+    if (!gltfimport::importEnv(in, meshes) || meshes.empty()) { fprintf(stderr, "[cookglb] import failed / empty: %s\n", in.c_str()); return 1; }
+    lap(("imported " + std::to_string(meshes.size()) + " meshes").c_str());
+    std::vector<ExportMesh> ems; ems.reserve(meshes.size());
+    size_t totV=0, totT=0;
+    for (auto& md : meshes) {
+        ExportMesh em; em.name = md.name;
+        em.positions = md.positions; em.uvs = md.uvs; em.indices = md.indices;
+        if (md.hasTexture) { em.rgba = md.texRGBA; }
+        totV += em.positions.size()/3; totT += em.indices.size()/3;
+        ems.push_back(std::move(em));
+    }
+    lap(("built ExportMeshes (" + std::to_string(totV) + " verts, " + std::to_string(totT) + " tris)").c_str());
+    bool ok=false;
+    auto progress = [](float f, const char* s){ fprintf(stderr, "[prog %3.0f%%] %s\n", f*100.f, s); fflush(stderr); };
+    auto apk = exportSceneAPK(ems, nuxd, {}, {}, true, &ok, nullptr, nullptr, {}, progress);
+    lap(ok ? "exportSceneAPK OK" : "exportSceneAPK FAILED");
+    if (!ok || apk.empty()) { fprintf(stderr, "[cookglb] cook failed\n"); return 1; }
+    FILE* f = fopen(out.c_str(), "wb"); if (!f) { fprintf(stderr, "[cookglb] cannot write %s\n", out.c_str()); return 1; }
+    fwrite(apk.data(), 1, apk.size(), f); fclose(f);
+    printf("COOKGLB OK: %zu meshes -> apk=%zuB -> %s\n", ems.size(), apk.size(), out.c_str());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     using namespace hslcook;
     if (argc > 1 && std::string(argv[1]) == "--export-test") return exportTest(argc, argv);
     if (argc > 1 && std::string(argv[1]) == "--remanifest") return remanifest(argc, argv);
+    if (argc > 1 && std::string(argv[1]) == "--cookglb") return cookGlb(argc, argv);
     std::string nuxd  = argc > 1 ? argv[1] : "Nuxd.apk";
     std::string out   = argc > 2 ? argv[2] : "cooker/out/myhome_cpp_unsigned.apk";
     std::string shdir = argc > 3 ? argv[3] : "cooker/shaders";

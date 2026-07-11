@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>   // exportSceneAPK progress callback
+#include <chrono>       // [COOKTRACE] stage timing to pinpoint cook hangs
 #include <cstdlib>
 #include <ctime>
 #include <thread>        // multi-threaded ASTC encode
@@ -2102,6 +2103,12 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                                            const std::string& editorSession = {}) {   // .hsledit text -> embedded in the APK so an ORPHAN cook re-opens with its scene items
     auto prog = [&](float f, const char* s){ if (progress) progress(f, s); };
     prog(0.02f, "Preparing scene");
+    // [COOKTRACE] wall-clock stage timing to pinpoint hangs (HSR_COOKTRACE=1). The LAST line printed before a
+    // freeze names the stalling stage. Zero cost when the env var is unset.
+    const bool ctOn = std::getenv("HSR_COOKTRACE") != nullptr;
+    auto ctT0 = std::chrono::steady_clock::now();
+    auto ctrace = [&](const char* s){ if (ctOn) { double dt = std::chrono::duration<double>(std::chrono::steady_clock::now()-ctT0).count();
+        fprintf(stderr, "[COOKTRACE] %8.2fs  %s\n", dt, s); fflush(stderr); } };
     if (ok) *ok = false;
     (void)vspv; (void)fspv;
     CookRng rng;
@@ -2292,9 +2299,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             if (aMin >= 250) { m.blend = false;
                 if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' OPAQUE-BLEND reclass (fully-opaque texture aMin=%u, blend -> OPAQUE depth-write)\n", mi, m.name.c_str(), aMin); }
         }
+    ctrace("before splitLargeStaticMeshes");
     std::vector<ExportMesh> meshesV = splitLargeStaticMeshes(meshesPre);
     // Split >60000-vert SKINNED meshes the SAME way (multi-part skinned CRASHES the device — snakeway 5_Car dragon).
     meshesV = splitLargeSkinnedMeshes(meshesV);
+    ctrace("after split; entering per-mesh cook loop");
     // ── HSR_FITCLIP: scale EVERY mesh under the shell's fixed far-clip plane (default R=4500, margin under 5000) ──
     // Per-mesh UNIFORM scale ABOUT THE SPAWN: each vertex keeps its DIRECTION (angular position) and the mesh keeps its
     // apparent size (size/distance) from the spawn -> looks identical, textures untouched, internal depth scales with it
@@ -2330,6 +2339,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     std::vector<uint8_t> zDepthWrite(meshesV.size(), 0);
     for (size_t i = 0; i < meshesV.size(); ++i) {
         if (progress && (i % 8 == 0 || i + 1 == meshesV.size())) { char sb[64]; snprintf(sb, sizeof sb, "Cooking mesh %zu/%zu", i+1, meshesV.size()); prog(0.05f + 0.70f*(float)i/(float)meshesV.size(), sb); }
+        if (ctOn) { char sb[128]; snprintf(sb, sizeof sb, "  mesh %zu/%zu '%s' (%zu verts, %zu tris)", i, meshesV.size(), meshesV[i].name.c_str(), meshesV[i].positions.size()/3, meshesV[i].indices.size()/3); ctrace(sb); }
         const ExportMesh& m = meshesV[i];
         if (m.positions.size() < 9 || m.indices.size() < 3) continue;   // skip empty
         // GENERIC depth-write discriminator (V79 MeshShellEnvMaskDepthWrite + HAS_ALPHACUTOFF): a HARD-EDGED / BIMODAL
@@ -3801,6 +3811,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         rels += (rels.empty() ? std::string() : std::string(",")) + relChildOf(mid, rootId);
         zDepthWrite[i] = zBlend ? 0 : 1;   // [Z-AUDIT] input: this mesh's final MATL depth-writes
     }
+    ctrace("per-mesh loop done; entering Z-AUDIT");
     // ── [Z-AUDIT] Z-FIGHT detector — coplanar overlapping DEPTH-WRITING triangles ("make sure NOTHING has
     //    z/depth fighting"). Z-fighting needs two depth-writing surfaces on (nearly) the SAME plane with real
     //    AREA overlap; blend surfaces never write depth so they can't fight. Detector: hash every depth-writing
@@ -3906,6 +3917,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 kv.first.first, an, kv.first.first==kv.first.second?"WITHIN":"<->", kv.first.second, bn, kv.second.first, kv.second.second*1e4f);
         }
     }
+    ctrace("Z-AUDIT done; entering floor/navmesh generation");
     if (rels.empty()) return {};
     if (whiteUsed) assets.push_back({ pWhite, whiteK.tgt, whiteTex, whiteK });
     // The SkyboxPlatformComponent makes the shell load its built-in skybox SURFACE shader + a texture from the SHELL package
@@ -4333,9 +4345,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     auto shellcfg = jbytes(shellConfigJson(spaceK, locomotion));
     assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
     assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });
+    ctrace("floor/navmesh done; packaging scene.zip");
     prog(0.80f, "Packaging scene.zip");
     auto sceneZip = assembleSceneZip(assets, shellcfg);
     if (outSceneZip) *outSceneZip = sceneZip;     // expose so the caller can splice extra (spoofed) APKs without re-cooking
+    ctrace("scene.zip packaged; splicing APK");
     prog(0.90f, "Building APK");
     // Package spoof: rename the shell's package to a chosen one so the port can MASQUERADE as an official env
     // (e.g. set HSR_COOK_SHELL=haven2025.apk + HSR_COOK_FROMPKG/HSR_COOK_PKG=<haven2025 pkg> to replace it). The
