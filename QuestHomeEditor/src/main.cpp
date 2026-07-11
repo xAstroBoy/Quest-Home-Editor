@@ -965,16 +965,16 @@ int main(int argc, char** argv) {
     // clear backgrounds. It also un-darkens V79 (baked-lit textures shown unlit, not re-lit by
     // PBR's dim synthesized IBL). CPU-skinned/animated meshes stream world-space positions into
     // the VBO, so this plain pos/uv vertex shader handles them too (no in-shader skinning).
-    if (isV79 || isOpa) {
+    if (isV79 || isOpa || isBlender) {
         vertSpirv.assign(kV79VertSpirv, kV79VertSpirv + kV79VertSpirvSize / sizeof(uint32_t));
         fragSpirv.assign(kV79FragSpirv, kV79FragSpirv + kV79FragSpirvSize / sizeof(uint32_t));
         // Cutout variant (discards texels below alpha threshold) for AlphaTest materials so
         // flags/foliage/animals draw in the opaque pass and write depth (faithful to libshell).
         alphaTestFragSpirv.assign(kV79FragAlphaSpirv, kV79FragAlphaSpirv + kV79FragAlphaSpirvSize / sizeof(uint32_t));
         skinnedVertSpirv.clear(); skinnedFragSpirv.clear();
-        fprintf(stderr, "[MAIN] %s env -> built-in unlit shader with texture-ALPHA output "
+        fprintf(stderr, "[MAIN] %s -> built-in unlit shader with texture-ALPHA output "
                         "(transparency fix; %zu vert / %zu frag words)\n",
-                isOpa ? "V79 .opa" : "V79 glTF", vertSpirv.size(), fragSpirv.size());
+                isBlender ? "Empty/Blender session" : (isOpa ? "V79 .opa" : "V79 glTF"), vertSpirv.size(), fragSpirv.size());
     }
 
     if (vertSpirv.empty() || fragSpirv.empty()) {
