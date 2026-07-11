@@ -131,11 +131,20 @@ GLFW, astc-encoder and Opus. No Vulkan SDK needed (volk loads at runtime). PhysX
 cmake -S QuestHomeEditor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target questhomeeditor
 
-# Linux
+# Linux (Option 1: One-command Makefile)
+make                    # builds both Editor GUI and CLI Cooker into ./build/
+make appimage           # builds a portable self-contained .AppImage
+make docker             # builds Linux binaries reproducibly inside a Docker container
+
+# Linux (Option 2: Build script)
+./build_linux.sh        # native build
+./build_linux.sh --appimage
+
+# Linux (Option 3: Manual CMake)
 sudo apt-get install -y cmake ninja-build libvulkan-dev \
   libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libwayland-dev libxkbcommon-dev
 cmake -S QuestHomeEditor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target questhomeeditor
+cmake --build build -j$(nproc)
 
 # macOS (MoltenVK)
 brew install molten-vk ninja
@@ -165,6 +174,7 @@ cmake --build build --target questhomeeditor
 | `QuestHomeEditor/src/` | Renderer + editor + cooker (C++17, mostly headers) |
 | `QuestHomeEditor/tools/` | Shader decompile/recompile helpers (spirv-cross, glslang) |
 | `QuestHomeEditor/third_party/` | Vendored deps (volk, Vulkan headers, miniz, stb, ACL/RTM, fonts) |
+| `Makefile` / `build_linux.sh` / `Dockerfile.linux` | One-command native, AppImage, and container builds for Linux |
 | `.github/workflows/build.yml` | 3-OS CI → prebuilt binaries |
 
 ## Community

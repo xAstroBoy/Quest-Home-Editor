@@ -1,0 +1,58 @@
+# Dockerfile.linux — Containerized Linux build environment for Quest Home Editor
+#
+# Builds both the GUI Editor ("Quest Home Editor") and the CLI Cooker ("hsl_cook")
+# inside a clean, reproducible Ubuntu container without needing local Linux build dependencies.
+#
+# Usage:
+#   1. Build container image:
+#      docker build -f Dockerfile.linux -t quest-home-editor-linux .
+#
+#   2. Extract compiled binaries to host ./dist directory:
+#      docker run --rm -v "$(pwd)/dist:/out" quest-home-editor-linux sh -c "cp -r /app/dist/* /out/"
+
+FROM ubuntu:22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ninja-build \
+    git \
+    pkg-config \
+    libvulkan-dev \
+    libx11-dev \
+    libxrandr-dev \
+    libxinerama-dev \
+    libxcursor-dev \
+    libxi-dev \
+    libwayland-dev \
+    libxkbcommon-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY . .
+
+RUN cmake -S QuestHomeEditor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build -j$(nproc)
+
+RUN mkdir -p /app/dist/fonts && \
+    cp "build/Quest Home Editor" /app/dist/ && \
+    cp "build/hsl_cook" /app/dist/ && \
+    cp -r QuestHomeEditor/third_party/fonts/* /app/dist/fonts/
+
+FROM ubuntu:22.04 AS runtime
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libvulkan1 \
+    libx11-6 \
+    libwayland-client0 \
+    libxkbcommon0 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /app/dist /app/dist
+
+ENTRYPOINT ["/app/dist/Quest Home Editor"]

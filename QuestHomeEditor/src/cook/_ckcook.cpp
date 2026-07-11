@@ -11,8 +11,12 @@
 #include <string>
 #include <chrono>
 
-static std::vector<uint8_t> readFile(const char* p) {
-    FILE* f = fopen(p, "rb"); if (!f) return {};
+static std::vector<uint8_t> readFile(const std::string& p) {
+    FILE* f = fopen(p.c_str(), "rb");
+    if (!f) f = fopen(("QuestHomeEditor/" + p).c_str(), "rb");
+    if (!f) f = fopen(("../QuestHomeEditor/" + p).c_str(), "rb");
+    if (!f) f = fopen(("hsr_renderer_cpp/" + p).c_str(), "rb");
+    if (!f) return {};
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     std::vector<uint8_t> b(n > 0 ? n : 0); if (n > 0) { size_t r = fread(b.data(), 1, n, f); b.resize(r); } fclose(f); return b;
 }
@@ -125,6 +129,15 @@ static int cookGlb(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     using namespace hslcook;
+    if (argc > 1 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
+        printf("Quest Home Editor CLI Cooker (hsl_cook)\n\n");
+        printf("Usage:\n");
+        printf("  hsl_cook --cookglb <in.glb> [Nuxd.apk] [out.apk]\n");
+        printf("  hsl_cook --remanifest <in.apk> <out_unsigned.apk> <newPkg>\n");
+        printf("  hsl_cook --export-test [Nuxd.apk] [out.apk] [shadersDir]\n");
+        printf("  hsl_cook [Nuxd.apk] [out.apk] [shadersDir]\n");
+        return 0;
+    }
     if (argc > 1 && std::string(argv[1]) == "--export-test") return exportTest(argc, argv);
     if (argc > 1 && std::string(argv[1]) == "--remanifest") return remanifest(argc, argv);
     if (argc > 1 && std::string(argv[1]) == "--cookglb") return cookGlb(argc, argv);

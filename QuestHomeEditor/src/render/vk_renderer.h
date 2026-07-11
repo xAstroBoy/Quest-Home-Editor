@@ -2719,7 +2719,11 @@ public:
         mv.pViewMasks = &viewMask;
         mv.correlationMaskCount = 1;
         mv.pCorrelationMasks = &corrMask;
+#ifdef __ANDROID__
         createInfo.pNext = &mv;
+#else
+        if (std::getenv("HSR_MULTIVIEW")) createInfo.pNext = &mv;
+#endif
 
         vkCreateRenderPass(device, &createInfo, nullptr, &renderPass);
     }
