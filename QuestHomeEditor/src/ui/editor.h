@@ -6776,9 +6776,16 @@ struct Editor {
         runAdb(ADB, sel, "root");                                   // best-effort: restart adbd as root (no-op on retail builds)
         if (!wifiIp.empty()) { std::string ip=wifiIp; if(ip.find(':')==std::string::npos) ip+=":5555"; runAdb(ADB,"","connect "+ip); }
         else runAdb(ADB, sel, "wait-for-device");                   // adbd may have restarted
+        // ROOT = ACTUALLY-USABLE root ONLY. We install the UNSPOOFED own-package home + select it via
+        // `su -c oculuspreferences --setc` — both require real root. The ONLY reliable signals are: adbd
+        // itself is uid 0, or `su` grants uid 0. The old `ro.debuggable==1` fallback was a FALSE POSITIVE
+        // (a userdebug build can be debuggable WITHOUT adbd-root or su) — it made us install the unspoofed
+        // home on a non-rooted device where it can NEVER be selected (silent `su` failure) and NO spoof got
+        // installed = the user's home didn't change. So a false negative here is SAFE (installs the working
+        // spoof); a false positive is NOT. Require a real uid=0.
         if (adbCapture(ADB, sel, "shell id").find("uid=0") != std::string::npos)        return true;   // adbd is root
-        if (adbCapture(ADB, sel, "shell su -c id").find("uid=0") != std::string::npos)  return true;   // su available
-        return adbCapture(ADB, sel, "shell getprop ro.debuggable").find('1') != std::string::npos;     // userdebug/eng
+        if (adbCapture(ADB, sel, "shell su -c id").find("uid=0") != std::string::npos)  return true;   // su grants root
+        return false;                                                                                  // no usable root -> spoof path
     }
     // ── Haven 2025 backup/restore ───────────────────────────────────────────────────────────────────────────
     static const char* HAVEN_PKG() { return "com.meta.shell.env.footprint.haven2025"; }
