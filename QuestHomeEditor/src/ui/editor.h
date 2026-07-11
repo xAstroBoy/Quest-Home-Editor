@@ -3445,6 +3445,22 @@ struct Editor {
     std::mutex logMx; std::deque<LogLine> logBuf; std::string logLastRaw;
     float logScroll = 0.f; bool logStick = true;   // logScroll = pixel offset; logStick = auto-scroll to newest
     bool autoLogStarted = false; std::atomic<bool> logVerboseSet{false};   // auto-start + one-time debug.logLevel=Verbose
+    // adb auto-grab: if no working adb is found at runtime, download Google's platform-tools in the background.
+    std::thread adbDlThread; std::atomic<bool> adbDling{false}; std::atomic<bool> adbDlDone{false};
+    std::string adbDlStatus; std::mutex adbDlMx; bool adbAutoTried = false;
+    void ensureAdbAsync(){
+        if (adbDling.load() || adbAutoTried || adbWorks()) return;   // already fine / already trying / already tried this session
+        adbAutoTried = true; adbDling.store(true);
+        { std::lock_guard<std::mutex> lk(adbDlMx); adbDlStatus = "Fetching adb (Google platform-tools, ~15 MB, one time)..."; }
+        if (adbDlThread.joinable()) adbDlThread.join();
+        adbDlThread = std::thread([this]{
+            auto prog=[this](float, const char* s){ std::lock_guard<std::mutex> lk(adbDlMx); adbDlStatus = s; };
+            std::string adb = hslcook::downloadPlatformTools(prog);
+            { std::lock_guard<std::mutex> lk(adbDlMx);
+              adbDlStatus = adb.empty() ? "adb download FAILED - check your connection, or Browse for adb.exe" : "adb ready"; }
+            adbDling.store(false); adbDlDone.store(true);   // UI thread rechecks adbWorks() on adbDlDone
+        });
+    }
     std::thread restoreThread; std::atomic<bool> restoring{false};   // "Restore original Haven 2025" button (runs off the UI thread)
     std::thread javaThread; std::atomic<int> javaState{0};           // proactive Java auto-install: 0=installing, 1=ready, 2=failed
     bool animSkinned = true;   // HZANIM skinned + 1-joint rigid clips (door/discs/screens/cars/train/sphere). DEFAULT ON:
@@ -3549,9 +3565,10 @@ struct Editor {
         if (restoreThread.joinable()) restoreThread.join();
         if (javaThread.joinable()) javaThread.join();
         if (geomThread.joinable()) geomThread.join();
+        if (adbDlThread.joinable()) adbDlThread.join();
         if (ready) { vkDeviceWaitIdle(r->device); uiDraw.destroy(); ready = false; }
     }
-    ~Editor() { stopLogStream(); if (cookThread.joinable()) cookThread.join(); if (restoreThread.joinable()) restoreThread.join(); if (javaThread.joinable()) javaThread.join(); if (geomThread.joinable()) geomThread.join(); }
+    ~Editor() { stopLogStream(); if (cookThread.joinable()) cookThread.join(); if (restoreThread.joinable()) restoreThread.join(); if (javaThread.joinable()) javaThread.join(); if (geomThread.joinable()) geomThread.join(); if (adbDlThread.joinable()) adbDlThread.join(); }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  INPUT  (GLFW callbacks in main route here; we accumulate into cx.in, cleared at end of buildFrame)
@@ -5520,6 +5537,8 @@ struct Editor {
     // ── Cook / Export panel: package name, auto-sign + spoof toggles, Cook button, live progress, status ──
     void drawCookPanel(float x, float y, float w) {
         auto& th=cx.th;
+        if (adbDlDone.exchange(false)) { adbWorks(true); adbDevScanned=false; }
+        ensureAdbAsync();                    // installing needs adb — auto-grab it (once, background) if missing
         float y0;
         cx.label(x,y,w,th.rowH,"Cook to bootable Quest APK",th.text); y+=th.rowH+6*uiScale;
         y0=y; cx.label(x,y,90*uiScale,th.rowH,"Package",th.textDim);
@@ -6537,14 +6556,62 @@ struct Editor {
     // adb resolution order: $HSR_ADB -> bundled beside the exe (adb.exe + AdbWinApi.dll + AdbWinUsbApi.dll, or a
     // platform-tools/ folder next to the renderer) -> the usual SDK path -> "adb" on PATH. Bundling those 3 files
     // beside the exe means users never need to install Android platform-tools.
+    // A UI-set adb path (via "Browse for adb…"), persisted to adb_path.txt beside the exe.
+    static std::string& adbUserSlot(){ static std::string s; return s; }
+    static bool&        adbUserLoaded(){ static bool b=false; return b; }
+    static std::string adbUserPath() {
+        if (!adbUserLoaded()) { adbUserLoaded()=true;
+            FILE* f=fopen(AppConfig::exeRel("adb_path.txt").c_str(),"rb");
+            if(f){ char b[1024]; size_t n=fread(b,1,sizeof b-1,f); fclose(f); b[n]=0; adbUserSlot()=b;
+                   while(!adbUserSlot().empty()&&(unsigned char)adbUserSlot().back()<=' ') adbUserSlot().pop_back(); } }
+        return adbUserSlot();
+    }
+    static void setAdbUserPath(const std::string& p){
+        adbUserSlot()=p; adbUserLoaded()=true;
+        FILE* f=fopen(AppConfig::exeRel("adb_path.txt").c_str(),"wb"); if(f){ fwrite(p.data(),1,p.size(),f); fclose(f);} }
+
+    // Resolve an adb binary: HSR_ADB -> UI-set path -> beside-the-exe (incl. auto-downloaded platform-tools/)
+    // -> common SDK / SideQuest / Homebrew installs -> "adb" on PATH.
     static std::string adbPath() {
         if (const char* a=std::getenv("HSR_ADB")) return a;
+        std::string u=adbUserPath(); if (!u.empty() && fileEx(u)) return u;
         std::string e1=AppConfig::exeRel("adb.exe"), e2=AppConfig::exeRel("platform-tools/adb.exe"), e3=AppConfig::exeRel("adb");
         if (fileEx(e1)) return e1;
-        if (fileEx(e2)) return e2;
+        if (fileEx(e2)) return e2;          // beside the exe, incl. the auto-downloaded platform-tools/
         if (fileEx(e3)) return e3;          // POSIX (Linux/macOS) bundled next to the binary
+#ifdef _WIN32
+        if (const char* la=std::getenv("LOCALAPPDATA")) { std::string L=la;
+            for (const char* p : { "\\Android\\Sdk\\platform-tools\\adb.exe",
+                                   "\\Programs\\SideQuest\\resources\\app.asar.unpacked\\build\\platform-tools\\adb.exe" })
+                { std::string c=L+p; if (fileEx(c)) return c; } }
+        if (const char* up=std::getenv("USERPROFILE")) { std::string U=up;
+            for (const char* p : { "\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
+                                   "\\SideQuest\\platform-tools\\adb.exe", "\\scrcpy\\adb.exe" })
+                { std::string c=U+p; if (fileEx(c)) return c; } }
         if (fileEx("C:/Android/platform-tools/adb.exe")) return "C:/Android/platform-tools/adb.exe";
-        return "adb";   // on PATH
+        if (fileEx("C:/platform-tools/adb.exe")) return "C:/platform-tools/adb.exe";
+#else
+        if (const char* h=std::getenv("HOME")) { std::string H=h;
+            for (const char* p : { "/Android/Sdk/platform-tools/adb", "/Library/Android/sdk/platform-tools/adb" })
+                { std::string c=H+p; if (fileEx(c)) return c; } }
+        for (const char* p : { "/usr/local/bin/adb", "/opt/homebrew/bin/adb", "/usr/bin/adb" }) if (fileEx(p)) return p;
+#endif
+        return "adb";   // last resort: PATH
+    }
+    // Does the resolved adb actually run? Cached (-1 unknown / 0 no / 1 yes); re-check after Download/Browse.
+    int adbOk = -1;
+    bool adbWorks(bool recheck=false){
+        if (recheck) adbOk=-1;
+        if (adbOk<0){ auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+            std::string v = adbCapture(
+#ifdef _WIN32
+                bs(adbPath())
+#else
+                adbPath()
+#endif
+                , "", "version");
+            adbOk = (v.find("Android Debug Bridge")!=std::string::npos) ? 1 : 0; }
+        return adbOk==1;
     }
     int runAdb(const std::string& adb, const std::string& sel, const std::string& tail) {
         char cmd[1600];
@@ -6994,6 +7061,8 @@ struct Editor {
     }
     void drawLogcatPanel(float x, float y, float w, float h){
         auto& dl=*cx.dl; auto& th=cx.th; ui::Font* lf = cx.mono? cx.mono : cx.font;
+        if (adbDlDone.exchange(false)) { adbWorks(true); adbDevScanned=false; }   // recheck after a background adb fetch
+        ensureAdbAsync();                                                          // auto-grab adb (once, background) if none is usable
         if (!autoLogStarted){ autoLogStarted=true; startLogStream(); }   // AUTO-START (+ auto full verbose) on first open
         float rh=24*uiScale, pad=8*uiScale, gap=4*uiScale, bx=x+pad, by=y+pad, rowRight=x+w-pad;
         // controls WRAP to a new row when they'd overflow the panel width (narrow / resized panels)
@@ -7024,6 +7093,24 @@ struct Editor {
           if (cx.button(ui::hashId("logdev"), dbx, dby, dbw, rh, dv.c_str())) { cycleAdbDevice(); std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); }
           cx.tip(dbx, dby, dbw, rh, "Which attached Quest to read. Click to CYCLE devices when several are\nconnected (from `adb devices`). \"default\" = the single attached one.");
           bx+=dbw+gap; }
+        // adb status / auto-grab banner — shown only while fetching, or when no usable adb was found.
+        if (adbDling.load() || !adbWorks()) {
+            bx = x+pad; by += rh+gap;
+            std::string st; { std::lock_guard<std::mutex> lk(adbDlMx); st = adbDlStatus; }
+            bool dling = adbDling.load();
+            std::string msg = dling ? ("adb: " + (st.empty()? std::string("downloading...") : st))
+                                    : ("adb not found - " + (st.empty()? std::string("auto-downloading Google platform-tools, or point at your own:") : st));
+            float mw = w-2*pad; dl.rect(bx, by, mw, rh, dling? ui::rgba(52,92,150,235) : ui::rgba(150,74,40,235));
+            cx.textAligned(bx+6*uiScale, by, mw-12*uiScale, rh, msg.c_str(), th.textSel, 0);
+            by += rh+gap; bx = x+pad;
+            if (!dling) {
+                if (btn("adbdl","Re-try download",130*uiScale,true,"Download Google's official platform-tools (adb) beside the app -\nthe correct build for THIS OS, ~15 MB, one time. Needs a connection.")) { adbAutoTried=false; ensureAdbAsync(); }
+                if (btn("adbbrowse","Browse for adb...",134*uiScale,false,"Point at an adb you already have (SideQuest's, the Android SDK's, scrcpy's).\nSaved to adb_path.txt for next time.")) {
+                    std::string p = pickFileWin32(L"Locate adb (adb.exe / adb)", L"adb (adb.exe;adb)", L"adb.exe;adb");
+                    if (!p.empty()) { setAdbUserPath(p); adbWorks(true); adbDevScanned=false; setStatus("adb set -> "+p); }
+                }
+            }
+        }
         float top = by+rh+6*uiScale; dl.rect(x,top-3*uiScale,w,1,th.splitLine);
         // log area
         float ax=x+pad, ay=top, aw=w-2*pad, ah=y+h-ay-pad; if(ah<20*uiScale) ah=20*uiScale;
@@ -7142,7 +7229,24 @@ struct Editor {
         if (co) CoUninitialize();
         return result;
 #else
-        (void)title; return "";
+        // Native file-open dialog: macOS (osascript) / Linux (zenity, then kdialog). Returns "" only on cancel.
+        (void)filtName;
+        std::string t; if (title) for (const wchar_t* p=title; *p; ++p) if (*p>=32 && *p<127) t += (char)*p;   // titles are ASCII
+        std::string spec; if (filtSpec) for (const wchar_t* p=filtSpec; *p; ++p) if (*p<127) spec += (char)*p;
+        auto esc=[](const std::string& s){ std::string o; for(char c:s){ if(c=='"'||c=='\\'||c=='`'||c=='$') o+='\\'; o+=c; } return o; };
+        auto run=[](const std::string& cmd)->std::string{ FILE* p=popen(cmd.c_str(),"r"); if(!p) return ""; std::string o; char b[1024]; size_t n; while((n=fread(b,1,sizeof b,p))>0) o.append(b,n); pclose(p);
+                                                          while(!o.empty()&&(o.back()=='\n'||o.back()=='\r')) o.pop_back(); return o; };
+  #ifdef __APPLE__
+        return run("osascript -e 'POSIX path of (choose file with prompt \""+esc(t)+"\")' 2>/dev/null");
+  #else
+        if (system("command -v zenity >/dev/null 2>&1")==0) {
+            std::string f; for (size_t i=0,st=0; i<=spec.size(); ++i) if (i==spec.size()||spec[i]==';') { std::string g=spec.substr(st,i-st); st=i+1; if(!g.empty()&&g!="*.*") f+=" --file-filter=\""+g+"\""; }   // *.png;*.jpg -> filters
+            return run("zenity --file-selection --title=\""+esc(t)+"\""+f+" 2>/dev/null");
+        }
+        if (system("command -v kdialog >/dev/null 2>&1")==0)
+            return run("kdialog --getopenfilename . 2>/dev/null");
+        return "";   // no portable picker installed (zenity/kdialog) — the caller's type-a-path field still works
+  #endif
 #endif
     }
     // Save-As dialog (returns the chosen path, or "" on cancel). Mirrors pickFileWin32 with IFileSaveDialog.
@@ -7173,7 +7277,22 @@ struct Editor {
         if (co) CoUninitialize();
         return result;
 #else
-        (void)title; (void)defName; return "";
+        // Native save dialog: macOS (osascript) / Linux (zenity --save). Returns "" only on cancel.
+        (void)filtName; (void)filtSpec;
+        std::string t; if (title) for (const wchar_t* p=title; *p; ++p) if (*p>=32 && *p<127) t += (char)*p;
+        std::string dn; if (defName) for (const wchar_t* p=defName; *p; ++p) if (*p>=32 && *p<127) dn += (char)*p;
+        auto esc=[](const std::string& s){ std::string o; for(char c:s){ if(c=='"'||c=='\\'||c=='`'||c=='$') o+='\\'; o+=c; } return o; };
+        auto run=[](const std::string& cmd)->std::string{ FILE* p=popen(cmd.c_str(),"r"); if(!p) return ""; std::string o; char b[1024]; size_t n; while((n=fread(b,1,sizeof b,p))>0) o.append(b,n); pclose(p);
+                                                          while(!o.empty()&&(o.back()=='\n'||o.back()=='\r')) o.pop_back(); return o; };
+  #ifdef __APPLE__
+        return run("osascript -e 'POSIX path of (choose file name with prompt \""+esc(t)+"\" default name \""+esc(dn)+"\")' 2>/dev/null");
+  #else
+        if (system("command -v zenity >/dev/null 2>&1")==0)
+            return run("zenity --file-selection --save --confirm-overwrite --title=\""+esc(t)+"\" --filename=\""+esc(dn)+"\" 2>/dev/null");
+        if (system("command -v kdialog >/dev/null 2>&1")==0)
+            return run("kdialog --getsavefilename \"./"+esc(dn)+"\" 2>/dev/null");
+        return "";
+  #endif
 #endif
     }
     // Import a Blender-edited glTF/glb back in. The env is rebuilt from the loader path (gltf_import.h), so we open it
