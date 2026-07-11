@@ -6629,7 +6629,9 @@ struct Editor {
         if (fileEx("C:/platform-tools/adb.exe")) return "C:/platform-tools/adb.exe";
 #else
         if (const char* h=std::getenv("HOME")) { std::string H=h;
-            for (const char* p : { "/Android/Sdk/platform-tools/adb", "/Library/Android/sdk/platform-tools/adb" })
+            for (const char* p : { "/Android/Sdk/platform-tools/adb", "/Library/Android/sdk/platform-tools/adb",
+                                   "/.config/SideQuest/platform-tools/adb",                        // SideQuest on Linux (Electron userData)
+                                   "/Library/Application Support/SideQuest/platform-tools/adb" })  // SideQuest on macOS
                 { std::string c=H+p; if (fileEx(c)) return c; } }
         for (const char* p : { "/usr/local/bin/adb", "/opt/homebrew/bin/adb", "/usr/bin/adb" }) if (fileEx(p)) return p;
 #endif
@@ -6639,14 +6641,12 @@ struct Editor {
     int adbOk = -1;
     bool adbWorks(bool recheck=false){
         if (recheck) adbOk=-1;
-        if (adbOk<0){ auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
-            std::string v = adbCapture(
+        if (adbOk<0){ auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
 #ifdef _WIN32
-                bs(adbPath())
-#else
-                adbPath()
+            for(char&c:p) if(c=='/')c='\\';
 #endif
-                , "", "version");
+            return p; };
+            std::string v = adbCapture(bs(adbPath()), "", "version");
             adbOk = (v.find("Android Debug Bridge")!=std::string::npos) ? 1 : 0; }
         return adbOk==1;
     }
@@ -6681,7 +6681,11 @@ struct Editor {
     }
     // Device PICKER: scan `adb devices -l` into adbDeviceList = {serial, "Model (serial)"} (ONLINE devices only).
     void refreshAdbDevices(){
-        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
         std::string out = adbCapture(bs(adbPath()), "", "devices -l");
         adbDeviceList.clear(); adbDevScanned = true;
         size_t s=0;
@@ -6716,7 +6720,11 @@ struct Editor {
     // applies to every env cook (the APK files are still written; only the optional auto-install is skipped).
     bool deviceConnected() {
         if (std::getenv("HSR_NOINSTALL")) return false;   // headless test cooks: write the APKs, never touch the user's Quest
-        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         if (!wifiIp.empty()) { std::string ip=wifiIp; if(ip.find(':')==std::string::npos) ip+=":5555"; runAdb(ADB,"","connect "+ip); }
         std::string st = adbCapture(ADB, sel, "get-state");
@@ -6724,7 +6732,11 @@ struct Editor {
             && st.find("offline")==std::string::npos && st.find("device")!=std::string::npos;
     }
     bool deviceIsRooted() {
-        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         runAdb(ADB, sel, "root");                                   // best-effort: restart adbd as root (no-op on retail builds)
         if (!wifiIp.empty()) { std::string ip=wifiIp; if(ip.find(':')==std::string::npos) ip+=":5555"; runAdb(ADB,"","connect "+ip); }
@@ -6756,7 +6768,11 @@ struct Editor {
     // exit-code check falsely reported "Restored". On a signature/downgrade Failure (our spoof is installed),
     // uninstall it and clean-install. Returns true only if adb actually printed Success.
     static bool installHavenBackup(const std::string& ADB, const std::string& sel, const std::vector<std::string>& apks, std::string& log) {
-        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
         auto build=[&](const char* verb){ std::string t=verb; for(auto&a:apks) t+=" \""+bs(a)+"\""; return t; };
         log = adbCapture(ADB, sel, build(apks.size()>1 ? "install-multiple -r -d -g" : "install -r -d -g"));
         if (log.find("Success")!=std::string::npos) return true;
@@ -6767,7 +6783,11 @@ struct Editor {
     // Back up the REAL haven2025 off the device BEFORE anything is uninstalled. Keeps the first/pristine backup;
     // never overwrites it. Pulls the FULL split set. Writes a HOW_TO_RESTORE.txt and reports the folder.
     HavenBkp backupOriginalHaven(std::string& outBkp) {
-        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         std::string dir = havenBackupDir(); outBkp = havenBackupApk();
         if (fileEx(outBkp) || !havenBackupApks().empty()) { fprintf(stderr, "[COOK] Haven 2025 backup already exists (pristine, kept): %s\n", dir.c_str()); return HB_OK; }
@@ -6801,7 +6821,11 @@ struct Editor {
     // MANUAL uninstall: rip out whatever Haven 2025 is installed (spoof or a different Meta version). No root needed
     // if it's a store/updatable app; a non-removable SYSTEM install can only be disabled (needs root to fully remove).
     void uninstallHaven() {
-        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial), pkg = HAVEN_PKG();
         if (!adbWorks(true)) { setStatus("adb not found - open the Logcat tab (it auto-downloads adb), or Browse for it."); return; }
         std::string prev = pkgVersion(ADB, sel, pkg);
@@ -6816,7 +6840,11 @@ struct Editor {
                        : "Couldn't fully remove Haven 2025 - it's a non-removable SYSTEM app on this headset (needs root). It's been disabled for the user where possible.");
     }
     void restoreHaven() {
-        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         std::vector<std::string> apks = havenBackupApks();
         if (apks.empty()) { setStatus("No Haven 2025 backup found in "+havenBackupDir()+" - nothing to restore (a backup is made automatically the first time you install a spoof)."); return; }
@@ -6846,7 +6874,11 @@ struct Editor {
     // Connect wireless adb to wifiIp (e.g. "192.168.1.35[:5555]"); call before installing over Wi-Fi.
     bool wifiConnect() {
         if (wifiIp.empty()) return false;
-        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
         std::string ADB=bs(adbPath()), ip=wifiIp; if (ip.find(':')==std::string::npos) ip+=":5555";
         bool ok = runAdb(ADB, "", "connect "+ip)==0;
         if (ok && adbSerial.empty()) adbSerial=ip;   // target it for the install
@@ -6872,7 +6904,11 @@ struct Editor {
         return vc.empty()? vn : (vc + (vn.empty()?"":(" / "+vn)));
     }
     bool installToDevice(const std::string& apkPath, const std::string& pkg, const std::function<void(float,const char*)>& progress, bool uninstallFirst=false, bool rooted=false) {
-        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
         std::string ADB=bs(adbPath()), AP=bs(apkPath), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         if (progress) progress(0.95f, "adb install");
         if (uninstallFirst) {
@@ -7028,7 +7064,11 @@ struct Editor {
     void startLogStream(){
         if (logRun.exchange(true)) return;
         logThread = std::thread([this]{
-            auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+            auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
             std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
             // AUTOMATIC FULL VERBOSE: raise libshell's log threshold once (no root), so the log has maximum detail.
             runAdb(ADB, sel, "shell setprop debug.logLevel Verbose"); logVerboseSet.store(true);
@@ -7066,7 +7106,11 @@ struct Editor {
     void stopLogStream(){ logRun.store(false); if(logThread.joinable()) logThread.join(); }
     // Reload the home (no root) so the FRESH env load streams into the log; raise verbosity + clear first.
     void reloadShellForLog(){
-        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         runAdb(ADB, sel, "shell setprop debug.logLevel Verbose");
         { std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); logLastTs.clear(); }
@@ -7076,7 +7120,11 @@ struct Editor {
         setStatus("Reloaded home + cleared log - watch the Logcat page for the env-load result.");
     }
     void setVerboseLogging(){
-        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         runAdb(ADB, sel, "shell setprop debug.logLevel Verbose");
         setStatus("debug.logLevel=Verbose set (no root). Reload the home for it to take effect.");
@@ -7084,7 +7132,11 @@ struct Editor {
     // Export a self-contained, SHAREABLE diagnostic report: device context + the (no-root) env-load log +
     // an auto verdict. This is what an unrooted user sends back to figure out WHY their Quest fell back to nuxd.
     void exportDiag(){
-        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         // default filename: quest_env_diag_<timestamp>.txt
         char ts[32]; { std::time_t t=std::time(nullptr); std::tm tm{};
@@ -7179,7 +7231,11 @@ struct Editor {
                 "Write a shareable diagnostic report (device info + resolved env +\nverdict + the env-load log) to a .txt and reveal it. Attach it on\nDiscord / GitHub when reporting a home that fell back to Haven/nuxd.")) exportDiag();
         if (btn("loghmenu","Home menu",96*uiScale,false,
                 "Open the HIDDEN Meta Home settings panel in the headset (no root):\nam start -n com.oculus.panelapp.settings/.SettingsActivity --es uri /home\nPut the headset on to see it.")) {
-            auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+            auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
             std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
             runAdb(ADB, sel, "shell am start -n com.oculus.panelapp.settings/.SettingsActivity --es uri /home");
             setStatus("Hidden Meta Home menu opened on the headset (panelapp.settings /home).");

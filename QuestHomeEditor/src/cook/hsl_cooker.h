@@ -1944,7 +1944,14 @@ inline std::string downloadPlatformTools(const std::function<void(float,const ch
     const char* osTag = "linux";   const char* adbName = "platform-tools/adb";
 #endif
     std::string already = exeDir + "/" + adbName;
-    if (fs::exists(already, ec)) return already;                      // fetched on a previous run
+    if (fs::exists(already, ec)) {                                    // fetched on a previous run
+#ifndef _WIN32
+        // self-heal: an earlier interrupted extract (or a zip tool that dropped the mode bits)
+        // leaves adb present but NOT executable -> "no devices" forever. Re-add +x every time.
+        fs::permissions(already, fs::perms::owner_exec|fs::perms::group_exec|fs::perms::others_exec, fs::perm_options::add, ec);
+#endif
+        return already;
+    }
     std::string url = std::string("https://dl.google.com/android/repository/platform-tools-latest-") + osTag + ".zip";
     std::string zip = exeDir + "/platform-tools.zip";
     if (!httpDownload(url, zip, prog, "Downloading Android platform-tools / adb (~15MB, one time)")) return "";
