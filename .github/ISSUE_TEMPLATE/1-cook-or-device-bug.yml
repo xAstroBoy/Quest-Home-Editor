@@ -1,0 +1,111 @@
+name: "🍳 Cook / device / libshell bug"
+description: A cooked home renders wrong, crashes the environment, falls back to Haven/nuxd, or a format/collision is decoded wrong on the headset.
+labels: ["bug", "libshell"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This tracker only accepts libshell/cook/device bugs and QOL improvements.** This template is for
+        the first kind: something the tool produces that is **wrong on the device or in the cook** (a port
+        that fails, renders incorrectly, crashes the env, falls back, bad collision, a mis-decoded format).
+
+        If your home **fell back to Haven / nuxd**, first open the **Logcat** tab → **Reload home** → **Export**
+        and attach that `quest_env_diag_*.txt` below — it usually contains the exact reason.
+  - type: checkboxes
+    id: policy
+    attributes:
+      label: Scope (required)
+      options:
+        - label: This is a **cook / device / libshell** bug (not a general support question or an off-topic request).
+          required: true
+        - label: I read the [Troubleshooting](https://github.com/xAstroBoy/Quest-Home-Editor/wiki/Troubleshooting) page and it didn't cover this.
+          required: true
+  - type: input
+    id: env
+    attributes:
+      label: Which home / env
+      description: The source env you loaded (name + format).
+      placeholder: e.g. cyberhome (.opa)  /  outerwilds (env.apk)  /  KH2Ca00.glb
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where does it go wrong?
+      options:
+        - On the headset after installing (cooked APK)
+        - In the desktop preview (before cooking)
+        - Both preview and device
+        - During the cook itself (cook fails / crashes)
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: What should happen, and what actually happens.
+      placeholder: |
+        Expected: the city skyline shows in the distance.
+        Actual: the skyline is black / clipped past ~5 km.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Drag <env> in
+        2. Cook tab → COOK + SIGN + INSTALL
+        3. Put headset on → …
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Headset + root
+      description: Model and whether it's rooted.
+      placeholder: e.g. Quest 3, NOT rooted (Haven spoof)  /  Quest Pro, rooted
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tool version
+      placeholder: e.g. v0.10.0 (or the commit hash)
+    validations:
+      required: true
+  - type: textarea
+    id: home
+    attributes:
+      label: Share the home (so it can be reproduced)
+      description: |
+        **Drag the actual home file in** — the source env you loaded (`.apk` / `.opa` / `.gltf` / `.glb` /
+        `.gltf.ovrscene`, or your `.hsledit` session). This is the single most useful thing for a
+        **rejected** or **won't-cook** home: with the file we can reproduce the cook here.
+        GitHub blocks some extensions in the upload box — if it won't take the raw file, **zip it** and
+        drag the `.zip` (or paste a link).
+    validations:
+      required: false
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: "📸 Screenshot pinpointing the problem (REQUIRED for a cooking / render issue)"
+      description: |
+        Drag an image in and **circle / arrow the exact thing that's wrong** — the mesh that's black,
+        the wall you fall through, the texture that's garbled, the object that didn't cook, etc.
+        We **cannot** fix a cooking/visual issue we can't see. "It looks wrong" without a marked-up
+        screenshot will be closed. (Not needed only if the home fully **fell back** — then the Logcat
+        Export below is the evidence.)
+    validations:
+      required: false
+  - type: textarea
+    id: diag
+    attributes:
+      label: Attach the rest of the evidence
+      description: |
+        Drag files in. Please attach whichever apply:
+        • the Logcat **Export** report (`quest_env_diag_*.txt`) — for a fell-back home
+        • the `_crash.txt` next to the exe — for a crash
+        • a short clip — for anything animated / intermittent
+    validations:
+      required: false

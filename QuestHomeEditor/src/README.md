@@ -1,4 +1,4 @@
-# hsr_renderer source layout
+# Quest Home Editor source layout
 
 | Dir / file | What lives here |
 |---|---|

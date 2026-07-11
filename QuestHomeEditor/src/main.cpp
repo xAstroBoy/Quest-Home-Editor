@@ -6,7 +6,7 @@
 //   → RENDSHAD (shader SPIRV from APK) → RENDMESH → MATLMATL → RENDTXTR (ASTC)
 //   → Vulkan rendering
 //
-// Usage: hsr_renderer.exe <apk_path>
+// Usage: Quest Home Editor.exe <apk_path>
 //
 // Controls: WASD=move, QE=up/down, mouse drag=look, scroll=speed, Esc=quit
 
@@ -445,12 +445,12 @@ int main(int argc, char** argv) {
       size_t s = p.find_last_of('/'); if (s != std::string::npos) AppConfig::s_exeDir = p.substr(0, s); }
 #endif
     // ── QUIET BY DEFAULT: no console popup — the main window opens straight to the drag-drop prompt, and all
-    //    diagnostics stream to `hsr_renderer.log` beside the exe (a shareable file instead of a console page).
+    //    diagnostics stream to `Quest Home Editor.log` beside the exe (a shareable file instead of a console page).
     //    HSR_CONSOLE=1 keeps the live console/terminal; headless/scripted modes keep stderr for capture.
     bool wantConsole = std::getenv("HSR_CONSOLE") || std::getenv("HSR_SHOW_CONSOLE");
     bool headlessOut = std::getenv("HSR_SHOT") || std::getenv("HSR_EXPORT") || std::getenv("HSR_BLENDER_EXPORT") || std::getenv("HSR_LIVE");
     if (!wantConsole && !headlessOut) {
-        std::string logp = (AppConfig::s_exeDir.empty()?std::string("."):AppConfig::s_exeDir) + "/hsr_renderer.log";
+        std::string logp = (AppConfig::s_exeDir.empty()?std::string("."):AppConfig::s_exeDir) + "/Quest Home Editor.log";
 #ifdef _WIN32
         if (freopen(logp.c_str(), "w", stderr)) { setvbuf(stderr, nullptr, _IOLBF, 4096); freopen(logp.c_str(), "a", stdout); }
         HWND con = GetConsoleWindow(); if (con) ShowWindow(con, SW_HIDE);   // no console window
@@ -464,12 +464,12 @@ int main(int argc, char** argv) {
     fprintf(stderr, "========================================================\n\n");
     if (!std::getenv("HSR_NO_TOOLCHECK")) hslcook::reportToolchain();   // startup readiness of the signing toolchain (-> log)
 
-    // ── standalone APK signer: `hsr_renderer --sign <foo.apk> [more.apk ...]` ──────────────────────────────
+    // ── standalone APK signer: `Quest Home Editor --sign <foo.apk> [more.apk ...]` ──────────────────────────────
     // Signs an ALREADY-BUILT APK (e.g. a shared/unsigned cooked home someone sent you) in place -> <name>_signed.apk,
     // so it installs without INSTALL_PARSE_FAILED_NO_CERTIFICATES. NO re-cook needed. Same auto-detected build-tools +
     // auto-generated debug keystore as the cooker (drop apksigner+zipalign beside the exe if you have no Android SDK).
     if (argc >= 2 && (std::string(argv[1]) == "--sign" || std::string(argv[1]) == "-s")) {
-        if (argc < 3) { fprintf(stderr, "usage: hsr_renderer --sign <apk> [more.apk ...]\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: Quest Home Editor --sign <apk> [more.apk ...]\n"); return 2; }
         int fails = 0;
         for (int i = 2; i < argc; ++i) {
             std::string in = argv[i];
@@ -483,13 +483,13 @@ int main(int argc, char** argv) {
         return fails ? 1 : 0;
     }
 
-    // `hsr_renderer --restore-haven` puts the ORIGINAL Meta Haven 2025 back from the auto-backup the cooker made
+    // `Quest Home Editor --restore-haven` puts the ORIGINAL Meta Haven 2025 back from the auto-backup the cooker made
     // (folder "Haven2025_Backup" beside the exe) before it installed a spoof, then relaunches the shell.
     if (argc >= 2 && std::string(argv[1]) == "--restore-haven") {
         return Editor::cliRestoreHaven();
     }
 
-    // `hsr_renderer --fetch-tools` pre-downloads the Android signing toolchain (Google build-tools + a Temurin JRE
+    // `Quest Home Editor --fetch-tools` pre-downloads the Android signing toolchain (Google build-tools + a Temurin JRE
     // if no Java) right beside the exe, so later --sign / Cook works on a clean machine with no SDK and no JDK.
     if (argc >= 2 && std::string(argv[1]) == "--fetch-tools") {
         auto p = [](float f, const char* s){ fprintf(stderr, "  [%3d%%] %s\n", (int)(f * 100.f), s); };

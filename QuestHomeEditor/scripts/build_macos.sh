@@ -1,5 +1,5 @@
 #!/bin/bash
-# hsr_renderer / editor — one-command macOS build (EXPERIMENTAL — Vulkan via MoltenVK).
+# Quest Home Editor / editor — one-command macOS build (EXPERIMENTAL — Vulkan via MoltenVK).
 # Mirrors the CI release workflow: brew deps, CMake+Ninja, PhysX off (Windows-only vendored libs;
 # the cooker falls back to the ColliderBox grid — fully functional).
 set -e
@@ -7,7 +7,7 @@ SDIR="$(cd "$(dirname "$0")/.." && pwd)"
 BDIR="$SDIR/build"
 
 echo "================================================"
-echo " hsr_renderer — macOS build (MoltenVK)"
+echo " Quest Home Editor — macOS build (MoltenVK)"
 echo "================================================"
 
 if ! command -v brew >/dev/null; then
@@ -25,8 +25,8 @@ cmake --build "$BDIR"
 echo ""
 echo "================================================"
 echo " Build SUCCESS"
-echo " Editor:  $BDIR/hsr_renderer"
-echo " Run:     ./hsr_renderer <env.apk | .gltf.ovrscene>"
+echo " Editor:  $BDIR/Quest Home Editor"
+echo " Run:     ./Quest Home Editor <env.apk | .gltf.ovrscene>"
 echo " NOTE: runs on MoltenVK (Vulkan->Metal). Untested territory —"
 echo " report issues at github.com/xAstroBoy/v79-quest-home-porter"
 echo "================================================"

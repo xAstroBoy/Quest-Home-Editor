@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build.py — build hsr_renderer. If the .exe is locked by a running instance
+build.py — build Quest Home Editor. If the .exe is locked by a running instance
 (LNK1104), kill it (looping until none remain) and retry. Prints the FULL
 compiler output — nothing trimmed.
 
@@ -11,7 +11,7 @@ Usage:
 import subprocess, sys, os, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-EXE  = "hsr_renderer.exe"
+EXE  = "Quest Home Editor.exe"
 
 def run_build():
     bat = os.path.join(HERE, "do_build.bat")
@@ -20,7 +20,7 @@ def run_build():
 
 def count_instances():
     r = subprocess.run(["powershell", "-NoProfile", "-Command",
-        "(Get-Process hsr_renderer -ErrorAction SilentlyContinue | Measure-Object).Count"],
+        "(Get-Process 'Quest Home Editor' -ErrorAction SilentlyContinue | Measure-Object).Count"],
         capture_output=True, text=True)
     try:    return int((r.stdout or "0").strip().splitlines()[-1])
     except: return -1
@@ -30,12 +30,12 @@ def kill_instances():
         if count_instances() == 0:
             return True
         subprocess.run(["powershell", "-NoProfile", "-Command",
-            "Get-Process hsr_renderer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"],
+            "Get-Process 'Quest Home Editor' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"],
             capture_output=True, text=True)
         time.sleep(0.4)
     n = count_instances()
     if n > 0:
-        print(f"[build.py] WARNING: {n} hsr_renderer instance(s) still alive after 6 kill attempts")
+        print(f"[build.py] WARNING: {n} Quest Home Editor instance(s) still alive after 6 kill attempts")
     return n == 0
 
 def main():

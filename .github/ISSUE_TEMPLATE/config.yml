@@ -1,0 +1,15 @@
+# Only the two templates below are accepted. Blank issues are disabled on purpose:
+# we ONLY take (1) libshell / cook / device bugs, or (2) editor quality-of-life (QOL).
+# Anything else (general support, "how do I…", requests to port a specific env, off-topic
+# feature ideas) will be closed. Read the wiki first — most problems are already answered.
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 Troubleshooting & FAQ (read this FIRST)
+    url: https://github.com/xAstroBoy/Quest-Home-Editor/wiki/Troubleshooting
+    about: Fell back to Haven, crash on launch, fall through the floor, adb not found, unsigned APK — all solved here.
+  - name: 🩺 Diagnose a rejected home (no root)
+    url: https://github.com/xAstroBoy/Quest-Home-Editor/wiki/Diagnosing-a-Rejected-Home
+    about: Use the Logcat tab to find EXACTLY why a cook fell back, then attach the Export report to a bug.
+  - name: 🛠️ Want to help / contribute?
+    url: https://github.com/xAstroBoy/Quest-Home-Editor/wiki/How-to-Contribute
+    about: Translations, docs, editor features, and the reverse-engineering workflow.
