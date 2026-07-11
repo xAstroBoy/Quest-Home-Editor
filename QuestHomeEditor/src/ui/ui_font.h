@@ -158,7 +158,11 @@ inline bool loadUIFont(Font& f, float px, bool mono = false, const std::vector<u
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/NotoSans-Regular.ttf",
+        "/usr/share/fonts/TTF/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/cantarell/Cantarell-Regular.otf",
 #endif
     };
     static const char* monos[] = {
@@ -173,6 +177,8 @@ inline bool loadUIFont(Font& f, float px, bool mono = false, const std::vector<u
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
         "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/usr/share/fonts/TTF/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
 #endif
     };
     const char* const* list = mono ? monos : sans;
@@ -182,7 +188,7 @@ inline bool loadUIFont(Font& f, float px, bool mono = false, const std::vector<u
     // the bytes, then do ONE loadBytes with the extra codepoints + CJK font.
     std::vector<uint8_t> ttf;
     if (!AppConfig::s_exeDir.empty()) {
-        const char* rel[] = { "fonts/", "third_party/fonts/", "../third_party/fonts/", "../Resources/fonts/" };
+        const char* rel[] = { "fonts/", "third_party/fonts/", "../third_party/fonts/", "../QuestHomeEditor/third_party/fonts/", "../Resources/fonts/" };
         const char* fn = mono ? "Consola.ttf" : "InterVariable.ttf";
         for (const char* r : rel) { std::string p = AppConfig::s_exeDir + "/" + r + fn; if (readFile(p.c_str(), ttf)) break; }
     }
