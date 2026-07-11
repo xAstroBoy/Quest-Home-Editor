@@ -3418,6 +3418,10 @@ struct Editor {
                                        // (empty) vista. OFF = the old `combined` spoof (envIsFootprint=0, no vista paired,
                                        // the v0.9.32 fix). Footprint is the native home type; combined is the fallback if
                                        // vista-neutralize can't run on a device. [[project_hsr_unrooted_footprint_vista_fix]]
+    bool autoFixVistas = true;         // DEFAULT ON: when a Quest connects, auto-detect a BROKEN vista (one that
+                                       // rejects on load → home drops to nuxd) from the recent logcat and re-neutralize
+                                       // it with the current (fixed) invisible vista — no manual button press needed.
+    std::string autoVistaCheckedSerial;// the device serial we've already auto-checked this session (check once per connect)
     bool killVistas = true;            // DEFAULT ON (unrooted spoof): after the spoof install, replace EVERY installed
                                        // com.meta.shell.env.vista.* package with an INVISIBLE (0-entity) environment, so
                                        // any vista the boot resolver force-pairs renders NOTHING. Only touches /data
@@ -5579,6 +5583,8 @@ struct Editor {
         cx.tip(x,y0,w,th.rowH,"Ship the spoof as a FOOTPRINT home (hsr_package_type=footprint), the\nnative home type - so the shell pairs a companion vista, which the\n'Neutralize vistas' option then fills with an INVISIBLE (empty) vista.\nOFF = the old 'combined' spoof (no vista paired) - use that only if\nvista-neutralize can't run on your device. Keep both ON."); y+=th.rowH+2*uiScale;
         y0=y; cx.checkbox(ui::hashId("killvistas"), x, y, "Neutralize vistas (install an invisible vista over each)", killVistas);
         cx.tip(x,y0,w,th.rowH,"After installing the spoof, replace EVERY installed vista package\n(com.meta.shell.env.vista.*) with an INVISIBLE 0-mesh environment.\nSo if the shell force-pairs a vista behind your home, it renders\nNOTHING. Only /data (updatable) vistas can be replaced without root;\na system-app vista is reported and left as-is. Keep ON if a vista\nstill shows behind your ported home."); y+=th.rowH+2*uiScale;
+        y0=y; cx.checkbox(ui::hashId("autofixvistas"), x, y, "Auto-fix a broken vista when the Quest connects", autoFixVistas);
+        cx.tip(x,y0,w,th.rowH,"When a Quest is plugged in, check the recent logcat for a vista that\nREJECTS on load (which drops your home to the nuxd fallback) and, if\nfound, automatically re-install the current invisible vista over it -\nno button press needed. Runs once per device per session."); y+=th.rowH+2*uiScale;
         // ── the AUDIO COOKER UI: shows what will ship + Replace/Add/Export/Revert (backend above: setAudioFromFile etc.) ──
         { if(audioInfo.empty() && !bgOgg.empty()) refreshAudioInfo();
           std::string al = bgOgg.empty() ? "  audio: none - Add one below"
@@ -6733,6 +6739,7 @@ struct Editor {
             std::string model; size_t mp=rest.find("model:"); if(mp!=std::string::npos){ mp+=6; size_t me=rest.find_first_of(" \t",mp); model=rest.substr(mp, me==std::string::npos?std::string::npos:me-mp); for(char&c:model) if(c=='_')c=' '; }
             adbDeviceList.push_back({serial, model.empty()?serial:(model+"  ("+serial+")")});
         }
+        if (!adbDeviceList.empty()) autoVistaCheckAsync();   // a Quest is attached — auto-detect + fix a broken vista (once per serial)
     }
     // Cycle adbSerial through the attached devices (+ the "default/only" empty state). Rescans if the list is empty.
     void cycleAdbDevice(){
@@ -6969,6 +6976,70 @@ struct Editor {
             relaunchShell(ADB, sel);
             setStage(1.f, "Done");
             setStatus("Neutralize vistas: "+r);
+            vistaBusy.store(false); restoring.store(false);
+        });
+    }
+    // Classify the recent env-load logcat: 1 = a vista REJECTED (broken → home fell to nuxd), 0 = a vista
+    // loaded cleanly, -1 = no env-load info in the buffer (home loaded too long ago → can't tell without a reload).
+    static int vistaLoadStateFromLog(const std::string& log){
+        bool sawVista=false, reject=false;
+        size_t s=0;
+        while (s<log.size()){ size_t nl=log.find('\n',s); std::string ln=log.substr(s, nl==std::string::npos?std::string::npos:nl-s); s=(nl==std::string::npos)?log.size():nl+1;
+            if (ln.find("streamables.zip")!=std::string::npos) continue;   // benign optional asset (see firstRejectReasonStr)
+            if (ln.find("as Vista")!=std::string::npos || ln.find("com.meta.shell.env.vista")!=std::string::npos) sawVista=true;
+            bool vistaCtx = ln.find("vista")!=std::string::npos || ln.find("empty_vista")!=std::string::npos;
+            if (vistaCtx && (ln.find("Asset ptr error")!=std::string::npos || ln.find("No entities")!=std::string::npos
+                          || ln.find("postInitAsset failed")!=std::string::npos || ln.find("Failed to validate ECS")!=std::string::npos)) reject=true;
+        }
+        if (reject) return 1;
+        if (sawVista) return 0;
+        return -1;
+    }
+    // AUTO-FIX on connect: detect a broken (rejecting) vista from the recent logcat and re-neutralize it with the
+    // current invisible vista. Runs at most once per device serial per session, non-intrusively (only reloads the
+    // shell to force a fresh load if the ring buffer has no env-load lines). Skips if a manual op is already running.
+    void autoVistaCheckAsync(){
+        if (!autoFixVistas) return;
+        if (restoring.load() || cooking.load() || vistaBusy.load()) return;
+        std::string serial = adbSerial.empty()? std::string("(default)") : adbSerial;
+        if (autoVistaCheckedSerial == serial) return;      // already checked this connection
+        if (adbDeviceList.empty()) return;                 // no device
+        autoVistaCheckedSerial = serial;
+        if (restoring.exchange(true)) return;
+        vistaBusy.store(true); cookProg.store(0.f);
+        if (restoreThread.joinable()) restoreThread.join();
+        restoreThread = std::thread([this]{
+            auto bs=[](std::string p){
+#ifdef _WIN32
+                for(char&c:p) if(c=='/')c='\\';
+#endif
+                return p; };
+            std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
+            if (!adbWorks(true)) { vistaBusy.store(false); restoring.store(false); return; }   // silent: no adb, nothing to do
+            setStage(0.1f, "checking for a broken vista");
+            std::string dump = adbCapture(ADB, sel, "logcat -d -v time -t 8000");
+            int st = vistaLoadStateFromLog(dump);
+            if (st == -1) {
+                // buffer has no env-load lines (home loaded long ago). Force ONE fresh load to test.
+                setStage(0.2f, "reloading home to test the vista");
+                runAdb(ADB, sel, "logcat -c");
+                runAdb(ADB, sel, "shell am force-stop com.oculus.vrshell");
+                for (int i=0;i<16;i++){ std::this_thread::sleep_for(std::chrono::milliseconds(800));
+                    dump = adbCapture(ADB, sel, "logcat -d -v time -t 8000");
+                    st = vistaLoadStateFromLog(dump);
+                    if (st!=-1 && (dump.find("Scene loaded")!=std::string::npos || dump.find("Asset ptr error")!=std::string::npos || dump.find("as Environment")!=std::string::npos)) break; }
+            }
+            if (st == 1) {
+                setStage(0.3f, "broken vista detected - replacing");
+                bool rooted = deviceIsRooted();
+                auto prog=[this](float f,const char* s){ setStage(0.3f + 0.6f*f, s); };
+                std::string r = neutralizeVistasOnDevice(ADB, sel, rooted, prog);
+                relaunchShell(ADB, sel);
+                setStage(1.f, "Done");
+                setStatus("Auto-fix: detected a BROKEN vista and replaced it with the invisible vista. "+r);
+            } else if (st == 0) {
+                setStatus("Vista OK on this Quest (loads without rejecting) - no fix needed.");
+            } // st==-1: couldn't determine (no env-load lines even after reload) - stay silent
             vistaBusy.store(false); restoring.store(false);
         });
     }
@@ -7364,6 +7435,7 @@ struct Editor {
         auto& dl=*cx.dl; auto& th=cx.th; ui::Font* lf = cx.mono? cx.mono : cx.font;
         if (adbDlDone.exchange(false)) { adbWorks(true); adbDevScanned=false; }   // recheck after a background adb fetch
         ensureAdbAsync();                                                          // auto-grab adb (once, background) if none is usable
+        if (!adbDevScanned) refreshAdbDevices();   // scan devices (also fires the auto vista-fix check when a Quest is attached)
         if (!autoLogStarted){ autoLogStarted=true; startLogStream(); }   // AUTO-START (+ auto full verbose) on first open
         float rh=24*uiScale, pad=8*uiScale, gap=4*uiScale, bx=x+pad, by=y+pad, rowRight=x+w-pad;
         // controls WRAP to a new row when they'd overflow the panel width (narrow / resized panels)
