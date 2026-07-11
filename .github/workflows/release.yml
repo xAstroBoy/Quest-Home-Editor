@@ -6,7 +6,7 @@ name: release
 # ⚠ Runs are currently blocked by an ACCOUNT-level billing lock ("your account is locked due to a
 # billing issue") — this affects Actions even on this PUBLIC repo. Once the GitHub billing is resolved,
 # re-run this workflow (or push a new `v*` tag) and the Linux + macOS + Windows binaries appear on the
-# release automatically. Until then, Linux/macOS users build from source: hsr_renderer_cpp/build_linux.sh
+# release automatically. Until then, Linux/macOS users build from source: QuestHomeEditor/build_linux.sh
 # (or see README "Building from source").
 #
 # PhysX is OFF in CI (it's a vendored Windows-only .lib); the cooker uses the device-compatible
@@ -63,7 +63,7 @@ jobs:
         run: choco install ninja -y
 
       - name: Configure (PhysX off → cross-platform)
-        run: cmake -S hsr_renderer_cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHSR_HAVE_PHYSX=OFF
+        run: cmake -S QuestHomeEditor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHSR_HAVE_PHYSX=OFF
 
       - name: Build (renderer/editor only)
         run: cmake --build build --target hsr_renderer
@@ -75,7 +75,7 @@ jobs:
           cp "build/${{ matrix.bin }}" "dist/${{ matrix.out }}"
           # Linux/macOS have no Segoe/Arial fallback — ship the open-source UI font beside the binary.
           mkdir -p "dist/third_party/fonts"
-          cp hsr_renderer_cpp/third_party/fonts/InterVariable.ttf "dist/third_party/fonts/" || true
+          cp QuestHomeEditor/third_party/fonts/InterVariable.ttf "dist/third_party/fonts/" || true
 
       - uses: actions/upload-artifact@v4
         with:

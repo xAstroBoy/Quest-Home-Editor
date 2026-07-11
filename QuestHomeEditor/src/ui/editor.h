@@ -3395,9 +3395,12 @@ struct Editor {
 
     // ── layout (draggable ratios) ──
     float rightRatio = 0.235f, outlinerRatio = 0.45f, timelineH = 80.f;
-    bool panelLeft = false;   // dock the tool column on the LEFT instead of the right (header ⇆ toggle)
+    bool panelLeft = false;   // dock the tool column on the LEFT instead of the right
+    bool dockDragging = false;   // Photoshop-style: grabbed the tool-panel grip → drag to re-dock LEFT/RIGHT
     VkRect2D rcHeader{}, rcViewport{}, rcOutliner{}, rcProps{}, rcTimeline{};
     int dragSplit = 0;           // 1=right border 2=outliner/props border 3=timeline border
+    // A home is "loaded" once meshes exist. Empty session (Logcat-only) hides the timeline + dock grip.
+    bool homeLoaded() const { return r && !r->gpuMeshes.empty(); }
 
     // ── properties tabs ──
     enum { TAB_OBJECT, TAB_SCENE, TAB_MATERIAL, TAB_ANIM, TAB_PHYSICS, TAB_COOK, TAB_LOGCAT };
@@ -3755,7 +3758,7 @@ struct Editor {
     int winW() const { int w=0,h=0; glfwGetWindowSize(win,&w,&h); return w; }
     int winH() const { int w=0,h=0; glfwGetWindowSize(win,&w,&h); return h; }
     // main gates camera/WASD on these
-    bool wantsMouse() const { return ctxOpen || knifeOn || cx.active!=0 || cx.kbFocus!=0 || gizmoDrag || exitDrag || playerDrag || boxSel || dragSplit!=0 || !inRect(rcViewport, cx.in.mx, cx.in.my); }
+    bool wantsMouse() const { return ctxOpen || knifeOn || cx.active!=0 || cx.kbFocus!=0 || gizmoDrag || exitDrag || playerDrag || boxSel || dragSplit!=0 || dockDragging || !inRect(rcViewport, cx.in.mx, cx.in.my); }
     bool wantsKeyboard() const { return cx.kbFocus != 0; }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -3851,7 +3854,7 @@ struct Editor {
         autoSaveTick(now);                                      // periodic dirty-checked session autosave
         drawOutliner();
         drawProperties();
-        drawTimeline();
+        if (homeLoaded()) drawTimeline();          // no timeline strip on the empty (Logcat-only) session
         wantCursor = 0;
         drawSplitters();
         // apply the resize cursor when hovering/dragging a splitter (create the standard cursors lazily)
@@ -3860,18 +3863,33 @@ struct Editor {
             if (!curV) curV = glfwCreateStandardCursor(GLFW_VRESIZE_CURSOR);
             glfwSetCursor(win, wantCursor==1 ? curH : wantCursor==2 ? curV : nullptr);
         }
-        // EMPTY SESSION (no home loaded): a clear "drag a file here" prompt instead of a dark void.
+        drawDockDrag();                                         // Photoshop-style re-dock drop zones (while grip is dragged)
+        // EMPTY SESSION (no home loaded): an ANIMATED "drag a file here" drop-zone instead of a dark void.
         if (r && r->gpuMeshes.empty()) {
             VkRect2D v=rcViewport; float hdr=26*uiScale;
             float vx=(float)v.offset.x, vy=(float)v.offset.y+hdr, vw=(float)v.extent.width, vh=(float)v.extent.height-hdr;
-            auto& th=cx.th;
-            cx.dl->pushClip(vx,vy,vw,vh);
-            cx.dl->rect(vx,vy,vw,vh, ui::rgba(28,30,38));
-            float cyc=vy+vh*0.5f;
-            cx.textAligned(vx, cyc-48*uiScale, vw, 34*uiScale, "Drag a home here to start", th.text, 1);
-            cx.textAligned(vx, cyc-6*uiScale,  vw, 20*uiScale, "Supported:  .apk   .gltf   .glb   .gltf.ovrscene   .opa", th.textDim, 1);
-            cx.textAligned(vx, cyc+26*uiScale, vw, 18*uiScale, "- or open the Logcat tab to diagnose a Quest (no root needed) -", th.textDim, 1);
-            cx.dl->popClip();
+            auto& th=cx.th; auto* d2=cx.dl; float t=(float)glfwGetTime();
+            float pulse=0.5f+0.5f*std::sin(t*2.0f);            // 0..1 breathing
+            float bob=std::sin(t*2.6f)*7.f*uiScale;            // arrow bob
+            d2->pushClip(vx,vy,vw,vh);
+            d2->rect(vx,vy,vw,vh, ui::rgba(28,30,38));
+            float cyc=vy+vh*0.5f, midx=vx+vw*0.5f;
+            // marching-ants dashed drop-zone box
+            float bw2=std::min(vw*0.60f, 540.f*uiScale), bh2=std::min(vh*0.52f, 260.f*uiScale);
+            float bx2=midx-bw2*0.5f, by2=cyc-bh2*0.5f, thk=2.f*uiScale;
+            uint32_t bcol=ui::rgba(64,140,235,(int)(55+120*pulse));
+            float dash=12*uiScale, dgap=9*uiScale, period=dash+dgap, off=std::fmod(t*36.f*uiScale, period);
+            for(float p=bx2-off; p<bx2+bw2; p+=period){ float a=std::max(p,bx2), b=std::min(p+dash,bx2+bw2); if(b>a){ d2->rect(a,by2,b-a,thk,bcol); d2->rect(a,by2+bh2-thk,b-a,thk,bcol);} }
+            for(float p=by2-off; p<by2+bh2; p+=period){ float a=std::max(p,by2), b=std::min(p+dash,by2+bh2); if(b>a){ d2->rect(bx2,a,thk,b-a,bcol); d2->rect(bx2+bw2-thk,a,thk,b-a,bcol);} }
+            // bobbing down-chevron (two beams forming a V)
+            float chx=midx, chy=cyc-58*uiScale+bob, cs=13*uiScale, ct=3.f*uiScale;
+            uint32_t chc=ui::rgba(96,170,250,(int)(150+95*pulse));
+            for(float k=0;k<=cs;k+=1.f){ d2->rect(chx-cs+k-ct*0.5f, chy+k-ct*0.5f, ct, ct, chc); d2->rect(chx+cs-k-ct*0.5f, chy+k-ct*0.5f, ct, ct, chc); }
+            // pulsing text
+            cx.textAligned(vx, cyc-16*uiScale, vw, 30*uiScale, "Drag a home here to start", ui::withA(th.text,(int)(165+90*pulse)), 1);
+            cx.textAligned(vx, cyc+18*uiScale, vw, 20*uiScale, "Supported:  .apk   .gltf   .glb   .gltf.ovrscene   .opa", th.textDim, 1);
+            cx.textAligned(vx, cyc+bh2*0.5f+8*uiScale, vw, 18*uiScale, "- or open the Logcat tab to diagnose a Quest (no root needed) -", th.textDim, 1);
+            d2->popClip();
         }
         drawContextMenu();                                      // floating; drawn last = on top
         drawAddMenu();
@@ -3889,7 +3907,7 @@ struct Editor {
     // ── tiled Blender layout: header strip on top, timeline strip on bottom, a right column (outliner over
     //    properties), and the 3D viewport filling the remaining left/center. Borders are draggable. ──
     void layout() {
-        float W=(float)fbW, H=(float)fbH, hH=cx.th.headerH, tH=timelineH;
+        float W=(float)fbW, H=(float)fbH, hH=cx.th.headerH, tH=homeLoaded()?timelineH:0.f;   // no timeline until a home loads
         float rightW = std::clamp(W*rightRatio, 220.f*uiScale, W*0.75f);   // up to 75% wide (log viewer / wide panels)
         float midY = hH, midH = H - hH - tH;
         float oH = std::clamp(midH*outlinerRatio, 80.f*uiScale, midH-80.f*uiScale);
@@ -3909,12 +3927,12 @@ struct Editor {
         // horizontal: outliner|properties
         float hy = (float)rcProps.offset.y;
         handleSplit(2, (float)rcOutliner.offset.x, hy-3, (float)rcOutliner.extent.width, 6, false);
-        // horizontal: middle|timeline
-        handleSplit(3, 0, (float)rcTimeline.offset.y-3, (float)fbW, 6, false);
+        // horizontal: middle|timeline (only when the timeline is shown)
+        if (homeLoaded()) handleSplit(3, 0, (float)rcTimeline.offset.y-3, (float)fbW, 6, false);
         // thin separator lines
         dl.rect(bx-1, by, 1, bh, cx.th.splitLine);
         dl.rect((float)rcProps.offset.x, hy-1, (float)rcProps.extent.width, 1, cx.th.splitLine);
-        dl.rect(0, (float)rcTimeline.offset.y-1, (float)fbW, 1, cx.th.splitLine);
+        if (homeLoaded()) dl.rect(0, (float)rcTimeline.offset.y-1, (float)fbW, 1, cx.th.splitLine);
     }
     void handleSplit(int id, float x, float y, float w, float h, bool vertical) {
         bool hv = cx.hover(x,y,w,h);
@@ -3929,7 +3947,27 @@ struct Editor {
         }
     }
 
+    // Photoshop-style panel re-dock: while the tab-strip grip is held, highlight the LEFT/RIGHT drop column
+    // (whichever half the cursor is over) and dock there on release. Drawn over the viewport, under menus/tooltips.
+    void drawDockDrag() {
+        if (!dockDragging) return;
+        auto& th=cx.th;
+        bool left = cx.in.mx < fbW*0.5f;
+        float colW = std::clamp((float)fbW*rightRatio, 220.f*uiScale, (float)fbW*0.75f);
+        float hy=(float)rcHeader.extent.height, hh=(float)fbH - hy - (homeLoaded()?timelineH:0.f);
+        float hx = left ? 0.f : (float)fbW-colW;
+        dl.rect(hx,hy,colW,hh, ui::rgba(64,140,235,55));
+        dl.border(hx,hy,colW,hh, ui::rgba(96,170,250,225));
+        cx.textAligned(hx, hy+hh*0.5f-10*uiScale, colW, 20*uiScale, left?"Dock LEFT":"Dock RIGHT", th.textSel, 1);
+        // a little chip riding the cursor
+        float cw2=100*uiScale, ch2=20*uiScale, cxp=std::min(cx.in.mx+12,(float)fbW-cw2), cyp=std::min(cx.in.my+12,(float)fbH-ch2);
+        dl.rect(cxp,cyp,cw2,ch2, ui::rgba(30,32,40,238)); dl.border(cxp,cyp,cw2,ch2, th.accent);
+        cx.textAligned(cxp,cyp,cw2,ch2,"Tool panel",th.text,1);
+        if (!cx.in.down[0]) { panelLeft = left; dockDragging=false; }   // dropped
+    }
+
     void drawTimeline() {
+        if (!homeLoaded()) return;
         auto& th=cx.th; VkRect2D a=rcTimeline;
         float x=(float)a.offset.x, y=(float)a.offset.y, w=(float)a.extent.width, h=(float)a.extent.height;
         dl.rect(x,y,w,h, th.headerBg);
@@ -4248,8 +4286,14 @@ struct Editor {
         cx.textAligned(pad, 0, 200*uiScale, h, "V79  Quest Home  Editor", th.text, 0);
         // menu strip (visual; functional menus land in cleanup phase)
         const char* menus[] = {"File","Edit","Object","View"};
+        const char* menuTips[] = {
+            "File actions - Save / Load a session, Export or Import a glTF, Cook to APK.\n(Use the Save / Load / Cook buttons on the right for now.)",
+            "Edit actions - Undo / Redo, and the per-object edits in the Object tab.",
+            "Object actions - add / duplicate / delete, and transform the selected mesh\n(see the Object and Geometry tabs).",
+            "View options - camera + viewport display (grid, gizmos, far-clip overlay)."};
         float mx = 220*uiScale;
-        for (auto m : menus) { float w = dl.textW(i18n::tr(m))+18*uiScale; cx.button(ui::hashId(m), mx, 3*uiScale, w, h-6*uiScale, m); mx += w+2*uiScale; }
+        for (int mi2=0; mi2<4; ++mi2) { const char* m=menus[mi2]; float w = dl.textW(i18n::tr(m))+18*uiScale;
+            cx.button(ui::hashId(m), mx, 3*uiScale, w, h-6*uiScale, m); cx.tip(mx, 3*uiScale, w, h-6*uiScale, menuTips[mi2]); mx += w+2*uiScale; }
         // language selector (GitHub #10): click for a dropdown of all languages; persisted + re-bakes the atlas
         { const char* ll = i18n::langName(i18n::g_lang); float w = dl.textW(ll)+26*uiScale; if (w < 64*uiScale) w = 64*uiScale;
           float lx = mx + 10*uiScale; langBtnX=lx; langBtnY=3*uiScale; langBtnW=w; langBtnH=h-6*uiScale;
@@ -4260,13 +4304,20 @@ struct Editor {
         if (cooking) { cx.progressBar(bx-150*uiScale, 4*uiScale, 150*uiScale+bw, bh, cookProg.load(), stageStr().c_str()); }
         else {
             if (cx.button(ui::hashId("hdrcook"), bx, 4*uiScale, bw, bh, "Cook APK", true)) { tab=TAB_COOK; startCook(); }
+            cx.tip(bx, 4*uiScale, bw, bh, "Cook the loaded home into an installable Quest APK (and install it\nif Install is on). Opens the Cook tab. Same as the Cook button there.");
             float sw=56*uiScale;
             if (cx.button(ui::hashId("hdrload"), bx-sw-4*uiScale, 4*uiScale, sw, bh, "Load")) loadProject();
+            cx.tip(bx-sw-4*uiScale, 4*uiScale, sw, bh, "Load a saved session (.hsledit) or a cooked APK back into the editor.\nRestores your edits, selection and cook settings.");
             if (cx.button(ui::hashId("hdrsave"), bx-2*sw-8*uiScale, 4*uiScale, sw, bh, "Save")) saveProject();
-            float blw = 96*uiScale;   // Blender round-trip: export (folder picker -> glTF) + import (file picker -> reopen)
+            cx.tip(bx-2*sw-8*uiScale, 4*uiScale, sw, bh, "Save this session to a .hsledit file (Ctrl+S) so your edits persist\nand you can reopen exactly where you left off.");
+            // Blender / glTF round-trip: export the home to a glTF project, edit it in Blender (or any 3D tool),
+            // then import the edited glTF/glb back in. Labels say plainly which way each button goes.
+            float blw = 104*uiScale;
             float bex = bx-2*sw-12*uiScale-blw;
-            if (cx.button(ui::hashId("hdrblend"),  bex, 4*uiScale, blw, bh, "-> Blender")) exportBlender();
-            if (cx.button(ui::hashId("hdrimport"), bex-blw-4*uiScale, 4*uiScale, blw, bh, "Blender ->")) importBlender();
+            if (cx.button(ui::hashId("hdrblend"),  bex, 4*uiScale, blw, bh, "Export glTF")) exportBlender();
+            cx.tip(bex, 4*uiScale, blw, bh, "Export this home to a glTF 2.0 project (meshes + materials + textures\n+ transforms) that opens in Blender or any 3D tool for editing.\nEdit it, then use \"Import glTF\" to bring it back and cook it.");
+            if (cx.button(ui::hashId("hdrimport"), bex-blw-4*uiScale, 4*uiScale, blw, bh, "Import glTF")) importBlender();
+            cx.tip(bex-blw-4*uiScale, 4*uiScale, blw, bh, "Import a glTF/glb you edited (e.g. in Blender) as a fresh session,\nso you can preview and cook the edited home. Pairs with \"Export glTF\".");
             { const char* s = autoSaveOn ? "Auto-save: On" : "Auto-save: Off"; float aw = dl.textW(s)+14*uiScale;   // crash-resistance: periodic .autosave + recovery on reopen
               float ax = bex-2*blw-8*uiScale-aw; float ay0=4*uiScale;
               if (cx.tab(ui::hashId("hdrautosave"), ax, ay0, aw, bh, s, autoSaveOn)) autoSaveOn = !autoSaveOn;
@@ -4296,27 +4347,31 @@ struct Editor {
         dl.rect((float)v.offset.x,(float)v.offset.y,(float)v.extent.width,bh, ui::withA(th.headerBg,210));
         cx.textAligned(v.offset.x+8*uiScale, v.offset.y, 200*uiScale, bh, "Viewport", th.textDim, 0);
         // transform-mode pills (G/R/S) + axis space
-        const char* ops[]={"Move","Rotate","Scale"}; float px=v.offset.x+90*uiScale;
-        for (int i=0;i<3;i++){ float w=dl.textW(ops[i])+14*uiScale; if (cx.tab(ui::hashId(2000+i, 7), px, v.offset.y, w, bh, ops[i], gizmoOp==i)) gizmoOp=i; px+=w; }
-        { const char* s = gizmoLocal?"Local":"World"; float w=dl.textW(s)+14*uiScale; if (cx.tab(ui::hashId("axspace"), px+6*uiScale, v.offset.y, w, bh, s, false)) gizmoLocal=!gizmoLocal; px+=w+6*uiScale; }
+        const char* ops[]={"Move","Rotate","Scale"};
+        const char* opTips[]={"Move (G) - drag the gizmo arrows to translate the selected mesh.",
+                              "Rotate (R) - drag the gizmo rings to rotate the selected mesh.",
+                              "Scale (S) - drag the gizmo handles to resize the selected mesh."};
+        float px=v.offset.x+90*uiScale;
+        for (int i=0;i<3;i++){ float w=dl.textW(ops[i])+14*uiScale; if (cx.tab(ui::hashId(2000+i, 7), px, v.offset.y, w, bh, ops[i], gizmoOp==i)) gizmoOp=i; cx.tip(px, (float)v.offset.y, w, bh, opTips[i]); px+=w; }
+        { const char* s = gizmoLocal?"Local":"World"; float w=dl.textW(s)+14*uiScale; if (cx.tab(ui::hashId("axspace"), px+6*uiScale, v.offset.y, w, bh, s, false)) gizmoLocal=!gizmoLocal; cx.tip(px+6*uiScale, (float)v.offset.y, w, bh, "Gizmo orientation: World (axis-aligned) or Local (the mesh's own\naxes). Click to toggle."); px+=w+6*uiScale; }
         // per-axis gizmo locks (Shift+X/Y/Z): a lit pill = that axis is LOCKED (dimmed on the gizmo, can't be grabbed)
         { const char* axn[3]={"X","Y","Z"}; px+=4*uiScale;
           for (int k=0;k<3;k++){ float w=dl.textW(axn[k])+10*uiScale;
               if (cx.tab(ui::hashId(2300+k, 11), px, v.offset.y, w, bh, axn[k], lockAxis[k])) lockAxis[k]=!lockAxis[k];
               cx.tip(px, (float)v.offset.y, w, bh, k==0?"Lock the X axis (Shift+X): the gizmo ignores it while lit.":k==1?"Lock the Y axis (Shift+Y): the gizmo ignores it while lit.":"Lock the Z axis (Shift+Z): the gizmo ignores it while lit.");
               px+=w+2*uiScale; } px+=4*uiScale; }
-        { const char* s = playSim?"Stop (P)":"Walk (P)"; float w=dl.textW(s)+16*uiScale; if (cx.tab(ui::hashId("walksim"), px+10*uiScale, v.offset.y, w, bh, s, playSim)) { if(playSim) stopSim(); else startSim(); } px+=w+16*uiScale; }
+        { const char* s = playSim?"Stop (P)":"Walk (P)"; float w=dl.textW(s)+16*uiScale; if (cx.tab(ui::hashId("walksim"), px+10*uiScale, v.offset.y, w, bh, s, playSim)) { if(playSim) stopSim(); else startSim(); } cx.tip(px+10*uiScale, (float)v.offset.y, w, bh, "Walk the home in first person (P): WASD + mouse to move on the\ncollision/navmesh - test that you can stand and don't fall through.\nPress P again to exit."); px+=w+16*uiScale; }
         // camera fly speed (drag or type) — in the header strip so it never fires a viewport pick
         { cx.textAligned(px, v.offset.y, 34*uiScale, bh, "Spd", th.textDim, 0); cx.dragFloat(ui::hashId("camspd"), px+34*uiScale, v.offset.y+1*uiScale, 54*uiScale, bh-2*uiScale, r->cam.speed, 0.1f, "%.1f"); px+=92*uiScale; }
         // PC PREVIEW AUDIO — front-and-center toggle (was buried in cook options). Mutes/unmutes the desktop background loop.
         { const char* s = previewAudio?"Audio: On":"Audio: Off"; float w=dl.textW(s)+16*uiScale;   // ASCII — the UI font has no emoji glyphs (the speaker emoji rendered as "????")
-          if (cx.tab(ui::hashId("hdraudio"), px+8*uiScale, v.offset.y, w, bh, s, previewAudio)) { previewAudio=!previewAudio; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); } px+=w+8*uiScale; }
+          if (cx.tab(ui::hashId("hdraudio"), px+8*uiScale, v.offset.y, w, bh, s, previewAudio)) { previewAudio=!previewAudio; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); } cx.tip(px+8*uiScale, (float)v.offset.y, w, bh, "Play the home's background audio loop here on the PC (what will ship\nin the cook). Click to mute/unmute the preview."); px+=w+8*uiScale; }
         // ALWAYS-ON-TOP toggle (window is NOT pinned by default now). "Pin" = keep the editor above other windows.
         { const char* s = alwaysOnTop?"Pin: On":"Pin: Off"; float w=dl.textW(s)+16*uiScale;
-          if (cx.tab(ui::hashId("hdrpin"), px+8*uiScale, v.offset.y, w, bh, s, alwaysOnTop)) { alwaysOnTop=!alwaysOnTop; if(win) glfwSetWindowAttrib(win, GLFW_FLOATING, alwaysOnTop?GLFW_TRUE:GLFW_FALSE); } px+=w+8*uiScale; }
+          if (cx.tab(ui::hashId("hdrpin"), px+8*uiScale, v.offset.y, w, bh, s, alwaysOnTop)) { alwaysOnTop=!alwaysOnTop; if(win) glfwSetWindowAttrib(win, GLFW_FLOATING, alwaysOnTop?GLFW_TRUE:GLFW_FALSE); } cx.tip(px+8*uiScale, (float)v.offset.y, w, bh, "Keep the editor window ABOVE other windows (handy next to Blender\nor the headset mirror). Click to toggle."); px+=w+8*uiScale; }
         // X-RAY: selected mesh wireframe over the boxes (align colliders to meshes without camera-angle ambiguity)
         { const char* s = "X-ray"; float w=dl.textW(s)+16*uiScale;
-          if (cx.tab(ui::hashId("hdrxray"), px+8*uiScale, v.offset.y, w, bh, s, xrayMesh)) xrayMesh=!xrayMesh; px+=w+8*uiScale; }
+          if (cx.tab(ui::hashId("hdrxray"), px+8*uiScale, v.offset.y, w, bh, s, xrayMesh)) xrayMesh=!xrayMesh; cx.tip(px+8*uiScale, (float)v.offset.y, w, bh, "X-ray: draw the selected mesh as a wireframe over everything, so you\ncan line up box colliders with the mesh regardless of camera angle."); px+=w+8*uiScale; }
         if (playSim) cx.textAligned(v.offset.x+8*uiScale, v.offset.y+v.extent.height-40*uiScale, v.extent.width-16, 18*uiScale, "WALK MODE - WASD+mouse to walk the navmesh, P to exit", ui::rgba(120,230,140), 0);
         // (overlay/gizmo toggles moved to their single home: the Scene tab "Gizmos / overlays" section —
         //  they used to duplicate here in the viewport header, which read as a confusing second selector)
@@ -4833,12 +4888,28 @@ struct Editor {
         dl.rect(x,y,w,h, th.panelBg);
         // tab strip
         float th_h = 22*uiScale; const char* tabs[]={"Object","Scene","Material","Anim","Physics","Cook","Logcat"};
-        // dock ⇆ toggle: move the whole tool column to the other side ("not everyone likes the right side")
-        float dbw = 30*uiScale;
-        if (cx.tab(ui::hashId("dockside"), x, y, dbw, th_h, panelLeft?">>":"<<", false)) panelLeft=!panelLeft;
-        cx.tip(x, y, dbw, th_h, "Dock the tool panel on the LEFT / RIGHT.\nDrag the divider (up to 75%) to resize it.");
+        const char* tabTips[]={
+            "Object - transform the selected mesh (move / rotate / scale), rename,\nhide, duplicate or delete it.",
+            "Scene - the Meta component manager: background/skybox, fog, colliders,\nspawn, audio; add navmeshes / box colliders.",
+            "Material - the selected mesh's material: base color, texture, blend mode,\ntransparency, emissive, double-sided.",
+            "Anim - playback + per-clip settings for animated meshes (loop, speed);\nscrub with the timeline at the bottom.",
+            "Physics - collision for the home: auto floor, real trimesh collider,\nnavmeshes and box colliders (so you don't fall through).",
+            "Cook - turn this home into an installable Quest APK: signing, spoof,\ncollision, fog, far-clip, and Install-over-adb settings.",
+            "Logcat - read WHY a cooked home loaded or fell back on the headset,\nover adb with NO root. Works even with no home loaded."};
+        // Photoshop-style dock grip: DRAG it to re-dock the tool panel LEFT/RIGHT (only once a home is loaded;
+        // on the empty Logcat-only session there's no grip - it was easy to misclick and pointless there).
+        float dbw = homeLoaded() ? 30*uiScale : 0.f;
+        if (homeLoaded()) {
+            bool hv = cx.hover(x, y, dbw, th_h);
+            dl.rect(x, y, dbw, th_h, (hv||dockDragging)?th.widgetHot:th.headerBg);
+            uint32_t gc = th.textDim;                                   // 2x3 grip dots
+            for (int gx=0;gx<2;gx++) for (int gy=0;gy<3;gy++)
+                dl.rect(x+dbw*0.5f-3*uiScale+gx*6*uiScale, y+th_h*0.5f-6*uiScale+gy*6*uiScale, 2*uiScale, 2*uiScale, gc);
+            if (hv && cx.in.pressed[0]) dockDragging=true;
+            cx.tip(x, y, dbw, th_h, "Grip - DRAG to dock the tool panel on the LEFT or RIGHT side\n(like Photoshop). Drag the divider between the panel and the\nviewport to resize it (up to 75% wide).");
+        }
         float tx=x+dbw, tw=(w-dbw)/7.f;
-        for (int i=0;i<7;i++){ if (cx.tab(ui::hashId(4000+i,13), tx, y, tw, th_h, tabs[i], tab==i)) { tab=i; propScroll=0.f; } tx+=tw; }
+        for (int i=0;i<7;i++){ if (cx.tab(ui::hashId(4000+i,13), tx, y, tw, th_h, tabs[i], tab==i)) { tab=i; propScroll=0.f; } cx.tip(tx, y, tw, th_h, tabTips[i]); tx+=tw; }
         dl.rect(x,y+th_h,w,1,th.splitLine);
         // Logcat page owns its whole area (its own scroll + live stream); handle it BEFORE the shared propScroll logic.
         if (tab==TAB_LOGCAT) { drawLogcatPanel(x, y+th_h+1, w, h-th_h-1); return; }
@@ -6926,21 +6997,33 @@ struct Editor {
         if (!autoLogStarted){ autoLogStarted=true; startLogStream(); }   // AUTO-START (+ auto full verbose) on first open
         float rh=24*uiScale, pad=8*uiScale, gap=4*uiScale, bx=x+pad, by=y+pad, rowRight=x+w-pad;
         // controls WRAP to a new row when they'd overflow the panel width (narrow / resized panels)
-        auto btn=[&](const char* id,const char* s,float bw,bool acc=false)->bool{
+        auto btn=[&](const char* id,const char* s,float bw,bool acc,const char* tipS)->bool{
             if (bx>x+pad && bx+bw>rowRight){ bx=x+pad; by+=rh+gap; }
-            bool r=cx.button(ui::hashId(id), bx, by, bw, rh, s, acc); bx+=bw+gap; return r; };
-        if (btn("logss", logRun.load()?"Stop":"Start", 66*uiScale, logRun.load())) { if(logRun.load()) stopLogStream(); else startLogStream(); }
-        if (btn("logrel","Reload home",112*uiScale,true)) reloadShellForLog();
-        if (btn("logclr","Clear",56*uiScale)) { std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); }
-        if (btn("logsave","Export",70*uiScale)) exportDiag();
+            float bxx=bx, byy=by;
+            bool r=cx.button(ui::hashId(id), bxx, byy, bw, rh, s, acc);
+            if (tipS) cx.tip(bxx, byy, bw, rh, tipS);
+            bx+=bw+gap; return r; };
+        if (btn("logss", logRun.load()?"Stop":"Start", 66*uiScale, logRun.load(),
+                "Start / Stop the live logcat stream (it auto-starts at full verbosity\nwhen you open this tab). No root needed.")) { if(logRun.load()) stopLogStream(); else startLogStream(); }
+        if (btn("logrel","Reload home",112*uiScale,true,
+                "Clears the log and restarts com.oculus.vrshell (am force-stop, no root),\nso you capture the home's env-load from a clean slate. Do this, then\nread the cyan EnvironmentSystem lines / Export.")) reloadShellForLog();
+        if (btn("logclr","Clear",56*uiScale,false,"Clear the captured lines (doesn't stop the stream).")) { std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); }
+        if (btn("logsave","Export",70*uiScale,false,
+                "Write a shareable diagnostic report (device info + resolved env +\nverdict + the env-load log) to a .txt and reveal it. Attach it on\nDiscord / GitHub when reporting a home that fell back to Haven/nuxd.")) exportDiag();
         { int mo=logMode.load(); const char* m = mo==0? "Filter: Env-load" : mo==1? "Filter: vrshell" : "Filter: EVERYTHING";
           if (bx>x+pad && bx+138*uiScale>rowRight){ bx=x+pad; by+=rh+gap; }
-          if (cx.tab(ui::hashId("logmode"), bx, by, 138*uiScale, rh, m, true)) { logMode.store((mo+1)%3); std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); } bx+=138*uiScale+gap; }
+          float fbx=bx, fby=by;
+          if (cx.tab(ui::hashId("logmode"), fbx, fby, 138*uiScale, rh, m, true)) { logMode.store((mo+1)%3); std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); }
+          cx.tip(fbx, fby, 138*uiScale, rh, "Cycle what's shown: Env-load (only the EnvironmentSystem load lines) ->\nvrshell (com.oculus.vrshell only) -> EVERYTHING (the full logcat).");
+          bx+=138*uiScale+gap; }
         // device picker (multiple Quests): click to cycle the target device (clears the log)
         { std::string dv = adbSerial.empty()? std::string("Dev: default") : ("Dev: "+adbSerial);
           float dbw = std::min(200.f*uiScale, 84.f*uiScale + (float)dv.size()*6.5f*uiScale);
           if (bx>x+pad && bx+dbw>rowRight){ bx=x+pad; by+=rh+gap; }
-          if (cx.button(ui::hashId("logdev"), bx, by, dbw, rh, dv.c_str())) { cycleAdbDevice(); std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); } bx+=dbw+gap; }
+          float dbx=bx, dby=by;
+          if (cx.button(ui::hashId("logdev"), dbx, dby, dbw, rh, dv.c_str())) { cycleAdbDevice(); std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); }
+          cx.tip(dbx, dby, dbw, rh, "Which attached Quest to read. Click to CYCLE devices when several are\nconnected (from `adb devices`). \"default\" = the single attached one.");
+          bx+=dbw+gap; }
         float top = by+rh+6*uiScale; dl.rect(x,top-3*uiScale,w,1,th.splitLine);
         // log area
         float ax=x+pad, ay=top, aw=w-2*pad, ah=y+h-ay-pad; if(ah<20*uiScale) ah=20*uiScale;

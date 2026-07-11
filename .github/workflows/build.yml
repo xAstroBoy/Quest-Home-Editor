@@ -17,15 +17,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
       - name: Configure
-        run: cmake -S hsr_renderer_cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S QuestHomeEditor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --target hsr_renderer
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory pkg/fonts | Out-Null
-          Copy-Item build/hsr_renderer.exe pkg/
-          Copy-Item hsr_renderer_cpp/third_party/fonts/* pkg/fonts/
+          Copy-Item "build/Quest Home Editor.exe" pkg/
+          Copy-Item QuestHomeEditor/third_party/fonts/* pkg/fonts/
           Compress-Archive -Path pkg/* -DestinationPath hsr_renderer-windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
@@ -41,21 +41,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build xorg-dev libwayland-dev libxkbcommon-dev libvulkan-dev
       - name: Configure
-        run: cmake -S hsr_renderer_cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S QuestHomeEditor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --target hsr_renderer
       - name: Package tar.gz
         run: |
           mkdir -p pkg/fonts
-          cp build/hsr_renderer pkg/
-          cp hsr_renderer_cpp/third_party/fonts/* pkg/fonts/
+          cp "build/Quest Home Editor" pkg/
+          cp QuestHomeEditor/third_party/fonts/* pkg/fonts/
           tar -czf hsr_renderer-linux-x64.tar.gz -C pkg .
       - name: Package AppImage
         run: |
           mkdir -p AppDir/usr/bin/fonts
-          cp build/hsr_renderer AppDir/usr/bin/
-          cp hsr_renderer_cpp/third_party/fonts/* AppDir/usr/bin/fonts/
-          cp hsr_renderer_cpp/app.png AppDir/hsr_renderer.png
+          cp "build/Quest Home Editor" AppDir/usr/bin/
+          cp QuestHomeEditor/third_party/fonts/* AppDir/usr/bin/fonts/
+          cp QuestHomeEditor/app.png AppDir/hsr_renderer.png
           cat > AppDir/hsr_renderer.desktop <<'EOF'
           [Desktop Entry]
           Type=Application
@@ -94,18 +94,18 @@ jobs:
       - name: Deps (MoltenVK = the Vulkan implementation on macOS; ninja)
         run: brew install ninja molten-vk
       - name: Configure
-        run: cmake -S hsr_renderer_cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S QuestHomeEditor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --target hsr_renderer
       - name: Package dmg (.app bundle with MoltenVK beside the binary — volk dlopens it)
         run: |
           APP="Quest Home Editor.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/fonts"
-          cp build/hsr_renderer "$APP/Contents/MacOS/"
+          cp "build/Quest Home Editor" "$APP/Contents/MacOS/"
           MVK="$(brew --prefix molten-vk)/lib/libMoltenVK.dylib"
           cp "$MVK" "$APP/Contents/MacOS/"
-          cp hsr_renderer_cpp/app.png "$APP/Contents/Resources/"
-          cp hsr_renderer_cpp/third_party/fonts/* "$APP/Contents/Resources/fonts/"
+          cp QuestHomeEditor/app.png "$APP/Contents/Resources/"
+          cp QuestHomeEditor/third_party/fonts/* "$APP/Contents/Resources/fonts/"
           cat > "$APP/Contents/Info.plist" <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

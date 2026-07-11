@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="QuestHomeEditor/app.png" width="168" alt="Quest Home Editor">
+</p>
+
 # Quest Home Editor — port old Meta Quest homes to today's Quest
 
 Load an **old (V79-era) Meta Quest home**, walk around it, edit it like a tiny Blender, then
@@ -21,10 +25,9 @@ Grab a build from **[Releases](../../releases)**:
 
 | File | For |
 | --- | --- |
-| `hsr_renderer.exe` | Windows, 2013+ CPU (AVX2 — fastest cooks) |
-| `hsr_renderer-windows-x64-compat.zip` | Windows, **any** 64-bit CPU (SSE4.1) |
-| `hsr_renderer-linux-x64.AppImage` / `.tar.gz` | Linux (CI — once Actions is live) |
-| `hsr_renderer-macos-arm64.dmg` / `-x64.dmg` | macOS, MoltenVK bundled (CI — once Actions is live) |
+| `Quest-Home-Editor-windows-x64.exe` | Windows, 64-bit (Vulkan GPU) |
+| `Quest-Home-Editor-linux-x64` / `.AppImage` | Linux (CI — once Actions is live) |
+| `Quest-Home-Editor-macos-arm64.dmg` / `-x64.dmg` | macOS, MoltenVK bundled (CI — once Actions is live) |
 
 A GPU with **Vulkan** support is required on every OS (macOS via MoltenVK, which the `.dmg` bundles).
 
