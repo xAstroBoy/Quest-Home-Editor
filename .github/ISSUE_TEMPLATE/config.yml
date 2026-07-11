@@ -4,6 +4,12 @@
 # feature ideas) will be closed. Read the wiki first — most problems are already answered.
 blank_issues_enabled: false
 contact_links:
+  - name: 💬 Discord (questions, help, screenshots, sharing ports)
+    url: https://discord.gg/cXnc4pQz7A
+    about: The fastest place for anything that isn't a confirmed cook/device bug or a QOL idea. Ask here first.
+  - name: 🗣️ GitHub Discussions (Q&A / show-and-tell / ideas)
+    url: https://github.com/xAstroBoy/Quest-Home-Editor/discussions
+    about: For questions and ideas that aren't a bug yet. Bugs that turn out real can graduate to an issue.
   - name: 📖 Troubleshooting & FAQ (read this FIRST)
     url: https://github.com/xAstroBoy/Quest-Home-Editor/wiki/Troubleshooting
     about: Fell back to Haven, crash on launch, fall through the floor, adb not found, unsigned APK — all solved here.
