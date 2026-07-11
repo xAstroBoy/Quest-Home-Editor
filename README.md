@@ -68,7 +68,7 @@ If a cooked home doesn't show up (the headset stays on Haven 2025 / the default)
    [Discord / Issues](#community) — it pinpoints the cause.
 
 `Filter` cycles the view **Env-load ↔ vrshell ↔ EVERYTHING**; the tool column can be **dragged wider
-(up to 75%)** and **docked left or right** (the `<<` / `>>` button on the tab strip).
+(up to 75%)** and **docked left or right** by dragging the grip on the tab strip (Photoshop-style).
 
 ## What it does
 
@@ -119,19 +119,19 @@ Vendored deps (Vulkan headers, volk, miniz, miniaudio, stb, ACL/RTM) are in-tree
 GLFW, astc-encoder and Opus. No Vulkan SDK needed (volk loads at runtime). PhysX is off by default.
 
 ```bash
-# Windows (MSVC + Ninja)         # from hsr_renderer_cpp/
+# Windows (MSVC + Ninja)         # from QuestHomeEditor/
 build_hsr.bat
 
 # Linux
 sudo apt-get install -y cmake ninja-build libvulkan-dev \
   libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libwayland-dev libxkbcommon-dev
-cmake -S hsr_renderer_cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target hsr_renderer
+cmake -S QuestHomeEditor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target questhomeeditor
 
 # macOS (MoltenVK)
 brew install molten-vk ninja
-cmake -S hsr_renderer_cpp -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target hsr_renderer
+cmake -S QuestHomeEditor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target questhomeeditor
 ```
 
 - Texture encoding defaults to **SSE4.1** (runs anywhere); add `-DHSR_AVX2=ON` on a 2013+ CPU for
@@ -145,17 +145,17 @@ cmake --build build --target hsr_renderer
 `INSTALL_PARSE_FAILED_NO_CERTIFICATES` = unsigned. Fix:
 
 ```
-hsr_renderer.exe --sign home.apk      # -> home_signed.apk
-hsr_renderer.exe --fetch-tools        # pre-fetch build-tools + JRE beside the exe (zero-SDK machines)
+"Quest Home Editor.exe" --sign home.apk      # -> home_signed.apk
+"Quest Home Editor.exe" --fetch-tools        # pre-fetch build-tools + JRE beside the exe (zero-SDK machines)
 ```
 
 ## Layout
 
 | Path | What |
 | --- | --- |
-| `hsr_renderer_cpp/src/` | Renderer + editor + cooker (C++17, mostly headers) |
-| `hsr_renderer_cpp/tools/` | Shader decompile/recompile helpers (spirv-cross, glslang) |
-| `hsr_renderer_cpp/third_party/` | Vendored deps (volk, Vulkan headers, miniz, stb, ACL/RTM, fonts) |
+| `QuestHomeEditor/src/` | Renderer + editor + cooker (C++17, mostly headers) |
+| `QuestHomeEditor/tools/` | Shader decompile/recompile helpers (spirv-cross, glslang) |
+| `QuestHomeEditor/third_party/` | Vendored deps (volk, Vulkan headers, miniz, stb, ACL/RTM, fonts) |
 | `.github/workflows/build.yml` | 3-OS CI → prebuilt binaries |
 
 ## Community

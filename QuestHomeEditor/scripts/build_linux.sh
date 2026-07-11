@@ -1,5 +1,5 @@
 #!/bin/bash
-# hsr_renderer / editor — one-command Linux build.
+# Quest Home Editor / editor — one-command Linux build.
 # Installs the system dev packages GLFW/Vulkan need (Debian/Ubuntu apt, Fedora dnf, Arch pacman),
 # then configures with CMake (FetchContent auto-downloads GLFW + astcenc; Vulkan headers are
 # vendored in third_party/) and builds Release.
@@ -10,7 +10,7 @@ SDIR="$(cd "$(dirname "$0")/.." && pwd)"
 BDIR="$SDIR/build"
 
 echo "================================================"
-echo " hsr_renderer — Linux build"
+echo " Quest Home Editor — Linux build"
 echo "================================================"
 
 # ── dev packages (same set the CI release workflow uses) ──
@@ -39,8 +39,8 @@ cmake --build "$BDIR"
 echo ""
 echo "================================================"
 echo " Build SUCCESS"
-echo " Editor:  $BDIR/hsr_renderer"
+echo " Editor:  $BDIR/Quest Home Editor"
 echo " Cooker:  $BDIR/hsl_cook"
-echo " Run:     ./hsr_renderer <env.apk | .gltf.ovrscene>"
+echo " Run:     ./Quest Home Editor <env.apk | .gltf.ovrscene>"
 echo " NOTE: needs a Vulkan-capable GPU driver (vulkaninfo to check)."
 echo "================================================"

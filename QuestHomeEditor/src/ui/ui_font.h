@@ -147,7 +147,7 @@ inline void loadFallbackFonts(std::vector<std::vector<uint8_t>>& out) {
 inline bool loadUIFont(Font& f, float px, bool mono = false, const std::vector<unsigned>* extraCps = nullptr) {
     static const char* sans[] = {
         "third_party/fonts/InterVariable.ttf", "../third_party/fonts/InterVariable.ttf",
-        "hsr_renderer_cpp/third_party/fonts/InterVariable.ttf",
+        "QuestHomeEditor/third_party/fonts/InterVariable.ttf",
         "third_party/fonts/SegoeUI.ttf",
 #ifdef _WIN32
         "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf",
@@ -163,7 +163,7 @@ inline bool loadUIFont(Font& f, float px, bool mono = false, const std::vector<u
     };
     static const char* monos[] = {
         "third_party/fonts/Consola.ttf", "../third_party/fonts/Consola.ttf",
-        "hsr_renderer_cpp/third_party/fonts/Consola.ttf",
+        "QuestHomeEditor/third_party/fonts/Consola.ttf",
 #ifdef _WIN32
         "C:/Windows/Fonts/consola.ttf", "C:/Windows/Fonts/cour.ttf",
 #elif defined(__APPLE__)

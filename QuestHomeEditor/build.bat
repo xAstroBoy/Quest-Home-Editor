@@ -45,7 +45,7 @@ if %ERRORLEVEL% neq 0 (
 echo.
 echo ================================================
 echo  Build SUCCESS
-echo  Binary: %BDIR%\hsr_renderer.exe
+echo  Binary: %BDIR%\Quest Home Editor.exe
 echo.
-echo  Usage: %BDIR%\hsr_renderer.exe ^<apk_path^>
+echo  Usage: %BDIR%\Quest Home Editor.exe ^<apk_path^>
 echo ================================================

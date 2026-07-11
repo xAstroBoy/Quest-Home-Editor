@@ -1,0 +1,44 @@
+name: "🎛️ QOL / editor improvement"
+description: A quality-of-life improvement to the editor/UI — a workflow that's clunky, a missing tooltip, a shortcut, a small usability win.
+labels: ["qol", "enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This tracker only accepts libshell/cook/device bugs and QOL improvements.** This template is for
+        the second kind: making the **editor nicer to use**. Small, focused QOL asks are welcome and often
+        merged fast.
+
+        Not this template: "please port <some env> for me", generic feature requests unrelated to editing/
+        cooking homes, or support questions — those are closed. If it's a device/cook bug, use the other
+        template.
+  - type: checkboxes
+    id: policy
+    attributes:
+      label: Scope (required)
+      options:
+        - label: This is an **editor quality-of-life / usability** improvement (not a support question or an off-topic request).
+          required: true
+  - type: textarea
+    id: pain
+    attributes:
+      label: What's clunky today?
+      description: The current behaviour that slows you down or confuses you.
+      placeholder: e.g. I can't tell which axis a collider is aligned to without rotating the camera.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would make it better?
+      description: Your proposed change. A rough sketch/mockup is great.
+      placeholder: e.g. show a tiny XYZ axis gizmo on the selected collider.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it helps
+      description: Who benefits and how often it comes up.
+    validations:
+      required: false

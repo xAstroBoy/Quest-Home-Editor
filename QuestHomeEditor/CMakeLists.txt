@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(hsr_renderer LANGUAGES C CXX)
+project(questhomeeditor LANGUAGES C CXX)
 if(WIN32)
     enable_language(RC)   # compile app.rc -> the .exe file icon
 endif()
@@ -108,7 +108,7 @@ set(PHYSX_LIBS
     "${PHYSX_DIR}/lib/PhysXFoundation_static.lib")
 
 # ── Executable ──────────────────────────────────────────────────
-add_executable(hsr_renderer
+add_executable(questhomeeditor
     src/main.cpp
     src/impl/miniaudio_impl.c
     src/impl/stb_vorbis_impl.c
@@ -121,9 +121,9 @@ add_executable(hsr_renderer
     $<$<BOOL:${WIN32}>:${CMAKE_SOURCE_DIR}/app.rc>   # Win32 .exe file icon
 )
 
-target_compile_definitions(hsr_renderer PRIVATE VK_NO_PROTOTYPES GLFW_INCLUDE_VULKAN)
+target_compile_definitions(questhomeeditor PRIVATE VK_NO_PROTOTYPES GLFW_INCLUDE_VULKAN)
 
-target_include_directories(hsr_renderer PRIVATE
+target_include_directories(questhomeeditor PRIVATE
     "${VULKAN_HEADERS_DIR}"
     "${VOLK_DIR}"
     "${MINIZ_DIR}"
@@ -133,17 +133,17 @@ target_include_directories(hsr_renderer PRIVATE
     "${CMAKE_SOURCE_DIR}/src"
 )
 
-target_include_directories(hsr_renderer PRIVATE
+target_include_directories(questhomeeditor PRIVATE
     "${astcenc_SOURCE_DIR}/Source"
 )
 
 # ── ACL + RTM (Animation Compression Library — header-only; decodes the V203 HzAnim clips) ──
-target_include_directories(hsr_renderer PRIVATE
+target_include_directories(questhomeeditor PRIVATE
     "${CMAKE_SOURCE_DIR}/third_party/acl/includes"
     "${CMAKE_SOURCE_DIR}/third_party/rtm/includes"
 )
 
-target_link_libraries(hsr_renderer PRIVATE
+target_link_libraries(questhomeeditor PRIVATE
     volk
     miniz
     ${GLFW_TARGET}
@@ -153,36 +153,36 @@ target_link_libraries(hsr_renderer PRIVATE
 
 # ── PhysX (optional) — only when -DHSR_HAVE_PHYSX=ON + the vendored libs are present ──
 if(HSR_HAVE_PHYSX)
-    target_compile_definitions(hsr_renderer PRIVATE HSR_HAVE_PHYSX PX_PHYSX_STATIC_LIB PX_CHECKED=1)
-    target_include_directories(hsr_renderer PRIVATE "${PHYSX_DIR}/include" "${PHYSX_DIR}/pxshared/include")
-    target_link_libraries(hsr_renderer PRIVATE ${PHYSX_LIBS})
+    target_compile_definitions(questhomeeditor PRIVATE HSR_HAVE_PHYSX PX_PHYSX_STATIC_LIB PX_CHECKED=1)
+    target_include_directories(questhomeeditor PRIVATE "${PHYSX_DIR}/include" "${PHYSX_DIR}/pxshared/include")
+    target_link_libraries(questhomeeditor PRIVATE ${PHYSX_LIBS})
 endif()
 
 # ── Platform-specific ───────────────────────────────────────────
 if(MSVC)
-    target_compile_options(hsr_renderer PRIVATE /Zc:__cplusplus)  # ACL checks __cplusplus for the C++ level
-    target_compile_options(hsr_renderer PRIVATE /Zi)              # debug symbols (PDB) for the crash-handler stack traces
-    target_compile_options(hsr_renderer PRIVATE /bigobj)          # main.cpp TU exceeds the 64k COFF section limit (big inline cook/shadergen headers)
-    target_link_options(hsr_renderer PRIVATE /DEBUG)              # emit the .pdb so segfault stacks resolve to file:line
+    target_compile_options(questhomeeditor PRIVATE /Zc:__cplusplus)  # ACL checks __cplusplus for the C++ level
+    target_compile_options(questhomeeditor PRIVATE /Zi)              # debug symbols (PDB) for the crash-handler stack traces
+    target_compile_options(questhomeeditor PRIVATE /bigobj)          # main.cpp TU exceeds the 64k COFF section limit (big inline cook/shadergen headers)
+    target_link_options(questhomeeditor PRIVATE /DEBUG)              # emit the .pdb so segfault stacks resolve to file:line
 endif()
 if(WIN32)
-    target_compile_definitions(hsr_renderer PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_definitions(questhomeeditor PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     # volk loads Vulkan at runtime — no vulkan-1.lib needed
     # miniaudio WASAPI backend needs COM (ole32) + winmm ; dbghelp = symbolized crash stack traces ;
     # ws2_32 = the HSR_LIVE HTTP control server (Winsock)
-    target_link_libraries(hsr_renderer PRIVATE ole32 winmm dbghelp ws2_32 gdi32 msimg32)   # gdi32/msimg32 = the in-window GDI loading splash (GradientFill)
+    target_link_libraries(questhomeeditor PRIVATE ole32 winmm dbghelp ws2_32 gdi32 msimg32)   # gdi32/msimg32 = the in-window GDI loading splash (GradientFill)
 elseif(APPLE)
     find_library(COCOA_LIBRARY Cocoa REQUIRED)
     find_library(IOKIT_LIBRARY IOKit REQUIRED)
-    target_link_libraries(hsr_renderer PRIVATE ${COCOA_LIBRARY} ${IOKIT_LIBRARY})
+    target_link_libraries(questhomeeditor PRIVATE ${COCOA_LIBRARY} ${IOKIT_LIBRARY})
 else()
     find_package(Vulkan REQUIRED)
-    target_link_libraries(hsr_renderer PRIVATE Vulkan::Vulkan)
+    target_link_libraries(questhomeeditor PRIVATE Vulkan::Vulkan)
 endif()
 
-# The product is "Quest Home Editor" — build the exe under that name (the CMake TARGET stays `hsr_renderer`
-# so `cmake --build --target hsr_renderer` and existing tooling keep working; only the output file is renamed).
-set_target_properties(hsr_renderer PROPERTIES OUTPUT_NAME "Quest Home Editor")
+# The product is "Quest Home Editor" — build the exe under that name (the CMake TARGET stays `questhomeeditor`
+# so `cmake --build --target questhomeeditor` and existing tooling keep working; only the output file is renamed).
+set_target_properties(questhomeeditor PROPERTIES OUTPUT_NAME "Quest Home Editor")
 
 # ── Shader resource ─────────────────────────────────────────────
 # The shaders are loaded at runtime from the APK (RENDSHAD → SPIRV).
@@ -191,7 +191,7 @@ set_target_properties(hsr_renderer PROPERTIES OUTPUT_NAME "Quest Home Editor")
 # ── hsl_cook — standalone self-contained APK cooker (no Vulkan/GLFW; builds fast) ──
 # Same hsl_cooker.h the editor's "Export APK" uses; this CLI driver validates the format pipeline.
 # hzanim_acl.cpp defines hzAclEncode() — exportSceneAPK() calls it for skinned-anim (HZAN) clips, so it MUST be
-# linked here too (the hsr_renderer target already compiles it). Without it: LNK2019 unresolved hzAclEncode.
+# linked here too (the questhomeeditor target already compiles it). Without it: LNK2019 unresolved hzAclEncode.
 add_executable(hsl_cook src/cook/_ckcook.cpp src/cook/hzanim_acl.cpp src/cook/physx_navmesh.cpp src/cook/embedded_assets.cpp src/impl/stb_image_impl.c)
 target_include_directories(hsl_cook PRIVATE
     "${MINIZ_DIR}"

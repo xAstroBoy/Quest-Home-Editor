@@ -23,7 +23,7 @@
 import sys, os, io, re, json, struct, zipfile, subprocess, hashlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)                       # hsr_renderer_cpp/
+ROOT = os.path.dirname(HERE)                       # QuestHomeEditor/
 GLSLANG = os.path.join(HERE, 'glslangValidator.exe')
 SPIRV_CROSS = os.path.join(HERE, 'spirv-cross.exe')
 MAGIC = b'\x03\x02\x23\x07'
@@ -150,7 +150,7 @@ def main():
     if len(sys.argv) < 2:
         print(__doc__); sys.exit(1)
     apk = sys.argv[1]
-    # output where the COOK reads it: <repo>/cooker/v79gen (the cook's CWD-relative "cooker/"), not hsr_renderer_cpp/cooker
+    # output where the COOK reads it: <repo>/cooker/v79gen (the cook's CWD-relative "cooker/"), not QuestHomeEditor/cooker
     outdir = os.path.join(os.path.dirname(ROOT), 'cooker', 'v79gen')
     os.makedirs(outdir, exist_ok=True)
     bases = {
@@ -161,7 +161,7 @@ def main():
     }
     for k, p in list(bases.items()):
         if not os.path.exists(p):
-            alt = p.replace('hsr_renderer_cpp' + os.sep + 'cooker', 'Junk 2' + os.sep + 'cooker')
+            alt = p.replace('QuestHomeEditor' + os.sep + 'cooker', 'Junk 2' + os.sep + 'cooker')
             if os.path.exists(alt): bases[k] = alt
     baseBytes = {k: open(p, 'rb').read() for k, p in bases.items()}
     baseGlsl, baseFwdIdx = {}, {}

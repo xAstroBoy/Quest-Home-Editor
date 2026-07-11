@@ -1,5 +1,5 @@
 @echo off
-REM hsr_renderer / editor - one-command Windows build.
+REM Quest Home Editor / editor - one-command Windows build.
 REM Auto-locates MSVC (any VS edition, via vswhere), configures with Ninja, builds Release.
 REM Dependencies (GLFW, astcenc) are auto-fetched by CMake FetchContent; Vulkan headers +
 REM everything else are vendored in third_party/ - no SDKs to install.
@@ -10,7 +10,7 @@ set "SDIR=%~dp0.."
 set "BDIR=%SDIR%\build"
 
 echo ================================================
-echo  hsr_renderer - Windows build
+echo  Quest Home Editor - Windows build
 echo ================================================
 
 REM Locate MSVC via vswhere (works for any VS Community/Pro/BuildTools with the C++ toolset)
@@ -50,8 +50,8 @@ if %ERRORLEVEL% neq 0 ( echo ERROR: build failed & exit /b 1 )
 echo.
 echo ================================================
 echo  Build SUCCESS
-echo  Editor:  %BDIR%\hsr_renderer.exe
+echo  Editor:  %BDIR%\Quest Home Editor.exe
 echo  Cooker:  %BDIR%\hsl_cook.exe
-echo  Run:     hsr_renderer.exe ^<env.apk or .gltf.ovrscene^>
+echo  Run:     Quest Home Editor.exe ^<env.apk or .gltf.ovrscene^>
 echo ================================================
 exit /b 0

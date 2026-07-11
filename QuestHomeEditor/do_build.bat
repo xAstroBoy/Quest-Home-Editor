@@ -23,6 +23,6 @@ set "PATH=%MSVCROOT%\bin\Hostx64\x64;%CMAKEDIR%\Ninja;%CMAKEDIR%\CMake\bin;%PATH
 
 echo MSVCVER=%MSVCVER%
 echo SDKVER=%SDKVER%
-cd /d "D:\Quest Stuff\Restore Old Envs\hsr_renderer_cpp\build"
+cd /d "D:\Quest Stuff\Restore Old Envs\QuestHomeEditor\build"
 ninja
 echo NINJA_EXIT=%ERRORLEVEL%

@@ -6685,12 +6685,12 @@ struct Editor {
             fputs("This folder holds a backup of the ORIGINAL Meta \"Haven 2025\" home (base.apk + any split_config.*.apk),\n"
                   "taken automatically before the converter replaced it with a spoofed (custom) home.\n\n"
                   "RESTORE the original Haven 2025:\n"
-                  "  hsr_renderer.exe --restore-haven    (or the editor's \"Restore original Haven 2025\" button)\n\n"
+                  "  "Quest Home Editor.exe" --restore-haven    (or the editor's \"Restore original Haven 2025\" button)\n\n"
                   "Do NOT delete this folder - it is the only copy of your original Haven 2025.\n"
                   "If you ever lose it, re-download Haven 2025 from Meta (headset Settings) or factory-reset.\n", rf);
             fclose(rf);
         }
-        fprintf(stderr, "[COOK] Backed up REAL Haven 2025 (%zu apk) -> %s  (restore: hsr_renderer --restore-haven)\n", pulled.size(), dir.c_str());
+        fprintf(stderr, "[COOK] Backed up REAL Haven 2025 (%zu apk) -> %s  (restore: "Quest Home Editor" --restore-haven)\n", pulled.size(), dir.c_str());
         return HB_OK;
     }
     // RESTORE the original Haven 2025 from the backup (button + --restore-haven CLI share installHavenBackup).
@@ -6707,7 +6707,7 @@ struct Editor {
         setStatus(ok ? ("Restored the ORIGINAL Haven 2025 ("+std::to_string(apks.size())+" apk"+std::string(apks.size()>1?"s":"")+") + relaunched shell.")
                      : ("Restore FAILED: "+(first.empty()?std::string("is the headset connected? (adb devices)"):first)+"  Backup kept in "+havenBackupDir()+"."));
     }
-    // Static CLI restore (no Editor instance / no serial) for `hsr_renderer --restore-haven`.
+    // Static CLI restore (no Editor instance / no serial) for `"Quest Home Editor" --restore-haven`.
     static int cliRestoreHaven() {
         std::string ADB=adbPath(); for(char&c:ADB) if(c=='/')c='\\';
         std::vector<std::string> apks = havenBackupApks();
