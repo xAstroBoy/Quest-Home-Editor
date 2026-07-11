@@ -5582,8 +5582,8 @@ struct Editor {
         cx.tip(x,y0,w,th.rowH,"Bake the environment's background audio loop into the cooked APK\n(FMOD asset placed at the spawn). Turn OFF for a silent home."); y+=th.rowH+2*uiScale;
         y0=y; cx.checkbox(ui::hashId("spooffp"), x, y, "Spoof as footprint (pairs an invisible vista)", spoofFootprint);
         cx.tip(x,y0,w,th.rowH,"Ship the spoof as a FOOTPRINT home (hsr_package_type=footprint), the\nnative home type - so the shell pairs a companion vista, which the\n'Neutralize vistas' option then fills with an INVISIBLE (empty) vista.\nOFF = the old 'combined' spoof (no vista paired) - use that only if\nvista-neutralize can't run on your device. Keep both ON."); y+=th.rowH+2*uiScale;
-        y0=y; cx.checkbox(ui::hashId("killvistas"), x, y, "Neutralize vistas (install an invisible vista over each)", killVistas);
-        cx.tip(x,y0,w,th.rowH,"After installing the spoof, replace EVERY installed vista package\n(com.meta.shell.env.vista.*) with an INVISIBLE 0-mesh environment.\nSo if the shell force-pairs a vista behind your home, it renders\nNOTHING. Only /data (updatable) vistas can be replaced without root;\na system-app vista is reported and left as-is. Keep ON if a vista\nstill shows behind your ported home."); y+=th.rowH+2*uiScale;
+        y0=y; cx.checkbox(ui::hashId("killvistas"), x, y, "Nullify vistas (UNROOTED spoof only - replaces real vistas)", killVistas);
+        cx.tip(x,y0,w,th.rowH,"UNROOTED ONLY. After installing the haven2025 spoof, replace EVERY\ninstalled vista package (com.meta.shell.env.vista.*) with an INVISIBLE\n0-mesh environment, so a force-paired vista renders nothing.\n\nNEVER runs on a ROOTED Quest: a rooted install uses your home's OWN\npackage (no vista pairing), so this would only DELETE your real Meta\nvistas for nothing. Reinstall a vista from the Store to get it back."); y+=th.rowH+2*uiScale;
         y0=y; cx.checkbox(ui::hashId("autofixvistas"), x, y, "Auto-fix a broken vista when the Quest connects", autoFixVistas);
         cx.tip(x,y0,w,th.rowH,"When a Quest is plugged in, check the recent logcat for a vista that\nREJECTS on load (which drops your home to the nuxd fallback) and, if\nfound, automatically re-install the current invisible vista over it -\nno button press needed. Runs once per device per session."); y+=th.rowH+2*uiScale;
         // ── the AUDIO COOKER UI: shows what will ship + Replace/Add/Export/Revert (backend above: setAudioFromFile etc.) ──
@@ -6585,10 +6585,12 @@ struct Editor {
             } else {
                 msg += rooted ? "  || ROOT but no system APK" : "  || no root and no spoof APK (enable the spoof toggle)";
             }
-            // ── NEUTRALIZE VISTAS: after the home install, replace every installed vista package with an
-            //    invisible (0-entity) environment so a force-paired vista renders nothing. Belt-and-suspenders
-            //    for the "vista still shows behind my home" case the nuxd-manifest spoof doesn't fully cover.
-            if (killVistas) {
+            // ── NEUTRALIZE VISTAS — UNROOTED SPOOF PATH ONLY. Replace every installed vista package with an
+            //    invisible (empty) environment so a force-paired vista renders nothing. ⛔ NEVER on ROOTED: a
+            //    rooted install puts the home under its OWN package and selects it via oculuspreferences — the
+            //    shell loads it standalone with NO footprint/vista pairing, so the real Meta vistas are
+            //    irrelevant to it and replacing them is destructive (removes the user's store vistas for nothing).
+            if (killVistas && !rooted) {
                 auto bs2=[](std::string p){
 #ifdef _WIN32
                     for(char&c:p) if(c=='/')c='\\';
@@ -6597,6 +6599,8 @@ struct Editor {
                 std::string ADB2=bs2(adbPath()), sel2 = adbSerial.empty()? "" : (" -s "+adbSerial);
                 progress(0.9f, "neutralizing vistas");
                 msg += "  || vistas: " + neutralizeVistasOnDevice(ADB2, sel2, rooted, progress);
+            } else if (killVistas && rooted) {
+                msg += "  || vistas: LEFT UNTOUCHED (rooted own-package install pairs no vista - neutralizing would only remove your real vistas).";
             }
         }
         if (terminalBar) fprintf(stderr, "\n");
@@ -7017,6 +7021,11 @@ struct Editor {
                 return p; };
             std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
             if (!adbWorks(true)) { vistaBusy.store(false); restoring.store(false); return; }   // silent: no adb, nothing to do
+            // ⛔ NEVER auto-touch vistas on a ROOTED Quest: rooted homes install under their own package (no
+            //    footprint/vista pairing), so the real vistas are unrelated - replacing them would be destructive.
+            //    Lightweight check (no `adb root` side effect): adbd uid 0, or su grants uid 0.
+            if (adbCapture(ADB, sel, "shell id").find("uid=0")!=std::string::npos
+             || adbCapture(ADB, sel, "shell su -c id").find("uid=0")!=std::string::npos) { vistaBusy.store(false); restoring.store(false); return; }
             setStage(0.1f, "checking for a broken vista");
             std::string dump = adbCapture(ADB, sel, "logcat -d -v time -t 8000");
             int st = vistaLoadStateFromLog(dump);
