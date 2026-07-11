@@ -5569,8 +5569,7 @@ struct Editor {
         else y+=4*uiScale;
         // ── HSL render config (distance fog + far clip): WYSIWYG — the preview applies the SAME values the cook ships ──
         y0=y; cx.checkbox(ui::hashId("cfgfog"), x, y, "Distance fog (preview + cook)", cfgFog);
-        cx.tip(x,y0,w,th.rowH,"Emit a ScenePlatformComponent distance fog AND show it live in the\npreview. Tune by eye; the preview closely approximates the device
-(confirm on the headset)."); y+=th.rowH+2*uiScale;
+        cx.tip(x,y0,w,th.rowH,"Emit a ScenePlatformComponent distance fog AND show it live in the\npreview. Tune by eye; the preview closely approximates the device\n(confirm on the headset)."); y+=th.rowH+2*uiScale;
         if (cfgFog) {
             char fb[48];
             y0=y; cx.label(x,y,150*uiScale,th.rowH,"  fog color r,g,b",th.textDim);
@@ -6686,12 +6685,12 @@ struct Editor {
             fputs("This folder holds a backup of the ORIGINAL Meta \"Haven 2025\" home (base.apk + any split_config.*.apk),\n"
                   "taken automatically before the converter replaced it with a spoofed (custom) home.\n\n"
                   "RESTORE the original Haven 2025:\n"
-                  "  "Quest Home Editor.exe" --restore-haven    (or the editor's \"Restore original Haven 2025\" button)\n\n"
+                  "  \"Quest Home Editor.exe\" --restore-haven    (or the editor's \"Restore original Haven 2025\" button)\n\n"
                   "Do NOT delete this folder - it is the only copy of your original Haven 2025.\n"
                   "If you ever lose it, re-download Haven 2025 from Meta (headset Settings) or factory-reset.\n", rf);
             fclose(rf);
         }
-        fprintf(stderr, "[COOK] Backed up REAL Haven 2025 (%zu apk) -> %s  (restore: "Quest Home Editor" --restore-haven)\n", pulled.size(), dir.c_str());
+        fprintf(stderr, "[COOK] Backed up REAL Haven 2025 (%zu apk) -> %s  (restore: \"Quest Home Editor\" --restore-haven)\n", pulled.size(), dir.c_str());
         return HB_OK;
     }
     // RESTORE the original Haven 2025 from the backup (button + --restore-haven CLI share installHavenBackup).

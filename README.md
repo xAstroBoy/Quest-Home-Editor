@@ -2,6 +2,13 @@
   <img src="QuestHomeEditor/app.png" width="168" alt="Quest Home Editor">
 </p>
 
+<p align="center">
+  <b><a href="https://discord.gg/cXnc4pQz7A">💬 Join the Quest Home Editor Discord</a></b>
+  &nbsp;·&nbsp; <a href="../../releases">⬇️ Download</a>
+  &nbsp;·&nbsp; <a href="../../wiki">📖 Wiki</a>
+  &nbsp;·&nbsp; <a href="../../discussions">🗣️ Discussions</a>
+</p>
+
 # Quest Home Editor — port old Meta Quest homes to today's Quest
 
 Load an **old (V79-era) Meta Quest home**, walk around it, edit it like a tiny Blender, then
