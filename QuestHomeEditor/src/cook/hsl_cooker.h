@@ -1330,12 +1330,19 @@ inline std::vector<uint8_t> assembleSceneZip(std::vector<CookAsset>& assets,
 // instantiates to nothing visible. [[project_hsr_unrooted_footprint_vista_fix]]
 inline std::vector<uint8_t> emptyVistaSceneZip() {
     CookRng rng(0x1157A0EDULL);                                  // deterministic → byte-stable rebuilds
-    const std::string MH = "meta/empty_vista";
-    std::string pContent = MH + "/content.hstf/template", pSpace = MH + "/space.hstf/template";
-    AssetKey3 contentK = keyForPath(pContent), spaceK = keyForPath(pSpace);
     std::string rootId  = makeUuid(rng);
     std::string content = templateJson(rootEntityJson(rootId), "");   // ONE Root entity (no mesh) — valid, renders nothing
-    std::string space   = spaceJson(rng, "empty_vista", contentK, 150000.0f);   // Scene entity (clip/fog) + content-ref
+    // ⛔ CACHE-BUST the template PATH by a hash of the content. The device AssetManager caches parsed
+    // template assets by the PATH hash ACROSS env reloads — so a previously-installed empty vista at the
+    // FIXED path `meta/empty_vista/content.hstf` (e.g. the pre-fix 0-entity one that failed "No entities")
+    // stays CACHED and re-serves its failure even after we reinstall a corrected template at the SAME path.
+    // Namespacing by the content hash gives the fixed template a FRESH AssetKey → the device actually loads
+    // it. Deterministic (same content → same tag) so identical rebuilds stay byte-stable. [[project_hsl_ondevice_envload]]
+    char tag[24]; snprintf(tag, sizeof tag, "empty_vista_%08x", (uint32_t)h64fnv(content));
+    const std::string MH = std::string("meta/") + tag;
+    std::string pContent = MH + "/content.hstf/template", pSpace = MH + "/space.hstf/template";
+    AssetKey3 contentK = keyForPath(pContent), spaceK = keyForPath(pSpace);
+    std::string space   = spaceJson(rng, tag, contentK, 150000.0f);   // Scene entity (clip/fog) + content-ref
     std::vector<CookAsset> assets;
     assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
     assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });

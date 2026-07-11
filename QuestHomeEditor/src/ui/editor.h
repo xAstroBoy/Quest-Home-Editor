@@ -7103,6 +7103,34 @@ struct Editor {
         if (!pid.empty()) runAdb(ADB, sel, "shell su -c \"kill "+pid+"\"");   // rooted (best-effort, cleaner)
         runAdb(ADB, sel, "shell am force-stop com.oculus.vrshell");           // universal no-root reload
     }
+    // ── env-reject REASON classifier (shared by the live diag + the exported report) ────────────────────────────
+    // Pull the ONE line that actually explains a nuxd fallback. Two hard-won rules from device logs:
+    //   • SKIP benign lines: "unable to open package .../streamables.zip" is an OPTIONAL asset absent even from
+    //     WORKING envs (nuxd logs it too, then loads fine) — it is NEVER the cause. (2026-07-11 diag mis-blamed it.)
+    //   • PRIORITY: a real ECS/asset reject ("No entities" / "Failed to validate ECS template" / "ErrorUnexpected" /
+    //     "postInitAsset failed" / "Asset ptr error") outranks a weak "unable to open package" that may appear first
+    //     in log order. Scan the strong causes first, the weak ones only if nothing strong matched.
+    static std::string reasonFromLine(const std::string& s){
+        size_t mp = s.find("): "); std::string msg = (mp!=std::string::npos && mp+3<=s.size()) ? s.substr(mp+3) : s;  // strip "TAG(pid): "
+        return msg;
+    }
+    static std::string firstRejectReasonStr(const std::string& logText){
+        static const char* HI[] = { "No entities", "Failed to validate ECS template", "ErrorUnexpected",
+            "postInitAsset failed", "Asset ptr error", "LoadEntry not found", "in zip from",
+            "package type not supported", "package path not valid", "deserialize asset manifest",
+            "MeshDefinition::fix", "MaterialDefinition::fix" };
+        static const char* LO[] = { "unable to open package", "Failed to load hsr" };
+        auto scan=[&](const char* const* arr, size_t n)->std::string{
+            size_t s2=0; while (s2<logText.size()){ size_t nl=logText.find('\n',s2); std::string ln=logText.substr(s2, nl==std::string::npos?std::string::npos:nl-s2); s2=(nl==std::string::npos)?logText.size():nl+1;
+                if (ln.find("streamables.zip")!=std::string::npos) continue;   // benign optional asset — never the cause
+                for (size_t i=0;i<n;i++) if (ln.find(arr[i])!=std::string::npos) return reasonFromLine(ln); }
+            return ""; };
+        std::string r = scan(HI, sizeof(HI)/sizeof(*HI)); return r.empty() ? scan(LO, sizeof(LO)/sizeof(*LO)) : r;
+    }
+    std::string firstRejectReason(const std::vector<LogLine>& snap){
+        std::string joined; for (auto& l : snap){ joined += l.t; joined += '\n'; }
+        return firstRejectReasonStr(joined);
+    }
     // ── NO-ROOT env-load diagnostics ("why did my home get rejected -> nuxd?") ──────────────────────────────────
     // libshell logs its ENTIRE EnvironmentSystem/EnvironmentManager load path to logcat (via __android_log_write,
     // tag "Clay"/"Shell"), and the reject reasons are emitted UNCONDITIONALLY at error level. `adb logcat` needs
@@ -7122,6 +7150,8 @@ struct Editor {
             "as Vista", "Scene loaded", "Hsr environment loaded", "Failed to load asset", "Asset ptr error",
             "unable to open package", "LoadEntry not found", "in zip from", "package type not supported",
             "package path not valid", "ClayPackage",
+            // ECS/template reject detail (the REAL cause of an empty/invalid template rejecting to nuxd)
+            "No entities", "Failed to validate ECS template", "ErrorUnexpected", "Failed to load nested template",
         };
         // Poll the log until a terminal marker lands (success or fallback), or ~12s.
         std::string dump;
@@ -7143,20 +7173,8 @@ struct Editor {
         if (!diagPath.empty()) { std::ofstream f(diagPath, std::ios::binary); if (f) f << "# env-load diagnostics (adb logcat, no root) for " << pkg << "\n" << filtered; }
         // Classify a one-line verdict. Pull the first concrete REASON line if it fell back.
         auto has = [&](const char* s){ return dump.find(s) != std::string::npos; };
-        auto firstReason = [&]() -> std::string {
-            static const char* CAUSES[] = { "Asset ptr error", "unable to open package", "in zip from",
-                "LoadEntry not found", "package type not supported", "package path not valid",
-                "Failed to load hsr", "Failed to deserialize asset manifest", "MeshDefinition::fix",
-                "MaterialDefinition::fix", "postInitAsset", "reason:" };
-            size_t s2 = 0;
-            while (s2 < filtered.size()) { size_t nl = filtered.find('\n', s2); std::string ln = filtered.substr(s2, nl==std::string::npos?std::string::npos:nl-s2); s2 = (nl==std::string::npos)?filtered.size():nl+1;
-                for (auto c : CAUSES) if (ln.find(c) != std::string::npos) {
-                    size_t p = ln.find("EnvironmentSystem"); if (p==std::string::npos) p = ln.find("EnvironmentManager");
-                    return p==std::string::npos ? ln : ln.substr(p); } }
-            return "";
-        };
         if (has("falling back to device default") || has("using fallback environment")) {
-            std::string r = firstReason();
+            std::string r = firstRejectReasonStr(filtered);
             return "REJECTED -> nuxd fallback. " + (r.empty() ? std::string("see ")+diagPath : r);
         }
         if (has("Scene loaded") || has("Hsr environment loaded")) return "Home loaded OK on device (Scene loaded).";
@@ -7304,11 +7322,11 @@ struct Editor {
         // resolved env + verdict from the captured log
         std::string resolved, verdict="(no env-load lines captured - use \"Reload home\" first)";
         for (auto& l : snap){ if (l.t.find("SetSystemEnvironment resolved")!=std::string::npos || l.t.find("Scene loaded:")!=std::string::npos){ size_t p=l.t.find("apk://"); if(p!=std::string::npos) resolved=l.t.substr(p); } }
-        { bool fail=false, ok=false; std::string reason;
+        { bool fail=false, ok=false;
           for (auto& l : snap){ const std::string& s=l.t;
             if (s.find("falling back to device default")!=std::string::npos || s.find("using fallback environment")!=std::string::npos) fail=true;
-            if (s.find("Scene loaded")!=std::string::npos || s.find("Hsr environment loaded")!=std::string::npos) ok=true;
-            if (reason.empty()) for (const char* c : {"Asset ptr error","unable to open package","in zip from","LoadEntry not found","package type not supported","package path not valid","Failed to load hsr","deserialize asset manifest","MeshDefinition::fix","MaterialDefinition::fix","postInitAsset"}) if (s.find(c)!=std::string::npos){ size_t p=s.find("EnvironmentSystem"); reason=(p==std::string::npos?s:s.substr(p)); break; } }
+            if (s.find("Scene loaded")!=std::string::npos || s.find("Hsr environment loaded")!=std::string::npos) ok=true; }
+          std::string reason = firstRejectReason(snap);
           if (fail) verdict = "REJECTED -> nuxd fallback." + (reason.empty()?std::string(""):("  Reason: "+reason));
           else if (ok) verdict = "Home loaded OK (Scene loaded).";
         }
