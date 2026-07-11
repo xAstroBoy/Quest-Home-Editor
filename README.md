@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <b><a href="https://discord.gg/cXnc4pQz7A">💬 Join the Quest Home Editor Discord</a></b>
+  <b><a href="https://discord.gg/cXnc4pQz7A">💬 Join the Quest Homes Discord</a></b>
   &nbsp;·&nbsp; <a href="../../releases">⬇️ Download</a>
   &nbsp;·&nbsp; <a href="../../wiki">📖 Wiki</a>
   &nbsp;·&nbsp; <a href="../../discussions">🗣️ Discussions</a>
