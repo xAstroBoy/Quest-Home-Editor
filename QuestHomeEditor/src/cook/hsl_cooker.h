@@ -1342,7 +1342,12 @@ inline std::vector<uint8_t> emptyVistaSceneZip() {
     const std::string MH = std::string("meta/") + tag;
     std::string pContent = MH + "/content.hstf/template", pSpace = MH + "/space.hstf/template";
     AssetKey3 contentK = keyForPath(pContent), spaceK = keyForPath(pSpace);
-    std::string space   = spaceJson(rng, tag, contentK, 150000.0f);   // Scene entity (clip/fog) + content-ref
+    // ⛔ NO ScenePlatformComponent (farP<=0 → spaceJson emits ONLY the content-ref, no Scene entity). The vista
+    // must NOT interfere with the FOOTPRINT home's rendering: a Scene entity's ScenePlatformComponent (fog/clip)
+    // runs for ANY loaded scene (IDA vf3 note) with NO vista-only gate, so our vista's fog+clip would OVERRIDE the
+    // home's and black out EVERYTHING (device 2026-07-12: home+vista both load, but the whole scene is black). A
+    // bare content-ref → Root scene is a valid, loadable vista that contributes NOTHING to fog/clip/lighting/sky.
+    std::string space   = spaceJson(rng, tag, contentK, /*farP=*/0.0f);   // content-ref only — zero scene config
     std::vector<CookAsset> assets;
     assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
     assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });
