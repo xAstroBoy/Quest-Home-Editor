@@ -32,9 +32,10 @@ Grab a build from **[Releases](../../releases)**:
 
 | File | For |
 | --- | --- |
-| `Quest-Home-Editor-windows-x64.exe` | Windows, 64-bit (Vulkan GPU) |
-| `Quest-Home-Editor-linux-x64` / `.AppImage` | Linux (CI — once Actions is live) |
-| `Quest-Home-Editor-macos-arm64.dmg` / `-x64.dmg` | macOS, MoltenVK bundled (CI — once Actions is live) |
+| `Quest-Home-Editor-windows-x64.exe` | Windows, any 64-bit CPU (Vulkan GPU) |
+| `Quest-Home-Editor-windows-x64.zip` | Same exe + bundled UI font |
+| `Quest-Home-Editor-linux-x64` / `.tar.gz` | Linux x86-64 (the `.tar.gz` bundles the UI font). Community build 🙏 |
+| `Quest-Home-Editor-macos-*.dmg` | macOS, MoltenVK bundled (CI — once Actions is live) |
 
 A GPU with **Vulkan** support is required on every OS (macOS via MoltenVK, which the `.dmg` bundles).
 
