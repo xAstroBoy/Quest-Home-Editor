@@ -1,2 +1,7 @@
 // Win32 resource — gives Quest Home Editor.exe its file icon (shown in Explorer / taskbar).
 1 ICON "app.ico"
+
+// Google platform-tools adb (adb.exe + AdbWinApi.dll + AdbWinUsbApi.dll), zipped and EMBEDDED in the exe so a
+// fully offline machine still gets adb: the editor extracts these beside itself if no external adb is found and
+// there's no network to download. adb is redistributable (SideQuest/scrcpy bundle it too). See editor.h ensureAdb.
+ADBWINZIP RCDATA "embed/adb-win.zip"

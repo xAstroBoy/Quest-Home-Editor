@@ -3449,8 +3449,14 @@ struct Editor {
     std::thread adbDlThread; std::atomic<bool> adbDling{false}; std::atomic<bool> adbDlDone{false};
     std::string adbDlStatus; std::mutex adbDlMx; bool adbAutoTried = false;
     void ensureAdbAsync(){
-        if (adbDling.load() || adbAutoTried || adbWorks()) return;   // already fine / already trying / already tried this session
-        adbAutoTried = true; adbDling.store(true);
+        if (adbDling.load() || adbAutoTried || adbWorks()) return;   // EXTERNAL adb already works -> use it, done.
+        adbAutoTried = true;
+#ifdef _WIN32
+        // OFFLINE fallback: adb is EMBEDDED in the exe (ADBWINZIP resource). Extract it beside the app (instant, no
+        // network) before trying a download. So: external adb -> embedded adb -> download.
+        { std::string a = extractEmbeddedAdb(); if (!a.empty() && adbWorks(true)) return; }
+#endif
+        adbDling.store(true);
         { std::lock_guard<std::mutex> lk(adbDlMx); adbDlStatus = "Fetching adb (Google platform-tools, ~15 MB, one time)..."; }
         if (adbDlThread.joinable()) adbDlThread.join();
         adbDlThread = std::thread([this]{
@@ -6579,6 +6585,28 @@ struct Editor {
 
     // Resolve an adb binary: HSR_ADB -> UI-set path -> beside-the-exe (incl. auto-downloaded platform-tools/)
     // -> common SDK / SideQuest / Homebrew installs -> "adb" on PATH.
+#ifdef _WIN32
+    // Extract the adb bundled INSIDE the exe (the ADBWINZIP resource: adb.exe + AdbWin*.dll) to platform-tools/
+    // beside the app. Instant + offline; used when no external adb is found. Returns the adb path, "" on failure.
+    static std::string extractEmbeddedAdb(){
+        namespace fs = std::filesystem;
+        std::string exeDir = AppConfig::exeRel(""); if(!exeDir.empty()&&(exeDir.back()=='/'||exeDir.back()=='\\')) exeDir.pop_back();
+        std::string adb = exeDir + "/platform-tools/adb.exe";
+        if (fileEx(adb)) return adb;                                 // already extracted on a previous run
+        HRSRC r = FindResourceA(nullptr, "ADBWINZIP", (LPCSTR)RT_RCDATA); if(!r) return "";
+        HGLOBAL h = LoadResource(nullptr, r); DWORD sz = SizeofResource(nullptr, r); const void* p = h? LockResource(h): nullptr;
+        if(!p || !sz) return "";
+        mz_zip_archive z; memset(&z,0,sizeof z);
+        if(!mz_zip_reader_init_mem(&z, p, sz, 0)) return "";
+        mz_uint n = mz_zip_reader_get_num_files(&z); bool ok=true;
+        for(mz_uint i=0;i<n;i++){ mz_zip_archive_file_stat st; if(!mz_zip_reader_file_stat(&z,i,&st)){ ok=false; break; }
+            if(mz_zip_reader_is_file_a_directory(&z,i)) continue;
+            std::string outp = exeDir + "/" + st.m_filename; std::error_code ec; fs::create_directories(fs::path(outp).parent_path(), ec);
+            if(!mz_zip_reader_extract_to_file(&z,i,outp.c_str(),0)){ ok=false; break; } }
+        mz_zip_reader_end(&z);
+        return (ok && fileEx(adb)) ? adb : "";
+    }
+#endif
     static std::string adbPath() {
         if (const char* a=std::getenv("HSR_ADB")) return a;
         std::string u=adbUserPath(); if (!u.empty() && fileEx(u)) return u;
