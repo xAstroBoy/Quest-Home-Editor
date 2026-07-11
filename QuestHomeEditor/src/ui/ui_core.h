@@ -299,7 +299,10 @@ struct Context {
         if(bx+bw>W) bx=ttX-bw-6; if(bx<0)bx=0;          // flip left / clamp on-screen
         if(by+bh>H) by=H-bh;      if(by<0)by=0;
         dl->rect(bx,by,bw,bh, rgba(22,22,22,238)); dl->border(bx,by,bw,bh, th.accent);
-        Font* of=dl->font; dl->font=fnt; float ty=by+pad+fnt->ascent;
+        // dl->text() places the baseline at y+ascent (y = line-box TOP), so pass the line TOP, NOT
+        // top+ascent — the old code added ascent here AND in dl->text, drawing every line one full
+        // ascent too low so the bottom lines overflowed the box ("tooltip text doesn't fit").
+        Font* of=dl->font; dl->font=fnt; float ty=by+pad;
         for(auto&l:lines){ dl->text(bx+pad,ty,l.c_str(),th.textSel); ty+=lineH; }
         dl->font=of;
     }

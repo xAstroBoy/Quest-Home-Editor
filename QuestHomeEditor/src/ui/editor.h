@@ -3413,6 +3413,11 @@ struct Editor {
     bool autoSign = true, spoofHaven = true;
     bool cookAudio = true;             // DEFAULT ON: bake the env's background audio loop into the cooked APK. Toggle off = silent home.
     bool cookAutoFloor = true;         // DEFAULT ON: when NO Navmesh item exists, the cook generates a walkable floor (ColliderBox grid / disk). OFF = ship ZERO generated collision (the "invisible wall I never placed").
+    bool killVistas = true;            // DEFAULT ON (unrooted spoof): after the spoof install, replace EVERY installed
+                                       // com.meta.shell.env.vista.* package with an INVISIBLE (0-entity) environment, so
+                                       // any vista the boot resolver force-pairs renders NOTHING. Only touches /data
+                                       // (updatable) vista packages; a non-removable system vista is reported, not forced.
+                                       // [[project_hsr_unrooted_footprint_vista_fix]]
     bool cookWarnOpen = false;         // pre-cook "no collision" confirmation modal is showing (blocks the frame's other input while up)
     // A cook has collision the player can stand on IF: the auto-floor is on, OR the user placed a Navmesh (walkable
     // mesh) or a Box collider. WITHOUT any of these the port ships zero collision — the player falls through forever
@@ -5565,6 +5570,8 @@ struct Editor {
         y0=y; cx.checkbox(ui::hashId("cookaudio"), x, y, "Ship background audio loop", cookAudio);
         y+=cx.th.rowH+2*uiScale; cx.checkbox(ui::hashId("cookautofloor"), x, y, "Auto floor collision (no Navmesh item)", cookAutoFloor);
         cx.tip(x,y0,w,th.rowH,"Bake the environment's background audio loop into the cooked APK\n(FMOD asset placed at the spawn). Turn OFF for a silent home."); y+=th.rowH+2*uiScale;
+        y0=y; cx.checkbox(ui::hashId("killvistas"), x, y, "Neutralize vistas (install an invisible vista over each)", killVistas);
+        cx.tip(x,y0,w,th.rowH,"After installing the spoof, replace EVERY installed vista package\n(com.meta.shell.env.vista.*) with an INVISIBLE 0-mesh environment.\nSo if the shell force-pairs a vista behind your home, it renders\nNOTHING. Only /data (updatable) vistas can be replaced without root;\na system-app vista is reported and left as-is. Keep ON if a vista\nstill shows behind your ported home."); y+=th.rowH+2*uiScale;
         // ── the AUDIO COOKER UI: shows what will ship + Replace/Add/Export/Revert (backend above: setAudioFromFile etc.) ──
         { if(audioInfo.empty() && !bgOgg.empty()) refreshAudioInfo();
           std::string al = bgOgg.empty() ? "  audio: none - Add one below"
@@ -5664,8 +5671,16 @@ struct Editor {
                 restoring.store(true);
                 restoreThread = std::thread([this]{ uninstallHaven(); restoring.store(false); });
             }
-            cx.tip(x,y0,w,th.rowH,"Uninstall whatever Haven 2025 is installed on the headset (your spoof,\nor a different Meta version) - no root needed, if it's a store app.\nDetects the installed version first. Then \"Restore original Haven 2025\"\nputs Meta's back, or just re-cook + install."); y += th.rowH+8*uiScale;
-        } else if (restoring.load()) { cx.label(x,y,w,th.rowH,"Working on Haven 2025...",th.textDim); y += th.rowH+8*uiScale; }
+            cx.tip(x,y0,w,th.rowH,"Uninstall whatever Haven 2025 is installed on the headset (your spoof,\nor a different Meta version) - no root needed, if it's a store app.\nDetects the installed version first. Then \"Restore original Haven 2025\"\nputs Meta's back, or just re-cook + install."); y += th.rowH+3*uiScale;
+            // Standalone vista-neutralize (no re-cook): install an invisible vista over every installed vista package.
+            y0=y; if (cx.button(ui::hashId("killvistabtn"), x, y, w, th.rowH, "Neutralize vistas now (invisible vista over each)")) neutralizeVistasButton();
+            cx.tip(x,y0,w,th.rowH,"Right now (no re-cook): replace every installed com.meta.shell.env.vista.*\npackage with an INVISIBLE 0-mesh environment, so a force-paired vista\nrenders nothing. Use this if a vista shows behind your ported home.\nUpdatable vistas are replaced without root; system-app vistas are\nreported (need root). Restore a vista by reinstalling it from the store."); y += th.rowH+8*uiScale;
+        } else if (restoring.load()) {
+            // live progress bar (vista-neutralize drives setStage per vista; restore/uninstall just show "working")
+            if (vistaBusy.load()) cx.progressBar(x, y, w, th.rowH+2*uiScale, cookProg.load(), stageStr().c_str());
+            else cx.label(x,y,w,th.rowH,"Working on Haven 2025...",th.textDim);
+            y += th.rowH+8*uiScale;
+        }
         // PREVIEW THE COOK IN-PLACE: swap this SAME window to the freshest cooked APK, rendered the
         // HSL/V203 way (the closest desktop match of the device) - and swap BACK to the source, no restart ever.
         if (!busy) {
@@ -6556,6 +6571,19 @@ struct Editor {
             } else {
                 msg += rooted ? "  || ROOT but no system APK" : "  || no root and no spoof APK (enable the spoof toggle)";
             }
+            // ── NEUTRALIZE VISTAS: after the home install, replace every installed vista package with an
+            //    invisible (0-entity) environment so a force-paired vista renders nothing. Belt-and-suspenders
+            //    for the "vista still shows behind my home" case the nuxd-manifest spoof doesn't fully cover.
+            if (killVistas) {
+                auto bs2=[](std::string p){
+#ifdef _WIN32
+                    for(char&c:p) if(c=='/')c='\\';
+#endif
+                    return p; };
+                std::string ADB2=bs2(adbPath()), sel2 = adbSerial.empty()? "" : (" -s "+adbSerial);
+                progress(0.9f, "neutralizing vistas");
+                msg += "  || vistas: " + neutralizeVistasOnDevice(ADB2, sel2, rooted, progress);
+            }
         }
         if (terminalBar) fprintf(stderr, "\n");
         // record the cook signature next to the APKs so "Install only" can detect an unchanged scene and skip
@@ -6838,6 +6866,97 @@ struct Editor {
         relaunchShell(ADB, sel);
         setStatus(gone ? "Uninstalled Haven 2025 (was version "+prev+"). Re-cook + install, or Restore original Haven 2025."
                        : "Couldn't fully remove Haven 2025 - it's a non-removable SYSTEM app on this headset (needs root). It's been disabled for the user where possible.");
+    }
+    // ── INVISIBLE VISTA: neutralize the shell's force-paired companion vista ─────────────────────────
+    // List every INSTALLED com.meta.shell.env.vista.* package. The boot resolver (IsDefaultVistaInstalled,
+    // a NAME check) pairs one of these with our haven2025 spoof independent of the env's footprint flag, so
+    // on some devices a vista still shows behind/instead of the ported home. No root needed to read.
+    std::vector<std::string> listInstalledVistas(const std::string& ADB, const std::string& sel) {
+        std::vector<std::string> out;
+        std::string s = adbCapture(ADB, sel, "shell pm list packages com.meta.shell.env.vista");
+        size_t p=0; while (p<s.size()){ size_t nl=s.find('\n',p); std::string ln=s.substr(p, nl==std::string::npos?std::string::npos:nl-p); p=(nl==std::string::npos)?s.size():nl+1;
+            while(!ln.empty()&&(ln.back()=='\r'||ln.back()==' '||ln.back()=='\t')) ln.pop_back();
+            size_t kp=ln.find("package:"); if(kp==std::string::npos) continue;
+            std::string pkg=ln.substr(kp+8);
+            if (pkg.rfind("com.meta.shell.env.vista.",0)==0 && pkg.find(' ')==std::string::npos) out.push_back(pkg);
+        }
+        return out;
+    }
+    // Replace EVERY installed vista package with an INVISIBLE (0-entity) environment so any vista the shell
+    // force-pairs renders nothing. Only /data (updatable) vistas can be replaced unrooted; a non-removable
+    // system vista is DETECTED and reported, never forced. Returns a one-line summary (+ per-pkg detail).
+    std::string neutralizeVistasOnDevice(const std::string& ADB, const std::string& sel, bool rooted,
+                                         const std::function<void(float,const char*)>& progress) {
+        if (progress) progress(0.0f, "detecting installed vistas...");
+        std::vector<std::string> vistas = listInstalledVistas(ADB, sel);
+        if (vistas.empty()) return "no com.meta.shell.env.vista.* packages installed (nothing to neutralize)";
+        std::string tmpU = AppConfig::exeRel("_invisible_vista.unsigned.apk");
+        std::string tmpS = AppConfig::exeRel("_invisible_vista.apk");
+        std::string tmpP = AppConfig::exeRel("_vista_pulled.apk");
+        int done=0, sysBlocked=0, failed=0; std::string detail;
+        const size_t NV = vistas.size();
+        for (size_t vi=0; vi<NV; ++vi) {
+            const std::string& vp = vistas[vi];
+            // progress advances per vista across [0..1]; the label names the vista + its index.
+            if (progress) progress((float)vi/(float)NV, ("vista "+std::to_string(vi+1)+"/"+std::to_string(NV)+": "+vp).c_str());
+            std::string path = adbCapture(ADB, sel, "shell pm path "+vp);   // package:/data/app/.../base.apk
+            bool systemApp = path.find("/system/")!=std::string::npos || path.find("/product/")!=std::string::npos
+                          || path.find("/vendor/")!=std::string::npos || path.find("/system_ext/")!=std::string::npos;
+            // PRIMARY: pull the REAL installed vista APK and empty ONLY its scene ("whatever the vista has,
+            // but an empty scene") — keeps its exact manifest/package/resources. FALLBACK: synthesize from
+            // the nuxd donor if the pull or the base-apk parse fails.
+            std::vector<uint8_t> apk; bool ok2=false;
+            std::string basePath; { size_t p=path.find("package:"); while(p!=std::string::npos){ size_t e=path.find_first_of("\r\n",p); std::string ln=path.substr(p+8, e==std::string::npos?std::string::npos:e-(p+8));
+                while(!ln.empty()&&(ln.back()=='\r'||ln.back()==' '))ln.pop_back();
+                if (ln.size()>4 && ln.substr(ln.size()-9)=="/base.apk"){ basePath=ln; break; } if(basePath.empty()&&ln.size()>4&&ln.substr(ln.size()-4)==".apk") basePath=ln;
+                p = e==std::string::npos?std::string::npos:path.find("package:",e); } }
+            if (!basePath.empty()) {
+                std::remove(tmpP.c_str());
+                runAdb(ADB, sel, "pull \""+basePath+"\" \""+tmpP+"\"");
+                std::vector<uint8_t> real; { FILE* f=fopen(tmpP.c_str(),"rb"); if(f){ fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ real.resize((size_t)n); if(fread(real.data(),1,(size_t)n,f)!=(size_t)n) real.clear(); } fclose(f); } }
+                if (!real.empty()) apk = hslcook::emptyOutVistaApk(real, &ok2);
+            }
+            std::remove(tmpP.c_str());
+            if (!ok2 || apk.empty()) apk = hslcook::buildInvisibleVista(vp, &ok2);   // fallback: synthesized empty env
+            if (!ok2 || apk.empty()) { ++failed; detail += "\n  - "+vp+": build failed"; continue; }
+            if (!writeFile(tmpU, apk)) { ++failed; detail += "\n  - "+vp+": temp write failed"; continue; }
+            bool signed_ = hslcook::signApk(tmpU, tmpS, progress);
+            std::remove(tmpU.c_str());
+            if (!signed_) { ++failed; detail += "\n  - "+vp+": sign failed"; continue; }
+            bool inst = installToDevice(tmpS, vp, progress, /*uninstallFirst=*/true, rooted);
+            if (inst)                      { ++done;       detail += "\n  - "+vp+": replaced with an invisible (empty) vista"; }
+            else if (systemApp && !rooted) { ++sysBlocked; detail += "\n  - "+vp+": SYSTEM app (in "+ (path.find("/product/")!=std::string::npos?"/product":"/system") +", needs root to replace) - left as-is"; }
+            else                           { ++failed;    detail += "\n  - "+vp+": install failed"; }
+        }
+        if (progress) progress(1.0f, "vistas neutralized");
+        std::remove(tmpS.c_str());
+        std::string sum = std::to_string(done)+"/"+std::to_string(vistas.size())+" neutralized";
+        if (sysBlocked) sum += ", "+std::to_string(sysBlocked)+" are system apps (need root)";
+        if (failed)     sum += ", "+std::to_string(failed)+" failed";
+        return sum + detail;
+    }
+    // Standalone button entry (off the UI thread): neutralize vistas without a full cook.
+    std::atomic<bool> vistaBusy{false};   // true while a vista-neutralize runs (shows the progress bar vs a plain label)
+    void neutralizeVistasButton() {
+        if (restoring.exchange(true)) return;
+        if (restoreThread.joinable()) restoreThread.join();
+        vistaBusy.store(true); cookProg.store(0.f);
+        restoreThread = std::thread([this]{
+            auto bs=[](std::string p){
+#ifdef _WIN32
+                for(char&c:p) if(c=='/')c='\\';
+#endif
+                return p; };
+            std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
+            if (!adbWorks(true)) { setStatus("adb not found - open the Logcat tab (it auto-downloads adb) or Browse for it."); vistaBusy.store(false); restoring.store(false); return; }
+            bool rooted = deviceIsRooted();
+            auto prog=[this](float f,const char* s){ setStage(f, s); };
+            std::string r = neutralizeVistasOnDevice(ADB, sel, rooted, prog);
+            relaunchShell(ADB, sel);
+            setStage(1.f, "Done");
+            setStatus("Neutralize vistas: "+r);
+            vistaBusy.store(false); restoring.store(false);
+        });
     }
     void restoreHaven() {
         auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED

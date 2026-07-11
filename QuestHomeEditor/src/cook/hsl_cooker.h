@@ -1302,6 +1302,70 @@ inline std::vector<uint8_t> assembleSceneZip(std::vector<CookAsset>& assets,
     return buildStoredZip(files);
 }
 
+// ── INVISIBLE VISTA ──────────────────────────────────────────────────────────────────────────────
+// A valid-but-EMPTY environment APK under a chosen VISTA package name. Purpose: NEUTRALIZE the shell's
+// force-paired companion vista. The boot resolver's IsDefaultVistaInstalled is a NAME check on
+// com.meta.shell.env.vista.<name> (device log 07-08) and pairs a vista independently of our env's
+// footprint flag. Even with the nuxd-manifest spoof (envIsFootprint=0 → vista=''), some devices still
+// pair one. Installing THIS over each installed vista package means that pairing loads a scene with
+// ZERO renderable entities → nothing draws → the home shows with no vista scenery, whatever the
+// resolver decides. It is a REAL loadable environment (space.hstf Scene entity + a 0-entity content
+// template), so the shell does NOT reject it to nux — reject fires only on a MISSING referenced asset,
+// and this references nothing. [[project_hsr_unrooted_footprint_vista_fix]]
+// The EMPTY scene.zip: a real, loadable scene (space.hstf Scene entity + a 0-entity content template) that
+// references nothing → the shell parses it fine (no missing-asset reject) but instantiates ZERO entities.
+inline std::vector<uint8_t> emptyVistaSceneZip() {
+    CookRng rng(0x1157A0EDULL);                                  // deterministic → byte-stable rebuilds
+    const std::string MH = "meta/empty_vista";
+    std::string pContent = MH + "/content.hstf/template", pSpace = MH + "/space.hstf/template";
+    AssetKey3 contentK = keyForPath(pContent), spaceK = keyForPath(pSpace);
+    std::string content = templateJson("", "");                 // ZERO entities, ZERO relationships
+    std::string space   = spaceJson(rng, "empty_vista", contentK, 150000.0f);   // Scene entity (clip/fog) + content-ref
+    std::vector<CookAsset> assets;
+    assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
+    assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });
+    auto shellcfg = jbytes(shellConfigJson(spaceK, /*locomotion=*/false));
+    return assembleSceneZip(assets, shellcfg);
+}
+// PRIMARY invisible-vista path: take the REAL installed vista APK (pulled from the device via pm path) and
+// keep EVERYTHING — its AndroidManifest (correct vista package + type), resources, dex — replacing ONLY
+// assets/scene.zip with the empty scene. "Whatever the vista has, but an empty scene." The caller re-signs
+// with our debug key and reinstalls over the (uninstalled) Meta-signed original. Returns {} on a bad zip.
+inline std::vector<uint8_t> emptyOutVistaApk(const std::vector<uint8_t>& realApk, bool* ok = nullptr) {
+    if (ok) *ok = false;
+    mz_zip_archive in; memset(&in,0,sizeof in);
+    if (!mz_zip_reader_init_mem(&in, realApk.data(), realApk.size(), 0)) return {};
+    mz_zip_archive out; memset(&out,0,sizeof out); mz_zip_writer_init_heap(&out,0,0);
+    auto emptyScene = emptyVistaSceneZip();
+    mz_uint n = mz_zip_reader_get_num_files(&in);
+    bool sawScene=false;
+    for (mz_uint i=0;i<n;i++){
+        mz_zip_archive_file_stat st; if(!mz_zip_reader_file_stat(&in,i,&st)) { mz_zip_reader_end(&in); mz_zip_writer_end(&out); return {}; }
+        if (mz_zip_reader_is_file_a_directory(&in,i)) continue;
+        std::string name = st.m_filename;
+        if (name=="META-INF/MANIFEST.MF" || name.rfind("META-INF/",0)==0) continue;   // drop any old JAR signature (we re-sign v2)
+        if (name=="assets/scene.zip"){ sawScene=true;
+            mz_zip_writer_add_mem(&out, name.c_str(), emptyScene.data(), emptyScene.size(), MZ_DEFAULT_COMPRESSION); continue; }
+        size_t sz=0; void* d = mz_zip_reader_extract_to_heap(&in, i, &sz, 0);
+        if (!d){ mz_zip_reader_end(&in); mz_zip_writer_end(&out); return {}; }
+        mz_uint fl = (name=="resources.arsc")?MZ_NO_COMPRESSION:MZ_DEFAULT_COMPRESSION;
+        mz_zip_writer_add_mem(&out, name.c_str(), d, sz, fl);
+        mz_free(d);
+    }
+    if (!sawScene) mz_zip_writer_add_mem(&out, "assets/scene.zip", emptyScene.data(), emptyScene.size(), MZ_DEFAULT_COMPRESSION);
+    mz_zip_reader_end(&in);
+    void* op=nullptr; size_t on=0; mz_zip_writer_finalize_heap_archive(&out,&op,&on);
+    std::vector<uint8_t> apk((uint8_t*)op,(uint8_t*)op+on); mz_free(op); mz_zip_writer_end(&out);
+    if (ok) *ok=true; return apk;
+}
+// FALLBACK invisible-vista path (device pull failed): SYNTHESIZE an empty environment APK under the vista
+// package name from the embedded nuxd donor + the haven manifest patched to vistaPkg (flipped to 'combined').
+inline std::vector<uint8_t> buildInvisibleVista(const std::string& vistaPkg, bool* ok = nullptr) {
+    if (ok) *ok = false;
+    auto sceneZip = emptyVistaSceneZip();
+    return spliceAPK(std::string{}, sceneZip, "com.meta.environment.prod.nuxd", vistaPkg, ok, {}, /*nuxdIdentity=*/false);
+}
+
 // ── multi-part RENDMESH: split arbitrary (u32-indexed) geometry into u16 parts of <=60000 unique verts, each with
 //    its own VB + LOCAL u16 IB. parseRendMesh concatenates parts' VBs and offsets each part's indices by the
 //    running vertex base, so per-part local 0-based indices are correct. Handles meshes of any size. ──────────

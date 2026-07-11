@@ -511,6 +511,45 @@ int main(int argc, char** argv) {
         return Editor::cliRestoreHaven();
     }
 
+    // `Quest Home Editor --build-invisible-vista <pkg> [out.apk]` writes a SIGNED invisible (0-entity) vista
+    // env APK under the given package name — the belt-and-suspenders that makes a force-paired vista render
+    // nothing. No device needed (build-verify / manual `adb install -r -d`).
+    if (argc >= 2 && std::string(argv[1]) == "--build-invisible-vista") {
+        if (argc < 3) { fprintf(stderr, "usage: Quest Home Editor --build-invisible-vista <vista-package> [out.apk]\n"
+                                         "  e.g. --build-invisible-vista com.meta.shell.env.vista.calming\n"); return 2; }
+        std::string pkg = argv[2];
+        std::string out = argc >= 4 ? argv[3] : (pkg + "_invisible.apk");
+        bool ok=false; auto apk = hslcook::buildInvisibleVista(pkg, &ok);
+        if (!ok || apk.empty()) { fprintf(stderr, "[VISTA] build FAILED for %s\n", pkg.c_str()); return 1; }
+        std::string tmp = out + ".unsigned";
+        { FILE* f=fopen(tmp.c_str(),"wb"); if(!f){ fprintf(stderr,"[VISTA] cannot write %s\n", tmp.c_str()); return 1; } fwrite(apk.data(),1,apk.size(),f); fclose(f); }
+        bool s = hslcook::signApk(tmp, out, [](float f,const char* m){ fprintf(stderr,"  [%3d%%] %s\n",(int)(f*100.f),m); });
+        std::remove(tmp.c_str());
+        if (!s) { fprintf(stderr, "[VISTA] sign FAILED (writing UNSIGNED %s)\n", out.c_str()); FILE* f=fopen(out.c_str(),"wb"); if(f){ fwrite(apk.data(),1,apk.size(),f); fclose(f);} return 1; }
+        fprintf(stderr, "[VISTA] OK -> %s  (install: adb install -r -d \"%s\")\n", out.c_str(), out.c_str());
+        return 0;
+    }
+
+    // `Quest Home Editor --empty-vista <real-vista.apk> [out.apk]` takes a REAL vista APK and rewrites it
+    // with an EMPTY scene — keeps its exact manifest/package/resources, replaces only assets/scene.zip — then
+    // signs it. This is the "whatever the vista has, but an empty scene" path (build-verify / manual install).
+    if (argc >= 2 && std::string(argv[1]) == "--empty-vista") {
+        if (argc < 3) { fprintf(stderr, "usage: Quest Home Editor --empty-vista <real-vista.apk> [out.apk]\n"); return 2; }
+        std::string inp = argv[2];
+        std::vector<uint8_t> real; { FILE* f=fopen(inp.c_str(),"rb"); if(!f){ fprintf(stderr,"[VISTA] cannot open %s\n", inp.c_str()); return 1; }
+            fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ real.resize((size_t)n); if(fread(real.data(),1,(size_t)n,f)!=(size_t)n){ fclose(f); return 1; } } fclose(f); }
+        std::string out = argc >= 4 ? argv[3] : (inp.substr(0, inp.size()>4?inp.size()-4:inp.size()) + "_empty.apk");
+        bool ok=false; auto apk = hslcook::emptyOutVistaApk(real, &ok);
+        if (!ok || apk.empty()) { fprintf(stderr, "[VISTA] empty-out FAILED (bad APK?)\n"); return 1; }
+        std::string tmp = out + ".unsigned"; { FILE* f=fopen(tmp.c_str(),"wb"); if(!f) return 1; fwrite(apk.data(),1,apk.size(),f); fclose(f); }
+        fprintf(stderr, "[VISTA] emptied APK: %zu bytes (was %zu)\n", apk.size(), real.size());
+        bool s = hslcook::signApk(tmp, out, [](float f,const char* m){ fprintf(stderr,"  [%3d%%] %s\n",(int)(f*100.f),m); });
+        if (!std::getenv("HSR_KEEP_UNSIGNED")) std::remove(tmp.c_str());
+        if (!s) { fprintf(stderr, "[VISTA] sign FAILED\n"); return 1; }
+        fprintf(stderr, "[VISTA] OK -> %s\n", out.c_str());
+        return 0;
+    }
+
     // `Quest Home Editor --fetch-tools` pre-downloads the Android signing toolchain (Google build-tools + a Temurin JRE
     // if no Java) right beside the exe, so later --sign / Cook works on a clean machine with no SDK and no JDK.
     if (argc >= 2 && std::string(argv[1]) == "--fetch-tools") {

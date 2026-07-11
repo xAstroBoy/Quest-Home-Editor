@@ -7,6 +7,7 @@
 #include <cstring>
 #include <vector>
 #include <string>
+#include <algorithm>
 #include "cook/apk_debug_key.h"
 
 namespace hslcook { namespace sign {
@@ -120,40 +121,48 @@ inline bool zipalign4(const std::vector<uint8_t>& in, std::vector<uint8_t>& out)
     uint16_t nrec = rd16(&in[eocd+10]);
     uint32_t cdOff = rd32(&in[eocd+16]);
     // walk central directory, copy each local entry to `out` with alignment padding for STORED entries.
-    struct CE { uint32_t lho; uint16_t method; };
+    // Read the AUTHORITATIVE crc/compressed/uncompressed sizes from the CENTRAL DIRECTORY (always correct),
+    // NOT the local header — miniz writes its local headers with the general-purpose DATA-DESCRIPTOR bit
+    // (0x08) set and the three size fields ZERO, deferring them to a descriptor after the data. The old code
+    // read comp from lo+18 (=0 there) and copied ZERO data bytes for every entry → a 3KB gutted APK (central
+    // dir intact so `unzip -l` "works", but no file data → won't install / won't load). We now rewrite each
+    // local header with the real sizes and CLEAR the data-descriptor bit (dropping the trailing descriptor),
+    // producing a canonical, descriptor-free APK exactly like real zipalign/apksigner. Byte-identical result
+    // for inputs that already had correct local headers.
+    struct CE { uint32_t lho, crc, csz, usz; uint16_t method, flag; };
     std::vector<uint32_t> newLocal(nrec);
     out.clear(); out.reserve(in.size()+nrec*4);
     size_t cp = cdOff;
-    // first pass: read CD entries (offset + method), in order.
     std::vector<CE> ces; ces.reserve(nrec);
     for (int i=0;i<nrec;i++){ if (cp+46>in.size()||rd32(&in[cp])!=0x02014b50) return false;
-        CE c; c.method=rd16(&in[cp+10]); c.lho=rd32(&in[cp+42]);
+        CE c; c.flag=rd16(&in[cp+8]); c.method=rd16(&in[cp+10]);
+        c.crc=rd32(&in[cp+16]); c.csz=rd32(&in[cp+20]); c.usz=rd32(&in[cp+24]); c.lho=rd32(&in[cp+42]);
         uint16_t nl=rd16(&in[cp+28]), el=rd16(&in[cp+30]), cl=rd16(&in[cp+32]); ces.push_back(c); cp+=46+nl+el+cl; }
-    // copy local entries with padding
     for (int i=0;i<nrec;i++){ size_t lo=ces[i].lho; if (lo+30>in.size()||rd32(&in[lo])!=0x04034b50) return false;
         uint16_t nl=rd16(&in[lo+26]), el=rd16(&in[lo+28]);
-        uint32_t comp=rd32(&in[lo+18]);
-        size_t hdr=30+nl+el, dataStart=lo+hdr;
+        size_t dataStart=lo+30+nl+el; if (dataStart+ces[i].csz>in.size()) return false;
         newLocal[i]=(uint32_t)out.size();
-        // for STORED entries, pad the extra field so `out.size()+hdr` (data offset) is 4-aligned
-        if (ces[i].method==0){ size_t curDataOff = out.size()+hdr; size_t pad=(4-(curDataOff&3))&3;
-            if (pad){ // append the local header with an enlarged extra field
-                out.insert(out.end(), in.begin()+lo, in.begin()+lo+30+nl);         // fixed hdr + name
-                std::vector<uint8_t> ex(in.begin()+lo+30+nl, in.begin()+lo+30+nl+el);
-                // append `pad` zero bytes as extra padding, fix the extra-field length field (offset 28)
-                for(size_t k=0;k<pad;k++) ex.push_back(0);
-                out[newLocal[i]+28]=(uint8_t)(el+pad); out[newLocal[i]+29]=(uint8_t)((el+pad)>>8);
-                out.insert(out.end(), ex.begin(), ex.end());
-                out.insert(out.end(), in.begin()+dataStart, in.begin()+dataStart+comp);
-                continue;
-            }
-        }
-        out.insert(out.end(), in.begin()+lo, in.begin()+dataStart+comp);   // header + (extra) + data, unchanged
+        // for STORED entries, pad the extra field so the data offset is 4-aligned (mmap of uncompressed assets)
+        size_t pad = 0;
+        if (ces[i].method==0){ size_t curDataOff = out.size()+30+nl+el; pad=(4-(curDataOff&3))&3; }
+        // copy the fixed 30-byte header + name + extra (+pad), then the compressed data (no descriptor)
+        size_t hdrStart = out.size();
+        out.insert(out.end(), in.begin()+lo, in.begin()+lo+30+nl+el);
+        if (pad){ out.insert(out.begin()+hdrStart+30+nl+el, pad, 0);
+                  uint16_t nel=(uint16_t)(el+pad); out[hdrStart+28]=(uint8_t)nel; out[hdrStart+29]=(uint8_t)(nel>>8); }
+        // patch this fresh local header: clear data-descriptor bit, write real crc + sizes from the CD
+        uint16_t nflag = (uint16_t)(ces[i].flag & ~0x0008);
+        out[hdrStart+6]=(uint8_t)nflag; out[hdrStart+7]=(uint8_t)(nflag>>8);
+        auto put32=[&](size_t o,uint32_t v){ out[o]=(uint8_t)v; out[o+1]=(uint8_t)(v>>8); out[o+2]=(uint8_t)(v>>16); out[o+3]=(uint8_t)(v>>24); };
+        put32(hdrStart+14, ces[i].crc); put32(hdrStart+18, ces[i].csz); put32(hdrStart+22, ces[i].usz);
+        out.insert(out.end(), in.begin()+dataStart, in.begin()+dataStart+ces[i].csz);
     }
     // rebuild central directory with fixed local-header offsets
     uint32_t newCdOff=(uint32_t)out.size(); cp=cdOff;
     for (int i=0;i<nrec;i++){ uint16_t nl=rd16(&in[cp+28]), el=rd16(&in[cp+30]), cl=rd16(&in[cp+32]);
         size_t start=out.size(); out.insert(out.end(), in.begin()+cp, in.begin()+cp+46+nl+el+cl);
+        // clear the data-descriptor bit here too, so the CD flag matches the rewritten local header
+        uint16_t cflag=(uint16_t)(rd16(&in[cp+8]) & ~0x0008); out[start+8]=(uint8_t)cflag; out[start+9]=(uint8_t)(cflag>>8);
         out[start+42]=(uint8_t)newLocal[i]; out[start+43]=(uint8_t)(newLocal[i]>>8); out[start+44]=(uint8_t)(newLocal[i]>>16); out[start+45]=(uint8_t)(newLocal[i]>>24);
         cp+=46+nl+el+cl; }
     uint32_t newCdSize=(uint32_t)out.size()-newCdOff;
