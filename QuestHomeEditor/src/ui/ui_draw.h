@@ -175,7 +175,7 @@ struct UIDraw {
         pci.stageCount=2; pci.pStages=st; pci.pVertexInputState=&vi; pci.pInputAssemblyState=&ia; pci.pViewportState=&vp;
         pci.pRasterizationState=&rs; pci.pMultisampleState=&ms; pci.pDepthStencilState=&ds; pci.pColorBlendState=&cb; pci.pDynamicState=&ds2;
         pci.layout=playout; pci.renderPass=r->renderPass; pci.subpass=0;
-        vkCreateGraphicsPipelines(r->device,VK_NULL_HANDLE,1,&pci,nullptr,&pipe);
+        vkCreateGraphicsPipelines(r->device,r->pipeCache,1,&pci,nullptr,&pipe);
         vkDestroyShaderModule(r->device,vm,nullptr); vkDestroyShaderModule(r->device,fm,nullptr);
     }
 

@@ -19,6 +19,10 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include <volk.h>
+#ifdef __linux__
+#include <dlfcn.h>    // dlopen-probe each ICD's driver library in the failure diagnostics
+#include <unistd.h>
+#endif
 
 // Vulkan renderer replicating libshell's pipeline.
 // Descriptor layout matches actual NUXD APK unlit.surface/shader SPIRV:
@@ -147,6 +151,13 @@ public:
     bool gpuLess = false;
     u32 instanceApiVersion = VK_API_VERSION_1_2;   // actual instance version after fallback (1.2 -> 1.1 -> 1.0)
     bool anisotropyEnabled = true;                 // false when the device lacks samplerAnisotropy (samplers must match)
+    // LAZY 3D pipelines: an EMPTY session (no meshes) never needs the 9 global mesh pipelines - the
+    // UI has its own - and a drag-in reload re-inits the whole renderer anyway. Skipping the build
+    // means an empty session opens INSTANTLY even on drivers whose shader JIT is slow or hangs
+    // (the Windows AMD "stuck at init: graphics pipeline" report). main sets deferPipelines when
+    // the scene is empty; render() builds on demand if meshes ever appear without a re-init.
+    bool deferPipelines = false;
+    bool pipelinesBuilt = false;
 
     void log(const char* fmt, ...) {
         if (!verbose) return;
@@ -173,6 +184,10 @@ public:
     VkExtent2D swapchainExtent = {1280, 720};
 
     VkRenderPass renderPass = VK_NULL_HANDLE;
+    // Disk-backed pipeline cache: some drivers (AMD especially) JIT-compile our pipelines for many
+    // seconds on first launch ("stuck at init: graphics pipeline"). The cache makes every later
+    // launch skip that compile. Fed to EVERY vkCreateGraphicsPipelines in the app.
+    VkPipelineCache pipeCache = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkPipeline graphicsPipeline = VK_NULL_HANDLE;
     VkPipeline alphaTestPipeline = VK_NULL_HANDLE;  // opaque DS + discard frag (cutouts)
@@ -482,6 +497,7 @@ public:
 
         if (!createLogicalDevice()) return false;
         volkLoadDevice(device);
+        initPipelineCache();   // disk-backed: repeat launches skip the driver's shader JIT
 
         // Per-phase markers: with the unbuffered log, a driver hang leaves the log ending AT the phase that hung.
         log("  init: swapchain");        createSwapchain();
@@ -489,7 +505,15 @@ public:
         log("  init: image views");      createImageViews();
         log("  init: render pass");      createRenderPass();
         log("  init: descriptor layout"); createDescriptorSetLayout();
-        log("  init: graphics pipeline (driver may JIT-compile shaders - can take seconds)"); createGraphicsPipeline();
+        // LAZY: an empty session never draws a mesh, so don't sit in the driver's shader JIT for
+        // pipelines nothing will use (a Windows AMD driver hung HERE on an empty session). A
+        // drag-in reload re-inits the renderer with the env's shaders and compiles then.
+        if (!deferPipelines) {
+            log("  init: graphics pipeline (driver may JIT-compile shaders - first run can take a while; cached for next launch)");
+            createGraphicsPipeline(); pipelinesBuilt = true;
+        } else {
+            log("  init: graphics pipeline DEFERRED (empty session - nothing to draw yet)");
+        }
         log("  init: depth resources");  createDepthResources();
         createFramebuffers();
         createCommandPool();
@@ -513,6 +537,8 @@ public:
 
         // Synthesized lighting (set1) for the real PBR shaders. No-op for unlit shaders.
         createLightingResources();
+
+        savePipelineCache();   // persist what the driver just compiled (per-material programs re-save in cleanup)
 
         log("Vulkan init complete.");
         log("  Physical device: (queue family %u)", graphicsQueueFamily);
@@ -1637,7 +1663,7 @@ public:
         if (pipelineLayout)        { vkDestroyPipelineLayout(device, pipelineLayout, nullptr); pipelineLayout = VK_NULL_HANDLE; }
         if (skinnedPipelineLayout) { vkDestroyPipelineLayout(device, skinnedPipelineLayout, nullptr); skinnedPipelineLayout = VK_NULL_HANDLE; }
         vertSpirv = vs; fragSpirv = fs;
-        createGraphicsPipeline();
+        createGraphicsPipeline(); pipelinesBuilt = true;
         log("shader HOT-RELOAD: GLOBAL builtin pipelines rebuilt (%s)", graphicsPipeline ? "ok" : "PIPELINE FAILED");
         return graphicsPipeline != VK_NULL_HANDLE;
     }
@@ -1645,6 +1671,11 @@ public:
     // ── Render frame ────────────────────────────────────────────
     void render() {
         if (gpuLess || device == VK_NULL_HANDLE) return;   // no-GPU cook mode: nothing to draw
+        if (!pipelinesBuilt && !gpuMeshes.empty()) {       // deferred build: meshes appeared without a re-init
+            log("  building 3D pipelines now (first mesh in a deferred session)");
+            createGraphicsPipeline(); pipelinesBuilt = true;
+            savePipelineCache();
+        }
         vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
         vkResetFences(device, 1, &inFlightFence);
 
@@ -2049,6 +2080,8 @@ public:
             return;
         }
         vkDeviceWaitIdle(device);
+        savePipelineCache();   // include pipelines built AFTER init (per-material programs, hot-reloads)
+        if (pipeCache) { vkDestroyPipelineCache(device, pipeCache, nullptr); pipeCache = VK_NULL_HANDLE; }
         for (auto& gm : gpuMeshes) {
             vkDestroyBuffer(device, gm.vbo, nullptr);
             vkFreeMemory(device, gm.vboMem, nullptr);
@@ -2314,6 +2347,8 @@ private:
         }
         // Bare probe: does ANY device enumerate when we ask for NO window-system extensions? If yes,
         // the GPU/driver are fine — it's the windowing path (classic: NVIDIA under native Wayland).
+        // If NO — the failure is BELOW Vulkan (kernel module / device nodes / driver mismatch);
+        // log that outcome too, it's the single most diagnostic bit in this whole dump.
         if (vkCreateInstance) {
             VkInstance probe = instance; instance = VK_NULL_HANDLE;
             u32 bare = 0;
@@ -2329,8 +2364,16 @@ private:
                     log("  >> it just can't present to this window system. On Linux this usually means native");
                     log("  >> Wayland with a driver lacking VK_KHR_wayland_surface - run from an X11/XWayland");
                     log("  >> session (the app already prefers X11 unless HSR_WAYLAND=1 is set), or update the driver.");
+                } else {
+                    log("  bare-probe: 0 devices even with NO window-surface extensions.");
+                    log("  >> The failure is BELOW Vulkan - the driver's kernel side isn't answering. Typical causes:");
+                    log("  >>   - you updated the GPU driver and haven't REBOOTED (kernel/userspace mismatch),");
+                    log("  >>   - the kernel module isn't loaded/built for this kernel (nvidia-dkms),");
+                    log("  >>   - running inside a container/sandbox without GPU (/dev/dri) access.");
                 }
                 vkDestroyInstance(instance, nullptr);
+            } else {
+                log("  bare-probe: could not even create a surfaceless instance.");
             }
             instance = probe;
         }
@@ -2341,8 +2384,36 @@ private:
             log("  Arch/Manjaro NVIDIA: sudo pacman -S nvidia-utils vulkan-icd-loader   (AMD/Intel: vulkan-radeon / vulkan-intel)");
             log("  Debian/Ubuntu NVIDIA: the proprietary driver + libvulkan1            (AMD/Intel: mesa-vulkan-drivers)");
         } else {
-            for (auto& m : manifests) log("  ICD manifest: %s", m.c_str());
-            log("  Verify with 'vulkaninfo'; if vulkaninfo ALSO fails, reinstall the driver + vulkan loader.");
+            // Per-ICD deep probe: dlopen the driver library named in each manifest. A load error here
+            // (missing lib, wrong ELF class, unresolved symbol after a partial update) is the EXACT
+            // root cause of "instance OK but 0 devices" and names the broken file outright.
+            for (auto& m : manifests) {
+                std::string lib;
+                if (FILE* f = fopen(m.c_str(), "rb")) {
+                    std::string j; char buf[4096]; size_t rn;
+                    while ((rn = fread(buf, 1, sizeof buf, f)) > 0) j.append(buf, rn);
+                    fclose(f);
+                    size_t p = j.find("\"library_path\"");
+                    if (p != std::string::npos) { p = j.find('"', j.find(':', p)); size_t e = j.find('"', p + 1);
+                        if (p != std::string::npos && e != std::string::npos) lib = j.substr(p + 1, e - p - 1); }
+                }
+                if (lib.empty()) { log("  ICD manifest: %s (no library_path?)", m.c_str()); continue; }
+                void* h = dlopen(lib.c_str(), RTLD_NOW | RTLD_LOCAL);
+                if (h) { log("  ICD manifest: %s -> %s [library loads OK]", m.c_str(), lib.c_str()); dlclose(h); }
+                else    log("  ICD manifest: %s -> %s [LOAD FAILED: %s]  << likely the root cause", m.c_str(), lib.c_str(), dlerror());
+            }
+            // Kernel-side device nodes: Mesa drivers need /dev/dri render nodes, NVIDIA needs /dev/nvidia*.
+            bool dri = access("/dev/dri", F_OK) == 0;
+            bool nvid = access("/dev/nvidiactl", F_OK) == 0 || access("/dev/nvidia0", F_OK) == 0;
+            log("  device nodes: /dev/dri %s, /dev/nvidia* %s", dri ? "present" : "MISSING", nvid ? "present" : "missing");
+            if (FILE* v = fopen("/sys/module/nvidia/version", "rb")) {
+                char kv[64] = {}; if (fgets(kv, sizeof kv, v)) { for (char& c : kv) if (c == '\n') c = 0;
+                    log("  nvidia kernel module loaded: version %s (must MATCH the userspace driver - mismatch = 0 devices until REBOOT)", kv); }
+                fclose(v);
+            } else if (nvid) log("  /dev/nvidia* present but /sys/module/nvidia missing - unusual; check 'lsmod | grep nvidia'.");
+            else log("  NVIDIA kernel module NOT loaded. Manjaro: install via mhwd / nvidia-dkms for THIS kernel, then reboot.");
+            log("  If you just updated the GPU driver: REBOOT first - a kernel/userspace mismatch enumerates 0 devices");
+            log("  from every driver. Verify with 'vulkaninfo'. Software fallback: install vulkan-swrast (lavapipe).");
         }
 #elif defined(_WIN32)
         log("  Windows: update your GPU driver (the driver ships the Vulkan ICD). If this is a remote");
@@ -3018,13 +3089,50 @@ public:
         createInfo.pNext = &mv;
 #else
         // Desktop: the render pass MUST match the device + the skinned shaders' MultiView capability.
-        // Use multiview iff the GPU supports it (default) — a device/renderpass mismatch -13s on modern
+        // Use multiview iff the GPU supports it — a device/renderpass mismatch -13s on modern
         // drivers but HANGS vkCreateGraphicsPipelines on some older GPUs. HSR_NO_MULTIVIEW forces it off
         // (workaround for the rare driver that -13s WITH multiview, e.g. some NVIDIA Linux setups).
-        if (multiviewSupported && !std::getenv("HSR_NO_MULTIVIEW")) createInfo.pNext = &mv;
+        // AND only when a shader that declares MultiView actually exists in this session: the env's
+        // skinned SPIRV, or the env's own per-material RENDSHAD shaders (V203 - compiled for the
+        // Quest's stereo). An EMPTY session / builtin-shader V79 session has neither - and a Windows
+        // RX 6600 hung vkCreateGraphicsPipelines forever compiling plain pipelines against the
+        // (pointlessly) multiview render pass.
+        bool needMv = !skinnedVertSpirv.empty() || !loadedShaders.empty();
+        if (multiviewSupported && needMv && !std::getenv("HSR_NO_MULTIVIEW")) createInfo.pNext = &mv;
+        log("  render pass: multiview %s%s", createInfo.pNext ? "ON" : "OFF",
+            createInfo.pNext ? "" : (!multiviewSupported ? " (GPU lacks it)" : needMv ? " (HSR_NO_MULTIVIEW)" : " (no multiview shaders in this session)"));
 #endif
 
         vkCreateRenderPass(device, &createInfo, nullptr, &renderPass);
+    }
+
+    // ── Disk-backed pipeline cache ───────────────────────────────
+    std::string cacheDir;   // set by main to the exe's dir (same place as the log); empty = cwd
+    std::string pipeCacheFile() const { return cacheDir.empty() ? std::string("shader_pipelines.cache") : cacheDir + "/shader_pipelines.cache"; }
+    void initPipelineCache() {
+        std::vector<char> blob;
+        if (FILE* f = fopen(pipeCacheFile().c_str(), "rb")) {
+            fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+            if (n > 0) { blob.resize((size_t)n); if (fread(blob.data(), 1, (size_t)n, f) != (size_t)n) blob.clear(); }
+            fclose(f);
+        }
+        VkPipelineCacheCreateInfo ci = {}; ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        ci.initialDataSize = blob.size(); ci.pInitialData = blob.empty() ? nullptr : blob.data();
+        if (vkCreatePipelineCache(device, &ci, nullptr, &pipeCache) != VK_SUCCESS) {
+            // stale/corrupt blob (driver update, different GPU): retry empty - never fatal
+            ci.initialDataSize = 0; ci.pInitialData = nullptr;
+            if (vkCreatePipelineCache(device, &ci, nullptr, &pipeCache) != VK_SUCCESS) pipeCache = VK_NULL_HANDLE;
+        }
+        if (pipeCache && !blob.empty())
+            log("  pipeline cache: %zu KB loaded (repeat launches skip the driver's shader JIT)", blob.size() / 1024);
+    }
+    void savePipelineCache() {
+        if (!pipeCache || device == VK_NULL_HANDLE) return;
+        size_t n = 0; vkGetPipelineCacheData(device, pipeCache, &n, nullptr);
+        if (!n) return;
+        std::vector<char> blob(n);
+        if (vkGetPipelineCacheData(device, pipeCache, &n, blob.data()) != VK_SUCCESS) return;
+        if (FILE* f = fopen(pipeCacheFile().c_str(), "wb")) { fwrite(blob.data(), 1, n, f); fclose(f); }
     }
 
     // Introspect a SPIR-V fragment shader for its set==2 descriptor bindings, so we
@@ -3426,24 +3534,24 @@ public:
         // opaque surface beneath them. Opaque pipelines stay unbiased.
         VkPipelineRasterizationStateCreateInfo rsBias=rs;     rsBias.depthBiasEnable=VK_TRUE;     rsBias.depthBiasConstantFactor=4.0f;     rsBias.depthBiasSlopeFactor=1.0f;
         VkPipelineRasterizationStateCreateInfo rsCullBias=rsCull; rsCullBias.depthBiasEnable=VK_TRUE; rsCullBias.depthBiasConstantFactor=4.0f; rsCullBias.depthBiasSlopeFactor=1.0f;
-        gp.pRasterizationState=&rs;         gp.pDepthStencilState=&ds;   gp.pColorBlendState=&cbIO; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipe);
-        gp.pRasterizationState=&rsBias;     gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIB; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeBlend);
-        gp.pRasterizationState=&rsCull;     gp.pDepthStencilState=&ds;   gp.pColorBlendState=&cbIO; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeCull);
-        gp.pRasterizationState=&rsCullBias; gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIB; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeBlendCull);
-        gp.pRasterizationState=&rsBias;     gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIA; vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeAdditive);
+        gp.pRasterizationState=&rs;         gp.pDepthStencilState=&ds;   gp.pColorBlendState=&cbIO; vkCreateGraphicsPipelines(device,pipeCache,1,&gp,nullptr,&p.pipe);
+        gp.pRasterizationState=&rsBias;     gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIB; vkCreateGraphicsPipelines(device,pipeCache,1,&gp,nullptr,&p.pipeBlend);
+        gp.pRasterizationState=&rsCull;     gp.pDepthStencilState=&ds;   gp.pColorBlendState=&cbIO; vkCreateGraphicsPipelines(device,pipeCache,1,&gp,nullptr,&p.pipeCull);
+        gp.pRasterizationState=&rsCullBias; gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIB; vkCreateGraphicsPipelines(device,pipeCache,1,&gp,nullptr,&p.pipeBlendCull);
+        gp.pRasterizationState=&rsBias;     gp.pDepthStencilState=&dsNoW;gp.pColorBlendState=&cbIA; vkCreateGraphicsPipelines(device,pipeCache,1,&gp,nullptr,&p.pipeAdditive);
         // Wireframe variant on THIS program's layout — so the editor "vertex structure" (F) + selection
         // highlight can draw per-material meshes without binding their descSet2 to the global-layout
         // wireframe pipeline (that mismatch HANGS the GPU on HSL — the click-freeze).
         { VkPipelineRasterizationStateCreateInfo rsWire=rs; rsWire.polygonMode=VK_POLYGON_MODE_LINE; rsWire.cullMode=VK_CULL_MODE_NONE;
           gp.pRasterizationState=&rsWire; gp.pDepthStencilState=&ds; gp.pColorBlendState=&cbIO;
-          vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&p.pipeWire); }
+          vkCreateGraphicsPipelines(device,pipeCache,1,&gp,nullptr,&p.pipeWire); }
         // Cutouts get a DEPTH-BIASED variant of the opaque pipeline (same shader — the cooked frag carries its
         // own discard): a masked decal coplanar with the surface beneath it depth-ties without the bias
         // (the residual "still z fighting" after the transparent-only pass).
         { VkGraphicsPipelineCreateInfo gpAT = gp;
           VkPipelineRasterizationStateCreateInfo rsATBias = rs; rsATBias.depthBiasEnable=VK_TRUE; rsATBias.depthBiasConstantFactor=4.0f; rsATBias.depthBiasSlopeFactor=1.0f;
           gpAT.pRasterizationState=&rsATBias; gpAT.pDepthStencilState=&ds; gpAT.pColorBlendState=&cbIO;
-          if (vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gpAT,nullptr,&p.pipeAlphaTest) != VK_SUCCESS)
+          if (vkCreateGraphicsPipelines(device,pipeCache,1,&gpAT,nullptr,&p.pipeAlphaTest) != VK_SUCCESS)
               p.pipeAlphaTest = p.pipe; }   // fallback: unbiased opaque
         vkDestroyShaderModule(device,vm,nullptr); vkDestroyShaderModule(device,fm,nullptr);
     }
@@ -3676,7 +3784,7 @@ public:
         pipeInfo.renderPass = renderPass;
         pipeInfo.subpass = 0;
 
-        VkResult pipeRes = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &graphicsPipeline);
+        VkResult pipeRes = vkCreateGraphicsPipelines(device, pipeCache, 1, &pipeInfo, nullptr, &graphicsPipeline);
         if (pipeRes != VK_SUCCESS) {
             log("ERROR: vkCreateGraphicsPipelines FAILED: %d — graphicsPipeline is null, nothing will render!", pipeRes);
             // Isolate which stage the driver rejects: try a vertex-only pipeline
@@ -3690,7 +3798,7 @@ public:
             vtest.pColorBlendState = nullptr;
             vtest.pDepthStencilState = nullptr;
             VkPipeline vp = VK_NULL_HANDLE;
-            VkResult vr = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &vtest, nullptr, &vp);
+            VkResult vr = vkCreateGraphicsPipelines(device, pipeCache, 1, &vtest, nullptr, &vp);
             log("  [diag] vertex-only pipeline result: %d  (%s)", vr, vr==VK_SUCCESS?"VERTEX OK -> fragment is the problem":"VERTEX rejected");
             if (vp) vkDestroyPipeline(device, vp, nullptr);
         } else
@@ -3698,7 +3806,7 @@ public:
 
         // Wireframe pipeline
         pipeInfo.pRasterizationState = &rsWireInfo;
-        VkResult wireRes = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &wireframePipeline);
+        VkResult wireRes = vkCreateGraphicsPipelines(device, pipeCache, 1, &pipeInfo, nullptr, &wireframePipeline);
         if (wireRes != VK_SUCCESS)
             log("WARN: wireframe pipeline creation failed: %d (fillModeNonSolid may not be supported)", wireRes);
         else
@@ -3736,7 +3844,7 @@ public:
             pipeInfo.pDepthStencilState = &dsBlend;
             pipeInfo.pColorBlendState = &cbBlendInfo;
 
-            VkResult blendRes = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &blendPipeline);
+            VkResult blendRes = vkCreateGraphicsPipelines(device, pipeCache, 1, &pipeInfo, nullptr, &blendPipeline);
             if (blendRes != VK_SUCCESS)
                 log("WARN: blend pipeline creation failed: %d", blendRes);
             else
@@ -3750,7 +3858,7 @@ public:
             pipeInfo.pRasterizationState = &rsCull;
             pipeInfo.pDepthStencilState  = &dsInfo;
             pipeInfo.pColorBlendState    = &cbInfo;
-            if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &graphicsPipelineCull) != VK_SUCCESS)
+            if (vkCreateGraphicsPipelines(device, pipeCache, 1, &pipeInfo, nullptr, &graphicsPipelineCull) != VK_SUCCESS)
                 log("WARN: opaque cull pipeline creation failed");
             else log("  Opaque (cull) pipeline created OK");
             // blend cull variant (same z-fight depth bias as the no-cull blend pipeline)
@@ -3761,7 +3869,7 @@ public:
             pipeInfo.pRasterizationState = &rsCullBias;
             pipeInfo.pDepthStencilState  = &dsBlend;
             pipeInfo.pColorBlendState    = &cbBlendInfo;
-            if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &blendPipelineCull) != VK_SUCCESS)
+            if (vkCreateGraphicsPipelines(device, pipeCache, 1, &pipeInfo, nullptr, &blendPipelineCull) != VK_SUCCESS)
                 log("WARN: blend cull pipeline creation failed");
             else log("  Blend (cull) pipeline created OK");
 
@@ -3784,7 +3892,7 @@ public:
             pipeInfo.pRasterizationState = &rsInfo;
             pipeInfo.pDepthStencilState  = &dsBlend;     // no depth write
             pipeInfo.pColorBlendState    = &cbAddInfo;
-            if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &additivePipeline) != VK_SUCCESS)
+            if (vkCreateGraphicsPipelines(device, pipeCache, 1, &pipeInfo, nullptr, &additivePipeline) != VK_SUCCESS)
                 log("WARN: additive pipeline creation failed");
             else log("  Additive pipeline created OK");
             // HARD additive (src=ONE) for PREMULTIPLIED textures (the cook bakes rgb*=a): premult*ONE = rgb*a = soft glow,
@@ -3792,7 +3900,7 @@ public:
             VkPipelineColorBlendAttachmentState cbAddHard = cbAddAtt; cbAddHard.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
             VkPipelineColorBlendStateCreateInfo cbAddHardInfo = cbAddInfo; cbAddHardInfo.pAttachments = &cbAddHard;
             pipeInfo.pColorBlendState = &cbAddHardInfo;
-            if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &additivePipelineHard) != VK_SUCCESS)
+            if (vkCreateGraphicsPipelines(device, pipeCache, 1, &pipeInfo, nullptr, &additivePipelineHard) != VK_SUCCESS)
                 log("WARN: hard additive pipeline creation failed");
 
             // restore for any later pipeline that reuses pipeInfo
@@ -3819,7 +3927,7 @@ public:
             atInfo.pRasterizationState = &rsATBias;    // fill + bias
             atInfo.pDepthStencilState = &dsInfo;       // depth test + WRITE on (occludes)
             atInfo.pColorBlendState = &cbInfo;         // no blend (cbAtt)
-            VkResult atRes = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &atInfo, nullptr, &alphaTestPipeline);
+            VkResult atRes = vkCreateGraphicsPipelines(device, pipeCache, 1, &atInfo, nullptr, &alphaTestPipeline);
             if (atRes != VK_SUCCESS)
                 log("WARN: alpha-test pipeline creation failed: %d", atRes);
             else
@@ -3909,7 +4017,7 @@ public:
                     skinPipeInfo.renderPass = renderPass;
                     skinPipeInfo.subpass = 0;
 
-                    VkResult skinPipeRes = vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                    VkResult skinPipeRes = vkCreateGraphicsPipelines(device, pipeCache, 1,
                                                                       &skinPipeInfo, nullptr, &skinnedPipeline);
                     if (skinPipeRes != VK_SUCCESS)
                         log("WARN: skinnedPipeline creation failed: %d", skinPipeRes);

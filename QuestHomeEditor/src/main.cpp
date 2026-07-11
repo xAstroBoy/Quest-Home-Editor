@@ -748,31 +748,19 @@ int main(int argc, char** argv) {
     //   1. $HSR_SHADER_APK            (explicit system-shader pack / any v200+ env)
     //   2. system_shaders.apk / .zip  next to the cwd or the renderer exe
     if (shaders.empty()) {
+        // NO dev-machine path walking here (the old code probed "Working (Current Env)/..." up
+        // FOUR parent dirs - meaningless noise on every user's machine). Env-agnostic sources only:
+        //   1. $HSR_SHADER_APK               (explicit system-shader pack / any v200+ env)
+        //   2. system_shaders.apk / .zip     beside the exe (a user/dev drops it there once)
+        //   3. else: the self-contained BUILT-IN shader (the correct V79 path anyway - libshell's
+        //      own ModelLoader DynamicShaderPBR renders V79 homes, it never pulls env shaders).
         std::vector<std::string> candidates;
         if (const char* e = std::getenv("HSR_SHADER_APK")) candidates.push_back(e);
         candidates.push_back("system_shaders.apk");
         candidates.push_back("system_shaders.zip");
-        candidates.push_back("../system_shaders.apk");
-        // Double-clicking the EXE sets no HSR_SHADER_APK, so auto-locate the HSR system shader
-        // pack (haven2025 / nuxd = the port target for V79) at the usual repo-relative spots,
-        // relative to either the repo root or the build dir the exe runs from. This is how the
-        // "Render APK (drag here).bat" wires it; we replicate it so double-click also works.
-        for (const char* base : { ".", "..", "../..", "../../..", "../../../.." }) {
-            candidates.push_back(std::string(base) + "/Working (Current Env)/com_meta_shell_env_footprint_haven2025.apk");
-            candidates.push_back(std::string(base) + "/Working (Current Env)/com_meta_environment_prod_nuxd.apk");
-            candidates.push_back(std::string(base) + "/haven2025_base.apk");
-        }
-        // For a v200+ TARGET (backporting), prefer the real shared shaders if present.
-        // BUT V79 sources (.gltf.ovrscene / .opa official homes) are rendered by libshell's
-        // OWN built-in shaders — the SystemShell ModelLoader compiles a dynamic PBR shader
-        // (ShaderCache.cpp / DynamicShaderPBR.cpp, "compiling PBR shader for featureMask"),
-        // it does NOT pull shaders from the env APK. So for V79 we don't require any external
-        // pack; we use the self-contained built-in shader below. Only probe the external pack
-        // when this is NOT a V79 source.
         for (auto& c : candidates) {
-            fprintf(stderr, "[MAIN] Input has no RENDSHAD - loading shaders from: %s\n", c.c_str());
-            loadShadersFromApk(c);
-            if (!shaders.empty()) break;
+            loadShadersFromApk(c);   // silent miss - only report what actually loaded
+            if (!shaders.empty()) { fprintf(stderr, "[MAIN] Input has no RENDSHAD - shaders loaded from: %s\n", c.c_str()); break; }
         }
         if (shaders.empty()) {
             // ── Built-in self-contained shader (the V79 "both sides" path) ──────────────
@@ -1100,6 +1088,11 @@ int main(int argc, char** argv) {
     // whose driver can't even enumerate a device; the automatic fallback also engages when the
     // bring-up ladder fails under HSR_EXPORT). Interactive editing still requires the renderer.
     if (std::getenv("HSR_NOGPU") && std::getenv("HSR_EXPORT")) vkRenderer.gpuLess = true;
+    // Empty session = nothing to draw = no reason to sit in the driver's shader JIT (or hang, on
+    // broken drivers) compiling 9 mesh pipelines nobody uses. Drag-in reloads re-init with the
+    // env's shaders and compile then; render() also builds on demand if meshes appear in place.
+    vkRenderer.deferPipelines = !sceneMeshes || sceneMeshes->empty();
+    vkRenderer.cacheDir = AppConfig::s_exeDir;   // shader_pipelines.cache beside the exe (same place as the log)
     g_renderer = &vkRenderer;
     vkRenderer.alphaTestFragSpirv = std::move(alphaTestFragSpirv);  // enables the cutout pipeline (V79/OPA)
     vkRenderer.globalShaderPath = g_globalShaderPath;               // per-material matParams match gate
@@ -1182,11 +1175,24 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
         HWND rhwnd = glfwGetWin32Window(g_window);
 #endif
+        auto vkT0 = std::chrono::steady_clock::now();
+        int stallWarned = 0;
         while (!vkDone.load()) {
             glfwPollEvents();
 #ifdef _WIN32
             paintLoadSplash(rhwnd, envBaseName.c_str(), /*waitingForDrop=*/false);
 #endif
+            // Driver-stall watchdog: if a driver call inside init never returns (seen: AMD Windows
+            // hanging vkCreateGraphicsPipelines), say so with actionable advice instead of looking
+            // frozen forever. The last [VK] "init:" line in the log names the exact phase that hung.
+            int elapsed = (int)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - vkT0).count();
+            if ((elapsed >= 25 && stallWarned == 0) || (elapsed >= 90 && stallWarned == 1)) {
+                ++stallWarned;
+                fprintf(stderr, "[MAIN] WARN: the GPU driver has been inside renderer init for %ds. First launches can\n"
+                                "       legitimately take a while (shader JIT - cached for next time), but if this NEVER\n"
+                                "       finishes it's a driver hang: update your GPU driver, and try HSR_NO_MULTIVIEW=1.\n"
+                                "       The last [VK] 'init:' line in Quest Home Editor.log is the phase that hung.\n", elapsed);
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(33));
         }
         vkInitThread.join();
