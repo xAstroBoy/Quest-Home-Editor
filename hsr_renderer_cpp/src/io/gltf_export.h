@@ -154,7 +154,8 @@ inline bool exportEnv(const std::vector<MeshData>& meshes, const std::string& ou
 
         // node (translation = world centroid)
         if (node) aNodes += ",";
-        char nt[256]; snprintf(nt,sizeof nt,"{\"name\":\"%s\",\"mesh\":%d,\"translation\":[%g,%g,%g]}", jesc(m.name).c_str(), meshIdx, cx,cy,cz);
+        char ntb[160]; snprintf(ntb,sizeof ntb,",\"mesh\":%d,\"translation\":[%g,%g,%g]}", meshIdx, cx,cy,cz);
+        std::string nt="{\"name\":\""+jesc(m.name)+"\""+ntb;   // name via unbounded std::string (avoid fixed-buffer truncation)
         aNodes += nt; sceneNodes.push_back(node++);
 
         // sidecar record: original index + hstf components (verbatim) for faithful re-cook
@@ -384,9 +385,14 @@ inline bool exportEnvFull(const std::vector<hslcook::ExportMesh>& meshes, const 
                 M4 local=m4trs(p,q,s); int par=(j<(int)m.hzParents.size())?m.hzParents[j]:-1;
                 world[j]=(par>=0&&par<jc)?m4mul(world[par],local):local;
                 std::string ch; for(size_t k=0;k<kids[j].size();++k){ if(k)ch+=","; ch+=std::to_string(kids[j][k]); }
-                char t[320]; snprintf(t,sizeof t,"{\"name\":\"j%d\",\"translation\":[%g,%g,%g],\"rotation\":[%g,%g,%g,%g],\"scale\":[%g,%g,%g]%s}",
-                    j,p[0],p[1],p[2],q[0],q[1],q[2],q[3],s[0],s[1],s[2], kids[j].empty()?"":(",\"children\":["+ch+"]").c_str());
-                Jnodes.push_back(t);
+                // Build the joint node with an UNBOUNDED std::string: a hub joint can parent dozens of children,
+                // and the old fixed char[320] snprintf TRUNCATED the "children":[...] list for such joints -> the
+                // closing ]} was lost -> invalid glTF JSON (cyberhome: joint "j6" parents ~40 joints). Only the
+                // fixed-width numeric prefix goes through snprintf; the variable-length children append as a string.
+                char nb[224]; snprintf(nb,sizeof nb,"{\"name\":\"j%d\",\"translation\":[%g,%g,%g],\"rotation\":[%g,%g,%g,%g],\"scale\":[%g,%g,%g]",
+                    j,p[0],p[1],p[2],q[0],q[1],q[2],q[3],s[0],s[1],s[2]);
+                std::string node=nb; if(!kids[j].empty()) node+=",\"children\":["+ch+"]"; node+="}";
+                Jnodes.push_back(node);
                 // inverseBind = inverse of the joint's GLOBAL rest (rig T * world[j]) so it matches exactly what glTF
                 // composes from the node hierarchy -> at bind the mesh shows the WORLD POSITION (no Blender mismatch).
                 M4 inv=m4inv(m4mul(T,world[j])); for(int k=0;k<16;k++) ibm.push_back(inv[k]);
@@ -435,7 +441,8 @@ inline bool exportEnvFull(const std::vector<hslcook::ExportMesh>& meshes, const 
         } else {
             // non-skinned mesh node at the pivot
             meshNode=(int)Jnodes.size();
-            char nt[256]; snprintf(nt,sizeof nt,"{\"name\":\"%s\",\"mesh\":%d,\"translation\":[%g,%g,%g]}",jesc(dispName).c_str(),meshIdx,pivot[0],pivot[1],pivot[2]);
+            char ntb[160]; snprintf(ntb,sizeof ntb,",\"mesh\":%d,\"translation\":[%g,%g,%g]}",meshIdx,pivot[0],pivot[1],pivot[2]);
+            std::string nt="{\"name\":\""+jesc(dispName)+"\""+ntb;   // name via unbounded std::string (a long mesh name must NOT truncate the node -> malformed JSON)
             Jnodes.push_back(nt); sceneNodes.push_back(meshNode);
             // NODE animation (spin / sway / translate / scale / pose) -> a node-transform animation on this node
             bool anim=false; std::string chans,samps; int sCount=0; const int NS=24;
