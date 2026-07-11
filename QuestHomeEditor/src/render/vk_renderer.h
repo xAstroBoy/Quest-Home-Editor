@@ -463,12 +463,13 @@ public:
         if (!createLogicalDevice()) return false;
         volkLoadDevice(device);
 
-        createSwapchain();
-        createImageViews();
-        createRenderPass();
-        createDescriptorSetLayout();
-        createGraphicsPipeline();
-        createDepthResources();
+        // Per-phase markers: with the unbuffered log, a driver hang leaves the log ending AT the phase that hung.
+        log("  init: swapchain");        createSwapchain();
+        log("  init: image views");      createImageViews();
+        log("  init: render pass");      createRenderPass();
+        log("  init: descriptor layout"); createDescriptorSetLayout();
+        log("  init: graphics pipeline (driver may JIT-compile shaders - can take seconds)"); createGraphicsPipeline();
+        log("  init: depth resources");  createDepthResources();
         createFramebuffers();
         createCommandPool();
         createSyncObjects();

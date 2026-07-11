@@ -451,16 +451,19 @@ int main(int argc, char** argv) {
     bool headlessOut = std::getenv("HSR_SHOT") || std::getenv("HSR_EXPORT") || std::getenv("HSR_BLENDER_EXPORT") || std::getenv("HSR_LIVE");
     if (!wantConsole && !headlessOut) {
         std::string logp = (AppConfig::s_exeDir.empty()?std::string("."):AppConfig::s_exeDir) + "/Quest Home Editor.log";
+        // UNBUFFERED: MSVCRT treats _IOLBF as full-buffering for files, so a hard hang (e.g. a driver deadlock in
+        // renderer init) would lose the last lines - the exact hang point. Unbuffered = every line hits disk, so
+        // the log always ends AT the call that hung. (Log volume is tiny; the perf cost is irrelevant.)
 #ifdef _WIN32
-        if (freopen(logp.c_str(), "w", stderr)) { setvbuf(stderr, nullptr, _IOLBF, 4096); freopen(logp.c_str(), "a", stdout); }
+        if (freopen(logp.c_str(), "w", stderr)) { setvbuf(stderr, nullptr, _IONBF, 0); freopen(logp.c_str(), "a", stdout); setvbuf(stdout, nullptr, _IONBF, 0); }
         HWND con = GetConsoleWindow(); if (con) ShowWindow(con, SW_HIDE);   // no console window
 #else
-        if (!isatty(fileno(stderr)) && freopen(logp.c_str(), "w", stderr)) { setvbuf(stderr, nullptr, _IOLBF, 4096); freopen(logp.c_str(), "a", stdout); }   // file-manager launch (no tty) -> log file; terminal launch keeps stderr
+        if (!isatty(fileno(stderr)) && freopen(logp.c_str(), "w", stderr)) { setvbuf(stderr, nullptr, _IONBF, 0); freopen(logp.c_str(), "a", stdout); setvbuf(stdout, nullptr, _IONBF, 0); }   // file-manager launch (no tty) -> log file
 #endif
     }
     fprintf(stderr, "========================================================\n");
-    fprintf(stderr, " HSR Renderer / Editor - libshell.so Vulkan replica\n");
-    fprintf(stderr, " Drag an .apk onto the window to load it\n");
+    fprintf(stderr, " Quest Home Editor - libshell.so Vulkan replica + cooker\n");
+    fprintf(stderr, " Drag an .apk / .opa / .gltf onto the window to load it\n");
     fprintf(stderr, "========================================================\n\n");
     if (!std::getenv("HSR_NO_TOOLCHECK")) hslcook::reportToolchain();   // startup readiness of the signing toolchain (-> log)
 
@@ -1144,7 +1147,30 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!vkRenderer.init(g_window, vertSpirv, fragSpirv, skinnedVertSpirv, skinnedFragSpirv)) {
+    // Init the renderer on a WORKER thread while the main thread keeps pumping events + painting the splash. Some
+    // drivers spend several seconds JIT-compiling pipelines during init; on the UI thread that froze the window
+    // ("not responding at starting renderer"). Now the window stays alive/closable, and if a driver call truly
+    // hangs the log (unbuffered) ends exactly at the [VK] line that hung. (glfwCreateWindowSurface is in GLFW's
+    // any-thread subset; glfwPollEvents stays on the main thread.)
+    bool vkInitOk = false;
+    if (interactive) {
+        std::atomic<bool> vkDone{false};
+        std::thread vkInitThread([&]{ vkInitOk = vkRenderer.init(g_window, vertSpirv, fragSpirv, skinnedVertSpirv, skinnedFragSpirv); vkDone.store(true); });
+#ifdef _WIN32
+        HWND rhwnd = glfwGetWin32Window(g_window);
+#endif
+        while (!vkDone.load()) {
+            glfwPollEvents();
+#ifdef _WIN32
+            paintLoadSplash(rhwnd, envBaseName.c_str(), /*waitingForDrop=*/false);
+#endif
+            std::this_thread::sleep_for(std::chrono::milliseconds(33));
+        }
+        vkInitThread.join();
+    } else {
+        vkInitOk = vkRenderer.init(g_window, vertSpirv, fragSpirv, skinnedVertSpirv, skinnedFragSpirv);
+    }
+    if (!vkInitOk) {
         fprintf(stderr, "[MAIN] FATAL: Vulkan init failed\n");
         glfwDestroyWindow(g_window);
         glfwTerminate();

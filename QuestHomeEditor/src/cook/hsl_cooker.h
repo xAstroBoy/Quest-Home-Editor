@@ -11,6 +11,7 @@
 #include "cook/haven_manifest_axml.h"   // haven2025's AndroidManifest.xml (binary AXML), hardcoded; the cook rewrites its package
 #include "cook/nuxd_manifest_axml.h"    // nuxd's AndroidManifest.xml (combined NON-footprint env); spoof uses it under the haven package name -> no vista
 #include "shadergen/shadergen.h"        // getTime() animation shader GENERATOR (C++; was cooker/make_*_shader.py)
+#include "cook/apk_sign_v2.h"            // SELF-CONTAINED APK signer (SHA-256 + RSA + v2 block + zipalign) — NO Java/apksigner
 #include <vector>
 #include <array>
 #include <cmath>
@@ -2026,30 +2027,12 @@ inline bool toolPresent(const char* cmd, const char* verArg = "--version") {
     return system(c.c_str()) == 0;
 }
 
-// One-shot STARTUP readiness check: report what the APK-signing toolchain has now, and what will be auto-fetched
-// on first use. Cheap (a couple of quiet `--version` probes + a filesystem scan); doesn't download anything.
+// Startup readiness note. APK signing is now 100% BUILT-IN (SHA-256 + RSA + APK v2 + zipalign in C++, with a
+// baked-in debug key) - no Java, no apksigner, no keytool, no zipalign binary, no downloads. The only external
+// tool left is `adb` (device install), which the editor auto-detects / auto-downloads on demand.
 inline void reportToolchain(FILE* out = stderr) {
-    namespace fs = std::filesystem; std::error_code ec;
-#ifdef _WIN32
-    bool curl = toolPresent("curl.exe");
-#else
-    bool curl = toolPresent("curl");
-#endif
-    bool java = toolPresent("java", "-version");   // keytool ships in the same bin dir, so java is the proxy
-    const char* btEnv = std::getenv("HSR_BUILDTOOLS");
-    std::string bt = btEnv ? std::string(btEnv) : AppConfig::detectBuildTools();
-    if (bt.empty()) bt = findToolDirUnder(AppConfig::exeRel("android-build-tools"), "apksigner");  // already downloaded?
-    std::string jdl = java ? "" : findToolDirUnder(AppConfig::exeRel("jre"), "keytool");           // downloaded JRE?
-
-    fprintf(out, "[TOOLS] APK signing toolchain (cook / --sign):\n");
-    fprintf(out, "  curl ......... %s\n", curl ? "ok (auto-download available)" : "MISSING (auto-download disabled)");
-    if (!bt.empty())     fprintf(out, "  build-tools .. ok: %s\n", bt.c_str());
-    else                 fprintf(out, "  build-tools .. none%s\n", curl ? " -> auto-download (~58MB) on first sign" : " -> install Android SDK or set HSR_BUILDTOOLS (no curl)");
-    if (java)            fprintf(out, "  java/keytool . on PATH\n");
-    else if (!jdl.empty()) fprintf(out, "  java/keytool . ok: %s (downloaded)\n", fs::path(jdl).parent_path().string().c_str());
-    else                 fprintf(out, "  java/keytool . none%s\n", curl ? " -> auto-download a JRE on first sign" : " -> install a JDK (no curl)");
-    bool ready = !bt.empty() && (java || !jdl.empty());
-    fprintf(out, "  status ....... %s\n", ready ? "READY" : (curl ? "will auto-provision on first sign" : "NOT READY (need curl, or install the SDK/JDK)"));
+    fprintf(out, "[TOOLS] APK signing: BUILT-IN (v2 signature + zipalign in C++, no Java/apksigner/keytool needed).\n");
+    fprintf(out, "        Device install uses adb (auto-detected: SideQuest / SDK / PATH, or auto-downloaded on demand).\n");
 }
 
 // AUTO-SIGN a cooked APK: zipalign + apksigner with a debug keystore -> an INSTALLABLE signed APK. PORTABLE (no
@@ -2057,65 +2040,24 @@ inline void reportToolchain(FILE* out = stderr) {
 // / LOCALAPPDATA / ~/Android/Sdk / common dirs), and the keystore is AUTO-GENERATED with keytool if missing (so a fresh
 // clone on any machine signs with zero setup — keytool ships with the JDK that apksigner needs anyway). Cross-platform
 // (Windows .bat/.exe + backslashes; POSIX apksigner/zipalign). Override via HSR_BUILDTOOLS / HSR_KEYSTORE.
+// SELF-CONTAINED sign: built-in zipalign (4-byte) + APK Signature Scheme v2 with a baked-in debug key.
+// NO Java, NO apksigner, NO keytool, NO zipalign binary, NO downloads. Quest (API 29+) accepts v2-only.
 inline bool signApk(const std::string& unsignedApk, const std::string& signedApk,
                     const std::function<void(float,const char*)>& progress = {}) {
     auto prog = [&](float f, const char* s){ if (progress) progress(f, s); };
-    namespace fs = std::filesystem;
-    std::string BT = ensureBuildTools(progress);                  // installed SDK, or AUTO-DOWNLOAD beside the exe
-    if (BT.empty()) { prog(1.0f, "no Android build-tools (auto-download failed - need curl + a network connection, or set HSR_BUILDTOOLS)"); return false; }
-    std::string JH = ensureJava(progress);                        // "" = java already on PATH; else a downloaded JRE
-    if (!JH.empty()) {                                            // route apksigner + keytool at the fetched JRE
-        std::string p = std::getenv("PATH") ? std::getenv("PATH") : "";
-#ifdef _WIN32
-        _putenv_s("JAVA_HOME", JH.c_str()); _putenv_s("PATH", (JH + "\\bin;" + p).c_str());
-#else
-        setenv("JAVA_HOME", JH.c_str(), 1); setenv("PATH", (JH + "/bin:" + p).c_str(), 1);
-#endif
-    }
-    const char* ksEnv = std::getenv("HSR_KEYSTORE");
-    std::error_code ec;
-    std::string KS;
-    if (ksEnv) KS = ksEnv;
-    else {   // prefer an existing keystore: beside the exe, then cooker/, then cwd
-        for (const std::string& c : { AppConfig::exeRel("debug.keystore"), std::string("cooker/debug.keystore"), std::string("debug.keystore") })
-            if (fs::exists(c, ec)) { KS = c; break; }
-        if (KS.empty()) KS = AppConfig::exeRel("debug.keystore");   // none found -> auto-generate it beside the exe
-    }
-    if (!fs::exists(KS, ec)) {                                 // no keystore on this machine -> make a throwaway debug one
-        prog(0.90f, "Generating debug keystore");
-        if (!fs::path(KS).parent_path().empty()) fs::create_directories(fs::path(KS).parent_path(), ec);
-        std::string kt = "keytool -genkeypair -keystore \"" + KS + "\" -alias myhome -storepass android -keypass android"
-                         " -keyalg RSA -keysize 2048 -validity 36500 -dname \"CN=HSR Debug\"";
-        if (system(kt.c_str()) != 0 || !fs::exists(KS, ec)) { prog(1.0f, "keystore gen failed (need JDK keytool on PATH)"); return false; }
-    }
-#ifdef _WIN32
-    auto bs = [](std::string p){ for (char& c : p) if (c == '/') c = '\\'; return p; };
-    std::string ZA = bs(BT) + "\\zipalign.exe", AS = bs(BT) + "\\apksigner.bat";
-    std::string U = bs(unsignedApk), S = bs(signedApk), A = S + ".aligned", K = bs(KS);
-    char cmd[1600];
-    // Windows system() runs `cmd /c <str>` which strips ONE outer quote pair; wrap the WHOLE command in an extra pair.
-    prog(0.92f, "Zipalign");
-    snprintf(cmd, sizeof cmd, "\"\"%s\" -f -p 4 \"%s\" \"%s\"\"", ZA.c_str(), U.c_str(), A.c_str());
-    if (system(cmd) != 0) { remove(A.c_str()); prog(1.0f, "Zipalign failed"); return false; }
-    prog(0.96f, "apksigner");
-    snprintf(cmd, sizeof cmd, "\"\"%s\" sign --ks \"%s\" --ks-pass pass:android --key-pass pass:android --ks-key-alias myhome --out \"%s\" \"%s\"\"",
-             AS.c_str(), K.c_str(), S.c_str(), A.c_str());
-    int rc = system(cmd);
-#else
-    std::string ZA = BT + "/zipalign", AS = BT + "/apksigner";
-    std::string U = unsignedApk, S = signedApk, A = S + ".aligned", K = KS;
-    char cmd[1600];
-    prog(0.92f, "Zipalign");
-    snprintf(cmd, sizeof cmd, "\"%s\" -f -p 4 \"%s\" \"%s\"", ZA.c_str(), U.c_str(), A.c_str());
-    if (system(cmd) != 0) { remove(A.c_str()); prog(1.0f, "Zipalign failed"); return false; }
-    prog(0.96f, "apksigner");
-    snprintf(cmd, sizeof cmd, "\"%s\" sign --ks \"%s\" --ks-pass pass:android --key-pass pass:android --ks-key-alias myhome --out \"%s\" \"%s\"",
-             AS.c_str(), K.c_str(), S.c_str(), A.c_str());
-    int rc = system(cmd);
-#endif
-    remove(A.c_str()); remove((signedApk + ".idsig").c_str());
-    prog(1.0f, rc == 0 ? "Signed OK" : "Sign failed");   // ASCII only (the editor font atlas is Latin-1)
-    return rc == 0;
+    std::vector<uint8_t> in;
+    { FILE* f = fopen(unsignedApk.c_str(), "rb"); if (!f) { prog(1.0f, "sign: can't open the unsigned APK"); return false; }
+      fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ in.resize((size_t)n); if(fread(in.data(),1,(size_t)n,f)!=(size_t)n){ fclose(f); prog(1.0f,"sign: read failed"); return false; } } fclose(f); }
+    prog(0.92f, "zipalign (built-in)");
+    std::vector<uint8_t> aligned;
+    if (!sign::zipalign4(in, aligned)) aligned.swap(in);          // unparseable zip -> sign as-is (still a valid v2 sig)
+    prog(0.96f, "signing v2 (built-in, no Java)");
+    std::vector<uint8_t> out;
+    if (!sign::signApkV2(aligned, out)) { prog(1.0f, "sign: v2 signing failed (bad APK?)"); return false; }
+    { FILE* f = fopen(signedApk.c_str(), "wb"); if (!f) { prog(1.0f, "sign: can't write the signed APK"); return false; }
+      fwrite(out.data(),1,out.size(),f); fclose(f); }
+    prog(1.0f, "Signed OK (v2, built-in)");
+    return true;
 }
 
 // Port ANY decoded scene (e.g. a V79 .ovrscene loaded by the renderer) to a bootable V203 APK: per-mesh RENDMESH
