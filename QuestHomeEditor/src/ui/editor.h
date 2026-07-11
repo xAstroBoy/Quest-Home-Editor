@@ -3413,6 +3413,11 @@ struct Editor {
     bool autoSign = true, spoofHaven = true;
     bool cookAudio = true;             // DEFAULT ON: bake the env's background audio loop into the cooked APK. Toggle off = silent home.
     bool cookAutoFloor = true;         // DEFAULT ON: when NO Navmesh item exists, the cook generates a walkable floor (ColliderBox grid / disk). OFF = ship ZERO generated collision (the "invisible wall I never placed").
+    bool spoofFootprint = true;        // DEFAULT ON: ship the spoof as a FOOTPRINT (hsr_package_type="footprint") so the
+                                       // shell pairs a companion vista — which killVistas then fills with an INVISIBLE
+                                       // (empty) vista. OFF = the old `combined` spoof (envIsFootprint=0, no vista paired,
+                                       // the v0.9.32 fix). Footprint is the native home type; combined is the fallback if
+                                       // vista-neutralize can't run on a device. [[project_hsr_unrooted_footprint_vista_fix]]
     bool killVistas = true;            // DEFAULT ON (unrooted spoof): after the spoof install, replace EVERY installed
                                        // com.meta.shell.env.vista.* package with an INVISIBLE (0-entity) environment, so
                                        // any vista the boot resolver force-pairs renders NOTHING. Only touches /data
@@ -5570,6 +5575,8 @@ struct Editor {
         y0=y; cx.checkbox(ui::hashId("cookaudio"), x, y, "Ship background audio loop", cookAudio);
         y+=cx.th.rowH+2*uiScale; cx.checkbox(ui::hashId("cookautofloor"), x, y, "Auto floor collision (no Navmesh item)", cookAutoFloor);
         cx.tip(x,y0,w,th.rowH,"Bake the environment's background audio loop into the cooked APK\n(FMOD asset placed at the spawn). Turn OFF for a silent home."); y+=th.rowH+2*uiScale;
+        y0=y; cx.checkbox(ui::hashId("spooffp"), x, y, "Spoof as footprint (pairs an invisible vista)", spoofFootprint);
+        cx.tip(x,y0,w,th.rowH,"Ship the spoof as a FOOTPRINT home (hsr_package_type=footprint), the\nnative home type - so the shell pairs a companion vista, which the\n'Neutralize vistas' option then fills with an INVISIBLE (empty) vista.\nOFF = the old 'combined' spoof (no vista paired) - use that only if\nvista-neutralize can't run on your device. Keep both ON."); y+=th.rowH+2*uiScale;
         y0=y; cx.checkbox(ui::hashId("killvistas"), x, y, "Neutralize vistas (install an invisible vista over each)", killVistas);
         cx.tip(x,y0,w,th.rowH,"After installing the spoof, replace EVERY installed vista package\n(com.meta.shell.env.vista.*) with an INVISIBLE 0-mesh environment.\nSo if the shell force-pairs a vista behind your home, it renders\nNOTHING. Only /data (updatable) vistas can be replaced without root;\na system-app vista is reported and left as-is. Keep ON if a vista\nstill shows behind your ported home."); y+=th.rowH+2*uiScale;
         // ── the AUDIO COOKER UI: shows what will ship + Replace/Add/Export/Revert (backend above: setAudioFromFile etc.) ──
@@ -6536,7 +6543,7 @@ struct Editor {
         //    nuxd is a non-removable system pkg). So install/backup stays on haven2025, but the shell loads it as a
         //    standalone Environment, not a footprint. nuxdIdentity=true selects the nuxd manifest. ──
         if (spoof && !sceneZip.empty()) {
-            bool ok2=false; auto apk2=spliceAPK(nuxd, sceneZip, "com.meta.environment.prod.nuxd", "com.meta.shell.env.footprint.haven2025", &ok2, {}, /*nuxdIdentity=*/true);
+            bool ok2=false; auto apk2=spliceAPK(nuxd, sceneZip, "com.meta.environment.prod.nuxd", "com.meta.shell.env.footprint.haven2025", &ok2, {}, /*nuxdIdentity=*/!spoofFootprint, /*footprintIdentity=*/spoofFootprint);
             if (ok2 && !apk2.empty()){
                 if (sign) {   // the spoof must ALSO be signed or it can't install (INSTALL_PARSE_FAILED_NO_CERTIFICATES)
                     std::string tmp2 = spoofOut + ".unsigned"; writeFile(tmp2, apk2);

@@ -1240,7 +1240,8 @@ inline std::vector<uint8_t> buildStoredZip(const std::vector<CookFile>& files) {
 // scene.zip is the env's. Returns the unsigned APK bytes. `baseApk` is ignored (kept for signature compatibility).
 inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vector<uint8_t>& sceneZip,
                                       const std::string& oldPkg, const std::string& newPkg, bool* ok = nullptr,
-                                      const std::string& editorSession = {}, bool nuxdIdentity = false) {
+                                      const std::string& editorSession = {}, bool nuxdIdentity = false,
+                                      bool footprintIdentity = false) {
     (void)baseApk; (void)oldPkg;
     if (ok) *ok = false;
     mz_zip_archive out; memset(&out,0,sizeof out); mz_zip_writer_init_heap(&out,0,0);
@@ -1265,7 +1266,16 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
         //    ONLY its package to haven2025 (`newPkg`). Result: package name = haven2025 (the ONE env an UNROOTED user
         //    can replace; nuxd itself is a non-removable SYSTEM package), manifest = a plain combined Environment ->
         //    the shell loads it standalone as an Environment, NO footprint, NO vista. (nuxdIdentity selects this path.)
-        if (nuxdIdentity) {
+        // FOOTPRINT IDENTITY (spoofFootprint): ship the REAL haven2025 FOOTPRINT manifest verbatim (package already
+        //   == haven2025), so the shell reads hsr_package_type="footprint" -> envIsFootprint=1 -> it PAIRS a companion
+        //   vista. That pairing is then filled by our INVISIBLE (empty-scene) vista (the killVistas neutralize), so the
+        //   home loads as a real footprint home with NO visible vista scenery. This is the "cooked spoof HAS vista
+        //   support" path (device: the resolver keeps the vista only when the env is a footprint). Overrides nuxdIdentity.
+        if (footprintIdentity) {
+            std::vector<uint8_t> hm(HAVEN_MANIFEST_AXML, HAVEN_MANIFEST_AXML + HAVEN_MANIFEST_AXML_LEN);
+            data = patchAxml(hm, "com.meta.shell.env.footprint.haven2025", newPkg);   // no-op when newPkg==haven2025; NO footprint->combined flip
+        }
+        else if (nuxdIdentity) {
             // HARDCODED nuxd combined-env manifest with the package name ALREADY rewritten to haven2025 offline
             // (cooker/gen_haven_combined_manifest.py). Used verbatim — no runtime AXML surgery. newPkg is ignored.
             (void)newPkg;
