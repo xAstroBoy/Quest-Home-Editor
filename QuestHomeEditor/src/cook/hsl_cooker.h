@@ -4396,6 +4396,32 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     auto shellcfg = jbytes(shellConfigJson(spaceK, locomotion));
     assets.push_back({ pContent, TGT_TEMPLATE, jbytes(content), contentK });
     assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });
+    // ── EMPTY vista-shadow templates (self-sufficient FOOTPRINT support). When the spoof ships as a footprint
+    //    (spoofFootprint), the shell force-pairs the calming VISTA — whose content is literally the home_c25
+    //    templates relit (calming_lightmap_overrides/home_w_calming_lm.hstf NESTS home_props/home_audio/
+    //    home_static_arch from OUR package by Meta's STOCK StringId keys). If those keys 404 the whole env is
+    //    invalid -> nux. The "Neutralize vistas" step replaces the vista with an empty one on-device, but a
+    //    hand-installed / shared APK never runs that step. So ALSO ship these 8 home_c25 templates EMPTY under
+    //    Meta's EXACT stock keys: the REAL vista's nested-template load then SUCCEEDS with ZERO entities (no
+    //    scenery, no nux) while OUR content.hstf renders the home. Harmless when no vista pairs (unreferenced).
+    //    HSR_NOVISTASHADOW disables. [[project_hsr_unrooted_footprint_vista_fix]]
+    if (!std::getenv("HSR_NOVISTASHADOW")) {
+        static const struct { const char* rel; uint64_t ing; } VS[] = {
+            { "templates/home_audio.hstf",              11173504047846864142ull },
+            { "templates/home_spawn_points.hstf",       16632049155738013495ull },
+            { "templates/home_simple_colliders.hstf",   17388586219142320831ull },
+            { "templates/Quest3/home_props.hstf",       12722279997147320471ull },
+            { "templates/Quest3/home_static_arch.hstf", 11631735261009407721ull },
+            { "templates/hpi/hpi_locators.hstf",        15392203948592102808ull },
+            { "templates/hpi/augment_collisions.hstf",    262343565626933461ull },
+            { "templates/hpi/directional_hotspot.hstf",  2985500425370876421ull },
+        };
+        const uint64_t STOCK_HOME_PKG = 12293612625969361106ull;   // StringId("meta/home_c25") — Meta's, ≠ our FNV
+        std::vector<uint8_t> emptyTpl = jbytes(templateJson("", ""));   // {"version":5,"entities":[],"relationships":[]}
+        for (auto& v : VS)
+            assets.push_back({ std::string("meta/home_c25/") + v.rel + "/template", TGT_TEMPLATE,
+                               emptyTpl, AssetKey3{ STOCK_HOME_PKG, v.ing, TGT_TEMPLATE } });
+    }
     ctrace("floor/navmesh done; packaging scene.zip");
     prog(0.80f, "Packaging scene.zip");
     auto sceneZip = assembleSceneZip(assets, shellcfg);
