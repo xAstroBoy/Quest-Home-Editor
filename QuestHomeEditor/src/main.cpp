@@ -423,6 +423,25 @@ static void errorCb(int err, const char* desc) {
     fprintf(stderr, "[GLFW] Err %d: %s\n", err, desc);
 }
 
+// GLFW init that PREFERS X11/XWayland on Linux. Several NVIDIA driver/loader combos enumerate 0
+// Vulkan devices (or lack VK_KHR_wayland_surface) under NATIVE Wayland while the same GPU works
+// over XWayland — and GLFW 3.4 picks Wayland by default whenever WAYLAND_DISPLAY is set, which is
+// exactly the broken combo users hit ("No Vulkan GPU" on an RTX). X11 also restores window icons
+// (Wayland can't set them). HSR_WAYLAND=1 opts back into native Wayland; a pure-Wayland session
+// without XWayland automatically falls back to whatever GLFW can run on.
+static bool hsrGlfwInit() {
+#if defined(__linux__) && defined(GLFW_PLATFORM)
+    if (!std::getenv("HSR_WAYLAND") && glfwPlatformSupported(GLFW_PLATFORM_X11))
+        glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11);
+    if (glfwInit()) return true;
+    fprintf(stderr, "[GLFW] X11 init failed (no XWayland?) - retrying with the default platform\n");
+    glfwInitHint(GLFW_PLATFORM, GLFW_ANY_PLATFORM);
+    return glfwInit() == GLFW_TRUE;
+#else
+    return glfwInit() == GLFW_TRUE;
+#endif
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(hsrCrashHandler);   // segfault → symbolized stack in stderr + _crash.txt
@@ -519,7 +538,7 @@ int main(int argc, char** argv) {
                           && !std::getenv("HSR_BLENDER_EXPORT");
     glfwSetErrorCallback(errorCb);
     if (interactive) {
-        if (!glfwInit()) { fprintf(stderr, "GLFW init failed\n"); return 1; }
+        if (!hsrGlfwInit()) { fprintf(stderr, "GLFW init failed\n"); return 1; }
         glfwDefaultWindowHints();
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
         // Don't STEAL FOCUS from whatever the user is doing - neither at creation nor when shown
@@ -1039,7 +1058,7 @@ int main(int argc, char** argv) {
     }
 
     // ── Step B: Init GLFW + Vulkan ─────────────────────────────
-    if (!glfwInit()) { fprintf(stderr, "GLFW init failed\n"); return 1; }   // no-op if already inited (interactive)
+    if (!hsrGlfwInit()) { fprintf(stderr, "GLFW init failed\n"); return 1; }   // no-op if already inited (interactive)
     // Title shows WHICH loader/format is active (V79 glTF / V79 OPA / HSL) + the env file name.
     std::string g_fmtName = isV79 ? "V79 glTF" : (isOpa ? "V79 OPA" : "HSL");
     std::string g_baseName = envBaseName;
@@ -1077,6 +1096,10 @@ int main(int argc, char** argv) {
     VkRenderer vkRenderer;
     vkRenderer.verbose = true;
     vkRenderer.debugMode = false;
+    // HSR_NOGPU=1 + HSR_EXPORT: cook with NO Vulkan at all (deterministic no-GPU cook for machines
+    // whose driver can't even enumerate a device; the automatic fallback also engages when the
+    // bring-up ladder fails under HSR_EXPORT). Interactive editing still requires the renderer.
+    if (std::getenv("HSR_NOGPU") && std::getenv("HSR_EXPORT")) vkRenderer.gpuLess = true;
     g_renderer = &vkRenderer;
     vkRenderer.alphaTestFragSpirv = std::move(alphaTestFragSpirv);  // enables the cutout pipeline (V79/OPA)
     vkRenderer.globalShaderPath = g_globalShaderPath;               // per-material matParams match gate
@@ -1172,6 +1195,32 @@ int main(int argc, char** argv) {
     }
     if (!vkInitOk) {
         fprintf(stderr, "[MAIN] FATAL: Vulkan init failed\n");
+        // Show a VISIBLE, actionable dialog instead of silently vanishing (which reads as a "hang"/crash). The app
+        // can't create a GPU the Vulkan loader doesn't report — this is a driver/loader problem on the machine.
+        if (interactive) {
+            const char* m =
+                "Quest Home Editor could not start the renderer.\n\n"
+                "No usable Vulkan GPU was found - and the app already retried every loader\n"
+                "configuration (portability, cleared ICD overrides, disabled implicit layers,\n"
+                "every installed driver manifest). This machine's Vulkan driver/loader is broken\n"
+                "or missing. Install/update the Vulkan driver for your GPU:\n"
+                "  - NVIDIA: the proprietary driver (Arch/Manjaro: nvidia-utils + vulkan-icd-loader)\n"
+                "  - AMD / Intel: mesa-vulkan-drivers (vulkan-radeon / vulkan-intel)\n"
+                "then relaunch. Verify with 'vulkaninfo'.\n\n"
+                "The log beside the app (Quest Home Editor.log) now contains a full diagnosis:\n"
+                "every configuration tried, the loader version, layers, and installed drivers -\n"
+                "send it if you need help. (Cooking from the command line still works without a\n"
+                "GPU: the cook is CPU-only.)";
+#ifdef _WIN32
+            MessageBoxA(nullptr, m, "Quest Home Editor - cannot start", MB_ICONERROR | MB_OK);
+#elif defined(__APPLE__)
+            std::string c = std::string("osascript -e 'display alert \"Quest Home Editor - cannot start\" message \"") + m + "\" as critical' >/dev/null 2>&1"; system(c.c_str());
+#else
+            std::string mm = m;
+            if (system("command -v zenity >/dev/null 2>&1") == 0)       { std::string c = "zenity --error --title=\"Quest Home Editor\" --width=460 --text=\"" + mm + "\" >/dev/null 2>&1"; system(c.c_str()); }
+            else if (system("command -v kdialog >/dev/null 2>&1") == 0) { std::string c = "kdialog --error \"" + mm + "\" >/dev/null 2>&1"; system(c.c_str()); }
+#endif
+        }
         glfwDestroyWindow(g_window);
         glfwTerminate();
         return 1;

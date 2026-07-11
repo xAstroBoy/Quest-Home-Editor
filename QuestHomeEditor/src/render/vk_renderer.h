@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <functional>
+#include <filesystem>
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -139,6 +140,13 @@ class VkRenderer {
 public:
     Camera cam;
     bool verbose = true;
+    // NO-GPU COOK MODE: set when the Vulkan bring-up ladder finds no usable GPU in a HEADLESS
+    // cook (HSR_EXPORT). The cook is CPU work — buildExportMeshes only reads the CPU fields of
+    // VkGpuMesh (model/name/flags) + the loader's MeshData — so uploadMesh fills those and skips
+    // every Vulkan call. People whose GPU/driver can't render can still cook + install.
+    bool gpuLess = false;
+    u32 instanceApiVersion = VK_API_VERSION_1_2;   // actual instance version after fallback (1.2 -> 1.1 -> 1.0)
+    bool anisotropyEnabled = true;                 // false when the device lacks samplerAnisotropy (samplers must match)
 
     void log(const char* fmt, ...) {
         if (!verbose) return;
@@ -405,6 +413,8 @@ public:
         skinnedVertSpirv = skinnedVertSpv;
         skinnedFragSpirv = skinnedFragSpv;
 
+        if (gpuLess) { log("NO-GPU COOK MODE (pre-set): skipping Vulkan init entirely."); return true; }
+
         log("Initializing Vulkan renderer...");
         log("  Vertex SPIRV: %zu bytes (%zu words)", vertSpv.size()*4, vertSpv.size());
         log("  Fragment SPIRV: %zu bytes (%zu words)", fragSpv.size()*4, fragSpv.size());
@@ -446,25 +456,36 @@ public:
         log("--- end SPIRV introspection ---");
 
         if (volkInitialize() != VK_SUCCESS) {
-            log("FATAL: volkInitialize failed");
+            log("FATAL: volkInitialize failed - no Vulkan loader on this machine (libvulkan/vulkan-1.dll)");
+            if (std::getenv("HSR_EXPORT")) {
+                log("HEADLESS COOK: continuing WITHOUT a GPU (the cook is CPU-side; preview disabled).");
+                gpuLess = true;
+                return true;
+            }
+            dumpLoaderDiagnostics();
             return false;
         }
 
-        if (!createInstance()) return false;
-        volkLoadInstance(instance);
+        // Robust bring-up: instead of dying on the first empty enumeration, walk a ladder of loader
+        // configurations (portability, stale ICD-override env cleared, implicit layers disabled,
+        // each ICD manifest explicitly) — the "compatible GPU but 0 devices" class of failures is
+        // almost always a loader/layer/ICD-selection problem, not the GPU.
+        if (!bringUpInstanceAndDevice(window)) {
+            if (std::getenv("HSR_EXPORT")) {
+                log("HEADLESS COOK: no usable Vulkan GPU - continuing WITHOUT one (the cook is CPU-side).");
+                gpuLess = true;
+                return true;
+            }
+            return false;
+        }
         setupDebugMessenger();
 
-        if (glfwCreateWindowSurface(instance, window, nullptr, &surface) != VK_SUCCESS) {
-            log("FATAL: Failed to create window surface");
-            return false;
-        }
-
-        if (!pickPhysicalDevice()) return false;
         if (!createLogicalDevice()) return false;
         volkLoadDevice(device);
 
         // Per-phase markers: with the unbuffered log, a driver hang leaves the log ending AT the phase that hung.
         log("  init: swapchain");        createSwapchain();
+        if (swapchain == VK_NULL_HANDLE) { log("FATAL: swapchain creation failed"); return false; }
         log("  init: image views");      createImageViews();
         log("  init: render pass");      createRenderPass();
         log("  init: descriptor layout"); createDescriptorSetLayout();
@@ -510,6 +531,38 @@ public:
         else                   buildModelMatrix(md.transform, gm.model);
         gm.local = md.transform;                           // authored TRS (editor outliner reads this)
         memcpy(gm.baseModel, gm.model, sizeof(gm.baseModel)); // edits are a delta applied on top of base
+
+        // NO-GPU COOK MODE: fill only the CPU fields the headless cook consumes - gm.model (world
+        // transform, incl. session edit deltas pivoted at the centroid), name/flags/components -
+        // and skip every Vulkan call. buildExportMeshes reads geometry/textures from MeshData.
+        if (gpuLess) {
+            gm.useBlend = md.useBlend; gm.alphaTest = md.alphaTest; gm.additive = md.additive;
+            gm.isSkybox = md.isSkybox; gm.overlayKind = md.overlayKind;
+            gm.cullBack = !md.doubleSided;
+            gm.nIdx = md.nIdx;
+            gm.name = md.name;
+            gm.components = md.components;
+            gm.info = std::to_string(md.texW) + "x" + std::to_string(md.texH) + (md.useBlend ? " blend" : " opaque");
+            if (!md.positions.empty()) {   // centroid = the session-edit pivot (loadProject needs it)
+                double cx=0, cy=0, cz=0; size_t nv = md.positions.size()/3;
+                float mn[3]={md.positions[0],md.positions[1],md.positions[2]};
+                float mx[3]={md.positions[0],md.positions[1],md.positions[2]};
+                for (size_t i=0;i<nv;++i){
+                    float px=md.positions[i*3], py=md.positions[i*3+1], pz=md.positions[i*3+2];
+                    cx+=px; cy+=py; cz+=pz;
+                    mn[0]=std::min(mn[0],px); mn[1]=std::min(mn[1],py); mn[2]=std::min(mn[2],pz);
+                    mx[0]=std::max(mx[0],px); mx[1]=std::max(mx[1],py); mx[2]=std::max(mx[2],pz);
+                }
+                float lc[3]={(float)(cx/nv),(float)(cy/nv),(float)(cz/nv)};
+                gm.centroid[0]=gm.model[0]*lc[0]+gm.model[4]*lc[1]+gm.model[8]*lc[2]+gm.model[12];
+                gm.centroid[1]=gm.model[1]*lc[0]+gm.model[5]*lc[1]+gm.model[9]*lc[2]+gm.model[13];
+                gm.centroid[2]=gm.model[2]*lc[0]+gm.model[6]*lc[1]+gm.model[10]*lc[2]+gm.model[14];
+                gm.bbMin[0]=mn[0]; gm.bbMin[1]=mn[1]; gm.bbMin[2]=mn[2];
+                gm.bbMax[0]=mx[0]; gm.bbMax[1]=mx[1]; gm.bbMax[2]=mx[2];
+            }
+            gpuMeshes.push_back(gm);
+            return;
+        }
 
         // SPLIT-PART TEXTURE SHARING: a piece from splitMeshParts leaves its texture/lightmap BYTE buffers
         // empty and points texShareSrc at the source mesh it was carved from, so every one of up-to-256
@@ -1530,6 +1583,7 @@ public:
         if (mi >= gpuMeshes.size() || mi >= meshes.size()) return false;
         VkGpuMesh& gm = gpuMeshes[mi]; const MeshData& md = meshes[mi];
         if (md.texRGBA.size() < (size_t)md.texW*md.texH*4 || md.texW < 1 || md.texH < 1) return false;
+        if (gpuLess || device == VK_NULL_HANDLE) return true;   // no-GPU cook: md.texRGBA is what ships - nothing to preview
         vkDeviceWaitIdle(device);   // safe: called from the editor between frames, no work in flight
         // ORPHAN (don't free) the old GPU texture: its VkImageView is still referenced by whichever set2 slot
         // uploadMesh bound BY SHADER-REFLECTION NAME (not a fixed binding), and re-deriving that exact slot here is
@@ -1562,6 +1616,7 @@ public:
     bool reloadShaderFor(int meshIdx, const std::vector<u32>& vs, const std::vector<u32>& fs) {
         if (vs.size() < 5 || fs.size() < 5) return false;
         if (meshIdx < 0 || meshIdx >= (int)gpuMeshes.size()) return false;
+        if (gpuLess || device == VK_NULL_HANDLE) return false;   // no-GPU cook: no pipelines exist
         vkDeviceWaitIdle(device);
         auto D = [&](VkPipeline& pp){ if (pp) { vkDestroyPipeline(device, pp, nullptr); pp = VK_NULL_HANDLE; } };
         int pi = gpuMeshes[meshIdx].progIdx;
@@ -1589,6 +1644,7 @@ public:
 
     // ── Render frame ────────────────────────────────────────────
     void render() {
+        if (gpuLess || device == VK_NULL_HANDLE) return;   // no-GPU cook mode: nothing to draw
         vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
         vkResetFences(device, 1, &inFlightFence);
 
@@ -1986,6 +2042,12 @@ public:
     }
 
     void cleanup() {
+        if (device == VK_NULL_HANDLE) {   // no-GPU cook mode (or init failed before the device)
+            if (surface)  vkDestroySurfaceKHR(instance, surface, nullptr);
+            if (instance) vkDestroyInstance(instance, nullptr);
+            surface = VK_NULL_HANDLE; instance = VK_NULL_HANDLE;
+            return;
+        }
         vkDeviceWaitIdle(device);
         for (auto& gm : gpuMeshes) {
             vkDestroyBuffer(device, gm.vbo, nullptr);
@@ -2046,57 +2108,58 @@ public:
 private:
     // ── Vulkan setup helpers ─────────────────────────────────────
 
-    bool createInstance() {
-        if (volkInitialize() != VK_SUCCESS) return false;
+    // Set/remove a process env var (the Vulkan loader re-reads its env at every vkCreateInstance,
+    // so these take effect between ladder attempts without a relaunch).
+    static void setEnvVar(const char* n, const char* v) {
+#ifdef _WIN32
+        _putenv_s(n, v ? v : "");    // empty value = remove on Windows
+#else
+        if (v) setenv(n, v, 1); else unsetenv(n);
+#endif
+    }
 
+    bool instanceExtAvailable(const char* name) {
+        u32 na = 0; vkEnumerateInstanceExtensionProperties(nullptr, &na, nullptr);
+        std::vector<VkExtensionProperties> avail(na);
+        if (na) vkEnumerateInstanceExtensionProperties(nullptr, &na, avail.data());
+        for (auto& e : avail) if (!strcmp(e.extensionName, name)) return true;
+        return false;
+    }
+
+    // One instance-creation attempt. Requests apiVersion 1.2 and falls back 1.1 -> 1.0 when the
+    // loader/driver reports VK_ERROR_INCOMPATIBLE_DRIVER (ancient loaders); drops the validation
+    // layer if it isn't installed instead of failing. surfaceless=true builds a bare instance with
+    // NO window-system extensions (diagnostic probe: does the GPU enumerate at all?).
+    VkResult tryCreateInstance(bool wantPortability, bool surfaceless = false) {
         VkApplicationInfo appInfo = {};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "HSR Renderer";
         appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.pEngineName = "HSR Replica";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-        // Vulkan 1.1 required: the skinned shader uses MultiView, and the multiview
-        // render-pass / device-feature structs are core in 1.1 (ignored on a 1.0
-        // instance, which left the skinned pipeline producing no output).
-        // 1.2 so we can enable shaderFloat16 / 16-bit storage via the aggregate
-        // Vulkan11/12 feature structs (NVIDIA honors these reliably; the standalone
-        // KHR structs on a 1.1 instance left float16 effectively off -> PBR vertex
-        // pipelines were rejected with VK_ERROR_UNKNOWN).
-        appInfo.apiVersion = VK_API_VERSION_1_2;
-
-        u32 glfwExtCount = 0;
-        const char** glfwExts = glfwGetRequiredInstanceExtensions(&glfwExtCount);
-        std::vector<const char*> extensions(glfwExts, glfwExts + glfwExtCount);
-        bool enableValidation = debugMode || std::getenv("HSR_VALIDATE") != nullptr;
+        // Vulkan 1.1 required: the skinned shader uses MultiView (core in 1.1). 1.2 so shaderFloat16 /
+        // 16-bit storage enable via the aggregate Vulkan11/12 feature structs (NVIDIA honors these
+        // reliably; the standalone KHR structs on a 1.1 instance left float16 effectively off -> PBR
+        // vertex pipelines were rejected with VK_ERROR_UNKNOWN). Older instances still bring the
+        // renderer up — the feature chain degrades (see createLogicalDevice).
+        std::vector<const char*> extensions;
+        if (!surfaceless) {
+            u32 glfwExtCount = 0;
+            const char** glfwExts = glfwGetRequiredInstanceExtensions(&glfwExtCount);
+            if (glfwExts) extensions.assign(glfwExts, glfwExts + glfwExtCount);
+            if (extensions.empty()) log("  WARN: GLFW reported no required instance extensions (no Vulkan-capable window backend?)");
+        }
+        bool enableValidation = !surfaceless && (debugMode || std::getenv("HSR_VALIDATE") != nullptr);
         if (enableValidation) extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         const char* validationLayers[] = {"VK_LAYER_KHRONOS_validation"};
 
-        // MoltenVK (macOS): Vulkan loaders >= 1.3.216 HIDE non-conformant "portability" drivers unless
-        // the app opts in via VK_KHR_portability_enumeration + the ENUMERATE_PORTABILITY flag. Without
-        // the opt-in, vkCreateInstance fails with VK_ERROR_INCOMPATIBLE_DRIVER (-9) even though MoltenVK
-        // is installed (issue #4 - "worked last time" = before a Vulkan SDK/loader update). Only added
-        // when the loader actually advertises it, so Windows/Linux and pre-1.3.216 loaders are untouched.
+        // Portability enumeration: REQUIRED opt-in for MoltenVK (macOS) and layered/software drivers
+        // (lavapipe, dzn) on loaders >= 1.3.216; on some NVIDIA-Linux loader combos setting it makes
+        // vkEnumeratePhysicalDevices return 0 — which is why the ladder tries BOTH states.
         VkInstanceCreateFlags instFlags = 0;
-        // Portability enumeration is a MoltenVK (macOS) opt-in. On Windows/Linux the real ICDs are CONFORMANT and
-        // enumerate by default; enabling the ENUMERATE_PORTABILITY flag there is at best pointless and on some
-        // NVIDIA-Linux loader combos makes vkEnumeratePhysicalDevices return 0 ("No Vulkan-capable GPU" on an RTX).
-        // So: macOS only, with an HSR_PORTABILITY=1 escape hatch for software Vulkan (lavapipe) on Linux/Windows.
-#ifdef __APPLE__
-        bool wantPortability = true;
-#else
-        bool wantPortability = std::getenv("HSR_PORTABILITY") != nullptr;
-#endif
-        if (wantPortability) {
-            u32 na = 0; vkEnumerateInstanceExtensionProperties(nullptr, &na, nullptr);
-            std::vector<VkExtensionProperties> avail(na);
-            if (na) vkEnumerateInstanceExtensionProperties(nullptr, &na, avail.data());
-            for (auto& e : avail)
-                if (!strcmp(e.extensionName, "VK_KHR_portability_enumeration")) {
-                    extensions.push_back("VK_KHR_portability_enumeration");
-                    instFlags |= 0x00000001;   // VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
-                    log("  Portability instance enumeration enabled (MoltenVK / software Vulkan)");
-                    break;
-                }
+        if (wantPortability && instanceExtAvailable("VK_KHR_portability_enumeration")) {
+            extensions.push_back("VK_KHR_portability_enumeration");
+            instFlags |= 0x00000001;   // VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
         }
 
         VkInstanceCreateInfo createInfo = {};
@@ -2105,22 +2168,188 @@ private:
         createInfo.pApplicationInfo = &appInfo;
         createInfo.enabledExtensionCount = (u32)extensions.size();
         createInfo.ppEnabledExtensionNames = extensions.data();
-        if (enableValidation) {
-            createInfo.enabledLayerCount = 1;
-            createInfo.ppEnabledLayerNames = validationLayers;
-        } else {
-            createInfo.enabledLayerCount = 0;
-        }
+        createInfo.enabledLayerCount = enableValidation ? 1 : 0;
+        createInfo.ppEnabledLayerNames = enableValidation ? validationLayers : nullptr;
 
-        VkResult res = vkCreateInstance(&createInfo, nullptr, &instance);
-        if (res != VK_SUCCESS) {
-            log("FATAL: vkCreateInstance failed: %d", res);
-            log("  Requested %u extensions:", (u32)extensions.size());
-            for (auto& e : extensions) log("    %s", e);
-            return false;
+        const u32 apiTries[3] = {VK_API_VERSION_1_2, VK_API_VERSION_1_1, VK_API_VERSION_1_0};
+        VkResult res = VK_ERROR_INCOMPATIBLE_DRIVER;
+        for (u32 api : apiTries) {
+            appInfo.apiVersion = api;
+            res = vkCreateInstance(&createInfo, nullptr, &instance);
+            if (res == VK_ERROR_LAYER_NOT_PRESENT && enableValidation) {
+                log("  validation layer not installed - continuing without it");
+                enableValidation = false;
+                createInfo.enabledLayerCount = 0; createInfo.ppEnabledLayerNames = nullptr;
+                if (!extensions.empty() && !strcmp(extensions.back(), VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) extensions.pop_back();
+                createInfo.enabledExtensionCount = (u32)extensions.size();
+                res = vkCreateInstance(&createInfo, nullptr, &instance);
+            }
+            if (res != VK_ERROR_INCOMPATIBLE_DRIVER) { if (res == VK_SUCCESS) instanceApiVersion = api; break; }
         }
-        log("  Instance created OK with %zu extensions", extensions.size());
-        return true;
+        if (res == VK_SUCCESS && !surfaceless) {
+            log("  Instance created OK: api 1.%u, %zu extensions%s", VK_VERSION_MINOR(instanceApiVersion),
+                extensions.size(), (instFlags & 1) ? " (+portability enumeration)" : "");
+            if (instanceApiVersion < VK_API_VERSION_1_2)
+                log("  WARN: old Vulkan loader (1.%u) - float16 PBR / multiview features may be reduced", VK_VERSION_MINOR(instanceApiVersion));
+        } else if (res != VK_SUCCESS && !surfaceless) {
+            log("  vkCreateInstance failed: %d (requested exts:%s)", res, [&]{ static std::string s; s.clear();
+                for (auto& e : extensions) { s += " "; s += e; } return s.c_str(); }());
+        }
+        return res;
+    }
+
+#ifdef __linux__
+    // All Vulkan ICD manifests visible on this system (the same dirs the loader scans). Used both to
+    // retry each driver EXPLICITLY (VK_DRIVER_FILES) and to tell the user exactly what's installed.
+    // Hardware ICDs first; software rasterizers (lavapipe/llvmpipe/swiftshader) LAST so a real GPU wins.
+    static std::vector<std::string> linuxIcdManifests() {
+        std::vector<std::string> dirs = {"/usr/share/vulkan/icd.d", "/usr/local/share/vulkan/icd.d", "/etc/vulkan/icd.d"};
+        if (const char* xdg = std::getenv("XDG_DATA_HOME")) dirs.push_back(std::string(xdg) + "/vulkan/icd.d");
+        if (const char* home = std::getenv("HOME")) dirs.push_back(std::string(home) + "/.local/share/vulkan/icd.d");
+        std::vector<std::string> out;
+        for (auto& d : dirs) {
+            std::error_code ec;
+            for (std::filesystem::directory_iterator it(d, ec), end; !ec && it != end; it.increment(ec)) {
+                if (it->path().extension() == ".json") out.push_back(it->path().string());
+            }
+        }
+        std::stable_sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
+            auto soft = [](const std::string& p) { return p.find("lvp") != std::string::npos || p.find("llvmpipe") != std::string::npos
+                                                       || p.find("swiftshader") != std::string::npos || p.find("swrast") != std::string::npos; };
+            return soft(a) < soft(b);
+        });
+        return out;
+    }
+#endif
+
+    // The bring-up ladder: try loader configurations in order until one yields an instance + a GPU
+    // with graphics+present on the window's surface. Leaves instance/surface/physicalDevice set.
+    bool bringUpInstanceAndDevice(GLFWwindow* window) {
+        // Stale loader-override env vars (a leftover VK_ICD_FILENAMES export from a Steam runtime,
+        // an old SDK setup script, a render-offload wrapper...) silently reduce the loader to 0
+        // drivers. Note them up front; the ladder retries with them cleared.
+        static const char* ICD_VARS[] = {"VK_ICD_FILENAMES", "VK_DRIVER_FILES", "VK_ADD_DRIVER_FILES",
+                                         "VK_LOADER_DRIVERS_SELECT", "VK_LOADER_DRIVERS_DISABLE"};
+        bool haveIcdOverride = false;
+        for (auto v : ICD_VARS) if (const char* s = std::getenv(v)) { haveIcdOverride = true; log("  NOTE: %s=%s is set (loader override)", v, s); }
+
+        struct Att { std::string label; bool portability; bool noImplicitLayers; bool clearIcdEnv; std::string driverFile; };
+        std::vector<Att> atts;
+#ifdef __APPLE__
+        // MoltenVK: portability is the default working config; a broken implicit layer is the main other suspect.
+        atts.push_back({"default (MoltenVK portability)", true, false, false, ""});
+        atts.push_back({"implicit layers disabled", true, true, false, ""});
+#else
+        bool envPort = std::getenv("HSR_PORTABILITY") != nullptr;
+        atts.push_back({"default", envPort, false, false, ""});
+        if (!envPort) atts.push_back({"portability enumeration ON (software/layered driver?)", true, false, false, ""});
+        atts.push_back({"implicit layers disabled (broken overlay/capture layer?)", envPort, true, false, ""});
+        atts.push_back({"implicit layers disabled + portability", true, true, false, ""});
+        if (haveIcdOverride) {
+            atts.push_back({"loader-override env cleared (stale VK_ICD_FILENAMES/VK_DRIVER_FILES?)", false, false, true, ""});
+            atts.push_back({"loader-override env cleared + portability", true, false, true, ""});
+            atts.push_back({"loader-override env cleared + implicit layers disabled", false, true, true, ""});
+        }
+#endif
+#ifdef __linux__
+        // Last resort: hand the loader each installed ICD manifest EXPLICITLY (real GPUs first,
+        // software rasterizers last — lavapipe as the final "at least it runs" fallback).
+        for (auto& m : linuxIcdManifests()) {
+            atts.push_back({"explicit ICD " + m, false, true, true, m});
+            atts.push_back({"explicit ICD " + m + " + portability", true, true, true, m});
+        }
+#endif
+
+        bool icdCleared = false;
+        for (size_t ai = 0; ai < atts.size(); ++ai) {
+            const Att& a = atts[ai];
+            if (ai) log("  bring-up retry %zu/%zu: %s", ai, atts.size() - 1, a.label.c_str());
+            if (a.clearIcdEnv && !icdCleared) { for (auto v : ICD_VARS) setEnvVar(v, nullptr); icdCleared = true; }
+            setEnvVar("VK_LOADER_LAYERS_DISABLE", a.noImplicitLayers ? "~implicit~" : nullptr);   // loader >= 1.3.234; older loaders ignore it
+            if (!a.driverFile.empty()) { setEnvVar("VK_DRIVER_FILES", a.driverFile.c_str()); setEnvVar("VK_ICD_FILENAMES", a.driverFile.c_str()); }
+
+            if (tryCreateInstance(a.portability) != VK_SUCCESS) { instance = VK_NULL_HANDLE; continue; }
+            volkLoadInstance(instance);
+            u32 ndev = 0; vkEnumeratePhysicalDevices(instance, &ndev, nullptr);
+            if (!ndev) {
+                log("  0 physical devices with this configuration");
+                vkDestroyInstance(instance, nullptr); instance = VK_NULL_HANDLE; continue;
+            }
+            if (glfwCreateWindowSurface(instance, window, nullptr, &surface) != VK_SUCCESS) {
+                log("  window-surface creation failed with this configuration");
+                surface = VK_NULL_HANDLE;
+                vkDestroyInstance(instance, nullptr); instance = VK_NULL_HANDLE; continue;
+            }
+            if (pickPhysicalDevice()) {
+                if (ai) log("  Vulkan came up via retry: %s", a.label.c_str());
+                return true;
+            }
+            vkDestroySurfaceKHR(instance, surface, nullptr); surface = VK_NULL_HANDLE;
+            vkDestroyInstance(instance, nullptr); instance = VK_NULL_HANDLE;
+        }
+        setEnvVar("VK_LOADER_LAYERS_DISABLE", nullptr);
+        dumpLoaderDiagnostics();
+        return false;
+    }
+
+    // Printed once when EVERY bring-up configuration failed: everything a support log needs to
+    // pinpoint the machine's Vulkan state (loader version, extensions, layers, ICDs, and whether
+    // the GPU enumerates at all without window-system extensions).
+    void dumpLoaderDiagnostics() {
+        log("FATAL: No usable Vulkan GPU after trying every loader configuration.");
+        if (volkGetInstanceVersion() != 0)
+            log("  loader instance version: 1.%u.%u", VK_VERSION_MINOR(volkGetInstanceVersion()), VK_VERSION_PATCH(volkGetInstanceVersion()));
+        if (vkEnumerateInstanceExtensionProperties) {
+            u32 na = 0; vkEnumerateInstanceExtensionProperties(nullptr, &na, nullptr);
+            std::vector<VkExtensionProperties> avail(na);
+            if (na) vkEnumerateInstanceExtensionProperties(nullptr, &na, avail.data());
+            std::string exts; for (auto& e : avail) { exts += " "; exts += e.extensionName; }
+            log("  instance extensions (%u):%s", na, exts.c_str());
+        }
+        if (vkEnumerateInstanceLayerProperties) {
+            u32 nl = 0; vkEnumerateInstanceLayerProperties(&nl, nullptr);
+            std::vector<VkLayerProperties> lay(nl);
+            if (nl) vkEnumerateInstanceLayerProperties(&nl, lay.data());
+            for (auto& l : lay) log("  layer: %s (%s)", l.layerName, l.description);
+        }
+        // Bare probe: does ANY device enumerate when we ask for NO window-system extensions? If yes,
+        // the GPU/driver are fine — it's the windowing path (classic: NVIDIA under native Wayland).
+        if (vkCreateInstance) {
+            VkInstance probe = instance; instance = VK_NULL_HANDLE;
+            u32 bare = 0;
+            if (tryCreateInstance(true, /*surfaceless=*/true) == VK_SUCCESS) {
+                volkLoadInstance(instance);
+                vkEnumeratePhysicalDevices(instance, &bare, nullptr);
+                if (bare) {
+                    std::vector<VkPhysicalDevice> pds(bare);
+                    vkEnumeratePhysicalDevices(instance, &bare, pds.data());
+                    for (auto& pd : pds) { VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(pd, &p);
+                        log("  bare-probe GPU: %s", p.deviceName); }
+                    log("  >> %u GPU(s) enumerate WITHOUT window-surface extensions: the DRIVER IS FINE,", bare);
+                    log("  >> it just can't present to this window system. On Linux this usually means native");
+                    log("  >> Wayland with a driver lacking VK_KHR_wayland_surface - run from an X11/XWayland");
+                    log("  >> session (the app already prefers X11 unless HSR_WAYLAND=1 is set), or update the driver.");
+                }
+                vkDestroyInstance(instance, nullptr);
+            }
+            instance = probe;
+        }
+#ifdef __linux__
+        auto manifests = linuxIcdManifests();
+        if (manifests.empty()) {
+            log("  NO Vulkan ICD manifests found in /usr/share/vulkan/icd.d etc. - the GPU DRIVER is not installed.");
+            log("  Arch/Manjaro NVIDIA: sudo pacman -S nvidia-utils vulkan-icd-loader   (AMD/Intel: vulkan-radeon / vulkan-intel)");
+            log("  Debian/Ubuntu NVIDIA: the proprietary driver + libvulkan1            (AMD/Intel: mesa-vulkan-drivers)");
+        } else {
+            for (auto& m : manifests) log("  ICD manifest: %s", m.c_str());
+            log("  Verify with 'vulkaninfo'; if vulkaninfo ALSO fails, reinstall the driver + vulkan loader.");
+        }
+#elif defined(_WIN32)
+        log("  Windows: update your GPU driver (the driver ships the Vulkan ICD). If this is a remote");
+        log("  desktop/VM session, RDP often hides the GPU - try locally or via a different remoting tool.");
+#else
+        log("  macOS: install MoltenVK (brew install molten-vk); keep libMoltenVK.dylib beside the app.");
+#endif
     }
 
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
@@ -2148,26 +2377,18 @@ private:
     bool pickPhysicalDevice() {
         u32 count = 0;
         vkEnumeratePhysicalDevices(instance, &count, nullptr);
-        if (count == 0) {
-            log("FATAL: No Vulkan-capable GPU found - the loader enumerated 0 physical devices.");
-#if defined(__APPLE__)
-            log("  macOS: install MoltenVK (brew install molten-vk); keep libMoltenVK.dylib beside the app.");
-#elif defined(_WIN32)
-            log("  Windows: update your GPU driver (it ships the Vulkan ICD).");
-#else
-            log("  Linux: install your GPU's Vulkan driver + loader. NVIDIA: the proprietary driver + 'vulkan-loader'/");
-            log("         'libvulkan1'. AMD/Intel: 'mesa-vulkan-drivers' ('vulkan-radeon'/'vulkan-intel'). Verify: vulkaninfo.");
-            log("         If vulkaninfo lists your GPU but this doesn't, try:  HSR_PORTABILITY=1 <app>  (or update the loader).");
-#endif
-            return false;
-        }
+        if (count == 0) return false;   // the bring-up ladder pre-checks + reports; nothing to log here
         std::vector<VkPhysicalDevice> devices(count);
         vkEnumeratePhysicalDevices(instance, &count, devices.data());
 
+        // Two passes: prefer a DISCRETE GPU (hybrid laptops enumerate iGPU+dGPU; picking whichever
+        // came first sometimes landed on the weaker/broken one), then accept anything that works.
+        for (int pass = 0; pass < 2; ++pass) {
         for (auto& pd : devices) {
             VkPhysicalDeviceProperties props;
             vkGetPhysicalDeviceProperties(pd, &props);
-            log("  Found GPU: %s (type=%d)", props.deviceName, props.deviceType);
+            if (pass == 0) log("  Found GPU: %s (type=%d)", props.deviceName, props.deviceType);
+            if (pass == 0 && props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) continue;
 
             u32 qfCount = 0;
             vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfCount, nullptr);
@@ -2181,20 +2402,25 @@ private:
                     physicalDevice = pd;
                     graphicsQueueFamily = i;
                     log("  Selected: %s, queue family %u", props.deviceName, i);
-                    // Probe shaderFloat16 support (needed by Haven's real PBR shaders).
-                    VkPhysicalDeviceShaderFloat16Int8Features f16 = {};
-                    f16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
-                    VkPhysicalDeviceFeatures2 feats2 = {};
-                    feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-                    feats2.pNext = &f16;
-                    vkGetPhysicalDeviceFeatures2(pd, &feats2);
-                    shaderFloat16Supported = (f16.shaderFloat16 == VK_TRUE);
+                    // Probe shaderFloat16 support (needed by Haven's real PBR shaders). On a 1.0-only
+                    // loader vkGetPhysicalDeviceFeatures2 doesn't exist - degrade instead of crashing.
+                    auto feats2Fn = vkGetPhysicalDeviceFeatures2 ? vkGetPhysicalDeviceFeatures2 : vkGetPhysicalDeviceFeatures2KHR;
+                    if (feats2Fn) {
+                        VkPhysicalDeviceShaderFloat16Int8Features f16 = {};
+                        f16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+                        VkPhysicalDeviceFeatures2 feats2 = {};
+                        feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                        feats2.pNext = &f16;
+                        feats2Fn(pd, &feats2);
+                        shaderFloat16Supported = (f16.shaderFloat16 == VK_TRUE);
+                    } else shaderFloat16Supported = false;
                     log("  GPU shaderFloat16: %s", shaderFloat16Supported ? "supported" : "NOT supported");
                     return true;
                 }
             }
         }
-        log("FATAL: No GPU with graphics + present support");
+        }
+        log("  No GPU with graphics + present support with this configuration");
         return false;
     }
 
@@ -2222,45 +2448,56 @@ private:
                 }
         }
 
-        // Enable the multiview feature — the skinned shader (unlitblendskinned)
-        // requires the MultiView SPIR-V capability; without it the skinned pipeline
-        // renders nothing (prism halo + motes invisible).
-        VkPhysicalDeviceMultiviewFeatures mvFeat = {};
-        mvFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES;
-        mvFeat.multiview = VK_TRUE;
-
         // Haven2025's real PBR shaders (isotropictiled.surface family) use SPIR-V Float16
         // + Int8 and 16/8-bit storage. Enable via the Vulkan 1.2 aggregate feature structs
         // (Vulkan11Features = multiview + 16-bit storage, Vulkan12Features = shaderFloat16/
         // Int8 + 8-bit storage). Query support first, enable only what's reported. NVIDIA
         // honors these reliably (the standalone KHR structs on a 1.1 instance did not, so
         // float16 vertex pipelines were rejected with VK_ERROR_UNKNOWN).
-        static VkPhysicalDeviceVulkan12Features v12q = {}; v12q.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-        static VkPhysicalDeviceVulkan11Features v11q = {}; v11q.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES; v12q.pNext = &v11q;
-        VkPhysicalDeviceFeatures2 q2 = {}; q2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2; q2.pNext = &v12q;
-        vkGetPhysicalDeviceFeatures2(physicalDevice, &q2);
-
-        static VkPhysicalDeviceVulkan11Features v11 = {}; v11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
-        multiviewSupported = (v11q.multiview == VK_TRUE);   // the skinned shaders declare MultiView — enable it (and the multiview render pass) only when the GPU actually supports it, else old GPUs hang creating the mismatched pipeline
-        v11.multiview = v11q.multiview;
-        v11.storageBuffer16BitAccess = v11q.storageBuffer16BitAccess;
-        v11.uniformAndStorageBuffer16BitAccess = v11q.uniformAndStorageBuffer16BitAccess;
-        v11.storagePushConstant16 = v11q.storagePushConstant16;
-        v11.storageInputOutput16 = v11q.storageInputOutput16;
+        // The aggregate structs are only VALID on a 1.2+ instance; after the api fallback
+        // (old loader) degrade: 1.1 = standalone multiview only, 1.0 = no feature chain.
+        void* devChain = nullptr;
+        auto feats2Fn = vkGetPhysicalDeviceFeatures2 ? vkGetPhysicalDeviceFeatures2 : vkGetPhysicalDeviceFeatures2KHR;
+        static VkPhysicalDeviceVulkan11Features v11 = {}; v11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES; v11.pNext = nullptr;
         static VkPhysicalDeviceVulkan12Features v12 = {}; v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-        v12.shaderFloat16 = v12q.shaderFloat16;
-        v12.shaderInt8 = v12q.shaderInt8;
-        v12.storageBuffer8BitAccess = v12q.storageBuffer8BitAccess;
-        v12.uniformAndStorageBuffer8BitAccess = v12q.uniformAndStorageBuffer8BitAccess;
-        v12.storagePushConstant8 = v12q.storagePushConstant8;
-        v11.pNext = &v12;
-        // mvFeat replaced by v11.multiview; chain v11/v12 directly.
-        log("  GPU float16=%d int8=%d sb16=%d push16=%d : Vulkan1.2 feature chain ENABLED",
-            v12.shaderFloat16, v12.shaderInt8, v11.storageBuffer16BitAccess, v11.storagePushConstant16);
+        static VkPhysicalDeviceMultiviewFeatures mvFeat = {}; mvFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES; mvFeat.pNext = nullptr;
+        multiviewSupported = false;
+        if (instanceApiVersion >= VK_API_VERSION_1_2 && feats2Fn) {
+            static VkPhysicalDeviceVulkan12Features v12q = {}; v12q = {}; v12q.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+            static VkPhysicalDeviceVulkan11Features v11q = {}; v11q = {}; v11q.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES; v12q.pNext = &v11q;
+            VkPhysicalDeviceFeatures2 q2 = {}; q2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2; q2.pNext = &v12q;
+            feats2Fn(physicalDevice, &q2);
+            multiviewSupported = (v11q.multiview == VK_TRUE);   // the skinned shaders declare MultiView — enable it (and the multiview render pass) only when the GPU actually supports it, else old GPUs hang creating the mismatched pipeline
+            v11.multiview = v11q.multiview;
+            v11.storageBuffer16BitAccess = v11q.storageBuffer16BitAccess;
+            v11.uniformAndStorageBuffer16BitAccess = v11q.uniformAndStorageBuffer16BitAccess;
+            v11.storagePushConstant16 = v11q.storagePushConstant16;
+            v11.storageInputOutput16 = v11q.storageInputOutput16;
+            v12.shaderFloat16 = v12q.shaderFloat16;
+            v12.shaderInt8 = v12q.shaderInt8;
+            v12.storageBuffer8BitAccess = v12q.storageBuffer8BitAccess;
+            v12.uniformAndStorageBuffer8BitAccess = v12q.uniformAndStorageBuffer8BitAccess;
+            v12.storagePushConstant8 = v12q.storagePushConstant8;
+            v11.pNext = &v12;
+            devChain = &v11;
+            log("  GPU float16=%d int8=%d sb16=%d push16=%d : Vulkan1.2 feature chain ENABLED",
+                v12.shaderFloat16, v12.shaderInt8, v11.storageBuffer16BitAccess, v11.storagePushConstant16);
+        } else if (feats2Fn) {
+            // 1.1 loader: multiview via its standalone struct (the skinned pipeline needs it)
+            VkPhysicalDeviceMultiviewFeatures mvq = {}; mvq.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES;
+            VkPhysicalDeviceFeatures2 q2 = {}; q2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2; q2.pNext = &mvq;
+            feats2Fn(physicalDevice, &q2);
+            multiviewSupported = (mvq.multiview == VK_TRUE);
+            mvFeat.multiview = mvq.multiview;
+            if (multiviewSupported) devChain = &mvFeat;
+            log("  Vulkan 1.1 loader: multiview=%d, float16 chain OFF (PBR pipelines may be reduced)", (int)multiviewSupported);
+        } else {
+            log("  Vulkan 1.0 loader: no feature chain (multiview/float16 OFF - basic rendering only)");
+        }
 
         VkDeviceCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        createInfo.pNext = &v11;
+        createInfo.pNext = devChain;
         createInfo.queueCreateInfoCount = 1;
         createInfo.pQueueCreateInfos = &qInfo;
         createInfo.enabledExtensionCount = (u32)deviceExts.size();
@@ -2269,8 +2506,11 @@ private:
         VkPhysicalDeviceFeatures supported = {};
         vkGetPhysicalDeviceFeatures(physicalDevice, &supported);
         VkPhysicalDeviceFeatures features = {};
-        features.samplerAnisotropy = VK_TRUE;
-        features.fillModeNonSolid = VK_TRUE;  // required for wireframe
+        // Only request what the device actually reports (requesting an unsupported feature is a
+        // guaranteed vkCreateDevice failure on minimal/software drivers).
+        features.samplerAnisotropy = supported.samplerAnisotropy;
+        anisotropyEnabled = (supported.samplerAnisotropy == VK_TRUE);
+        features.fillModeNonSolid = supported.fillModeNonSolid;  // wireframe (degrades to solid if absent)
         if (supported.textureCompressionASTC_LDR) {
             features.textureCompressionASTC_LDR = VK_TRUE;
             astcLdrSupported = true;
@@ -2280,8 +2520,25 @@ private:
         }
         createInfo.pEnabledFeatures = &features;
 
-        if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &device) != VK_SUCCESS) {
-            log("FATAL: vkCreateDevice failed");
+        VkResult dres = vkCreateDevice(physicalDevice, &createInfo, nullptr, &device);
+        if (dres != VK_SUCCESS && devChain) {
+            // Some drivers reject a feature chain they half-support - retry with NO chain
+            // (multiview/float16 off) rather than refusing to start at all.
+            log("  vkCreateDevice failed (%d) with the feature chain - retrying without it", dres);
+            createInfo.pNext = nullptr; multiviewSupported = false;
+            dres = vkCreateDevice(physicalDevice, &createInfo, nullptr, &device);
+        }
+        if (dres != VK_SUCCESS && features.samplerAnisotropy) {
+            // Last resort: drop optional base features too (anisotropy/wireframe) - software or
+            // minimal drivers (some lavapipe builds) may not offer them.
+            log("  vkCreateDevice still failing (%d) - retrying with minimal features", dres);
+            features = {};
+            if (supported.fillModeNonSolid) features.fillModeNonSolid = VK_TRUE;
+            anisotropyEnabled = false;   // samplers must match (anisotropyEnable would be invalid now)
+            dres = vkCreateDevice(physicalDevice, &createInfo, nullptr, &device);
+        }
+        if (dres != VK_SUCCESS) {
+            log("FATAL: vkCreateDevice failed: %d", dres);
             return false;
         }
         vkGetDeviceQueue(device, graphicsQueueFamily, 0, &graphicsQueue);
@@ -2298,12 +2555,17 @@ private:
         std::vector<VkSurfaceFormatKHR> formats(formatCount);
         vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, formats.data());
 
-        swapchainFormat = VK_FORMAT_B8G8R8A8_SRGB;
-        for (auto& f : formats) {
-            if (f.format == VK_FORMAT_B8G8R8A8_SRGB && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-                swapchainFormat = f.format;
-                break;
-            }
+        // Prefer BGRA8-sRGB, then RGBA8-sRGB (some Linux/Android-ish drivers only expose RGBA order),
+        // else take whatever the surface offers - a wrong-gamma picture beats no window at all.
+        swapchainFormat = formats.empty() ? VK_FORMAT_B8G8R8A8_SRGB : formats[0].format;
+        VkColorSpaceKHR swapColorSpace = formats.empty() ? VK_COLOR_SPACE_SRGB_NONLINEAR_KHR : formats[0].colorSpace;
+        for (VkFormat want : {VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB}) {
+            bool found = false;
+            for (auto& f : formats)
+                if (f.format == want && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                    swapchainFormat = f.format; swapColorSpace = f.colorSpace; found = true; break;
+                }
+            if (found) break;
         }
 
         swapchainExtent = caps.currentExtent;
@@ -2337,7 +2599,7 @@ private:
         createInfo.surface = surface;
         createInfo.minImageCount = imageCount;
         createInfo.imageFormat = swapchainFormat;
-        createInfo.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        createInfo.imageColorSpace = swapColorSpace;
         createInfo.imageExtent = swapchainExtent;
         createInfo.imageArrayLayers = 1;
         createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -2348,7 +2610,14 @@ private:
         createInfo.clipped = VK_TRUE;
         createInfo.oldSwapchain = VK_NULL_HANDLE;
 
-        vkCreateSwapchainKHR(device, &createInfo, nullptr, &swapchain);
+        VkResult scres = vkCreateSwapchainKHR(device, &createInfo, nullptr, &swapchain);
+        if (scres != VK_SUCCESS) {
+            // Retry without the TRANSFER_SRC usage (screenshot readback) - a few drivers reject it.
+            log("  vkCreateSwapchainKHR failed (%d) - retrying without TRANSFER_SRC usage", scres);
+            createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            scres = vkCreateSwapchainKHR(device, &createInfo, nullptr, &swapchain);
+        }
+        if (scres != VK_SUCCESS) { log("FATAL: vkCreateSwapchainKHR failed: %d", scres); swapchain = VK_NULL_HANDLE; return; }
 
         vkGetSwapchainImagesKHR(device, swapchain, &imageCount, nullptr);
         swapchainImages.resize(imageCount);
@@ -2396,6 +2665,7 @@ public:
         log("  [SKYIBL] equirect %dx%d -> IBL cubes (spec 64, diff 16) ok=%d", w, h, (int)iblDiffuse.ok());
     }
     void setSpecularCubemap(const std::vector<uint8_t>& raw) {
+        if (gpuLess || device == VK_NULL_HANDLE) return;
         int S = 0; std::vector<uint8_t> faces;   // 6 faces of S*S*RGBA16F, contiguous
         if (raw.empty() || !ibl::extractCubeRawRGBA16F(raw.data(), raw.size(), S, faces) || S <= 0) return;
         const size_t faceBytes = (size_t)S * S * 4 * 2;
@@ -2461,6 +2731,7 @@ public:
     // still need a VALID cube view bound there or it's a descriptor type mismatch -> crash. Give them
     // a tiny BLACK cube (reflection adds nothing). Call for every V79/OPA env after setSpecularCubemap.
     void ensureSpecCube() {
+        if (gpuLess || device == VK_NULL_HANDLE) return;
         if (iblSpecView != VK_NULL_HANDLE) return;
         createSolidCubemap(0.0f, 0.0f, 0.0f, iblSpecImage, iblSpecMem, iblSpecView);
     }
@@ -4066,8 +4337,8 @@ public:
         samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        samplerInfo.anisotropyEnable = VK_TRUE;
-        samplerInfo.maxAnisotropy = 16.0f;
+        samplerInfo.anisotropyEnable = anisotropyEnabled ? VK_TRUE : VK_FALSE;   // matches what the device was created with
+        samplerInfo.maxAnisotropy = anisotropyEnabled ? 16.0f : 1.0f;
         samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;   // trilinear: sample the mip chain
         samplerInfo.maxLod = VK_LOD_CLAMP_NONE;                   // use all available mips (anti-alias)
         VkSampler sampler;

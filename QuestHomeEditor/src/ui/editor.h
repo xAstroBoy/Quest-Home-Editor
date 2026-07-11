@@ -3442,7 +3442,7 @@ struct Editor {
     struct LogLine { std::string t; uint8_t sev; bool env; };   // sev: 0=V/D 1=I 2=W 3=E ; env=env-load line (highlight/filter)
     std::thread logThread; std::atomic<bool> logRun{false};
     std::atomic<int> logMode{1};       // display filter: 0=env-load only, 1=all vrshell (--pid capture), 2=EVERYTHING (all logcat)
-    std::mutex logMx; std::deque<LogLine> logBuf; std::string logLastRaw;
+    std::mutex logMx; std::deque<LogLine> logBuf; std::string logLastRaw; std::string logLastTs;
     float logScroll = 0.f; bool logStick = true;   // logScroll = pixel offset; logStick = auto-scroll to newest
     bool autoLogStarted = false; std::atomic<bool> logVerboseSet{false};   // auto-start + one-time debug.logLevel=Verbose
     // adb auto-grab: if no working adb is found at runtime, download Google's platform-tools in the background.
@@ -3539,7 +3539,9 @@ struct Editor {
         loadLangPref();                                  // restore the saved UI language BEFORE the first font bake (CJK atlas)
         reloadUIFont(baseFontPx * uiScale);
         mono = font;   // the UI pipeline binds ONE atlas (the main font); "mono" MUST share it or its glyph UVs index garbage
-        uiDraw.init(r, &font);
+        // NO-GPU COOK MODE: no device -> no UI atlas/pipeline (uiDraw's first call writes a GPU
+        // texture through r->device = null-deref). The headless cook never draws the overlay.
+        if (!r->gpuLess && r->device != VK_NULL_HANDLE) uiDraw.init(r, &font);
         cx.font = &font; cx.mono = &font;
         // text-field clipboard (Ctrl+C/X/V) -> the OS clipboard via GLFW
         cx.setClip = [this](const char* s){ if (win && s) glfwSetClipboardString(win, s); };
@@ -6956,7 +6958,7 @@ struct Editor {
         std::string dump;
         for (int i = 0; i < 16; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(750));
-            dump = adbCapture(ADB, sel, "logcat -d -v brief -t 6000");   // -d = dump+exit; no root needed
+            dump = adbCapture(ADB, sel, "logcat -d -v time -t 6000");   // -d = dump+exit; no root needed (-v time: chronological + unambiguous)
             if (dump.find("Scene loaded") != std::string::npos ||
                 dump.find("falling back to device default") != std::string::npos ||
                 dump.find("using fallback environment") != std::string::npos) break;
@@ -6999,8 +7001,21 @@ struct Editor {
             "Asset ptr error", "unable to open package", "LoadEntry not found", "Scene loaded",
             "Hsr environment loaded", "package type not supported", "in zip from", "deserialize asset manifest" };
         for (auto h : HL) if (ln.find(h)!=std::string::npos) return 4;   // env-load highlight
-        char p = ln.empty()?'I':ln[0];                                   // `-v brief` starts with the priority letter
-        return p=='E'?3 : p=='W'?2 : p=='I'?1 : 0;
+        // Priority letter = the char right before the first '/' — works for BOTH `-v brief`
+        // ("E/Tag(pid): msg") and `-v time` ("MM-DD HH:MM:SS.mmm E/Tag(pid): msg"; the date uses
+        // '-' and the time ':', so the first '/' is always the priority separator).
+        char p = 'I';
+        { size_t sl = ln.find('/'); if (sl != std::string::npos && sl >= 1) p = ln[sl-1]; }
+        return p=='E'||p=='F'?3 : p=='W'?2 : p=='I'?1 : 0;
+    }
+    // Timestamp prefix of a `-v time` logcat line ("MM-DD HH:MM:SS.mmm", 18 chars); "" if absent.
+    // Timestamps make the stream-merge deterministic: when the exact anchor line isn't found in the
+    // next dump (buffer wrapped, --pid scope changed), we append ONLY lines newer than the last one
+    // instead of re-appending the whole dump (which duplicated + interleaved lines in the export).
+    static std::string logTsOf(const std::string& ln){
+        if (ln.size() >= 18 && isdigit((unsigned char)ln[0]) && isdigit((unsigned char)ln[1]) && ln[2]=='-'
+            && ln[5]==' ' && ln[8]==':' && ln[11]==':' && ln[14]=='.') return ln.substr(0, 18);
+        return std::string();
     }
     static bool isEnvLine(const std::string& ln){
         static const char* K[] = {"EnvironmentSystem","EnvironmentManager","SetSystemEnvironment","AssetHandler",
@@ -7019,17 +7034,31 @@ struct Editor {
             runAdb(ADB, sel, "shell setprop debug.logLevel Verbose"); logVerboseSet.store(true);
             while (logRun.load()){
                 std::string pid; { std::string pids=adbCapture(ADB, sel, "shell pidof com.oculus.vrshell"); for(char c:pids){ if(c=='\r'||c=='\n'||c==' ')break; pid.push_back(c);} }
-                // capture EVERYTHING: mode 2 (or while vrshell is mid-restart with no pid) grabs the whole buffer;
-                // otherwise scope to the vrshell process (--pid) so the ring buffer stays vrshell-focused.
-                std::string cmd = (logMode.load()==2 || pid.empty()) ? "logcat -d -v brief -t 8000"
-                                                                      : ("logcat -d -v brief --pid="+pid+" -t 8000");
+                // Mode 2 grabs the whole buffer; mode 0/1 scope to the vrshell process (--pid) so the
+                // ring buffer stays vrshell-focused. While vrshell is mid-restart (no pid yet) SKIP the
+                // poll instead of dumping everything: mixing an unscoped dump into a scoped stream is
+                // exactly what interleaved foreign lines into the exported log. The new process's early
+                // lines aren't lost - the next scoped -t 8000 dump still contains them.
+                if (logMode.load()!=2 && pid.empty()){ for (int i=0;i<8 && logRun.load();++i) std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
+                // `-v time` (not brief): the timestamp makes every line unique enough to merge the
+                // rolling dumps deterministically - and the export becomes provably chronological.
+                std::string cmd = (logMode.load()==2) ? "logcat -d -v time -t 8000"
+                                                      : ("logcat -d -v time --pid="+pid+" -t 8000");
                 std::string dump = adbCapture(ADB, sel, cmd);
                 std::vector<std::string> lines; { size_t s=0; while(s<dump.size()){ size_t nl=dump.find('\n',s); std::string l=dump.substr(s, nl==std::string::npos?std::string::npos:nl-s); while(!l.empty()&&l.back()=='\r')l.pop_back(); if(!l.empty())lines.push_back(l); s=(nl==std::string::npos)?dump.size():nl+1; } }
-                size_t startIdx=0; if(!logLastRaw.empty()){ for(size_t i=lines.size(); i-->0;){ if(lines[i]==logLastRaw){ startIdx=i+1; break; } } }
+                // Merge: find the exact last-appended line (anchor) and take what follows. If the anchor
+                // is gone (buffer wrapped / scope changed), fall back to the TIMESTAMP: append only lines
+                // strictly newer than the last appended one. (The old code re-appended the ENTIRE dump on
+                // an anchor miss -> thousands of duplicated, out-of-order lines "mixed in each".)
+                size_t startIdx=0; bool anchored=false;
+                if(!logLastRaw.empty()){ for(size_t i=lines.size(); i-->0;){ if(lines[i]==logLastRaw){ startIdx=i+1; anchored=true; break; } } }
                 { std::lock_guard<std::mutex> lk(logMx);
-                  for (size_t i=startIdx;i<lines.size();++i){ const std::string& ln=lines[i]; logBuf.push_back({ln, logSevOf(ln), isEnvLine(ln)}); }
+                  for (size_t i=startIdx;i<lines.size();++i){ const std::string& ln=lines[i];
+                      if (!anchored && !logLastTs.empty()){ std::string ts=logTsOf(ln); if (!ts.empty() && ts<=logLastTs) continue; }
+                      logBuf.push_back({ln, logSevOf(ln), isEnvLine(ln)}); }
                   while (logBuf.size()>12000) logBuf.pop_front(); }
-                if (!lines.empty()) logLastRaw = lines.back();
+                if (!lines.empty()){ logLastRaw = lines.back();
+                    for (size_t i=lines.size(); i-->0;){ std::string ts=logTsOf(lines[i]); if(!ts.empty()){ logLastTs=ts; break; } } }
                 for (int i=0;i<8 && logRun.load();++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         });
@@ -7040,7 +7069,7 @@ struct Editor {
         auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
         std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
         runAdb(ADB, sel, "shell setprop debug.logLevel Verbose");
-        { std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); }
+        { std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); logLastTs.clear(); }
         runAdb(ADB, sel, "logcat -c");
         runAdb(ADB, sel, "shell am force-stop com.oculus.vrshell");
         logStick=true; if(!logRun.load()) startLogStream();
@@ -7115,7 +7144,7 @@ struct Editor {
         if (!haven.empty() && haven.back()!='\n') f << "\n";
         f << "env packages:\n" << envpkgs << "\n";
         f << "--- VERDICT ---\n" << verdict << "\n\n";
-        f << "--- env-load log (adb logcat -v brief, NO root; " << snap.size() << " lines) ---\n";
+        f << "--- env-load log (adb logcat -v time, NO root, chronological; " << snap.size() << " lines) ---\n";
         for (auto& l : snap) f << l.t << "\n";
         f.close();
         std::error_code ec; std::string abs = std::filesystem::absolute(path, ec).string();
@@ -7145,13 +7174,20 @@ struct Editor {
                 "Start / Stop the live logcat stream (it auto-starts at full verbosity\nwhen you open this tab). No root needed.")) { if(logRun.load()) stopLogStream(); else startLogStream(); }
         if (btn("logrel","Reload home",112*uiScale,true,
                 "Clears the log and restarts com.oculus.vrshell (am force-stop, no root),\nso you capture the home's env-load from a clean slate. Do this, then\nread the cyan EnvironmentSystem lines / Export.")) reloadShellForLog();
-        if (btn("logclr","Clear",56*uiScale,false,"Clear the captured lines (doesn't stop the stream).")) { std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); }
+        if (btn("logclr","Clear",56*uiScale,false,"Clear the captured lines (doesn't stop the stream).")) { std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); logLastTs.clear(); }
         if (btn("logsave","Export",70*uiScale,false,
                 "Write a shareable diagnostic report (device info + resolved env +\nverdict + the env-load log) to a .txt and reveal it. Attach it on\nDiscord / GitHub when reporting a home that fell back to Haven/nuxd.")) exportDiag();
+        if (btn("loghmenu","Home menu",96*uiScale,false,
+                "Open the HIDDEN Meta Home settings panel in the headset (no root):\nam start -n com.oculus.panelapp.settings/.SettingsActivity --es uri /home\nPut the headset on to see it.")) {
+            auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+            std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
+            runAdb(ADB, sel, "shell am start -n com.oculus.panelapp.settings/.SettingsActivity --es uri /home");
+            setStatus("Hidden Meta Home menu opened on the headset (panelapp.settings /home).");
+        }
         { int mo=logMode.load(); const char* m = mo==0? "Filter: Env-load" : mo==1? "Filter: vrshell" : "Filter: EVERYTHING";
           if (bx>x+pad && bx+138*uiScale>rowRight){ bx=x+pad; by+=rh+gap; }
           float fbx=bx, fby=by;
-          if (cx.tab(ui::hashId("logmode"), fbx, fby, 138*uiScale, rh, m, true)) { logMode.store((mo+1)%3); std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); }
+          if (cx.tab(ui::hashId("logmode"), fbx, fby, 138*uiScale, rh, m, true)) { logMode.store((mo+1)%3); std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); logLastTs.clear(); }
           cx.tip(fbx, fby, 138*uiScale, rh, "Cycle what's shown: Env-load (only the EnvironmentSystem load lines) ->\nvrshell (com.oculus.vrshell only) -> EVERYTHING (the full logcat).");
           bx+=138*uiScale+gap; }
         // device picker (multiple Quests): click to cycle the target device (clears the log)
@@ -7159,7 +7195,7 @@ struct Editor {
           float dbw = std::min(200.f*uiScale, 84.f*uiScale + (float)dv.size()*6.5f*uiScale);
           if (bx>x+pad && bx+dbw>rowRight){ bx=x+pad; by+=rh+gap; }
           float dbx=bx, dby=by;
-          if (cx.button(ui::hashId("logdev"), dbx, dby, dbw, rh, dv.c_str())) { cycleAdbDevice(); std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); }
+          if (cx.button(ui::hashId("logdev"), dbx, dby, dbw, rh, dv.c_str())) { cycleAdbDevice(); std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); logLastTs.clear(); }
           cx.tip(dbx, dby, dbw, rh, "Which attached Quest to read. Click to CYCLE devices when several are\nconnected (from `adb devices`). \"default\" = the single attached one.");
           bx+=dbw+gap; }
         // adb status / auto-grab banner — shown only while fetching, or when no usable adb was found.

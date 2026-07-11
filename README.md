@@ -6,6 +6,7 @@
   <b><a href="https://discord.gg/cXnc4pQz7A">💬 Join the Quest Homes Discord</a></b>
   &nbsp;·&nbsp; <a href="../../releases">⬇️ Download</a>
   &nbsp;·&nbsp; <a href="../../wiki">📖 Wiki</a>
+  &nbsp;·&nbsp; <a href="https://www.youtube.com/watch?v=m8XBqsU6-NU">🎬 Video guide</a>
   &nbsp;·&nbsp; <a href="../../discussions">🗣️ Discussions</a>
 </p>
 
@@ -23,6 +24,16 @@ a full scene editor, and the V79→V205 cooker.
 
 **📖 Start here → [the Wiki](../../wiki)** — install guide, cook walkthrough, troubleshooting, and
 deep-dive internals.
+
+**🎬 Prefer video?** The Mysticle walks through the whole thing — install, porting a home, and the
+result in-headset:
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=m8XBqsU6-NU">
+    <img src="https://i.ytimg.com/vi/m8XBqsU6-NU/hqdefault.jpg" width="420" alt="Video guide — We Officially Got Custom Quest Homes Back... (The Mysticle)"><br>
+    <b>▶ We Officially Got Custom Quest Homes Back...</b> — The Mysticle
+  </a>
+</p>
 
 ---
 
