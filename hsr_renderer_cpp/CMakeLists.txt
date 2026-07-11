@@ -180,6 +180,10 @@ else()
     target_link_libraries(hsr_renderer PRIVATE Vulkan::Vulkan)
 endif()
 
+# The product is "Quest Home Editor" — build the exe under that name (the CMake TARGET stays `hsr_renderer`
+# so `cmake --build --target hsr_renderer` and existing tooling keep working; only the output file is renamed).
+set_target_properties(hsr_renderer PROPERTIES OUTPUT_NAME "Quest Home Editor")
+
 # ── Shader resource ─────────────────────────────────────────────
 # The shaders are loaded at runtime from the APK (RENDSHAD → SPIRV).
 # No compile-time shader embedding needed.

@@ -186,6 +186,7 @@ static void hsrHttpServer(int port) {
 #include "core/audio.h"
 #include "ui/editor.h"
 #include "io/gltf_export.h"   // Blender round-trip: env -> glTF 2.0 project
+#include "app_icon_rgba.h"    // embedded 64x64 window/taskbar icon (from icon.png)
 #include "io/gltf_import.h"   // Blender round-trip: re-import an edited glTF project
 #include "miniz.h"
 #ifdef _WIN32
@@ -214,12 +215,15 @@ static double          g_rPressX = 0, g_rPressY = 0, g_rightX = 0, g_rightY = 0;
 static Editor*         g_editor = nullptr;      // the custom-UI editor (defined in editor.h above); callbacks route input here
 
 // Procedural editor icon: a dark disc with the R/G/B move-gizmo motif (matches the editor's gizmo). No asset file.
+// "Quest Home Editor" window/taskbar icon — sampled from the embedded 64x64 master (app_icon_rgba.h,
+// extracted from the project's icon.png). Nearest-neighbour resample to the requested size (fine for an icon).
 static void genEditorIcon(int S, std::vector<unsigned char>& px) {
-    px.assign((size_t)S*S*4, 0); float c=(S-1)*0.5f, R=S*0.47f;
-    auto set=[&](int x,int y,int r,int g,int b,int a){ if(x<0||y<0||x>=S||y>=S)return; size_t i=((size_t)y*S+x)*4; px[i]=(unsigned char)r;px[i+1]=(unsigned char)g;px[i+2]=(unsigned char)b;px[i+3]=(unsigned char)a; };
-    for (int y=0;y<S;y++) for (int x=0;x<S;x++){ float dx=x-c,dy=y-c; if (dx*dx+dy*dy<=R*R) set(x,y,44,46,54,255); }
-    auto axis=[&](float ang,float L,int r,int g,int b){ float dx=std::sin(ang),dy=-std::cos(ang); for(float t=0;t<=L;t+=0.5f){ float xx=c+dx*t,yy=c+dy*t; for(int oy=-1;oy<=1;oy++)for(int ox=-1;ox<=1;ox++) set((int)(xx+0.5f)+ox,(int)(yy+0.5f)+oy,r,g,b,255);} for(int oy=-2;oy<=2;oy++)for(int ox=-2;ox<=2;ox++) set((int)(c+dx*L+0.5f)+ox,(int)(c+dy*L+0.5f)+oy,r,g,b,255); };
-    float L=S*0.34f; axis(1.5708f,L,232,72,72); axis(0.f,L,96,210,96); axis(3.6651f,L,80,130,245);  // X red, Y green, Z blue
+    px.assign((size_t)S*S*4, 0); const int A = kAppIconSize;
+    for (int y=0;y<S;y++) for (int x=0;x<S;x++){
+        int sx=x*A/S, sy=y*A/S; if(sx>=A)sx=A-1; if(sy>=A)sy=A-1;
+        const unsigned char* s=&kAppIconRGBA[((size_t)sy*A+sx)*4]; size_t i=((size_t)y*S+x)*4;
+        px[i]=s[0]; px[i+1]=s[1]; px[i+2]=s[2]; px[i+3]=s[3];
+    }
 }
 
 static void dropCb(GLFWwindow*, int count, const char** paths) {
@@ -440,22 +444,25 @@ int main(int argc, char** argv) {
     if (argc > 0 && argv[0]) { std::error_code ec; std::string p = std::filesystem::absolute(argv[0], ec).string();
       size_t s = p.find_last_of('/'); if (s != std::string::npos) AppConfig::s_exeDir = p.substr(0, s); }
 #endif
+    // ── QUIET BY DEFAULT: no console popup — the main window opens straight to the drag-drop prompt, and all
+    //    diagnostics stream to `hsr_renderer.log` beside the exe (a shareable file instead of a console page).
+    //    HSR_CONSOLE=1 keeps the live console/terminal; headless/scripted modes keep stderr for capture.
+    bool wantConsole = std::getenv("HSR_CONSOLE") || std::getenv("HSR_SHOW_CONSOLE");
+    bool headlessOut = std::getenv("HSR_SHOT") || std::getenv("HSR_EXPORT") || std::getenv("HSR_BLENDER_EXPORT") || std::getenv("HSR_LIVE");
+    if (!wantConsole && !headlessOut) {
+        std::string logp = (AppConfig::s_exeDir.empty()?std::string("."):AppConfig::s_exeDir) + "/hsr_renderer.log";
+#ifdef _WIN32
+        if (freopen(logp.c_str(), "w", stderr)) { setvbuf(stderr, nullptr, _IOLBF, 4096); freopen(logp.c_str(), "a", stdout); }
+        HWND con = GetConsoleWindow(); if (con) ShowWindow(con, SW_HIDE);   // no console window
+#else
+        if (!isatty(fileno(stderr)) && freopen(logp.c_str(), "w", stderr)) { setvbuf(stderr, nullptr, _IOLBF, 4096); freopen(logp.c_str(), "a", stdout); }   // file-manager launch (no tty) -> log file; terminal launch keeps stderr
+#endif
+    }
     fprintf(stderr, "========================================================\n");
     fprintf(stderr, " HSR Renderer / Editor - libshell.so Vulkan replica\n");
     fprintf(stderr, " Drag an .apk onto the window to load it\n");
     fprintf(stderr, "========================================================\n\n");
-    if (!std::getenv("HSR_NO_TOOLCHECK")) hslcook::reportToolchain();   // startup readiness of the signing toolchain
-#ifdef _WIN32
-    // Console is VISIBLE by default (you need it to read coords/logs while debugging). Only hide it
-    // when HSR_HIDE_CONSOLE is explicitly set (GUI-only mode). Also bring it to the foreground.
-    if (std::getenv("HSR_HIDE_CONSOLE")) {
-        HWND con = GetConsoleWindow();
-        if (con) ShowWindow(con, SW_HIDE);
-    } else {
-        HWND con = GetConsoleWindow();
-        if (con) ShowWindow(con, SW_SHOW);
-    }
-#endif
+    if (!std::getenv("HSR_NO_TOOLCHECK")) hslcook::reportToolchain();   // startup readiness of the signing toolchain (-> log)
 
     // ── standalone APK signer: `hsr_renderer --sign <foo.apk> [more.apk ...]` ──────────────────────────────
     // Signs an ALREADY-BUILT APK (e.g. a shared/unsigned cooked home someone sent you) in place -> <name>_signed.apk,
@@ -524,27 +531,14 @@ int main(int argc, char** argv) {
           icons[0]={48,48,p48.data()}; icons[1]={32,32,p32.data()}; glfwSetWindowIcon(g_window, 2, icons); }
 #endif
         glfwSetDropCallback(g_window, dropCb);
-        if (apkPath.empty()) {
-            // Launched bare: the main window IS the drop zone. Wait here until an .apk lands on it.
-            glfwSetWindowTitle(g_window, "HSR Renderer - drag an environment .apk here");
-            g_doReload = false; g_dropPath.clear();
-#ifdef _WIN32
-            HWND hwnd = glfwGetWin32Window(g_window);
-#endif
-            while (!glfwWindowShouldClose(g_window) && !g_doReload) {
-#ifdef _WIN32
-                paintLoadSplash(hwnd, nullptr, /*waitingForDrop=*/true);
-#endif
-                glfwWaitEventsTimeout(0.05);
-            }
-            if (!g_doReload || g_dropPath.empty()) { glfwDestroyWindow(g_window); glfwTerminate(); return 0; }
-            apkPath = g_dropPath; g_doReload = false; g_dropPath.clear();
-        }
+        // Launched bare: DON'T block on a drop-zone popup. Open the FULL editor with an empty scene so the
+        // Logcat page (and all tools) are usable standalone; drag a home onto the window anytime to load it.
+        if (apkPath.empty()) glfwSetWindowTitle(g_window, "Quest Home Editor - drag a home in, or use the Logcat tab");
     }
-    fprintf(stderr, "[MAIN] APK: %s\n\n", apkPath.c_str());
+    fprintf(stderr, "[MAIN] APK: %s\n\n", apkPath.empty()?"(none - empty session)":apkPath.c_str());
     std::string envBaseName = apkPath;
     { size_t sl = envBaseName.find_last_of("/\\"); if (sl != std::string::npos) envBaseName = envBaseName.substr(sl + 1); }
-    if (interactive) glfwSetWindowTitle(g_window, ("HSR Renderer - loading " + envBaseName + " ...").c_str());
+    if (interactive && !apkPath.empty()) glfwSetWindowTitle(g_window, ("Quest Home Editor - loading " + envBaseName + " ...").c_str());
 
     // ── IN-PLACE ENV RELOAD LOOP ────────────────────────────────────────────────────────────────
     // The editor can SWAP the loaded env WITHOUT restarting the process: cook -> "Preview cooked
@@ -592,6 +586,12 @@ int main(int argc, char** argv) {
     // it synchronously, unchanged.
     auto loadSceneCPU = [&]() -> bool {
     g_loadProgress.set("Reading APK...");
+    // EMPTY SESSION (no home given): open the full editor anyway so the Logcat page + tools work standalone.
+    // Reuse the Blender/glTF path (built-in unlit shader fallback) with an EMPTY mesh list; drag a home in later.
+    if (apkPath.empty()) {   // empty session: no file to parse; reuse the glTF path's built-in shader with 0 meshes
+        fprintf(stderr, "[MAIN] Empty session - opening the editor with no home (drag one in anytime).\n");
+        isBlender = true; blenderMeshes.clear(); sceneMeshes = &blenderMeshes;
+    }
     // Companion env to render alongside (merged at the shared origin). Explicit via HSR_BACKDROP, or AUTO:
     // a "vista_" env is a BACKGROUND scenery for the haven2025 home, so auto-load haven2025 from the same
     // folder and render the home inside the vista (one command: just open the vista APK).
@@ -618,6 +618,7 @@ int main(int argc, char** argv) {
     // Blender round-trip IMPORT: a plain .gltf/.glb (NOT a V79 .ovrscene) = a re-imported, Blender-edited project.
     // Load it into MeshData[] so the editor's HSL tools can tweak it further and re-cook to an APK.
     g_loadProgress.set("Parsing scene...");
+    if (!apkPath.empty()) {   // empty session skips format detection (isBlender+empty meshes already set above)
     isBlender = gltfimport::isPlainGltf(apkPath) && gltfimport::importEnv(apkPath, blenderMeshes);
     isV79 = !isBlender && gltf.load(apkPath);
     if (isBlender) {
@@ -655,6 +656,7 @@ int main(int argc, char** argv) {
         if (companionPath.empty()) loader.applyLightmapOverrides(loader.meshes);   // single env (no companion)
         sceneMeshes = &loader.meshes;
     }
+    }   // end if(!apkPath.empty()) — empty session falls straight to the built-in shader below
 
     // Extract shaders from the manifest (RENDSHAD entries)
     g_loadProgress.set("Loading shaders...");

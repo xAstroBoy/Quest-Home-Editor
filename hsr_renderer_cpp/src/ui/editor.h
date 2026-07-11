@@ -77,6 +77,9 @@ struct Editor {
     VkRenderer*  r = nullptr;
     AudioPlayer* audio = nullptr;
     GLFWwindow*  win = nullptr;
+    GLFWcursor*  curH = nullptr; GLFWcursor* curV = nullptr; int wantCursor = 0;   // splitter resize cursors (1=H,2=V)
+    std::vector<std::pair<std::string,std::string>> adbDeviceList;                 // {serial, "Model (serial)"} for the device picker
+    bool adbDevScanned = false;                                                    // auto-scan devices once when the Cook panel opens
     bool ready = false;
     std::string projectPath;           // the loaded env path; the editor session saves/loads to <projectPath>.hsledit
     bool*  animOverride = nullptr;     // main's loop reads these through pointers (timeline scrub)
@@ -3392,6 +3395,7 @@ struct Editor {
 
     // ── layout (draggable ratios) ──
     float rightRatio = 0.235f, outlinerRatio = 0.45f, timelineH = 80.f;
+    bool panelLeft = false;   // dock the tool column on the LEFT instead of the right (header ⇆ toggle)
     VkRect2D rcHeader{}, rcViewport{}, rcOutliner{}, rcProps{}, rcTimeline{};
     int dragSplit = 0;           // 1=right border 2=outliner/props border 3=timeline border
 
@@ -3432,11 +3436,12 @@ struct Editor {
     std::string adbSerial, wifiIp;     // device serial ("" = default); wifiIp -> "adb connect" for wireless adb
     bool loadDiag = true;              // after an unrooted install+reload, capture the no-root env-load logcat and show WHY it was accepted/rejected
     // ── Logcat page state (live, NO-ROOT vrshell log viewer) ────────────────────────────────────────────────────
-    struct LogLine { std::string t; uint8_t sev; };   // sev: 0=V/D 1=I 2=W 3=E 4=env-load highlight
+    struct LogLine { std::string t; uint8_t sev; bool env; };   // sev: 0=V/D 1=I 2=W 3=E ; env=env-load line (highlight/filter)
     std::thread logThread; std::atomic<bool> logRun{false};
-    std::atomic<int> logMode{0};       // 0 = env-load lines only, 1 = ALL vrshell logs (--pid)
+    std::atomic<int> logMode{1};       // display filter: 0=env-load only, 1=all vrshell (--pid capture), 2=EVERYTHING (all logcat)
     std::mutex logMx; std::deque<LogLine> logBuf; std::string logLastRaw;
     float logScroll = 0.f; bool logStick = true;   // logScroll = pixel offset; logStick = auto-scroll to newest
+    bool autoLogStarted = false; std::atomic<bool> logVerboseSet{false};   // auto-start + one-time debug.logLevel=Verbose
     std::thread restoreThread; std::atomic<bool> restoring{false};   // "Restore original Haven 2025" button (runs off the UI thread)
     std::thread javaThread; std::atomic<int> javaState{0};           // proactive Java auto-install: 0=installing, 1=ready, 2=failed
     bool animSkinned = true;   // HZANIM skinned + 1-joint rigid clips (door/discs/screens/cars/train/sphere). DEFAULT ON:
@@ -3847,7 +3852,27 @@ struct Editor {
         drawOutliner();
         drawProperties();
         drawTimeline();
+        wantCursor = 0;
         drawSplitters();
+        // apply the resize cursor when hovering/dragging a splitter (create the standard cursors lazily)
+        if (win) {
+            if (!curH) curH = glfwCreateStandardCursor(GLFW_HRESIZE_CURSOR);
+            if (!curV) curV = glfwCreateStandardCursor(GLFW_VRESIZE_CURSOR);
+            glfwSetCursor(win, wantCursor==1 ? curH : wantCursor==2 ? curV : nullptr);
+        }
+        // EMPTY SESSION (no home loaded): a clear "drag a file here" prompt instead of a dark void.
+        if (r && r->gpuMeshes.empty()) {
+            VkRect2D v=rcViewport; float hdr=26*uiScale;
+            float vx=(float)v.offset.x, vy=(float)v.offset.y+hdr, vw=(float)v.extent.width, vh=(float)v.extent.height-hdr;
+            auto& th=cx.th;
+            cx.dl->pushClip(vx,vy,vw,vh);
+            cx.dl->rect(vx,vy,vw,vh, ui::rgba(28,30,38));
+            float cyc=vy+vh*0.5f;
+            cx.textAligned(vx, cyc-48*uiScale, vw, 34*uiScale, "Drag a home here to start", th.text, 1);
+            cx.textAligned(vx, cyc-6*uiScale,  vw, 20*uiScale, "Supported:  .apk   .gltf   .glb   .gltf.ovrscene   .opa", th.textDim, 1);
+            cx.textAligned(vx, cyc+26*uiScale, vw, 18*uiScale, "- or open the Logcat tab to diagnose a Quest (no root needed) -", th.textDim, 1);
+            cx.dl->popClip();
+        }
         drawContextMenu();                                      // floating; drawn last = on top
         drawAddMenu();
         drawHoleOverlay();                                      // numbered orange hole outlines - CLICK a marker to seal that hole
@@ -3865,18 +3890,21 @@ struct Editor {
     //    properties), and the 3D viewport filling the remaining left/center. Borders are draggable. ──
     void layout() {
         float W=(float)fbW, H=(float)fbH, hH=cx.th.headerH, tH=timelineH;
-        float rightW = std::clamp(W*rightRatio, 220.f*uiScale, W*0.5f);
+        float rightW = std::clamp(W*rightRatio, 220.f*uiScale, W*0.75f);   // up to 75% wide (log viewer / wide panels)
         float midY = hH, midH = H - hH - tH;
-        rcHeader   = {{0,0},{(uint32_t)W,(uint32_t)hH}};
-        rcViewport = {{0,(int)midY},{(uint32_t)(W-rightW),(uint32_t)midH}};
         float oH = std::clamp(midH*outlinerRatio, 80.f*uiScale, midH-80.f*uiScale);
-        rcOutliner = {{(int)(W-rightW),(int)midY},{(uint32_t)rightW,(uint32_t)oH}};
-        rcProps    = {{(int)(W-rightW),(int)(midY+oH)},{(uint32_t)rightW,(uint32_t)(midH-oH)}};
+        rcHeader   = {{0,0},{(uint32_t)W,(uint32_t)hH}};
+        float panelX = panelLeft ? 0.f : (W-rightW);         // tool column on the LEFT or RIGHT
+        float viewX  = panelLeft ? rightW : 0.f;
+        rcViewport = {{(int)viewX,(int)midY},{(uint32_t)(W-rightW),(uint32_t)midH}};
+        rcOutliner = {{(int)panelX,(int)midY},{(uint32_t)rightW,(uint32_t)oH}};
+        rcProps    = {{(int)panelX,(int)(midY+oH)},{(uint32_t)rightW,(uint32_t)(midH-oH)}};
         rcTimeline = {{0,(int)(H-tH)},{(uint32_t)W,(uint32_t)tH}};
     }
     void drawSplitters() {
-        // vertical: viewport|right column
-        float bx = (float)rcOutliner.offset.x, by=(float)rcHeader.extent.height, bh=(float)(rcViewport.extent.height);
+        // vertical: viewport|tool column (boundary = panel's viewport-facing edge, left OR right dock)
+        float bx = panelLeft ? (float)(rcOutliner.offset.x + rcOutliner.extent.width) : (float)rcOutliner.offset.x;
+        float by=(float)rcHeader.extent.height, bh=(float)(rcViewport.extent.height);
         handleSplit(1, bx-3, by, 6, bh, true);
         // horizontal: outliner|properties
         float hy = (float)rcProps.offset.y;
@@ -3890,10 +3918,11 @@ struct Editor {
     }
     void handleSplit(int id, float x, float y, float w, float h, bool vertical) {
         bool hv = cx.hover(x,y,w,h);
+        if (hv || dragSplit==id) wantCursor = vertical ? 1 : 2;   // show the resize cursor on hover/drag
         if (hv && cx.in.pressed[0]) dragSplit = id;
         if (dragSplit == id) {
             if (cx.in.down[0]) {
-                if (id==1) rightRatio = std::clamp((fbW - cx.in.mx)/(float)fbW, 0.12f, 0.5f);
+                if (id==1) rightRatio = std::clamp((panelLeft ? cx.in.mx : (fbW - cx.in.mx))/(float)fbW, 0.12f, 0.75f);
                 else if (id==2) { float midH=(float)rcViewport.extent.height; outlinerRatio = std::clamp((cx.in.my - rcHeader.extent.height)/midH, 0.12f, 0.88f); }
                 else if (id==3) timelineH = std::clamp((float)fbH - cx.in.my, 36.f, (float)fbH*0.5f);
             } else dragSplit = 0;
@@ -4804,7 +4833,11 @@ struct Editor {
         dl.rect(x,y,w,h, th.panelBg);
         // tab strip
         float th_h = 22*uiScale; const char* tabs[]={"Object","Scene","Material","Anim","Physics","Cook","Logcat"};
-        float tx=x, tw=w/7.f;
+        // dock ⇆ toggle: move the whole tool column to the other side ("not everyone likes the right side")
+        float dbw = 30*uiScale;
+        if (cx.tab(ui::hashId("dockside"), x, y, dbw, th_h, panelLeft?">>":"<<", false)) panelLeft=!panelLeft;
+        cx.tip(x, y, dbw, th_h, "Dock the tool panel on the LEFT / RIGHT.\nDrag the divider (up to 75%) to resize it.");
+        float tx=x+dbw, tw=(w-dbw)/7.f;
         for (int i=0;i<7;i++){ if (cx.tab(ui::hashId(4000+i,13), tx, y, tw, th_h, tabs[i], tab==i)) { tab=i; propScroll=0.f; } tx+=tw; }
         dl.rect(x,y+th_h,w,1,th.splitLine);
         // Logcat page owns its whole area (its own scroll + live stream); handle it BEFORE the shared propScroll logic.
@@ -5494,9 +5527,13 @@ struct Editor {
         cx.textField(ui::hashId("wifiip"), x+66*uiScale, y, w-66*uiScale-70*uiScale, th.rowH, wifiIp);
         if (cx.button(ui::hashId("wificon"), x+w-68*uiScale, y, 66*uiScale, th.rowH, "Connect")) wifiConnect();
         cx.tip(x,y0,w,th.rowH,"Wireless adb: type the headset IP (e.g. 192.168.1.35) and\nConnect. Enable Wi-Fi adb on the headset first.\nLeave blank to use a USB cable."); y+=th.rowH+2*uiScale;
+        // ── device PICKER (several Quests attached): click to CYCLE; Refresh re-scans `adb devices` ──
+        if (!adbDevScanned) refreshAdbDevices();
         y0=y; cx.label(x,y,64*uiScale,th.rowH,"Device",th.textDim);
-        cx.textField(ui::hashId("adbser"), x+66*uiScale, y, w-66*uiScale, th.rowH, adbSerial);
-        cx.tip(x,y0,w,th.rowH,"adb device serial to target (see `adb devices`).\nBlank = the default/only device. Set this when several\ndevices are attached at once."); y+=th.rowH;
+        float rbw=64*uiScale;
+        if (cx.button(ui::hashId("devpick"), x+66*uiScale, y, w-66*uiScale-rbw-4*uiScale, th.rowH, adbDeviceLabel().c_str())) cycleAdbDevice();
+        if (cx.button(ui::hashId("devref"), x+w-rbw, y, rbw, th.rowH, "Refresh")) { refreshAdbDevices(); setStatus("adb: "+std::to_string(adbDeviceList.size())+" device(s) attached."); }
+        cx.tip(x,y0,w,th.rowH,"Pick which attached Quest to target when several are connected.\nClick the name to CYCLE devices; Refresh re-scans `adb devices`.\n\"(default / only device)\" = unset (uses the single attached one)."); y+=th.rowH;
         cx.label(x,y,w,th.rowH*0.85f,"USB: leave blank. Wi-Fi: type IP, Connect.",th.textDim); y+=th.rowH*0.95f+6*uiScale;
         bool busy = cooking.load();
         if (busy) { cx.progressBar(x, y, w, th.rowH+2*uiScale, cookProg.load(), stageStr().c_str()); }
@@ -6467,6 +6504,34 @@ struct Editor {
 #endif
         return out;
     }
+    // Device PICKER: scan `adb devices -l` into adbDeviceList = {serial, "Model (serial)"} (ONLINE devices only).
+    void refreshAdbDevices(){
+        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        std::string out = adbCapture(bs(adbPath()), "", "devices -l");
+        adbDeviceList.clear(); adbDevScanned = true;
+        size_t s=0;
+        while (s<out.size()){ size_t nl=out.find('\n',s); std::string ln=out.substr(s, nl==std::string::npos?std::string::npos:nl-s); s=(nl==std::string::npos)?out.size():nl+1;
+            while(!ln.empty()&&(ln.back()=='\r'||ln.back()==' '||ln.back()=='\t')) ln.pop_back();
+            if(ln.empty()||ln.rfind("List of",0)==0||ln.rfind("* daemon",0)==0||ln.rfind("adb",0)==0) continue;
+            size_t sp=ln.find_first_of(" \t"); if(sp==std::string::npos) continue;
+            std::string serial=ln.substr(0,sp), rest=ln.substr(sp);
+            if(rest.find(" device")==std::string::npos && rest.find("\tdevice")==std::string::npos) continue;   // skip offline/unauthorized
+            std::string model; size_t mp=rest.find("model:"); if(mp!=std::string::npos){ mp+=6; size_t me=rest.find_first_of(" \t",mp); model=rest.substr(mp, me==std::string::npos?std::string::npos:me-mp); for(char&c:model) if(c=='_')c=' '; }
+            adbDeviceList.push_back({serial, model.empty()?serial:(model+"  ("+serial+")")});
+        }
+    }
+    // Cycle adbSerial through the attached devices (+ the "default/only" empty state). Rescans if the list is empty.
+    void cycleAdbDevice(){
+        if (adbDeviceList.empty()) refreshAdbDevices();
+        if (adbDeviceList.empty()) { adbSerial.clear(); return; }
+        int idx=-1; for(size_t i=0;i<adbDeviceList.size();++i) if(adbDeviceList[i].first==adbSerial){ idx=(int)i; break; }
+        ++idx; adbSerial = (idx>=(int)adbDeviceList.size()) ? std::string() : adbDeviceList[idx].first;
+    }
+    std::string adbDeviceLabel() const {
+        if (adbSerial.empty()) return "(default / only device)";
+        for (auto& d:adbDeviceList) if (d.first==adbSerial) return d.second;
+        return adbSerial;
+    }
     // True if the device's adb shell can act as root (su works, or adbd itself is root, or it's a userdebug build).
     // ROOT lets us install the proper own-package env and auto-select it via `oculuspreferences --setc`; without it
     // we fall back to the haven2025 spoof (which the user picks manually in the home menu).
@@ -6730,28 +6795,33 @@ struct Editor {
         char p = ln.empty()?'I':ln[0];                                   // `-v brief` starts with the priority letter
         return p=='E'?3 : p=='W'?2 : p=='I'?1 : 0;
     }
+    static bool isEnvLine(const std::string& ln){
+        static const char* K[] = {"EnvironmentSystem","EnvironmentManager","SetSystemEnvironment","AssetHandler",
+            "falling back","using fallback","postInitAsset","MeshDefinition","MaterialDefinition","asset manifest",
+            "entitlement","checkShellEnvironmentRequirements","as Environment","as Footprint","as Vista","Scene loaded",
+            "Hsr environment","Failed to load","Asset ptr error","unable to open package","LoadEntry not found",
+            "in zip from","package type not supported","ClayPackage","SystemComposer"};
+        for (auto k:K) if (ln.find(k)!=std::string::npos) return true; return false;
+    }
     void startLogStream(){
         if (logRun.exchange(true)) return;
         logThread = std::thread([this]{
             auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
             std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
-            static const char* KEEP[] = {"EnvironmentSystem","EnvironmentManager","SetSystemEnvironment","AssetHandler",
-                "falling back","using fallback","postInitAsset","MeshDefinition","MaterialDefinition","asset manifest",
-                "entitlement","checkShellEnvironmentRequirements","as Environment","as Footprint","as Vista","Scene loaded",
-                "Hsr environment","Failed to load","Asset ptr error","unable to open package","LoadEntry not found",
-                "in zip from","package type not supported","ClayPackage"};
+            // AUTOMATIC FULL VERBOSE: raise libshell's log threshold once (no root), so the log has maximum detail.
+            runAdb(ADB, sel, "shell setprop debug.logLevel Verbose"); logVerboseSet.store(true);
             while (logRun.load()){
                 std::string pid; { std::string pids=adbCapture(ADB, sel, "shell pidof com.oculus.vrshell"); for(char c:pids){ if(c=='\r'||c=='\n'||c==' ')break; pid.push_back(c);} }
-                std::string cmd = "logcat -d -v brief -t 4000";
-                if (logMode.load()==1 && !pid.empty()) cmd = "logcat -d -v brief --pid="+pid+" -t 4000";
+                // capture EVERYTHING: mode 2 (or while vrshell is mid-restart with no pid) grabs the whole buffer;
+                // otherwise scope to the vrshell process (--pid) so the ring buffer stays vrshell-focused.
+                std::string cmd = (logMode.load()==2 || pid.empty()) ? "logcat -d -v brief -t 8000"
+                                                                      : ("logcat -d -v brief --pid="+pid+" -t 8000");
                 std::string dump = adbCapture(ADB, sel, cmd);
                 std::vector<std::string> lines; { size_t s=0; while(s<dump.size()){ size_t nl=dump.find('\n',s); std::string l=dump.substr(s, nl==std::string::npos?std::string::npos:nl-s); while(!l.empty()&&l.back()=='\r')l.pop_back(); if(!l.empty())lines.push_back(l); s=(nl==std::string::npos)?dump.size():nl+1; } }
                 size_t startIdx=0; if(!logLastRaw.empty()){ for(size_t i=lines.size(); i-->0;){ if(lines[i]==logLastRaw){ startIdx=i+1; break; } } }
                 { std::lock_guard<std::mutex> lk(logMx);
-                  for (size_t i=startIdx;i<lines.size();++i){ const std::string& ln=lines[i];
-                      if (logMode.load()==0){ bool keep=false; for(auto k:KEEP) if(ln.find(k)!=std::string::npos){keep=true;break;} if(!keep) continue; }
-                      logBuf.push_back({ln, logSevOf(ln)}); }
-                  while (logBuf.size()>8000) logBuf.pop_front(); }
+                  for (size_t i=startIdx;i<lines.size();++i){ const std::string& ln=lines[i]; logBuf.push_back({ln, logSevOf(ln), isEnvLine(ln)}); }
+                  while (logBuf.size()>12000) logBuf.pop_front(); }
                 if (!lines.empty()) logLastRaw = lines.back();
                 for (int i=0;i<8 && logRun.load();++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
@@ -6775,49 +6845,141 @@ struct Editor {
         runAdb(ADB, sel, "shell setprop debug.logLevel Verbose");
         setStatus("debug.logLevel=Verbose set (no root). Reload the home for it to take effect.");
     }
-    void saveLogToFile(){
-        std::error_code ec; std::filesystem::create_directories("saved", ec);
-        std::string path = "saved/vrshell_logcat.txt";
-        std::ofstream f(path, std::ios::binary); if(!f){ setStatus("Could not write "+path); return; }
-        std::lock_guard<std::mutex> lk(logMx);
-        for (auto& l : logBuf) f << l.t << "\n";
-        setStatus("Saved "+std::to_string(logBuf.size())+" log lines -> "+path);
+    // Export a self-contained, SHAREABLE diagnostic report: device context + the (no-root) env-load log +
+    // an auto verdict. This is what an unrooted user sends back to figure out WHY their Quest fell back to nuxd.
+    void exportDiag(){
+        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
+        // default filename: quest_env_diag_<timestamp>.txt
+        char ts[32]; { std::time_t t=std::time(nullptr); std::tm tm{};
+#ifdef _WIN32
+            localtime_s(&tm,&t);
+#else
+            localtime_r(&t,&tm);
+#endif
+            std::strftime(ts,sizeof ts,"%Y%m%d_%H%M%S",&tm); }
+        std::string defBase = std::string("quest_env_diag_") + ts + ".txt";
+        std::string path;
+#ifdef _WIN32
+        std::wstring defName=L"quest_env_diag_"; { std::string s=ts; defName.append(s.begin(),s.end()); defName+=L".txt"; }
+        path = pickSaveWin32(L"Export env-load diagnostic report", defName.c_str());
+        if (path.empty()) return;   // dialog cancelled
+#else
+        // Linux/macOS: no native save dialog here -> write next to the exe's working dir (revealed after).
+        path = defBase;
+#endif
+        auto gp=[&](const char* p){ std::string v=adbCapture(ADB, sel, std::string("shell getprop ")+p); while(!v.empty()&&(v.back()=='\n'||v.back()=='\r'||v.back()==' '))v.pop_back(); return v; };
+        // snapshot the log
+        std::vector<LogLine> snap; { std::lock_guard<std::mutex> lk(logMx); snap.assign(logBuf.begin(), logBuf.end()); }
+        // device context (all NO-ROOT)
+        bool devOk = adbCapture(ADB, sel, "get-state").find("device")!=std::string::npos;
+        std::string model = gp("ro.product.model"), device = gp("ro.product.device");
+        std::string osrel = gp("ro.build.version.release"), disp = gp("ro.build.display.id");
+        bool rootAdb = adbCapture(ADB, sel, "shell id").find("uid=0")!=std::string::npos
+                    || adbCapture(ADB, sel, "shell su -c id").find("uid=0")!=std::string::npos;
+        std::string logLvl = gp("debug.logLevel");
+        std::string haven  = adbCapture(ADB, sel, "shell pm path com.meta.shell.env.footprint.haven2025");
+        std::string envpkgs= adbCapture(ADB, sel, "shell pm list packages com.environment");
+        // resolved env + verdict from the captured log
+        std::string resolved, verdict="(no env-load lines captured - use \"Reload home\" first)";
+        for (auto& l : snap){ if (l.t.find("SetSystemEnvironment resolved")!=std::string::npos || l.t.find("Scene loaded:")!=std::string::npos){ size_t p=l.t.find("apk://"); if(p!=std::string::npos) resolved=l.t.substr(p); } }
+        { bool fail=false, ok=false; std::string reason;
+          for (auto& l : snap){ const std::string& s=l.t;
+            if (s.find("falling back to device default")!=std::string::npos || s.find("using fallback environment")!=std::string::npos) fail=true;
+            if (s.find("Scene loaded")!=std::string::npos || s.find("Hsr environment loaded")!=std::string::npos) ok=true;
+            if (reason.empty()) for (const char* c : {"Asset ptr error","unable to open package","in zip from","LoadEntry not found","package type not supported","package path not valid","Failed to load hsr","deserialize asset manifest","MeshDefinition::fix","MaterialDefinition::fix","postInitAsset"}) if (s.find(c)!=std::string::npos){ size_t p=s.find("EnvironmentSystem"); reason=(p==std::string::npos?s:s.substr(p)); break; } }
+          if (fail) verdict = "REJECTED -> nuxd fallback." + (reason.empty()?std::string(""):("  Reason: "+reason));
+          else if (ok) verdict = "Home loaded OK (Scene loaded).";
+        }
+        std::ofstream f(path, std::ios::binary);
+        if (!f){ setStatus("Export failed (can't write "+path+")"); return; }
+        f << "=== Quest Home Editor - env-load diagnostic report ===\n";
+        f << "generated   : " << ts << "\n\n";
+        f << "--- device (all read WITHOUT root) ---\n";
+        f << "adb online  : " << (devOk?"yes":"NO - connect the Quest via adb") << "\n";
+        f << "serial      : " << (adbSerial.empty()?std::string("(default)"):adbSerial) << "\n";
+        f << "model       : " << model << "  (" << device << ")\n";
+        f << "os          : Android " << osrel << "  build " << disp << "\n";
+        f << "adb root    : " << (rootAdb?"yes":"no (unrooted - the spoof path)") << "\n";
+        f << "debug.logLevel: " << (logLvl.empty()?std::string("(unset)"):logLvl) << "\n\n";
+        f << "--- environment ---\n";
+        f << "resolved env: " << (resolved.empty()?std::string("(unknown - reload the home)"):resolved) << "\n";
+        f << "haven2025   : " << (haven.empty()?std::string("(not installed?)"):haven);
+        if (!haven.empty() && haven.back()!='\n') f << "\n";
+        f << "env packages:\n" << envpkgs << "\n";
+        f << "--- VERDICT ---\n" << verdict << "\n\n";
+        f << "--- env-load log (adb logcat -v brief, NO root; " << snap.size() << " lines) ---\n";
+        for (auto& l : snap) f << l.t << "\n";
+        f.close();
+        std::error_code ec; std::string abs = std::filesystem::absolute(path, ec).string();
+#ifdef _WIN32
+        system(("explorer /select,\""+abs+"\"").c_str());
+#elif defined(__APPLE__)
+        system(("open -R \""+abs+"\" >/dev/null 2>&1 &").c_str());                                  // reveal in Finder
+#else
+        system(("xdg-open \""+std::filesystem::path(abs).parent_path().string()+"\" >/dev/null 2>&1 &").c_str());   // open the folder
+#endif
+        setStatus("Exported diagnostic report ("+std::to_string(snap.size())+" log lines) -> "+abs);
     }
     void drawLogcatPanel(float x, float y, float w, float h){
         auto& dl=*cx.dl; auto& th=cx.th; ui::Font* lf = cx.mono? cx.mono : cx.font;
-        float rh=24*uiScale, pad=8*uiScale, bx=x+pad, by=y+pad;
-        auto btn=[&](const char* id,const char* s,float bw,bool acc=false){ bool r=cx.button(ui::hashId(id), bx, by, bw, rh, s, acc); bx+=bw+4*uiScale; return r; };
+        if (!autoLogStarted){ autoLogStarted=true; startLogStream(); }   // AUTO-START (+ auto full verbose) on first open
+        float rh=24*uiScale, pad=8*uiScale, gap=4*uiScale, bx=x+pad, by=y+pad, rowRight=x+w-pad;
+        // controls WRAP to a new row when they'd overflow the panel width (narrow / resized panels)
+        auto btn=[&](const char* id,const char* s,float bw,bool acc=false)->bool{
+            if (bx>x+pad && bx+bw>rowRight){ bx=x+pad; by+=rh+gap; }
+            bool r=cx.button(ui::hashId(id), bx, by, bw, rh, s, acc); bx+=bw+gap; return r; };
         if (btn("logss", logRun.load()?"Stop":"Start", 66*uiScale, logRun.load())) { if(logRun.load()) stopLogStream(); else startLogStream(); }
-        if (btn("logrel","Reload home",108*uiScale,true)) reloadShellForLog();
+        if (btn("logrel","Reload home",112*uiScale,true)) reloadShellForLog();
         if (btn("logclr","Clear",56*uiScale)) { std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); }
-        if (btn("logsave","Save",52*uiScale)) saveLogToFile();
-        { const char* m = logMode.load()==0? "Filter: Env-load" : "Filter: All vrshell";
-          if (cx.tab(ui::hashId("logmode"), bx, by, 132*uiScale, rh, m, true)) { logMode.store(logMode.load()^1); std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); } bx+=136*uiScale; }
-        if (btn("logverb","Verbose",76*uiScale)) setVerboseLogging();
-        float top = y+pad+rh+6*uiScale; dl.rect(x,top-3*uiScale,w,1,th.splitLine);
+        if (btn("logsave","Export",70*uiScale)) exportDiag();
+        { int mo=logMode.load(); const char* m = mo==0? "Filter: Env-load" : mo==1? "Filter: vrshell" : "Filter: EVERYTHING";
+          if (bx>x+pad && bx+138*uiScale>rowRight){ bx=x+pad; by+=rh+gap; }
+          if (cx.tab(ui::hashId("logmode"), bx, by, 138*uiScale, rh, m, true)) { logMode.store((mo+1)%3); std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); } bx+=138*uiScale+gap; }
+        // device picker (multiple Quests): click to cycle the target device (clears the log)
+        { std::string dv = adbSerial.empty()? std::string("Dev: default") : ("Dev: "+adbSerial);
+          float dbw = std::min(200.f*uiScale, 84.f*uiScale + (float)dv.size()*6.5f*uiScale);
+          if (bx>x+pad && bx+dbw>rowRight){ bx=x+pad; by+=rh+gap; }
+          if (cx.button(ui::hashId("logdev"), bx, by, dbw, rh, dv.c_str())) { cycleAdbDevice(); std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); } bx+=dbw+gap; }
+        float top = by+rh+6*uiScale; dl.rect(x,top-3*uiScale,w,1,th.splitLine);
         // log area
         float ax=x+pad, ay=top, aw=w-2*pad, ah=y+h-ay-pad; if(ah<20*uiScale) ah=20*uiScale;
         dl.rect(ax,ay,aw,ah, th.field); dl.border(ax,ay,aw,ah, th.border);
-        float lh = lf->lineHeight>1.f? lf->lineHeight+2*uiScale : 16*uiScale;
+        float lh = lf->lineHeight>1.f? lf->lineHeight+1*uiScale : 15*uiScale;
         std::vector<LogLine> snap; { std::lock_guard<std::mutex> lk(logMx); snap.assign(logBuf.begin(), logBuf.end()); }
-        float total = snap.size()*lh, maxScroll = std::max(0.f, total-ah+4*uiScale);
+        // display filter: mode 0 = env-load lines only; 1/2 = all captured lines
+        int mode=logMode.load(); std::vector<const LogLine*> view; view.reserve(snap.size());
+        for (auto& l : snap) if (mode!=0 || l.env) view.push_back(&l);
+        // WRAP each line to the panel width. Use a REALISTIC average glyph width (measuring 'm' — the widest —
+        // wrapped ~20% early, leaving blank space to the right); sample a natural mix of log chars instead.
+        static const char SAMP[] = "abcdefghijklmnopqrstuvwxyz0123456789 /:.()[]";   // 44 chars
+        float charW = lf->textWidth(SAMP)/44.f; if(charW<3.f) charW=6.f;
+        int maxChars = std::max(24, (int)((aw-10*uiScale)/charW));
+        auto rowsOf=[&](const std::string& s){ int n=(int)((s.size()+(size_t)maxChars-1)/(size_t)maxChars); return n<1?1:n; };
+        size_t totalRows=0; for (auto p:view) totalRows += rowsOf(p->t);
+        float total = totalRows*lh, maxScroll = std::max(0.f, total-ah+4*uiScale);
         if (cx.hover(ax,ay,aw,ah) && cx.in.wheel!=0){ logScroll -= cx.in.wheel*lh*3.f; logStick=false; }
         if (logStick) logScroll = maxScroll;
         logScroll = std::clamp(logScroll, 0.f, maxScroll);
         if (logScroll >= maxScroll-1.f) logStick=true;
         dl.pushClip(ax,ay,aw,ah);
-        int first=(int)(logScroll/lh); if(first<0)first=0;
-        float ly = ay+2*uiScale - (logScroll - first*lh);
-        for (int i=first; i<(int)snap.size() && ly<ay+ah; ++i, ly+=lh){
-            uint32_t col = snap[i].sev==3? ui::rgba(255,96,96) : snap[i].sev==4? ui::rgba(120,220,255)
-                         : snap[i].sev==2? ui::rgba(240,200,90) : snap[i].sev==1? th.text : th.textDim;
-            cx.textAligned(ax+5*uiScale, ly, aw-10*uiScale, lh, snap[i].t.c_str(), col, 0, lf);
+        float ly = ay+2*uiScale - logScroll;
+        for (auto p : view){
+            int rc=rowsOf(p->t); float lineH=rc*lh;
+            if (ly+lineH >= ay && ly < ay+ah){
+                uint32_t col = p->env? ui::rgba(120,220,255) : p->sev==3? ui::rgba(255,96,96)
+                             : p->sev==2? ui::rgba(240,200,90) : p->sev==1? th.text : th.textDim;
+                for (int r=0;r<rc;r++){ float ry=ly+r*lh; if(ry>=ay+ah)break; if(ry+lh<ay)continue;
+                    std::string seg=p->t.substr((size_t)r*maxChars, (size_t)maxChars);
+                    cx.textAligned(ax+5*uiScale, ry, aw-10*uiScale, lh, seg.c_str(), col, 0, lf); }
+            }
+            ly += lineH; if (ly >= ay+ah) break;
         }
         dl.popClip();
-        if (snap.empty())
+        if (view.empty())
             cx.textAligned(ax+8*uiScale, ay+8*uiScale, aw-16*uiScale, lh,
-                logRun.load()? "streaming... press \"Reload home\" to capture a fresh env-load (NO root needed)"
-                             : "Press Start, connect the Quest via adb (NO root), then \"Reload home\" to see WHY the env loads or falls back to nuxd.",
+                logRun.load()? "streaming (full verbose, no root)... press \"Reload home\" to capture a fresh env-load"
+                             : "Connect the Quest via adb (NO root). Streaming auto-starts; press \"Reload home\" to see WHY the env loads or falls back to nuxd.",
                 th.textDim, 0, lf);
     }
     // ── Blender round-trip ──────────────────────────────────────────────────────────────────────────────────────
@@ -6898,6 +7060,37 @@ struct Editor {
         return result;
 #else
         (void)title; return "";
+#endif
+    }
+    // Save-As dialog (returns the chosen path, or "" on cancel). Mirrors pickFileWin32 with IFileSaveDialog.
+    static std::string pickSaveWin32(const wchar_t* title, const wchar_t* defName, const wchar_t* filtName = L"Text (*.txt)", const wchar_t* filtSpec = L"*.txt") {
+#ifdef _WIN32
+        std::string result; bool co = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
+        IFileSaveDialog* dlg = nullptr;
+        if (SUCCEEDED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg))) && dlg) {
+            COMDLG_FILTERSPEC filt[] = { { filtName, filtSpec }, { L"All files", L"*.*" } };
+            dlg->SetFileTypes(2, filt); dlg->SetDefaultExtension(L"txt");
+            if (defName) dlg->SetFileName(defName);
+            DWORD opt = 0; dlg->GetOptions(&opt); dlg->SetOptions(opt | FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM);
+            if (title) dlg->SetTitle(title);
+            if (SUCCEEDED(dlg->Show(nullptr))) {
+                IShellItem* item = nullptr;
+                if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+                    PWSTR w = nullptr;
+                    if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &w)) && w) {
+                        int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+                        if (n > 1) { result.resize(n - 1); WideCharToMultiByte(CP_UTF8, 0, w, -1, &result[0], n, nullptr, nullptr); }
+                        CoTaskMemFree(w);
+                    }
+                    item->Release();
+                }
+            }
+            dlg->Release();
+        }
+        if (co) CoUninitialize();
+        return result;
+#else
+        (void)title; (void)defName; return "";
 #endif
     }
     // Import a Blender-edited glTF/glb back in. The env is rebuilt from the loader path (gltf_import.h), so we open it

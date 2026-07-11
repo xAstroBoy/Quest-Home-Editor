@@ -45,6 +45,28 @@ A GPU with **Vulkan** support is required on every OS (macOS via MoltenVK, which
 Full walkthrough: **[Installation & Setup](../../wiki/Installation-and-Setup)** →
 **[Cooking a Home](../../wiki/Cooking-a-Home)**.
 
+## My port fell back to Haven / nuxd — report it (no root needed)
+
+If a cooked home doesn't show up (the headset stays on Haven 2025 / the default), the shell
+**rejected** it and fell back. The **Logcat** tab tells you *exactly why* — and it works on an
+**unrooted** Quest (tethered `adb` only; no `su`, no Magisk):
+
+1. Connect the Quest by USB (or wireless `adb`) — Developer Mode on, USB-debugging accepted.
+2. Open the **`Logcat`** tab. It **auto-starts** at full verbosity (`debug.logLevel Verbose`,
+   set with no root) and streams `com.oculus.vrshell`'s log live.
+3. Click **`Reload home`** — that clears the log and restarts the shell so you capture the *fresh*
+   env load. Watch the highlighted (cyan) `EnvironmentSystem` lines:
+   - `Scene loaded: apk://…` → it loaded fine.
+   - `Environment failed to load … falling back to device default …` → it was **rejected**, and the
+     line just above it is the reason (`Asset ptr error … reason: …`, `Failed to find '…' in zip`,
+     `LoadEntry not found`, `package type not supported`, `MeshDefinition::fix …`, …).
+4. Click **`Export`** → it writes a self-contained report (device model/OS, selected env, the load
+   log, and a one-line verdict) and reveals it. **Attach that file** when you report the issue on
+   [Discord / Issues](#community) — it pinpoints the cause.
+
+`Filter` cycles the view **Env-load ↔ vrshell ↔ EVERYTHING**; the tool column can be **dragged wider
+(up to 75%)** and **docked left or right** (the `<<` / `>>` button on the tab strip).
+
 ## What it does
 
 **Porting (the point of it all)**

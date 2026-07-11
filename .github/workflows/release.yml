@@ -30,16 +30,16 @@ jobs:
         include:
           - os: windows-latest
             name: windows-x64
-            bin: hsr_renderer.exe
-            out: hsr_renderer-windows-x64.exe
+            bin: Quest Home Editor.exe
+            out: Quest-Home-Editor-windows-x64.exe
           - os: ubuntu-latest
             name: linux-x64
-            bin: hsr_renderer
-            out: hsr_renderer-linux-x64
+            bin: Quest Home Editor
+            out: Quest-Home-Editor-linux-x64
           - os: macos-latest
             name: macos-arm64
-            bin: hsr_renderer
-            out: hsr_renderer-macos-arm64
+            bin: Quest Home Editor
+            out: Quest-Home-Editor-macos-arm64
     steps:
       - uses: actions/checkout@v4
 
