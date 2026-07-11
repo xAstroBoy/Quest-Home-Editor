@@ -108,10 +108,11 @@ patches your Quest's VrShell (far-clip escape, moonjump/fly, no-gravity, live pl
 on-device control bridge) so the editor's live controls and headset mirror work. Source only; you build it
 against your own headset's VrShell.
 
-**Renderer (the ground truth)**
+**Renderer (a faithful preview replica)**
 - Vulkan replica of `libshell`'s HSR pipeline: per-material `MeshShellEnv`, reversed-Z,
-  authored blend state, IBL, lightmaps, fog — the desktop preview is the reference the cook
-  is validated against, so *what you preview is what you cook*.
+  authored blend state, IBL, lightmaps, fog. It is a **close preview, not the final word** — the
+  **Quest's own `libshell` is the real renderer**; some things only appear correctly on the headset,
+  so **always verify a cook on-device**.
 
 ## Building from source
 
