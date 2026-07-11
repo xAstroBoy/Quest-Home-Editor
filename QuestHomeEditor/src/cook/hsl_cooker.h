@@ -1929,6 +1929,34 @@ inline std::string downloadBuildTools(const std::function<void(float,const char*
     return bt;
 }
 
+// DOWNLOAD Google's official platform-tools (adb + AdbWin*.dll) and extract them BESIDE the exe, so the
+// `platform-tools/adb.exe` path that adbPath() already probes lights up. Returns the adb path, "" on failure.
+inline std::string downloadPlatformTools(const std::function<void(float,const char*)>& prog) {
+    namespace fs = std::filesystem; std::error_code ec;
+    std::string exeDir = AppConfig::exeRel("");
+    if (!exeDir.empty() && (exeDir.back()=='/'||exeDir.back()=='\\')) exeDir.pop_back();
+#if defined(_WIN32)
+    const char* osTag = "windows"; const char* adbName = "platform-tools/adb.exe";
+#elif defined(__APPLE__)
+    const char* osTag = "darwin";  const char* adbName = "platform-tools/adb";
+#else
+    const char* osTag = "linux";   const char* adbName = "platform-tools/adb";
+#endif
+    std::string already = exeDir + "/" + adbName;
+    if (fs::exists(already, ec)) return already;                      // fetched on a previous run
+    std::string url = std::string("https://dl.google.com/android/repository/platform-tools-latest-") + osTag + ".zip";
+    std::string zip = exeDir + "/platform-tools.zip";
+    if (!httpDownload(url, zip, prog, "Downloading Android platform-tools / adb (~15MB, one time)")) return "";
+    if (prog) prog(0.70f, "Extracting platform-tools");
+    if (!extractZipTo(zip, exeDir)) { if (prog) prog(1.0f, "platform-tools extract failed"); return ""; }  // zip has a top-level platform-tools/ dir
+    fs::remove(zip, ec);
+    std::string adb = exeDir + "/" + adbName;
+#ifndef _WIN32
+    if (fs::exists(adb, ec)) fs::permissions(adb, fs::perms::owner_exec|fs::perms::group_exec|fs::perms::others_exec, fs::perm_options::add, ec);
+#endif
+    return fs::exists(adb, ec) ? adb : "";
+}
+
 // build-tools to use: HSR_BUILDTOOLS -> installed SDK -> AUTO-DOWNLOAD beside the exe.
 inline std::string ensureBuildTools(const std::function<void(float,const char*)>& prog) {
     const char* btEnv = std::getenv("HSR_BUILDTOOLS");
