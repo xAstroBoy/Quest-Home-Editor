@@ -63,6 +63,9 @@ static inline void hsrSockTimeoutMs(SOCKET s, int ms) {
 #include <chrono>
 #include <atomic>
 #include <mutex>
+#include <deque>
+#include <fstream>
+#include <filesystem>
 #include <set>
 #include <map>
 #include <array>
@@ -3393,7 +3396,7 @@ struct Editor {
     int dragSplit = 0;           // 1=right border 2=outliner/props border 3=timeline border
 
     // ── properties tabs ──
-    enum { TAB_OBJECT, TAB_SCENE, TAB_MATERIAL, TAB_ANIM, TAB_PHYSICS, TAB_COOK };
+    enum { TAB_OBJECT, TAB_SCENE, TAB_MATERIAL, TAB_ANIM, TAB_PHYSICS, TAB_COOK, TAB_LOGCAT };
     int tab = TAB_OBJECT;
 
     // ── cook (threaded) ──
@@ -3427,6 +3430,13 @@ struct Editor {
                                        // when UNROOTED (rooted headsets hot-swap via the environment_selected IPC, no kill
                                        // needed); 1=Always; 2=Never. Cook-panel cycle button.
     std::string adbSerial, wifiIp;     // device serial ("" = default); wifiIp -> "adb connect" for wireless adb
+    bool loadDiag = true;              // after an unrooted install+reload, capture the no-root env-load logcat and show WHY it was accepted/rejected
+    // ── Logcat page state (live, NO-ROOT vrshell log viewer) ────────────────────────────────────────────────────
+    struct LogLine { std::string t; uint8_t sev; };   // sev: 0=V/D 1=I 2=W 3=E 4=env-load highlight
+    std::thread logThread; std::atomic<bool> logRun{false};
+    std::atomic<int> logMode{0};       // 0 = env-load lines only, 1 = ALL vrshell logs (--pid)
+    std::mutex logMx; std::deque<LogLine> logBuf; std::string logLastRaw;
+    float logScroll = 0.f; bool logStick = true;   // logScroll = pixel offset; logStick = auto-scroll to newest
     std::thread restoreThread; std::atomic<bool> restoring{false};   // "Restore original Haven 2025" button (runs off the UI thread)
     std::thread javaThread; std::atomic<int> javaState{0};           // proactive Java auto-install: 0=installing, 1=ready, 2=failed
     bool animSkinned = true;   // HZANIM skinned + 1-joint rigid clips (door/discs/screens/cars/train/sphere). DEFAULT ON:
@@ -3533,7 +3543,7 @@ struct Editor {
         if (geomThread.joinable()) geomThread.join();
         if (ready) { vkDeviceWaitIdle(r->device); uiDraw.destroy(); ready = false; }
     }
-    ~Editor() { if (cookThread.joinable()) cookThread.join(); if (restoreThread.joinable()) restoreThread.join(); if (javaThread.joinable()) javaThread.join(); if (geomThread.joinable()) geomThread.join(); }
+    ~Editor() { stopLogStream(); if (cookThread.joinable()) cookThread.join(); if (restoreThread.joinable()) restoreThread.join(); if (javaThread.joinable()) javaThread.join(); if (geomThread.joinable()) geomThread.join(); }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  INPUT  (GLFW callbacks in main route here; we accumulate into cx.in, cleared at end of buildFrame)
@@ -4793,10 +4803,12 @@ struct Editor {
         float x=(float)a.offset.x, y=(float)a.offset.y, w=(float)a.extent.width, h=(float)a.extent.height;
         dl.rect(x,y,w,h, th.panelBg);
         // tab strip
-        float th_h = 22*uiScale; const char* tabs[]={"Object","Scene","Material","Anim","Physics","Cook"};
-        float tx=x, tw=w/6.f;
-        for (int i=0;i<6;i++){ if (cx.tab(ui::hashId(4000+i,13), tx, y, tw, th_h, tabs[i], tab==i)) { tab=i; propScroll=0.f; } tx+=tw; }
+        float th_h = 22*uiScale; const char* tabs[]={"Object","Scene","Material","Anim","Physics","Cook","Logcat"};
+        float tx=x, tw=w/7.f;
+        for (int i=0;i<7;i++){ if (cx.tab(ui::hashId(4000+i,13), tx, y, tw, th_h, tabs[i], tab==i)) { tab=i; propScroll=0.f; } tx+=tw; }
         dl.rect(x,y+th_h,w,1,th.splitLine);
+        // Logcat page owns its whole area (its own scroll + live stream); handle it BEFORE the shared propScroll logic.
+        if (tab==TAB_LOGCAT) { drawLogcatPanel(x, y+th_h+1, w, h-th_h-1); return; }
         // SCROLLABLE content: the tool panels outgrew the window - mouse wheel over the panel scrolls,
         // the offset applies to every tab's content, clamped generously (tabs report no exact height).
         if (cx.hover(x, y+th_h, w, h-th_h) && cx.in.wheel!=0) propScroll -= cx.in.wheel * th.rowH * 3.f;
@@ -6622,8 +6634,10 @@ struct Editor {
         // Shell restart is an OPTION (Auto=only unrooted / Always / Never). UNROOTED needs it (nothing else reloads the
         // replaced haven2025); the reload is `am force-stop` (kill is denied to uid 2000) — see relaunchShell.
         if (shellRestart==1 || (shellRestart==0 && !rooted)) {
-            if (progress) progress(0.99f, "relaunch shell");
+            if (progress) progress(0.99f, loadDiag ? "relaunch + diagnose load" : "relaunch shell");
+            if (loadDiag) { runAdb(ADB, sel, "shell setprop debug.logLevel Verbose"); runAdb(ADB, sel, "logcat -c"); }   // raise verbosity + clear (no root)
             relaunchShell(ADB, sel);
+            if (loadDiag) setStatus(captureEnvDiagnostics(ADB, sel, pkg, apkPath+".loaddiag.txt"));   // NO-ROOT: read WHY it loaded/rejected
         }
         return true;
     }
@@ -6645,6 +6659,166 @@ struct Editor {
         // a rooted su-kill of the exact pid is a cleaner bonus when available.
         if (!pid.empty()) runAdb(ADB, sel, "shell su -c \"kill "+pid+"\"");   // rooted (best-effort, cleaner)
         runAdb(ADB, sel, "shell am force-stop com.oculus.vrshell");           // universal no-root reload
+    }
+    // ── NO-ROOT env-load diagnostics ("why did my home get rejected -> nuxd?") ──────────────────────────────────
+    // libshell logs its ENTIRE EnvironmentSystem/EnvironmentManager load path to logcat (via __android_log_write,
+    // tag "Clay"/"Shell"), and the reject reasons are emitted UNCONDITIONALLY at error level. `adb logcat` needs
+    // NO ROOT (the shell uid holds READ_LOGS), so on a retail/unrooted Quest we can read exactly why the env failed.
+    // We ALSO raise `debug.logLevel Verbose` (a shell-settable debug prop libshell reads at process init) for extra
+    // context. The EXACT strings below are lifted from libshell.so v206 (IDA): the fallback marker @0x2091c6, the
+    // manager reason @0xa73c0, and the specific causes (Asset ptr error @0xae208, Failed-to-find-in-zip @0x208f1b,
+    // LoadEntry-not-found @0x20922c, MeshDefinition/MaterialDefinition::fix, manifest FourCc/version, etc.).
+    // Writes the full filtered env-load log to <apk>.loaddiag.txt and returns a one-line verdict for the status bar.
+    std::string captureEnvDiagnostics(const std::string& ADB, const std::string& sel, const std::string& pkg, const std::string& diagPath) {
+        // The lines that matter (substring match against each logcat line).
+        static const std::vector<std::string> KEEP = {
+            "EnvironmentSystem:", "EnvironmentManager:", "SetSystemEnvironment resolved", "AssetHandler",
+            "falling back to device default", "using fallback environment", "postInitAsset",
+            "MeshDefinition::fix", "MaterialDefinition::fix", "Failed to deserialize asset manifest",
+            "Skipping entitlement check", "checkShellEnvironmentRequirements", "as Environment", "as Footprint",
+            "as Vista", "Scene loaded", "Hsr environment loaded", "Failed to load asset", "Asset ptr error",
+            "unable to open package", "LoadEntry not found", "in zip from", "package type not supported",
+            "package path not valid", "ClayPackage",
+        };
+        // Poll the log until a terminal marker lands (success or fallback), or ~12s.
+        std::string dump;
+        for (int i = 0; i < 16; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(750));
+            dump = adbCapture(ADB, sel, "logcat -d -v brief -t 6000");   // -d = dump+exit; no root needed
+            if (dump.find("Scene loaded") != std::string::npos ||
+                dump.find("falling back to device default") != std::string::npos ||
+                dump.find("using fallback environment") != std::string::npos) break;
+        }
+        // Filter to the env-load lines.
+        std::string filtered; size_t start = 0;
+        while (start < dump.size()) {
+            size_t nl = dump.find('\n', start); std::string line = dump.substr(start, nl==std::string::npos?std::string::npos:nl-start);
+            start = (nl==std::string::npos) ? dump.size() : nl+1;
+            for (const auto& k : KEEP) if (line.find(k) != std::string::npos) { filtered += line; if(!filtered.empty()&&filtered.back()!='\n') filtered += '\n'; break; }
+        }
+        // Persist the full filtered log for the user to share.
+        if (!diagPath.empty()) { std::ofstream f(diagPath, std::ios::binary); if (f) f << "# env-load diagnostics (adb logcat, no root) for " << pkg << "\n" << filtered; }
+        // Classify a one-line verdict. Pull the first concrete REASON line if it fell back.
+        auto has = [&](const char* s){ return dump.find(s) != std::string::npos; };
+        auto firstReason = [&]() -> std::string {
+            static const char* CAUSES[] = { "Asset ptr error", "unable to open package", "in zip from",
+                "LoadEntry not found", "package type not supported", "package path not valid",
+                "Failed to load hsr", "Failed to deserialize asset manifest", "MeshDefinition::fix",
+                "MaterialDefinition::fix", "postInitAsset", "reason:" };
+            size_t s2 = 0;
+            while (s2 < filtered.size()) { size_t nl = filtered.find('\n', s2); std::string ln = filtered.substr(s2, nl==std::string::npos?std::string::npos:nl-s2); s2 = (nl==std::string::npos)?filtered.size():nl+1;
+                for (auto c : CAUSES) if (ln.find(c) != std::string::npos) {
+                    size_t p = ln.find("EnvironmentSystem"); if (p==std::string::npos) p = ln.find("EnvironmentManager");
+                    return p==std::string::npos ? ln : ln.substr(p); } }
+            return "";
+        };
+        if (has("falling back to device default") || has("using fallback environment")) {
+            std::string r = firstReason();
+            return "REJECTED -> nuxd fallback. " + (r.empty() ? std::string("see ")+diagPath : r);
+        }
+        if (has("Scene loaded") || has("Hsr environment loaded")) return "Home loaded OK on device (Scene loaded).";
+        if (filtered.empty()) return "No env-load logs captured (device asleep, or shell didn't reload). Wake the Quest + retry.";
+        return std::string("Load inconclusive - see ") + diagPath;
+    }
+    // ── LIVE no-root logcat stream for the Logcat page ──────────────────────────────────────────────────────────
+    static uint8_t logSevOf(const std::string& ln){
+        static const char* HL[] = { "EnvironmentSystem", "EnvironmentManager", "falling back to device default",
+            "using fallback environment", "postInitAsset", "MeshDefinition::fix", "MaterialDefinition::fix",
+            "Asset ptr error", "unable to open package", "LoadEntry not found", "Scene loaded",
+            "Hsr environment loaded", "package type not supported", "in zip from", "deserialize asset manifest" };
+        for (auto h : HL) if (ln.find(h)!=std::string::npos) return 4;   // env-load highlight
+        char p = ln.empty()?'I':ln[0];                                   // `-v brief` starts with the priority letter
+        return p=='E'?3 : p=='W'?2 : p=='I'?1 : 0;
+    }
+    void startLogStream(){
+        if (logRun.exchange(true)) return;
+        logThread = std::thread([this]{
+            auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+            std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
+            static const char* KEEP[] = {"EnvironmentSystem","EnvironmentManager","SetSystemEnvironment","AssetHandler",
+                "falling back","using fallback","postInitAsset","MeshDefinition","MaterialDefinition","asset manifest",
+                "entitlement","checkShellEnvironmentRequirements","as Environment","as Footprint","as Vista","Scene loaded",
+                "Hsr environment","Failed to load","Asset ptr error","unable to open package","LoadEntry not found",
+                "in zip from","package type not supported","ClayPackage"};
+            while (logRun.load()){
+                std::string pid; { std::string pids=adbCapture(ADB, sel, "shell pidof com.oculus.vrshell"); for(char c:pids){ if(c=='\r'||c=='\n'||c==' ')break; pid.push_back(c);} }
+                std::string cmd = "logcat -d -v brief -t 4000";
+                if (logMode.load()==1 && !pid.empty()) cmd = "logcat -d -v brief --pid="+pid+" -t 4000";
+                std::string dump = adbCapture(ADB, sel, cmd);
+                std::vector<std::string> lines; { size_t s=0; while(s<dump.size()){ size_t nl=dump.find('\n',s); std::string l=dump.substr(s, nl==std::string::npos?std::string::npos:nl-s); while(!l.empty()&&l.back()=='\r')l.pop_back(); if(!l.empty())lines.push_back(l); s=(nl==std::string::npos)?dump.size():nl+1; } }
+                size_t startIdx=0; if(!logLastRaw.empty()){ for(size_t i=lines.size(); i-->0;){ if(lines[i]==logLastRaw){ startIdx=i+1; break; } } }
+                { std::lock_guard<std::mutex> lk(logMx);
+                  for (size_t i=startIdx;i<lines.size();++i){ const std::string& ln=lines[i];
+                      if (logMode.load()==0){ bool keep=false; for(auto k:KEEP) if(ln.find(k)!=std::string::npos){keep=true;break;} if(!keep) continue; }
+                      logBuf.push_back({ln, logSevOf(ln)}); }
+                  while (logBuf.size()>8000) logBuf.pop_front(); }
+                if (!lines.empty()) logLastRaw = lines.back();
+                for (int i=0;i<8 && logRun.load();++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        });
+    }
+    void stopLogStream(){ logRun.store(false); if(logThread.joinable()) logThread.join(); }
+    // Reload the home (no root) so the FRESH env load streams into the log; raise verbosity + clear first.
+    void reloadShellForLog(){
+        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
+        runAdb(ADB, sel, "shell setprop debug.logLevel Verbose");
+        { std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); }
+        runAdb(ADB, sel, "logcat -c");
+        runAdb(ADB, sel, "shell am force-stop com.oculus.vrshell");
+        logStick=true; if(!logRun.load()) startLogStream();
+        setStatus("Reloaded home + cleared log - watch the Logcat page for the env-load result.");
+    }
+    void setVerboseLogging(){
+        auto bs=[](std::string p){ for(char&c:p) if(c=='/')c='\\'; return p; };
+        std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
+        runAdb(ADB, sel, "shell setprop debug.logLevel Verbose");
+        setStatus("debug.logLevel=Verbose set (no root). Reload the home for it to take effect.");
+    }
+    void saveLogToFile(){
+        std::error_code ec; std::filesystem::create_directories("saved", ec);
+        std::string path = "saved/vrshell_logcat.txt";
+        std::ofstream f(path, std::ios::binary); if(!f){ setStatus("Could not write "+path); return; }
+        std::lock_guard<std::mutex> lk(logMx);
+        for (auto& l : logBuf) f << l.t << "\n";
+        setStatus("Saved "+std::to_string(logBuf.size())+" log lines -> "+path);
+    }
+    void drawLogcatPanel(float x, float y, float w, float h){
+        auto& dl=*cx.dl; auto& th=cx.th; ui::Font* lf = cx.mono? cx.mono : cx.font;
+        float rh=24*uiScale, pad=8*uiScale, bx=x+pad, by=y+pad;
+        auto btn=[&](const char* id,const char* s,float bw,bool acc=false){ bool r=cx.button(ui::hashId(id), bx, by, bw, rh, s, acc); bx+=bw+4*uiScale; return r; };
+        if (btn("logss", logRun.load()?"Stop":"Start", 66*uiScale, logRun.load())) { if(logRun.load()) stopLogStream(); else startLogStream(); }
+        if (btn("logrel","Reload home",108*uiScale,true)) reloadShellForLog();
+        if (btn("logclr","Clear",56*uiScale)) { std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); }
+        if (btn("logsave","Save",52*uiScale)) saveLogToFile();
+        { const char* m = logMode.load()==0? "Filter: Env-load" : "Filter: All vrshell";
+          if (cx.tab(ui::hashId("logmode"), bx, by, 132*uiScale, rh, m, true)) { logMode.store(logMode.load()^1); std::lock_guard<std::mutex> lk(logMx); logBuf.clear(); logLastRaw.clear(); } bx+=136*uiScale; }
+        if (btn("logverb","Verbose",76*uiScale)) setVerboseLogging();
+        float top = y+pad+rh+6*uiScale; dl.rect(x,top-3*uiScale,w,1,th.splitLine);
+        // log area
+        float ax=x+pad, ay=top, aw=w-2*pad, ah=y+h-ay-pad; if(ah<20*uiScale) ah=20*uiScale;
+        dl.rect(ax,ay,aw,ah, th.field); dl.border(ax,ay,aw,ah, th.border);
+        float lh = lf->lineHeight>1.f? lf->lineHeight+2*uiScale : 16*uiScale;
+        std::vector<LogLine> snap; { std::lock_guard<std::mutex> lk(logMx); snap.assign(logBuf.begin(), logBuf.end()); }
+        float total = snap.size()*lh, maxScroll = std::max(0.f, total-ah+4*uiScale);
+        if (cx.hover(ax,ay,aw,ah) && cx.in.wheel!=0){ logScroll -= cx.in.wheel*lh*3.f; logStick=false; }
+        if (logStick) logScroll = maxScroll;
+        logScroll = std::clamp(logScroll, 0.f, maxScroll);
+        if (logScroll >= maxScroll-1.f) logStick=true;
+        dl.pushClip(ax,ay,aw,ah);
+        int first=(int)(logScroll/lh); if(first<0)first=0;
+        float ly = ay+2*uiScale - (logScroll - first*lh);
+        for (int i=first; i<(int)snap.size() && ly<ay+ah; ++i, ly+=lh){
+            uint32_t col = snap[i].sev==3? ui::rgba(255,96,96) : snap[i].sev==4? ui::rgba(120,220,255)
+                         : snap[i].sev==2? ui::rgba(240,200,90) : snap[i].sev==1? th.text : th.textDim;
+            cx.textAligned(ax+5*uiScale, ly, aw-10*uiScale, lh, snap[i].t.c_str(), col, 0, lf);
+        }
+        dl.popClip();
+        if (snap.empty())
+            cx.textAligned(ax+8*uiScale, ay+8*uiScale, aw-16*uiScale, lh,
+                logRun.load()? "streaming... press \"Reload home\" to capture a fresh env-load (NO root needed)"
+                             : "Press Start, connect the Quest via adb (NO root), then \"Reload home\" to see WHY the env loads or falls back to nuxd.",
+                th.textDim, 0, lf);
     }
     // ── Blender round-trip ──────────────────────────────────────────────────────────────────────────────────────
     // Modern full-Explorer FOLDER picker (IFileOpenDialog + FOS_PICKFOLDERS). Returns "" on cancel / non-Windows.
