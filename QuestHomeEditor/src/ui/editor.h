@@ -7661,6 +7661,7 @@ struct Editor {
         if (std::getenv("HSR_NOAUDIO")) cookAudio=false;  // headless/CLI: cook a silent home (no background audio loop)
         if (std::getenv("HSR_NOINSTALL")) installAfterCook=false;   // batch/CLI: cook the APK files only, don't touch the device
         if (std::getenv("HSR_NOAUTOFLOOR")) cookAutoFloor=false;   // headless/CLI: honor the no-generated-collision flag (runCook re-derives the env var from this)
+        if (std::getenv("HSR_NOBOUNDSOVERRIDE")) antiCull=false;    // headless/CLI: honor "Anti-cull bounds" OFF (runCook re-derives it from antiCull, else the member default clobbers the env var)
         setenv_("HSR_HZANIM", animSkinned ? "1" : "");   // BEFORE buildExportMeshes (same as startCook): the extractor's RIGID+UV gates read it
         auto ems = buildExportMeshes();
         std::array<float,3> spawn{ r->cam.pos[0], r->cam.pos[1], r->cam.pos[2] };
