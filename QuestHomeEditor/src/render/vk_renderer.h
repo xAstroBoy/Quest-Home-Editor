@@ -1,6 +1,7 @@
 #pragma once
 #include "core/types.h"
 #include "core/camera.h"
+#include "core/config.h"   // AppConfig::s_gpuName (specs banner)
 #include "render/ibl.h"
 #include <vector>
 #include <string>
@@ -2472,6 +2473,7 @@ private:
                 if (qfProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT && presentSupport) {
                     physicalDevice = pd;
                     graphicsQueueFamily = i;
+                    AppConfig::s_gpuName = props.deviceName;   // fills the GPU line of the log/export specs banner
                     log("  Selected: %s, queue family %u", props.deviceName, i);
                     // Probe shaderFloat16 support (needed by Haven's real PBR shaders). On a 1.0-only
                     // loader vkGetPhysicalDeviceFeatures2 doesn't exist - degrade instead of crashing.
@@ -3048,6 +3050,12 @@ public:
         depthAtt.format = VK_FORMAT_D32_SFLOAT;   // FLOAT depth: reversed-Z only gains precision on a float buffer.
                                                   // D24_UNORM gave reversed-Z NO benefit -> z-fighting/blinking at the
                                                   // huge 0.1..40000 range. D32_SFLOAT = near-uniform precision, no z-fight.
+        // HSR_DEVDEPTH = DEVICE-FAITHFUL Z-FIGHT PREVIEW: the Quest shell renders through a D24 depth buffer (reversed-Z
+        // gains it NOTHING = standard non-linear precision), so coplanar/near-coplanar cooked surfaces z-fight ON DEVICE
+        // that our D32_SFLOAT preview resolves cleanly (= "the renderer doesn't show the fighting"). Toggle D24 to make
+        // the preview reproduce the device's precision so z-fighting is visible + fixable BEFORE cooking.
+        { const char* dd = std::getenv("HSR_DEVDEPTH");
+          if (dd && std::string(dd) != "d32") depthAtt.format = VK_FORMAT_D24_UNORM_S8_UINT; }   // =d32 keeps float depth but device near/far (A/B the format alone)
         depthAtt.samples = VK_SAMPLE_COUNT_1_BIT;
         depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -4045,6 +4053,8 @@ public:
 
     void createDepthResources() {
         VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;   // float depth for reversed-Z (see renderpass note)
+        { const char* dd = std::getenv("HSR_DEVDEPTH");
+          if (dd && std::string(dd) != "d32") depthFormat = VK_FORMAT_D24_UNORM_S8_UINT; }   // device-faithful z-fight preview (see renderpass)
         createImage(swapchainExtent.width, swapchainExtent.height, depthFormat,
                     VK_IMAGE_TILING_OPTIMAL,
                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
@@ -4508,6 +4518,16 @@ public:
     void fitFarToScene() {
         if (farFitDone || gpuMeshes.empty()) return;
         farFitDone = true;
+        // HSR_DEVDEPTH also matches the Quest eye camera's clip range (PortalStereoCamera near=0.066 far=5000, a
+        // HARDCODED shell value — [[project_hsr_eye_subcamera_farclip]]). With the D24 buffer this reproduces the
+        // device's exact depth-precision distribution, so preview z-fighting matches on-device 1:1. (Far geometry
+        // beyond 5000 GPU-clips here just as it does on device.) HSR_CLIPFAR overrides the far.
+        if (std::getenv("HSR_DEVDEPTH")) {
+            cam.nearZ = 0.066f; cam.farZ = 5000.0f;
+            if (const char* e = std::getenv("HSR_CLIPFAR")) { float v=(float)atof(e); if (v>0) cam.farZ=v; }
+            log("  [DEVDEPTH] device-faithful depth: D24 buffer, near=%.3f far=%.0f (Quest portal camera precision)", cam.nearZ, cam.farZ);
+            return;
+        }
         // HSR_CLIP: use the DEVICE's finite far/near clip planes (from space.hstf) instead of fitting to scene.
         // Geometry beyond farClippingPlane is then GPU-clipped exactly as on-device — toggle off to draw all.
         if (std::getenv("HSR_CLIP") && sceneFarClip > 0.f) {

@@ -6507,7 +6507,10 @@ struct Editor {
         setenv_("HSR_HZANIM", animSkinned ? "1" : "");   // emit skeletal HZANIM clips so skinned meshes ANIMATE on device (clouds/koi/droids)
         setenv_("HSR_NOCULL", noCull ? "1" : "");         // scene-spanning bounds -> V205 never culls our meshes (V79-style draw-everything); fixes cooked-home clipping
         setenv_("HSR_NOAUTOFLOOR", cookAutoFloor ? "" : "1");   // Cook-tab toggle: OFF = no generated floor/walls at all
-        setenv_("HSR_NAVTRIMESH", solidCollision ? "1" : "");  // real double-sided trimesh collider (haven2025 SEBD: 16-align manifest + 128-align RTree + count-shift); off -> ColliderBox grid
+        // real double-sided trimesh collider (haven2025 SEBD: 16-align manifest + 128-align RTree + count-shift); off -> ColliderBox grid.
+        // SEBD holds on device (v206 confirmed). HSR_FORCE_NAVBOX = escape hatch to the always-compatible ColliderBox
+        // tilted-box path (device builds it from halfExtents, no cooked RTree) if a future PhysX build ever rejects the RTree.
+        setenv_("HSR_NAVTRIMESH", (solidCollision && !std::getenv("HSR_FORCE_NAVBOX")) ? "1" : "");
         setenv_("HSR_NAVSLOPE", "");                           // no forced slope: the bake's solidCollision path now keeps ALL faces natively incl. CEILINGS (the old "0" dropped the roof undersides -> jump-through)
         setenv_("HSR_VOXSOLID", voxelSolid ? "1" : "");        // thick all-sides voxel ColliderBoxes: OPT-IN, DEFAULT OFF (reverted — it walled off room interiors, "can't walk inside rooms"). Default collision = thin per-triangle floor+wall boxes (walkable). HSR_VOXSOLID re-enables for the thin-wall clip case.
         // HSL render config -> cook's ScenePlatformComponent (the SAME values the live preview applies = WYSIWYG)
@@ -7155,7 +7158,7 @@ struct Editor {
             for (const auto& k : KEEP) if (line.find(k) != std::string::npos) { filtered += line; if(!filtered.empty()&&filtered.back()!='\n') filtered += '\n'; break; }
         }
         // Persist the full filtered log for the user to share.
-        if (!diagPath.empty()) { std::ofstream f(diagPath, std::ios::binary); if (f) f << "# env-load diagnostics (adb logcat, no root) for " << pkg << "\n" << filtered; }
+        if (!diagPath.empty()) { std::ofstream f(diagPath, std::ios::binary); if (f) f << "# " << AppConfig::sysInfo() << "# env-load diagnostics (adb logcat, no root) for " << pkg << "\n" << filtered; }
         // Classify a one-line verdict. Pull the first concrete REASON line if it fell back.
         auto has = [&](const char* s){ return dump.find(s) != std::string::npos; };
         if (has("falling back to device default") || has("using fallback environment")) {
@@ -7317,8 +7320,9 @@ struct Editor {
         }
         std::ofstream f(path, std::ios::binary);
         if (!f){ setStatus("Export failed (can't write "+path+")"); return; }
-        f << "=== Quest Home Editor - env-load diagnostic report ===\n";
+        f << "=== Quest Home Editor v" << AppConfig::s_version << " - env-load diagnostic report ===\n";
         f << "generated   : " << ts << "\n\n";
+        f << "--- editor build + host PC ---\n" << AppConfig::sysInfo() << "\n";
         f << "--- device (all read WITHOUT root) ---\n";
         f << "adb online  : " << (devOk?"yes":"NO - connect the Quest via adb") << "\n";
         f << "serial      : " << (adbSerial.empty()?std::string("(default)"):adbSerial) << "\n";

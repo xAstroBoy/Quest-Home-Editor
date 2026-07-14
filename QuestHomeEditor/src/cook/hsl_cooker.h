@@ -2405,6 +2405,27 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     // blend). Filled as each mesh's final MATL is chosen; the coplanar-overlap z-fight audit below the loop only
     // needs to check depth-writing surfaces (blend never writes depth, so it can't z-fight — it can only sort wrong).
     std::vector<uint8_t> zDepthWrite(meshesV.size(), 0);
+    // ── SMART FLOOR = AUTO MESH-COLLIDER ──────────────────────────────────────────────────────────────────────
+    // When auto-floor collision is ON and the env has NO user-placed Navmesh item, give EVERY STATIC mesh a real
+    // SEBD trimesh collider (exactly the per-mesh "add collider" that works by hand, applied to all static geometry)
+    // so floors/walls/columns are solid — you walk the actual surfaces and can't phase through walls, instead of the
+    // up-facing heightfield smart floor which shipped NO usable collision. GEOMETRICALLY-animated meshes (skinned/
+    // HZANIM move, spin, translate, scale) are SKIPPED — a static collider would be wrong for a moving mesh (the
+    // rule: "any mesh EXCEPT animated ones"). Material-only anims (UV-scroll/flipbook) keep a collider — geometry is
+    // static. Skyboxes skipped. HSR_NOAUTOFLOOR (editor "Auto floor collision" OFF) or HSR_NOSMARTMESHCOL disables.
+    bool autoMeshCollide = false;
+    { bool userNavPre = false;
+      for (const auto& si : sceneItems) if (si.type == sitem::NAVMESH && si.navVerts.size() >= 9) { userNavPre = true; break; }
+      autoMeshCollide = !std::getenv("HSR_NOAUTOFLOOR") && !userNavPre && !std::getenv("HSR_NOSMARTMESHCOL");
+      if (autoMeshCollide) { size_t nCol=0;
+          for (auto& mm : meshesV) {
+              bool geomAnim = (mm.hzFrames > 1) || mm.rotAnim || mm.rotReplay || mm.transAnim || mm.scaleAnim;
+              bool isSky = mm.name.find("sky")!=std::string::npos || mm.name.find("Sky")!=std::string::npos;
+              if (!geomAnim && !isSky && mm.positions.size() >= 9 && mm.indices.size() >= 3) { mm.wantCollider = true; ++nCol; }
+          }
+          if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] smart floor = AUTO MESH-COLLIDER: %zu static meshes -> SEBD trimesh colliders (no user navmesh)\n", nCol);
+      }
+    }
     for (size_t i = 0; i < meshesV.size(); ++i) {
         if (progress && (i % 8 == 0 || i + 1 == meshesV.size())) { char sb[64]; snprintf(sb, sizeof sb, "Cooking mesh %zu/%zu", i+1, meshesV.size()); prog(0.05f + 0.70f*(float)i/(float)meshesV.size(), sb); }
         if (ctOn) { char sb[128]; snprintf(sb, sizeof sb, "  mesh %zu/%zu '%s' (%zu verts, %zu tris)", i, meshesV.size(), meshesV[i].name.c_str(), meshesV[i].positions.size()/3, meshesV[i].indices.size()/3); ctrace(sb); }
@@ -4071,6 +4092,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                 }
             }
             if (userNav) { nTiles=1; if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] smart floor skipped (user navmesh is the ground)\n"); goto floorFallback; }
+            if (autoMeshCollide) { nTiles=1; if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] heightfield smart floor skipped (per-mesh SEBD colliders are the ground)\n"); goto floorFallback; }
             if (wt.empty() || wmxx<=wmnx || wmxz<=wmnz) goto floorFallback;
             {
             float ex2=wmxx-wmnx, ez2=wmxz-wmnz, ext2=ex2>ez2?ex2:ez2;

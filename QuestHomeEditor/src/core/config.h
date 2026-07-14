@@ -22,8 +22,10 @@
 #elif defined(__APPLE__)
   #include <mach-o/dyld.h>     // _NSGetExecutablePath
   #include <unistd.h>
+  #include <sys/utsname.h>
 #else
   #include <unistd.h>          // readlink(/proc/self/exe)
+  #include <sys/utsname.h>
 #endif
 
 struct AppConfig {
@@ -47,6 +49,42 @@ struct AppConfig {
     // tools dropped beside the exe — no env vars, no SDK install. exeRel() resolves a path relative to it.
     static inline std::string s_exeDir;
     static std::string exeRel(const std::string& rel) { return s_exeDir.empty() ? rel : (s_exeDir + "/" + rel); }
+
+    // ── build version + host machine specs ────────────────────────────────────────────────────────────────────
+    // Bump on every release. Printed at the top of each run's `Quest Home Editor.log`, shown in the window title,
+    // and prepended to every logcat/diag EXPORT — so a shared log or bug report always states WHICH build produced
+    // it and on WHAT hardware. s_gpuName is filled in by the renderer once a Vulkan device is picked.
+    static constexpr const char* s_version = "0.10.15";
+    static inline std::string s_gpuName;
+
+    static std::string sysInfo() {   // multi-line: version + OS + CPU + RAM + GPU
+        std::string out = std::string("Quest Home Editor v") + s_version + "\n";
+        char v[600];
+#ifdef _WIN32
+        auto rk = [](const char* key, const char* val, char* dst, DWORD cap)->bool{
+            DWORD sz = cap; return RegGetValueA(HKEY_LOCAL_MACHINE, key, val, RRF_RT_REG_SZ, nullptr, dst, &sz) == ERROR_SUCCESS; };
+        char osName[256]="", osDisp[64]="", osBuild[64]="", cpu[256]="";
+        rk("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "ProductName",       osName,  sizeof osName);
+        rk("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "DisplayVersion",    osDisp,  sizeof osDisp);
+        rk("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "CurrentBuildNumber",osBuild, sizeof osBuild);
+        rk("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString", cpu, sizeof cpu);
+        for (int i=(int)strlen(cpu)-1; i>=0 && cpu[i]==' '; --i) cpu[i]=0;   // trim registry trailing spaces
+        std::string osStr = osName[0]?osName:"Windows";
+        if (osBuild[0] && atoi(osBuild) >= 22000) { size_t w10=osStr.find("Windows 10"); if (w10!=std::string::npos) osStr.replace(w10, 10, "Windows 11"); }   // registry ProductName lies "Windows 10" on 11
+        out += std::string("OS:  ") + osStr + (osDisp[0]?std::string(" ")+osDisp:"") + (osBuild[0]?std::string(" (build ")+osBuild+")":"") + "\n";
+        SYSTEM_INFO si; GetSystemInfo(&si);
+        snprintf(v, sizeof v, "CPU: %s (%lu threads)\n", cpu[0]?cpu:"?", (unsigned long)si.dwNumberOfProcessors); out += v;
+        MEMORYSTATUSEX ms; ms.dwLength = sizeof ms; if (GlobalMemoryStatusEx(&ms)) { snprintf(v, sizeof v, "RAM: %.1f GB\n", ms.ullTotalPhys/1073741824.0); out += v; }
+#else
+        struct utsname un; if (uname(&un)==0) { snprintf(v, sizeof v, "OS:  %s %s %s\n", un.sysname, un.release, un.machine); out += v; }
+        long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+        long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGE_SIZE);
+        snprintf(v, sizeof v, "CPU: %ld threads\n", nproc>0?nproc:0); out += v;
+        if (pages>0 && psz>0) { snprintf(v, sizeof v, "RAM: %.1f GB\n", (double)pages*(double)psz/1073741824.0); out += v; }
+#endif
+        out += std::string("GPU: ") + (s_gpuName.empty()?std::string("(pending device init)"):s_gpuName) + "\n";
+        return out;
+    }
 
     // Full path of the running executable — portable (Win32 / macOS / Linux). "" if the OS can't say.
     static std::string exePath() {

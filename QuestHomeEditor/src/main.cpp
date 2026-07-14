@@ -188,6 +188,9 @@ static void hsrHttpServer(int port) {
 #include "io/gltf_export.h"   // Blender round-trip: env -> glTF 2.0 project
 #include "app_icon_rgba.h"    // embedded 64x64 window/taskbar icon (from icon.png)
 #include "io/gltf_import.h"   // Blender round-trip: re-import an edited glTF project
+#include "io/glb2apk.h"       // a dropped/opened .glb/.gltf -> a Quest Home source .ovrscene APK (community GLB support:
+                              // externalizes embedded textures to PNG/JPEG + folds the real UV set into TEXCOORD_0 so
+                              // GLB models don't render black; then the normal gltf_loader .ovrscene path consumes it)
 #include "miniz.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -229,6 +232,13 @@ static void genEditorIcon(int S, std::vector<unsigned char>& px) {
 static void dropCb(GLFWwindow*, int count, const char** paths) {
     if (count > 0 && paths[0]) {
         std::string p = paths[0];
+        // A raw .glb/.gltf model is NOT an env APK (every loader keys on assets/scene.zip): repack it into a source
+        // .ovrscene APK first (glb2apk — embedded-texture + wrong-UV fixes) and load THAT as if an APK had been dropped.
+        if (glb2apk::isModel(p)) {
+            std::string err, apk = glb2apk::convertForDrop(p, err);
+            if (apk.empty()) { fprintf(stderr, "[DROP] glb2apk convert failed: %s\n", err.c_str()); return; }   // keep current env
+            p = apk;
+        }
         // accept .apk (and any path — the loader figures out the rest)
         g_dropPath = p; g_doReload = true;
         fprintf(stderr, "[DROP] reload -> %s\n", p.c_str());
@@ -481,9 +491,10 @@ int main(int argc, char** argv) {
 #endif
     }
     fprintf(stderr, "========================================================\n");
-    fprintf(stderr, " Quest Home Editor - libshell.so Vulkan replica + cooker\n");
+    fprintf(stderr, " Quest Home Editor v%s - libshell.so Vulkan replica + cooker\n", AppConfig::s_version);
     fprintf(stderr, " Drag an .apk / .opa / .gltf onto the window to load it\n");
-    fprintf(stderr, "========================================================\n\n");
+    fprintf(stderr, "========================================================\n");
+    fprintf(stderr, "%s\n", AppConfig::sysInfo().c_str());   // version + PC specs at the TOP of every .log
     if (!std::getenv("HSR_NO_TOOLCHECK")) hslcook::reportToolchain();   // startup readiness of the signing toolchain (-> log)
 
     // ── standalone APK signer: `Quest Home Editor --sign <foo.apk> [more.apk ...]` ──────────────────────────────
@@ -585,7 +596,7 @@ int main(int argc, char** argv) {
         glfwWindowHint(GLFW_FOCUSED, GLFW_FALSE);
         glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_FALSE);
         if (std::getenv("HSR_FLOATING")) glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
-        g_window = glfwCreateWindow(g_winW, g_winH, "HSR Renderer - Quest Home Editor", nullptr, nullptr);
+        g_window = glfwCreateWindow(g_winW, g_winH, (std::string("Quest Home Editor v") + AppConfig::s_version).c_str(), nullptr, nullptr);
         if (!g_window) { fprintf(stderr, "Window creation failed\n"); glfwTerminate(); return 1; }
 #ifndef __APPLE__   // macOS windows have no icons - glfwSetWindowIcon just logs Cocoa error 65548 there
         { GLFWimage icons[2]; std::vector<unsigned char> p48, p32; genEditorIcon(48,p48); genEditorIcon(32,p32);
@@ -594,7 +605,7 @@ int main(int argc, char** argv) {
         glfwSetDropCallback(g_window, dropCb);
         // Launched bare: DON'T block on a drop-zone popup. Open the FULL editor with an empty scene so the
         // Logcat page (and all tools) are usable standalone; drag a home onto the window anytime to load it.
-        if (apkPath.empty()) glfwSetWindowTitle(g_window, "Quest Home Editor - drag a home in, or use the Logcat tab");
+        if (apkPath.empty()) glfwSetWindowTitle(g_window, (std::string("Quest Home Editor v") + AppConfig::s_version + " - drag a home in, or use the Logcat tab").c_str());
     }
     fprintf(stderr, "[MAIN] APK: %s\n\n", apkPath.empty()?"(none - empty session)":apkPath.c_str());
     std::string envBaseName = apkPath;
@@ -680,6 +691,15 @@ int main(int argc, char** argv) {
     // Load it into MeshData[] so the editor's HSL tools can tweak it further and re-cook to an APK.
     g_loadProgress.set("Parsing scene...");
     if (!apkPath.empty()) {   // empty session skips format detection (isBlender+empty meshes already set above)
+    // A raw .glb/.gltf model dropped in / passed on the command line is repacked into a source .ovrscene APK first
+    // (glb2apk: externalize embedded textures + fold the real UV set into TEXCOORD_0), so it flows down the proven
+    // gltf_loader .ovrscene path (correct textures/materials/anims) instead of rendering black. Falls back to the raw
+    // Blender-import path if conversion fails. HSR_NOGLB2APK forces the old raw import (Blender round-trip debugging).
+    if (glb2apk::isModel(apkPath) && !std::getenv("HSR_NOGLB2APK")) {
+        std::string err, conv = glb2apk::convertForDrop(apkPath, err);
+        if (!conv.empty()) { fprintf(stderr, "[GLB2APK] %s -> %s\n", apkPath.c_str(), conv.c_str()); apkPath = conv; }
+        else fprintf(stderr, "[GLB2APK] convert failed (%s) — falling back to raw glTF import\n", err.c_str());
+    }
     isBlender = gltfimport::isPlainGltf(apkPath) && gltfimport::importEnv(apkPath, blenderMeshes);
     isV79 = !isBlender && gltf.load(apkPath);
     if (isBlender) {
