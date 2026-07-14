@@ -1270,6 +1270,41 @@ public:
         float meanLocal[3]={0,0,0}; { size_t nvv=rec->basePos.size()/3;
             if (nvv){ double s0=0,s1=0,s2=0; for (size_t v=0;v<nvv;v++){ s0+=rec->basePos[v*3]; s1+=rec->basePos[v*3+1]; s2+=rec->basePos[v*3+2]; }
                       meanLocal[0]=(float)(s0/nvv); meanLocal[1]=(float)(s1/nvv); meanLocal[2]=(float)(s2/nvv); } }
+        // DENSIFY FAST SPINNERS: the device NLERPs the ACL joint clip between bake frames. If the WORLD rotation
+        // between consecutive frames is large, NLERP diverges from the true SLERP arc -> verts far from the spin
+        // axis err by (angle-gap × radius) (synthwave Cylinder.008 spins fast at 30fps -> ~51° gap -> 36u rim error,
+        // ANIM-VERIFY maxErr 36). Sample the composed rotation finely, SUM the per-step angle = the TOTAL angular
+        // travel, and raise NF so each bake step rotates < ~7° (NLERP≈SLERP there). Slow spins (small travel) are
+        // UNCHANGED, so the grid-aligned common case is untouched; a fast spinner's smooth translation resamples off
+        // -grid harmlessly (the Star-Trek sawtooth-translation teleport is not a fast spinner, so it never triggers).
+        // MIRROR GUARD for the two spin heuristics below: a node with a NEGATIVE-determinant world matrix (outerwilds
+        // planets carry a uniform NEGATIVE scale -51) is a rotoinversion — matTrs extracts a POSITIVE scale + a GARBAGE
+        // quaternion, so per-frame "rotation" deltas are pure noise. That wrecked both passes (densify blew NF to 146k
+        // on a bogus ~1M° travel; unwrap counted 144k phantom "resets"). Skip both for mirrored nodes — their RELATIVE
+        // -clip variant already carries the flip. det(W_3x3) sign = the flip test (scale magnitude is irrelevant).
+        // SCALE-INDEPENDENT flip test: NORMALIZE each column (strip scale) so det = ±1 = proper/mirror regardless of
+        // scale magnitude, and read it at the first NON-degenerate frame (japan's fast fans have a degenerate frame-0
+        // scale from the flame-fix path — a raw det(W0)≈0 there would wrongly exclude a genuinely proper spinner).
+        bool spinProper = true;
+        for (int s=0; s<4; s++){ float W[16]; worldAt(node, clipDur*(float)s/4.f, W);
+            float c0=sqrtf(W[0]*W[0]+W[1]*W[1]+W[2]*W[2]), c1=sqrtf(W[4]*W[4]+W[5]*W[5]+W[6]*W[6]), c2=sqrtf(W[8]*W[8]+W[9]*W[9]+W[10]*W[10]);
+            if (c0<1e-5f||c1<1e-5f||c2<1e-5f) continue;   // degenerate frame — sign unreliable, try the next
+            float a0=W[0]/c0,a1=W[1]/c0,a2=W[2]/c0, b0=W[4]/c1,b1=W[5]/c1,b2=W[6]/c1, e0=W[8]/c2,e1=W[9]/c2,e2=W[10]/c2;
+            float dN = a0*(b1*e2-b2*e1) + a1*(b2*e0-b0*e2) + a2*(b0*e1-b1*e0);
+            spinProper = dN > 0.f; break; }
+        if (!std::getenv("HSR_NOSPINDENSIFY") && spinProper) {
+            int SN = NF > 200 ? NF : 200; float pq[4]={0,0,0,1}; double angTravel=0; bool have=false;
+            for (int s = 0; s <= SN; s++) { float W[16]; worldAt(node, clipDur*(float)s/(float)SN, W);
+                float q[4],tt[3],ss[3]; matTrs(W,q,tt,ss);
+                if (have){ double d=pq[0]*q[0]+pq[1]*q[1]+pq[2]*q[2]+pq[3]*q[3]; if(d<0)d=-d; if(d>1)d=1; angTravel += 2.0*acos(d); }
+                pq[0]=q[0];pq[1]=q[1];pq[2]=q[2];pq[3]=q[3]; have=true; }
+            int needNF = (int)(angTravel / (7.0*3.14159265358979/180.0) + 0.5);
+            if (needNF > 8192) needNF = 8192;   // safety cap: no real spinner needs >160 spins of frames
+            if (needNF > NF) {
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[GLTF-RIGID] mesh%d node%d SPIN-DENSIFY: %.0f° travel -> NF %d->%d\n", meshIdx, node, angTravel*57.2957795, NF, needNF);
+                NF = needNF; bakeFps = (float)NF / clipDur;
+            }
+        }
         float cen0[3]={0,0,0}, vertTravel=0.f;   // vertTravel = centroid travel (orbit magnitude)
         std::vector<float> mats((size_t)NF*16);
         float o0[3]={0,0,0}, maxd=0.f, rotMaxd=0.f, sclMaxd=0.f, rs0[9]={0}, sc0[3]={1,1,1};
@@ -1320,6 +1355,52 @@ public:
                         meshIdx, node, maxd, vertTravel, rotMaxd, sclMaxd, clipDur, requireRotation ? "AND (R>=0.02 or S>=0.05)" : "");
             return e;
         }
+        // ── CONTINUOUS SPIN UNWRAP (synthwave/steam_void far spinners, maxErr 36). A node whose OWN rotation loops
+        //    a sub-360° MONOTONIC segment (Cylinder.008: 120° over 1.667s, repeated ~20× inside the 33s clip) bakes
+        //    as a SAWTOOTH. The device NLERPs every internal reset (120°->0°) as a fast BACKWARD flick, while the
+        //    V79 source resets INSTANTLY — invisible on the 3-fold-symmetric mesh the 120°=360/3 loop was authored
+        //    for, so the source reads as a smooth 72°/s spin and our flick is the visible bug. A single ACL clip
+        //    can only teleport at ITS OWN loop, never at 20 internal ones, so the only faithful device motion is a
+        //    CONTINUOUS forward spin: detect the recurring big backward jumps and re-accumulate the rotation as one
+        //    monotonic spin (identical on the symmetric mesh, 20 flicks -> at most 1 at the clip seam). HSR_NOSPINUNWRAP off.
+        //    (ANIM-VERIFY scores this "worse" — it demands the device reproduce the per-vertex sawtooth, which no
+        //    interpolating GPU animator can; the smooth spin is the correct visual, the metric is the artifact here.)
+        if (!std::getenv("HSR_NOSPINUNWRAP") && NF >= 8 && spinProper) {
+            std::vector<float> qs((size_t)NF*4), ts((size_t)NF*3), ss((size_t)NF*3);
+            for (int f=0; f<NF; f++) matTrs(&mats[(size_t)f*16], &qs[(size_t)f*4], &ts[(size_t)f*3], &ss[(size_t)f*3]);
+            std::vector<float> ang(NF, 0.f); int resets=0; double sumNorm=0; int nNorm=0;
+            const float RESET = 0.5236f;   // 30°: a one-frame jump this big is a wrap, not real motion
+            for (int f=1; f<NF; f++) {
+                float* q=&qs[(size_t)f*4]; float* p=&qs[(size_t)(f-1)*4];
+                float dt=p[0]*q[0]+p[1]*q[1]+p[2]*q[2]+p[3]*q[3];
+                if (dt<0){ q[0]=-q[0];q[1]=-q[1];q[2]=-q[2];q[3]=-q[3]; dt=-dt; }   // hemisphere-continuous
+                if (dt>1)dt=1; float a=2.f*acosf(dt); ang[f]=a;
+                if (a>RESET) resets++; else { sumNorm+=a; nNorm++; }
+            }
+            // Only a RECURRING sawtooth (>=2 resets) riding a real underlying spin qualifies; a lone sharp turn or a
+            // static node never triggers, so legit rigid clips are untouched.
+            if (resets>=2 && nNorm>0 && sumNorm/nNorm>1e-4) {
+                auto qmul=[](const float*a,const float*b,float*o){
+                    float x=a[3]*b[0]+a[0]*b[3]+a[1]*b[2]-a[2]*b[1];
+                    float y=a[3]*b[1]-a[0]*b[2]+a[1]*b[3]+a[2]*b[0];
+                    float z=a[3]*b[2]+a[0]*b[1]-a[1]*b[0]+a[2]*b[3];
+                    float w=a[3]*b[3]-a[0]*b[0]-a[1]*b[1]-a[2]*b[2]; o[0]=x;o[1]=y;o[2]=z;o[3]=w; };
+                std::vector<float> Q((size_t)NF*4); for(int k=0;k<4;k++) Q[k]=qs[k];
+                float prevD[4]={0,0,0,1}; bool haveD=false;
+                for (int f=1; f<NF; f++) {
+                    float cp[4]={-qs[(size_t)(f-1)*4],-qs[(size_t)(f-1)*4+1],-qs[(size_t)(f-1)*4+2],qs[(size_t)(f-1)*4+3]};
+                    float d[4]; qmul(&qs[(size_t)f*4], cp, d);           // world incremental rotation q[f]*conj(q[f-1])
+                    if (d[3]<0){ d[0]=-d[0];d[1]=-d[1];d[2]=-d[2];d[3]=-d[3]; }
+                    if (ang[f]>RESET && haveD) { d[0]=prevD[0];d[1]=prevD[1];d[2]=prevD[2];d[3]=prevD[3]; }  // continue, don't reset
+                    else { prevD[0]=d[0];prevD[1]=d[1];prevD[2]=d[2];prevD[3]=d[3]; haveD=true; }
+                    float nq[4]; qmul(d, &Q[(size_t)(f-1)*4], nq);
+                    float l=sqrtf(nq[0]*nq[0]+nq[1]*nq[1]+nq[2]*nq[2]+nq[3]*nq[3]); if(l>1e-8f)for(int k=0;k<4;k++)nq[k]/=l;
+                    for(int k=0;k<4;k++) Q[(size_t)f*4+k]=nq[k];
+                }
+                for (int f=0; f<NF; f++) trsMat(&ts[(size_t)f*3], &Q[(size_t)f*4], &ss[(size_t)f*3], &mats[(size_t)f*16]);
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[GLTF-RIGID] mesh%d node%d SPIN-UNWRAP: %d internal resets -> continuous spin\n", meshIdx, node, resets);
+            }
+        }
         const float* W0 = &mats[0];
         // ── IDENTITY-BIND + RELATIVE clip M(f) = W(f)·inv(W0) (the mirror / non-uniform-scale fix, ANIM-VERIFY
         //    2026-07-08): the old scheme (bind = matTrs(W0) with ONE uniform scale, clip = matTrs(W(f))) LOSES
@@ -1361,31 +1442,68 @@ public:
             for (int c=0;c<3 && bindClean;c++) for (int rr=0;rr<3;rr++)
                 if (std::fabs(rc[c*3+rr]*w0su - W0[c*4+rr]) > 1e-3f*std::max(std::fabs(w0su),1.f)) { bindClean = false; break; }
         }
-        // variant 0 = W0-bind + W(f) clip (proven; needs a bind-representable W0)
-        // variant 1 = identity bind + RELATIVE M(f)=W(f)·inv(W0) clip + W0-baked rest (mirror/non-uniform W0)
-        // variant 2 = identity bind + RAW W(f) clip + LOCAL rest (tinyplanet fire1: non-uniform W0 AND animated
-        //             scale — inv(W0) conjugates the axis-aligned scale into SHEAR M(f) can't carry, while W(f)
-        //             itself IS clean TRS; ship it directly and keep the verts node-local: vert = W(f)·base exact)
-        int variant = bindClean ? 0 : 1;
+        // ── SCHEME SELECTION (pick by SHEAR of the raw per-frame world matrix, NOT by W0 uniformity) ──
+        // variant 0 = UNIT bind (Tref·Rref) + per-axis scale-RATIO clip + Wref-baked rest. Handles uniform OR
+        //   NON-uniform axis-aligned scale (per-axis ratio) at ANY tiny world scale (unit bind -> invBind never
+        //   blows up). REQUIRES W(f) to be a clean TRS (matTrs = T·R·diag(S), no shear).
+        // variant 1 = identity bind + RELATIVE M(f)=W(f)·inv(W0) clip + W0-baked rest (cancels a MIRROR/sheared
+        //   W0). ⚠ inv(W0) EXPLODES when W0 scale is tiny -> M(f) translation ~|T0|/s0 huge -> ACL quantization
+        //   thrash = the mesh TELEPORTS out of place (rifthome flamecube2-5: node scale 1.2 × 0.01 root = ~0.012
+        //   world -> M(f) transl ~333). So v1 is ONLY for genuine shear, never merely non-uniform scale.
+        // variant 2 = identity bind + RAW W(f) clip + LOCAL rest (non-uniform W0 AND animated scale, shear case).
+        // A clean-TRS node (all the flames/leaves: translation + axis-aligned scale, zero shear) ALWAYS takes the
+        // stable variant 0; only a truly SHEARED W(f) (a parent's non-uniform scale × this node's rotation) falls
+        // back to v1/v2. (bindClean is kept only for the [GLTF-RIGID] verbose log below.)
+        auto shearOf = [&](bool useM) -> float {
+            float worst = 0.f; int cf[4] = {0, NF/3, (2*NF)/3, NF-1};
+            for (int ci = 0; ci < 4; ci++) {
+                float M[16];
+                if (useM) mul44(&mats[(size_t)cf[ci]*16], invW0, M); else memcpy(M, &mats[(size_t)cf[ci]*16], 64);
+                float q[4], t[3], s[3]; matTrs(M, q, t, s);
+                float x=q[0],y=q[1],z=q[2],w=q[3], rc[9]={1-2*(y*y+z*z),2*(x*y+w*z),2*(x*z-w*y), 2*(x*y-w*z),1-2*(x*x+z*z),2*(y*z+w*x), 2*(x*z+w*y),2*(y*z-w*x),1-2*(x*x+y*y)};
+                for (int c=0;c<3;c++) for (int rr=0;rr<3;rr++){ float dv=std::fabs(rc[c*3+rr]*s[c]-M[c*4+rr]); if (dv>worst) worst=dv; }
+            }
+            return worst; };
+        int variant = bindClean ? 0 : 1;                                  // proven baseline (275/275): uniform clean W0 -> v0
         if (!bindClean) {
-            auto shearOf = [&](bool useM) -> float {
-                float worst = 0.f; int cf[4] = {0, NF/3, (2*NF)/3, NF-1};
-                for (int ci = 0; ci < 4; ci++) {
-                    float M[16];
-                    if (useM) mul44(&mats[(size_t)cf[ci]*16], invW0, M); else memcpy(M, &mats[(size_t)cf[ci]*16], 64);
-                    float q[4], t[3], s[3]; matTrs(M, q, t, s);
-                    float x=q[0],y=q[1],z=q[2],w=q[3], rc[9]={1-2*(y*y+z*z),2*(x*y+w*z),2*(x*z-w*y), 2*(x*y-w*z),1-2*(x*x+z*z),2*(y*z+w*x), 2*(x*z+w*y),2*(y*z-w*x),1-2*(x*x+y*y)};
-                    for (int c=0;c<3;c++) for (int rr=0;rr<3;rr++){ float dv=std::fabs(rc[c*3+rr]*s[c]-M[c*4+rr]); if (dv>worst) worst=dv; }
-                }
-                return worst; };
-            float shM = shearOf(true);
-            if (shM > 1e-2f && shearOf(false) < shM) variant = 2;
+            float shRaw = shearOf(false), shM = shearOf(true);
+            if (shM > 1e-2f && shRaw < shM) variant = 2;                  // sheared W0 -> raw W(f) + LOCAL rest (as before)
+            else if (w0su < 0.1f && shRaw < 1e-3f) variant = 0;           // TARGETED: non-uniform but CLEAN-TRS at TINY world
+        }                                                                  //   scale -> v0 ref-frame (flamecube2-5; v1's M(f)
+                                                                          //   =W(f)·inv(W0) explodes at tiny scale -> teleport)
+        // (Far-from-origin SPINNERS — synthwave/steam_void huge distant cylinders, |W0t|~880 + rotDev 2.8, maxErr ~36 —
+        // are NOT variant-fixable: decompErr=0 rules out shear, and both v0 and v2 reconstruct the same ~2.7% error on a
+        // ~1300u motion. It's a deeper reconstruction/precision limit for very large far spinning meshes; left as-is.)
+        // BIND SCALE = 1 + clip carries the per-axis scale RATIO to a REFERENCE frame (the OPA "beams out of
+        // place" fix, ported to glTF — rifthome lantern flames "shoot in from the sides / drag"). The device forms
+        // invBind from the DECOMPOSED bind TRS; binding with the frame's world scale is FATAL when it is tiny
+        // (flame ~1e-5, from the ~0.01 scene-root × 0.001 node scale): invBind = inv(W) blows up (scale 1/s,
+        // translation |T|/s ~7400) and the device amplifies every ACL quant error by it -> the mesh thrashes.
+        // FIX: bind with UNIT scale (invBind = inv(Tref·Rref), scale 1, NO amplification) and store the mover
+        // clip's scale as the per-frame RATIO s(f)/sref. Then vert = clip·inv(Tref·Rref)·(Wref·base) = W(f)·base
+        // EXACTLY, WORLD-baked rest STAYS at the hearth (variant-2's LOCAL rest sat at the origin = the flame
+        // "shot in from the sides"), anchors keep ±50000 (bind scale 1 -> no cull collapse).
+        // REFERENCE = frame 0, UNLESS its scale is degenerate (flame frame-0 scale ~1e-5, invisible): then s(f)/s0
+        // EXPLODES past ACL's encodable range and the whole clip (T,R,S) decodes to GARBAGE. Use the MAX-scale
+        // frame instead -> ratio stays in [0,1] and ACL is exact; the driven skin is unchanged (ref cancels).
+        // HSR_RIGIDRAWSCALE restores the old raw-scale / scaled-bind encoding.
+        bool ratioScale = (variant == 0) && w0su < 0.1f && !std::getenv("HSR_RIGIDRAWSCALE");   // ONLY tiny-world-scale v0 nodes; normal-scale keep the proven raw encoding
+        float refQ[4]={w0q[0],w0q[1],w0q[2],w0q[3]}, refT[3]={w0t[0],w0t[1],w0t[2]}, refS[3]={w0s[0],w0s[1],w0s[2]};
+        float Wref[16]; memcpy(Wref, W0, 64);
+        if (ratioScale && w0su < 0.1f) {                 // frame-0 scale degenerate -> reference the MAX-scale frame
+            int refF = 0; float best = -1.f;
+            for (int f = 0; f < NF; f++) { float q[4],t[3],s[3]; matTrs(&mats[(size_t)f*16], q,t,s);
+                float g = std::cbrt(std::fabs(s[0]*s[1]*s[2])); if (g > best) { best = g; refF = f; } }
+            memcpy(Wref, &mats[(size_t)refF*16], 64); matTrs(Wref, refQ, refT, refS);
+            if (std::getenv("HSR_VERBOSE"))
+                fprintf(stderr, "[GLTF-RIGID] mesh%d node%d degenerate frame-0 scale %.2g -> REF frame %d (scale %.4f)\n",
+                        meshIdx, node, w0su, refF, std::cbrt(std::fabs(refS[0]*refS[1]*refS[2])));
         }
         e.jointCount = 2; e.parents = {-1, 0};
         if (variant == 0) {
-            e.jointPos   = {0,0,0, w0t[0],w0t[1],w0t[2]};
-            e.jointQuat  = {1,0,0,0, w0q[3],w0q[0],w0q[1],w0q[2]};   // (w,x,y,z) for HZAN:SKEL; matTrs q is (x,y,z,w)
-            e.jointScale = {1, (w0su>1e-4f||w0su<-1e-4f)?w0su:1.f};
+            e.jointPos   = {0,0,0, refT[0],refT[1],refT[2]};
+            e.jointQuat  = {1,0,0,0, refQ[3],refQ[0],refQ[1],refQ[2]};   // (w,x,y,z) for HZAN:SKEL; matTrs q is (x,y,z,w)
+            e.jointScale = {1, ratioScale ? 1.f : ((w0su>1e-4f||w0su<-1e-4f)?w0su:1.f)};
         } else {
             e.jointPos   = {0,0,0, 0,0,0};
             e.jointQuat  = {1,0,0,0, 1,0,0,0};   // both joints bind at IDENTITY -> device invBind = I
@@ -1396,12 +1514,13 @@ public:
         for (int f = 0; f < NF; f++) {
             float M[16];
             if (variant == 1) mul44(&mats[(size_t)f*16], invW0, M); // clip = relative M(f) (mirror/non-uniform W0 cancelled)
-            else              memcpy(M, &mats[(size_t)f*16], 64);   // clip = W(f) directly (v0: invBind=inv(W0) cancels; v2: LOCAL rest)
+            else              memcpy(M, &mats[(size_t)f*16], 64);   // clip = W(f) directly (v0: invBind=inv(T0·R0) cancels; v2: LOCAL rest)
             float q[4], t[3], s[3]; matTrs(M, q, t, s);
+            if (ratioScale) for (int c=0;c<3;c++) s[c] = (std::fabs(refS[c])>1e-8f) ? s[c]/refS[c] : 1.f;   // clip scale = ratio to the REFERENCE frame (bind is UNIT scale)
             float* r = &e.trsLocal[(size_t)(f*2+0)*10]; r[0]=0;r[1]=0;r[2]=0;r[3]=1; r[4]=0;r[5]=0;r[6]=0; r[7]=1;r[8]=1;r[9]=1;   // joint0 = STATIC identity (no root motion to extract)
             float* p = &e.trsLocal[(size_t)(f*2+1)*10]; p[0]=q[0];p[1]=q[1];p[2]=q[2];p[3]=q[3]; p[4]=t[0];p[5]=t[1];p[6]=t[2]; p[7]=s[0];p[8]=s[1];p[9]=s[2];
             float x=q[0],y=q[1],z=q[2],w=q[3], rc[9]={1-2*(y*y+z*z),2*(x*y+w*z),2*(x*z-w*y), 2*(x*y-w*z),1-2*(x*x+z*z),2*(y*z+w*x), 2*(x*z+w*y),2*(y*z-w*x),1-2*(x*x+y*y)};
-            for (int c=0;c<3;c++) for (int rr=0;rr<3;rr++){ float dv=std::fabs(rc[c*3+rr]*s[c]-M[c*4+rr]); if (dv>decompErr) decompErr=dv; }
+            for (int c=0;c<3;c++) for (int rr=0;rr<3;rr++){ float rawS=ratioScale?s[c]*refS[c]:s[c]; float dv=std::fabs(rc[c*3+rr]*rawS-M[c*4+rr]); if (dv>decompErr) decompErr=dv; }   // shear check uses RAW scale (clip stores the ratio)
         }
         if (decompErr > 1e-2f)
             fprintf(stderr, "[GLTF-RIGID] mesh%d node%d WARN mover clip not clean TRS (shear residual %.4f, variant=%d) — motion will deviate\n", meshIdx, node, decompErr, variant);
@@ -1421,6 +1540,7 @@ public:
                 float M[16], W[16]; worldAt(node, clipDur - 1e-4f, W);
                 if (variant == 1) mul44(W, invW0, M); else memcpy(M, W, 64);
                 float q[4], t[3], s[3]; matTrs(M, q, t, s);
+                if (ratioScale) for (int c=0;c<3;c++) s[c] = (std::fabs(refS[c])>1e-8f) ? s[c]/refS[c] : 1.f;
                 e.trsLocal.resize((size_t)(NF+1)*2*10);
                 float* r = &e.trsLocal[(size_t)(NF*2+0)*10]; r[0]=0;r[1]=0;r[2]=0;r[3]=1; r[4]=0;r[5]=0;r[6]=0; r[7]=1;r[8]=1;r[9]=1;
                 float* p = &e.trsLocal[(size_t)(NF*2+1)*10]; p[0]=q[0];p[1]=q[1];p[2]=q[2];p[3]=q[3]; p[4]=t[0];p[5]=t[1];p[6]=t[2]; p[7]=s[0];p[8]=s[1];p[9]=s[2];
@@ -1437,11 +1557,11 @@ public:
         size_t nv = rec->basePos.size()/3;
         if (variant == 2) e.restPos = rec->basePos;   // LOCAL rest: the raw W(f) clip carries the full placement (vert = W(f)·base)
         else {
-            e.restPos.resize(nv*3);   // verts WORLD-baked into the frame-0 rest (FULL W0 incl. mirror/non-uniform scale)
+            e.restPos.resize(nv*3);   // verts WORLD-baked into the REFERENCE-frame rest (Wref = W0 except the degenerate-scale case; v1 uses W0)
             for (size_t v = 0; v < nv; v++) { const float* b = &rec->basePos[v*3]; float* o = &e.restPos[v*3];
-                o[0]=W0[0]*b[0]+W0[4]*b[1]+W0[8]*b[2]+W0[12];
-                o[1]=W0[1]*b[0]+W0[5]*b[1]+W0[9]*b[2]+W0[13];
-                o[2]=W0[2]*b[0]+W0[6]*b[1]+W0[10]*b[2]+W0[14]; }
+                o[0]=Wref[0]*b[0]+Wref[4]*b[1]+Wref[8]*b[2]+Wref[12];
+                o[1]=Wref[1]*b[0]+Wref[5]*b[1]+Wref[9]*b[2]+Wref[13];
+                o[2]=Wref[2]*b[0]+Wref[6]*b[1]+Wref[10]*b[2]+Wref[14]; }
         }
         e.boneIdx.assign(nv*4, 0); e.boneWgt.assign(nv*4, 0);
         for (size_t v = 0; v < nv; v++) { e.boneIdx[v*4]=1; e.boneWgt[v*4]=255; }   // weight every vert to the MOVING joint
