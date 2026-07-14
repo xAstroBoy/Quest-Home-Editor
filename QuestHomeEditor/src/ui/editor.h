@@ -3147,10 +3147,10 @@ struct Editor {
         std::string s; char b[640];
         s += "HSLEDIT 2\n";
         snprintf(b,sizeof b,"CAM %.4f %.4f %.4f %.5f %.5f\n", r->cam.pos[0],r->cam.pos[1],r->cam.pos[2], r->cam.yaw, r->cam.pitch); s+=b;
-        snprintf(b,sizeof b,"CFG %d %.3f %.3f %.3f %.1f %.4f %.0f %d %.0f %d %d %d %d %d %d %d %.4f %.4f %.4f\n",
+        snprintf(b,sizeof b,"CFG %d %.3f %.3f %.3f %.1f %.4f %.0f %d %.0f %d %d %d %d %d %d %d %.4f %.4f %.4f %d\n",
             cfgFog?1:0, cfgFogColor[0],cfgFogColor[1],cfgFogColor[2], cfgFogStart, cfgFogDensity, cfgFar,
             skybox?1:0, skyboxDist, noCull?1:0, solidCollision?1:0, animSkinned?1:0, cookAudio?1:0, previewAudio?1:0, voxelSolid?1:0,
-            bgColorSet?1:0, bgColor[0], bgColor[1], bgColor[2]); s+=b;
+            bgColorSet?1:0, bgColor[0], bgColor[1], bgColor[2], antiCull?1:0); s+=b;
         for(int i=0;i<(int)r->gpuMeshes.size();++i){ auto& gm=r->gpuMeshes[i];
             snprintf(b,sizeof b,"MESH %d %s %.5f %.5f %.5f %.6f %.6f %.6f %.6f %.5f %.5f %.5f %d\n", i, qstr(gm.name).c_str(),
                 gm.editT[0],gm.editT[1],gm.editT[2], gm.editR[0],gm.editR[1],gm.editR[2],gm.editR[3],
@@ -3247,7 +3247,7 @@ struct Editor {
             size_t e=all.find('\n',p); std::string line=all.substr(p, e==std::string::npos?std::string::npos:e-p); p=(e==std::string::npos)?all.size():e+1;
             auto t=tokenize(line); if(t.empty()) continue;
             if(t[0]=="CAM" && t.size()>=6){ r->cam.pos[0]=(float)atof(t[1].c_str()); r->cam.pos[1]=(float)atof(t[2].c_str()); r->cam.pos[2]=(float)atof(t[3].c_str()); r->cam.yaw=(float)atof(t[4].c_str()); r->cam.pitch=(float)atof(t[5].c_str()); }
-            else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; /* t[15]=voxelSolid: NOT loaded — stays at the reverted default (false); old sessions saved 1 and would re-wall rooms */ if(t.size()>=20){ bgColorSet=atoi(t[16].c_str())!=0; bgColor[0]=(float)atof(t[17].c_str()); bgColor[1]=(float)atof(t[18].c_str()); bgColor[2]=(float)atof(t[19].c_str()); if(bgColorSet&&r){ r->clearRGB[0]=bgColor[0]; r->clearRGB[1]=bgColor[1]; r->clearRGB[2]=bgColor[2]; } } g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
+            else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; /* t[15]=voxelSolid: NOT loaded — stays at the reverted default (false); old sessions saved 1 and would re-wall rooms */ if(t.size()>=20){ bgColorSet=atoi(t[16].c_str())!=0; bgColor[0]=(float)atof(t[17].c_str()); bgColor[1]=(float)atof(t[18].c_str()); bgColor[2]=(float)atof(t[19].c_str()); if(bgColorSet&&r){ r->clearRGB[0]=bgColor[0]; r->clearRGB[1]=bgColor[1]; r->clearRGB[2]=bgColor[2]; } } if(t.size()>=21) antiCull=atoi(t[20].c_str())!=0; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
             else if(t[0]=="MESH" && t.size()>=14 && !cooked){ int idx=atoi(t[1].c_str()); if(geomAuth && idx>=baseMeshCount) continue;   /* GEOM2 owns created meshes; compacted sidecar re-orders them = stale indices */ if(idx>=0&&idx<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[idx];
                 gm.name=t[2]; gm.editT[0]=(float)atof(t[3].c_str()); gm.editT[1]=(float)atof(t[4].c_str()); gm.editT[2]=(float)atof(t[5].c_str());
                 gm.editR[0]=(float)atof(t[6].c_str()); gm.editR[1]=(float)atof(t[7].c_str()); gm.editR[2]=(float)atof(t[8].c_str()); gm.editR[3]=(float)atof(t[9].c_str());
@@ -3432,6 +3432,7 @@ struct Editor {
     }
     bool previewAudio = true;          // DEFAULT ON: play the env's background loop HERE on the PC while previewing. Toggle off = mute desktop playback (drives g_audioMuted).
     bool solidCollision = true;        // DEFAULT ON: cook a REAL double-sided trimesh collider (floor+walls+columns, haven2025 SEBD format). Off = floor-only ColliderBox grid.
+    bool antiCull = true;              // DEFAULT ON: emit MeshPartBoundsOverride (scene-spanning bound) so animated meshes never frustum-cull. Turn OFF if a cook is REJECTED/black on an OLDER Quest OS that chokes on the component (drops HSR_NOBOUNDSOVERRIDE).
     bool prevSolidCol = true;          // tracks solidCollision so the navmesh gizmo re-bakes (walls appear/vanish in the preview) when it's toggled.
     bool voxelSolid = false;           // DEFAULT OFF (reverted): thick all-orientation voxel ColliderBoxes (voxelSolidBoxes)
                                        // gave walls real VOLUME so a teleported head can't clip a paper-thin wall — BUT thickening
@@ -5595,6 +5596,8 @@ struct Editor {
         cx.tip(x,y0,w,th.rowH,"Cook a REAL double-sided triangle-mesh collider for the whole env -\nwalk on floors AND get blocked by walls/columns, enter rooms through\ndoorways (haven2025's cooked-PhysX SEBD format, device-verified).\nOFF = a floor-only ColliderBox grid (walkable but you phase walls)."); y+=th.rowH+6*uiScale;
         if (solidCollision != prevSolidCol) { prevSolidCol = solidCollision; bakeNavmeshes(items); }   // re-bake so the gizmo shows floor+walls (on) / floor-only (off)
         // (thick all-sides voxel collision is REVERTED to OFF — it walled off room interiors; HSR_VOXSOLID re-enables it)
+        y0=y; cx.checkbox(ui::hashId("anticull"), x, y, "Anti-cull bounds (animated meshes stay visible)", antiCull);
+        cx.tip(x,y0,w,th.rowH,"Stamp MeshPartBoundsOverride on every mesh so animated/skinned\nmeshes never frustum-cull (\"shows then goes invisible\") on newer\nQuest OS. Leave ON unless your cook is REJECTED or renders BLACK\non an OLDER headset - some older OS builds choke on this component;\nturning it OFF drops it entirely so the env loads everywhere."); y+=th.rowH+6*uiScale;
         g_audioMuted.store(!previewAudio, std::memory_order_relaxed);   // bind the toggle to the live audio-callback mute flag
         y0=y; cx.checkbox(ui::hashId("skybox"), x, y, "Far backdrop -> skybox (escapes the 5000 far-clip dome)", skybox);
         cx.tip(x,y0,w,th.rowH,"Route distant geometry (centroid > the meters below) to the\nSkyboxPlatformComponent pass, which is EXEMPT from the shell's\nhard PortalStereoCamera far=5000 clip (the black dome locked to\nyour head). This is the ONLY way official homes/vistas show km-\ndistant scenery - they skybox it, they do NOT use a bigger far.\nThe backdrop becomes camera-locked (no walk-up parallax), which\nis imperceptible at km range. Near/mid geometry stays walkable."); y+=th.rowH+2*uiScale;
@@ -6507,6 +6510,7 @@ struct Editor {
         setenv_("HSR_HZANIM", animSkinned ? "1" : "");   // emit skeletal HZANIM clips so skinned meshes ANIMATE on device (clouds/koi/droids)
         setenv_("HSR_NOCULL", noCull ? "1" : "");         // scene-spanning bounds -> V205 never culls our meshes (V79-style draw-everything); fixes cooked-home clipping
         setenv_("HSR_NOAUTOFLOOR", cookAutoFloor ? "" : "1");   // Cook-tab toggle: OFF = no generated floor/walls at all
+        setenv_("HSR_NOBOUNDSOVERRIDE", antiCull ? "" : "1");   // Cook-tab "Anti-cull bounds" toggle: OFF drops MeshPartBoundsOverride (fixes REJECT/black on older Quest OS that chokes on it)
         // real double-sided trimesh collider (haven2025 SEBD: 16-align manifest + 128-align RTree + count-shift); off -> ColliderBox grid.
         // SEBD holds on device (v206 confirmed). HSR_FORCE_NAVBOX = escape hatch to the always-compatible ColliderBox
         // tilted-box path (device builds it from halfExtents, no cooked RTree) if a future PhysX build ever rejects the RTree.
