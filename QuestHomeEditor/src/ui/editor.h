@@ -211,6 +211,8 @@ struct Editor {
     std::function<void(int,int,hslcook::ExportMesh&)> hzAnimExtractor;             // V79 HZANIM skeletal hook
     std::function<std::string(int)> animSourceProbe;                               // ANIM-AUDIT: which SOURCE anim channels touch mesh i ("" = none) — per-format (main.cpp), INDEPENDENT of the cook extractors' gates so silent drops show up
     std::function<bool(int,int,int,std::vector<float>&,int&,float&)> flipbookSequencer;   // FLIPBOOK observed cell order: (meshIdx, cols, rows) -> per-frame 2x3 UV mats + N + loopSec (the row-major @global-fps ASSUMPTION was wrong for TV/torches/fires)
+    std::function<int(int)> looseVertBinder;   // right-click "Bind loose verts": (meshIdx) -> #unweighted verts bound to their nearest joint (live; fixes static whale-eyes). null = not a glTF env.
+    std::function<int(int)> looseVertCounter;  // (meshIdx) -> how many UNWEIGHTED (static) verts the skinned mesh has (menu shows the item only when >0).
     std::vector<uint8_t> bgOgg;                                                    // env background loop -> FMOD asset
     // ── BACKGROUND AUDIO cooker (view / REPLACE / ADD / export / revert) ─────────────────────────────────────
     // bgOgg = what the cook SHIPS (FMOD SND asset, auto-start loop entity at spawn). envOgg keeps the env's
@@ -4163,6 +4165,11 @@ struct Editor {
             {std::string("Reset transform")+suf,3,-1},
             {"Copy name",4,-1} };
         if (nHidden>0) main.push_back({std::string("Unhide ALL (")+std::to_string(nHidden)+")",7,-1});
+        // SKIN REPAIR: a skinned mesh with UNWEIGHTED verts (the static "whale-eyes" — parts the modeler left with no
+        // skin weight, frozen at bind pose while the body animates). Offer to bind them to their nearest joint. Shown
+        // ONLY when there are loose verts, right under the name so it's easy to find.
+        if (looseVertCounter && gm.dynamicVerts) { int lv=looseVertCounter(ctxMesh);
+            if (lv>0) main.insert(main.begin()+1, {std::string("Bind ")+std::to_string(lv)+" loose verts to skeleton (fix static parts)",49,-1}); }
         // The FULL action set (shared by main rows and submenu rows).
         auto runAct=[&](int a){
                 if (a==0) focusMesh(gm);
@@ -4182,6 +4189,9 @@ struct Editor {
                 else if (a==7) { for (int i=0;i<(int)r->gpuMeshes.size();++i) r->setHidden(i,false); setStatus("Unhid ALL meshes"); }   // unhide everything
                 else if (a==8) { if (!inSel(ctxMesh)) selectOne(ctxMesh); duplicateSelected(); }   // clone selection (independent copy, cooks too)
                 else if (a==9) { if (!inSel(ctxMesh)) selectOne(ctxMesh); toggleDeleteSelected(); }  // drop from render + cook (Ctrl+Z restores)
+                else if (a==49) { if (looseVertBinder){ int n=looseVertBinder(ctxMesh); geomDirty=true;   // bind unweighted verts -> next animate() re-skins them; cook reads the fixed weights too
+                                    setStatus(n>0 ? ("Bound "+std::to_string(n)+" loose verts to the nearest skinned surface - they now follow the animation (cook + preview)")
+                                                  : "No loose (unweighted) verts on this mesh"); } }
                 else if (a==18) { if (!inSel(ctxMesh)) selectOne(ctxMesh); gizmoOp=2; tab=TAB_OBJECT;   // STRETCH: per-axis Scale gizmo + the Object tab's Scale fields
                                   setStatus("Scale gizmo ON - drag a box handle to stretch per-axis, or the CENTER square for uniform (all 3 axes) - or type in Object > Scale"); }
                 // GEOMETRY ops apply to the WHOLE multi-selection (each source -> its own result, all re-selected)

@@ -378,6 +378,12 @@ static void keyCb(GLFWwindow* w, int key, int sc, int act, int mods) {
         g_renderer->wireframe = !g_renderer->wireframe;
         fprintf(stderr, "[MAIN] Wireframe: %s\n", g_renderer->wireframe ? "ON" : "OFF");
     }
+    // L = HEADLIGHT / UNLIT diagnostic: cycle OFF -> unlit(1.0) -> overbright(2.5) -> OFF. Forces every mesh's
+    // shader color flat-bright so dark/black meshes reveal their base texture (tell whale-eyes from delete-me spheres).
+    if (key == GLFW_KEY_L && act == GLFW_PRESS && g_renderer) {
+        g_renderer->fullbright = (g_renderer->fullbright <= 0.f) ? 1.0f : (g_renderer->fullbright < 2.f ? 2.5f : 0.f);
+        fprintf(stderr, "[MAIN] Headlight/unlit: %s\n", g_renderer->fullbright<=0.f?"OFF":(g_renderer->fullbright<2.f?"UNLIT (1.0)":"OVERBRIGHT (2.5)"));
+    }
     // P = save an in-engine screenshot of exactly what's on screen
     if (key == GLFW_KEY_P && act == GLFW_PRESS && g_renderer) {
         g_renderer->screenshot("hsr_shot.png");
@@ -1110,7 +1116,7 @@ int main(int argc, char** argv) {
     std::string g_fmtName = isV79 ? "V79 glTF" : (isOpa ? "V79 OPA" : "HSL");
     std::string g_baseName = envBaseName;
     std::string g_title = "HSR Renderer [Vulkan]  -  " + g_fmtName + "  -  " + g_baseName +
-                          "   |   WASD=move drag=look  Tab/N=next mesh B=prev  F=wire  Esc=quit";
+                          "   |   WASD=move drag=look  Tab/N=next mesh B=prev  F=wire  L=headlight  Esc=quit";
     if (!g_window) {   // headless/scripted modes create the window only now (after the synchronous load)
         glfwDefaultWindowHints();
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
@@ -1358,6 +1364,7 @@ int main(int argc, char** argv) {
     if (const char* hm = std::getenv("HSR_HIDEMAT")) { vkRenderer.hideMat = hm; }
     if (const char* sm = std::getenv("HSR_SOLOMAT")) { vkRenderer.soloMat = sm; }
     if (std::getenv("HSR_WIRE")) vkRenderer.wireframe = true;   // headless wireframe diagnostic
+    if (const char* fb = std::getenv("HSR_FULLBRIGHT")) { float v=(float)atof(fb); vkRenderer.fullbright = (v>0.f)?v:1.5f; }   // headlight/unlit diagnostic (also the L key)
     // Camera override for headless captures: HSR_CAM="x,y,z,yawDeg,pitchDeg"
     if (const char* cs = std::getenv("HSR_CAM")) {
         float x,y,z,yd,pd;
@@ -1514,6 +1521,8 @@ int main(int argc, char** argv) {
     // OPT-IN ONLY (HSR_VAT) until the on-device VAT entity setup is reversed; the DEFAULT wisp port = poseAnim.
     if (isV79 && std::getenv("HSR_VAT")) editor.vatBaker = [&gltf](int meshIdx, int frames, int& nv){ return gltf.bakeVAT(meshIdx, frames, nv); };
     // FLIPBOOK observed-sequence extractor (the row-major-order/global-fps assumption fix).
+    if (isV79) { editor.looseVertBinder  = [&gltf](int meshIdx){ return gltf.applyLooseVertBindForMesh(meshIdx); };
+                 editor.looseVertCounter = [&gltf](int meshIdx){ return gltf.looseVertCount(meshIdx); }; }
     if (isV79) editor.flipbookSequencer = [&gltf](int meshIdx, int cols, int rows, std::vector<float>& mats, int& N, float& loop) {
         return gltf.flipbookCellSequence(meshIdx, cols, rows, mats, N, loop);
     };
