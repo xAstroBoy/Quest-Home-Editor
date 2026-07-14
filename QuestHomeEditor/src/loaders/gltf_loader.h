@@ -1216,7 +1216,18 @@ public:
         // try the RATIONAL LCM first (phonebox 1.1667+2.3333 -> 2.3333s, seamless forever — the "reset is
         // fucked up" fix); only an irrational beat falls back to the master-timeline bake (one reshuffle/loop).
         if (clipDur <= 1e-4f || latestStart > 0.05f) clipDur = animDuration;
-        else if (multiPeriod) { float lcm = rationalLcmPeriod(chainPeriods); clipDur = (lcm > 1e-4f) ? lcm : animDuration; }
+        else if (multiPeriod) {
+            float lcm = rationalLcmPeriod(chainPeriods);
+            // IRRATIONAL BEAT (no small LCM): do NOT fall back to the global animDuration. For a CHILD node that
+            // rides a parent's motion (steam_void mesh0.001/.002: a 4.1s own-spin UNDER mesh0's 29s orbit), an
+            // animDuration clip (60s = some OTHER mesh's length) loops OUT OF PHASE with the 29s parent -> the child
+            // DRIFTS off the orbit every parent-loop ("small anim out of place"). Keep the LONGEST chain period
+            // (already in clipDur) so the DOMINANT macro-motion — the parent orbit — loops CLEANLY and the child
+            // stays locked to its parent/siblings; only the shorter sub-spin takes a small seam snap. HSR_MPMASTER=animDur.
+            if (lcm > 1e-4f) clipDur = lcm;
+            else if (std::getenv("HSR_MPMASTER")) clipDur = animDuration;   // opt back into the old master-timeline bake
+            // else: keep clipDur = the longest chain period (the parent/dominant loop)
+        }
         if (clipDur <= 1e-4f) return e;
         // NATIVE key-rate sampling (min 30fps), floor 64 (short clips), NO cap — FULL PORT (the old 256 "device
         // clip size limit" was a misdiagnosis — official whale clips are 240 KB and the device loads them fine).
