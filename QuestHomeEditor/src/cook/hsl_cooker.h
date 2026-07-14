@@ -630,10 +630,16 @@ inline std::string entityJson(const std::string& id, const std::string& name,
     //    ErrorInvalidArg → the flecs component generation ABORTED on EVERY mesh entity → nothing rendered = PURE BLACK.
     //    The three fields are byte-identical across v0/v1 (both libshells carry them), so emitting the LOWEST version
     //    loads exact on old devices AND up-translates cleanly on v206 — forward-compatible, no cull regression.
+    // ── boundsCenter/boundsHalfSize are Vec4, NOT Vec3 (older-OS REJECT fix): v206 stores each as a 16-byte OWORD
+    //    (IDA getter sub_2137B1C = `*a3=*a6` on _OWORD + 16-byte-align check) and its JSON parser LENIENTLY accepted
+    //    the 3-field {x,y,z} (w defaulted 0). The Oct-2023 OS parser is STRICT: it emits `Core: Expected:'Vec4',
+    //    Found:'{x,y,z}'` → the content.hstf template JSON load ABORTS (ErrorMissingData) → space.hstf postInitAsset
+    //    ErrorUnexpected → the WHOLE env is REJECTED to nuxd. Emit the 4th component w:0 → strict-Vec4 parse passes on
+    //    old AND new. HSR_NOBOUNDSOVERRIDE (Cook-panel "Anti-cull bounds" toggle) drops the component entirely.
     if (name != "NavDebug" && !std::getenv("HSR_NOBOUNDSOVERRIDE"))
         comps += ",{\"data\":{\"class\":\"horizon::renderer::MeshPartBoundsOverride\",\"version\":0,\"data\":"
-                 "{\"partIndex\":0,\"boundsCenter\":{\"x\":0,\"y\":0,\"z\":0},"
-                 "\"boundsHalfSize\":{\"x\":100000,\"y\":100000,\"z\":100000}}},\"dataType\":\"horizon::DataDefinitionAsset\"}";
+                 "{\"partIndex\":0,\"boundsCenter\":{\"x\":0,\"y\":0,\"z\":0,\"w\":0},"
+                 "\"boundsHalfSize\":{\"x\":100000,\"y\":100000,\"z\":100000,\"w\":0}}},\"dataType\":\"horizon::DataDefinitionAsset\"}";
     // walkable: collision mesh + static physics body (so locomotion/teleport land on it)
     if (colliderRef.pkg || colliderRef.ing || colliderRef.tgt) {
         comps += "," + comp("ColliderMeshPlatformComponent", 1, std::string("{\"meshAsset\":") + refJson(colliderRef) + "}");
