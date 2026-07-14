@@ -623,8 +623,15 @@ inline std::string entityJson(const std::string& id, const std::string& name,
     // sub_2B8CF18) REPLACES the per-part cull bound with a fixed AABB. Emit a SCENE-SPANNING box (center 0, halfSize 1e5)
     // so the cull bound always covers the view → never frustum/occlusion-culled. partIndex 0 = each entity's single
     // cooked part (one material per entity). Skip the NavDebug overlay. HSR_NOBOUNDSOVERRIDE disables for A/B.
+    // ── VERSION 0, NOT 1 (pure-black on older OS fix): v206 registers this class at version 1 (IDA: MOV W4,#1 @
+    //    0x25a6824, field-reflect sub_259A5E4 = {partIndex@0, boundsCenter@16, boundsHalfSize@32}) but the Oct-2023
+    //    Quest OS registers it at version 0. libshell's VersionTranslatorManager only migrates OLD→NEW, so stamping
+    //    version 1 there hit "Asset version newer than defined (version=1, defined=0)" → boundsHalfSize value-copy
+    //    ErrorInvalidArg → the flecs component generation ABORTED on EVERY mesh entity → nothing rendered = PURE BLACK.
+    //    The three fields are byte-identical across v0/v1 (both libshells carry them), so emitting the LOWEST version
+    //    loads exact on old devices AND up-translates cleanly on v206 — forward-compatible, no cull regression.
     if (name != "NavDebug" && !std::getenv("HSR_NOBOUNDSOVERRIDE"))
-        comps += ",{\"data\":{\"class\":\"horizon::renderer::MeshPartBoundsOverride\",\"version\":1,\"data\":"
+        comps += ",{\"data\":{\"class\":\"horizon::renderer::MeshPartBoundsOverride\",\"version\":0,\"data\":"
                  "{\"partIndex\":0,\"boundsCenter\":{\"x\":0,\"y\":0,\"z\":0},"
                  "\"boundsHalfSize\":{\"x\":100000,\"y\":100000,\"z\":100000}}},\"dataType\":\"horizon::DataDefinitionAsset\"}";
     // walkable: collision mesh + static physics body (so locomotion/teleport land on it)
