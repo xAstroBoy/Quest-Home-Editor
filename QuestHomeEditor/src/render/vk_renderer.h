@@ -288,6 +288,8 @@ public:
     // GLOBAL light manipulation (editor "Lighting" panel): multiplies every draw's color push-constant
     // (rgb = light color/brightness, a = global opacity). Live — no re-upload needed. {1,1,1,1} = faithful.
     float lightMul[4] = {1.f, 1.f, 1.f, 1.f};
+    float fullbright = 0.f;   // >0 = HEADLIGHT/UNLIT diagnostic: force the shader's UniformColor to this flat value so
+                              // dark/black meshes show their raw base texture (spot whale-eyes vs delete-me artifacts).
     float ambientRGB[3] = {0.95f, 0.90f, 0.83f};   // synth default (used when the env has NO real lightprobes)
     bool  hasEnvAmbient = false;                    // set by main when the env's REAL ambient was parsed from its
                                                     // LightprobesPlatformComponent .lprb (field2 L00/3.5449). When true,
@@ -1761,6 +1763,7 @@ public:
             pcData[17] = gm.curTint[1]*gm.lmPow[1]*lightMul[1]*gm.editTint[1];
             pcData[18] = gm.curTint[2]*gm.lmPow[2]*lightMul[2]*gm.editTint[2];
             pcData[19] = gm.curTint[3]*lightMul[3]*gm.editTint[3];
+            if (fullbright > 0.f) { pcData[16]=pcData[17]=pcData[18]=fullbright; }   // HEADLIGHT/UNLIT: flat bright base (alpha kept)
             vkCmdPushConstants(cmd, pl,
                 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80, pcData);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1845,6 +1848,7 @@ public:
                     memcpy(pcData, gm.model, 64);
                     pcData[16] = lightMul[0]*gm.editTint[0]; pcData[17] = lightMul[1]*gm.editTint[1];
                     pcData[18] = lightMul[2]*gm.editTint[2]; pcData[19] = lightMul[3]*gm.editTint[3];
+                    if (fullbright > 0.f) { pcData[16]=pcData[17]=pcData[18]=fullbright; }   // HEADLIGHT/UNLIT for skinned (whale)
                     vkCmdPushConstants(cmd, skinnedPipelineLayout,
                         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80, pcData);
                     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,

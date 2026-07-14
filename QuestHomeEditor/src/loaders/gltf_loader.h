@@ -652,6 +652,14 @@ public:
                             readAccessorF((int)attr["JOINTS_0"].asInt(), 4, jf);
                             rec.jidx.resize((size_t)nv*4); rec.jw.resize((size_t)nv*4);
                             for (u32 i=0;i<nv*4;++i){ rec.jidx[i]=(u8)(jf[i]+0.5f); rec.jw[i]=(i<wf.size())?wf[i]:0.f; }
+                            // Loose (unweighted) verts are left AS-AUTHORED by default (faithful). Two ways to repair the
+                            // "static whale-eyes" case: the interactive right-click "Bind loose verts to nearest joint"
+                            // (applyLooseVertBindForMesh, live) or HSR_AUTOSKINWEIGHT at load (headless/scripted). Both call
+                            // the same autoBindLooseVertsRec.
+                            if (std::getenv("HSR_AUTOSKINWEIGHT")) {
+                                int f=autoBindLooseVertsRec(rec);
+                                if (f && std::getenv("HSR_VERBOSE")) fprintf(stderr, "[GLTF-SKIN] '%s' auto-bound %d UNWEIGHTED verts -> nearest weighted neighbor\n", nd.has("name")?nd["name"].asString().c_str():"?", f);
+                            }
                             rec.meshIdx=(int)meshes.size();
                             md.dynamicVerts=true; md.gltfMeshIndex=(int)skinned.size();
                             for (u32 i=0;i<nv*3;++i) md.positions[i]=pos[i];   // placeholder; animate fixes
@@ -1781,6 +1789,38 @@ public:
         }
         isOsc=true; amp=peak; period=clipDur; omega=0.f;     // bounded swing -> OSCILLATION (sway); signed amp = swing direction
         return fabsf(amp) > 0.02f;                            // >~1deg sway, else treat as static
+    }
+    // Repair UNWEIGHTED skin verts (weightSum~0) — the whale-eyes fix: a modeler left the eye spheres with no skin
+    // weight so they froze at bind pose while the skeleton swam the body. COPY the full skin (jidx+jw) of the NEAREST
+    // ALREADY-WEIGHTED vertex, so each loose vert moves EXACTLY like the surface next to it (the eyes ride the head's
+    // own blend). Binding to a single nearest JOINT tore the eye apart — adjacent verts landed on different joints
+    // that pull apart ("eye moving out"); inheriting a neighbour's weights keeps the piece rigid + seamless. Idempotent.
+    int autoBindLooseVertsRec(SkinnedRec& rec) {
+        if (rec.skin<0 || (size_t)rec.skin>=gskins.size()) return 0;
+        if (rec.jw.size() < (size_t)rec.nv*4 || rec.jidx.size() < (size_t)rec.nv*4 || rec.basePos.size() < (size_t)rec.nv*3) return 0;
+        // indices of weighted "donor" verts
+        std::vector<u32> donor; donor.reserve(rec.nv);
+        for (u32 u=0; u<rec.nv; ++u) if (rec.jw[u*4]+rec.jw[u*4+1]+rec.jw[u*4+2]+rec.jw[u*4+3] > 0.1f) donor.push_back(u);
+        if (donor.empty()) return 0;   // nothing weighted to copy from
+        int fixed=0;
+        for (u32 v=0; v<rec.nv; ++v){
+            if (rec.jw[v*4]+rec.jw[v*4+1]+rec.jw[v*4+2]+rec.jw[v*4+3] > 0.1f) continue;   // already weighted
+            const float* p=&rec.basePos[v*3]; float best=1e30f; u32 bw=donor[0];
+            for (u32 u : donor){ const float* q=&rec.basePos[u*3]; float dx=p[0]-q[0],dy=p[1]-q[1],dz=p[2]-q[2]; float d=dx*dx+dy*dy+dz*dz; if(d<best){best=d;bw=u;} }
+            for (int k=0;k<4;k++){ rec.jidx[v*4+k]=rec.jidx[bw*4+k]; rec.jw[v*4+k]=rec.jw[bw*4+k]; } ++fixed;
+        }
+        return fixed;
+    }
+    // Right-click "Bind loose verts": apply the loose-vert bind to the skinned mesh at this editor/gltf mesh index.
+    int applyLooseVertBindForMesh(int meshIdx) {
+        int n=0; for (auto& r : skinned) if (r.meshIdx==meshIdx) n += autoBindLooseVertsRec(r);
+        return n;
+    }
+    // How many UNWEIGHTED (static) verts a skinned mesh has — the menu shows/enables the action only when >0.
+    int looseVertCount(int meshIdx) {
+        for (auto& r : skinned) if (r.meshIdx==meshIdx && r.jw.size()>=(size_t)r.nv*4) {
+            int c=0; for (u32 v=0; v<r.nv; ++v) if (r.jw[v*4]+r.jw[v*4+1]+r.jw[v*4+2]+r.jw[v*4+3] <= 0.1f) ++c; return c; }
+        return 0;
     }
     HzAnimExport extractHzAnim(int meshIdx, int frames) {
         HzAnimExport e;
