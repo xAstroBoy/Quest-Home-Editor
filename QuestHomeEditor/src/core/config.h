@@ -54,7 +54,7 @@ struct AppConfig {
     // Bump on every release. Printed at the top of each run's `Quest Home Editor.log`, shown in the window title,
     // and prepended to every logcat/diag EXPORT — so a shared log or bug report always states WHICH build produced
     // it and on WHAT hardware. s_gpuName is filled in by the renderer once a Vulkan device is picked.
-    static constexpr const char* s_version = "0.10.19";
+    static constexpr const char* s_version = "0.10.20";
     static inline std::string s_gpuName;
 
     static std::string sysInfo() {   // multi-line: version + OS + CPU + RAM + GPU
