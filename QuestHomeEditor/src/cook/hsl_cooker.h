@@ -1728,7 +1728,12 @@ struct ExportMesh {
     std::vector<float> vatOffsets;  // VAT vertex offsets, frames*vertexCount*3 (WORLD space) -> animated via VAT (non-skeletal)
     int vatFrames = 0;
     bool pulse = false;             // node-animated billboard (flame wisp) -> CUSTOM wisp_pulse.surface (unlitblend + getTime() brightness pulse)
-    bool skybox = false;            // user-marked far backdrop -> SkyboxPlatformComponent (depth-clamped, EXEMPT from the PortalStereoCamera far=5000 clip)
+    // Visual-only distant scenery that must keep its relative layout. Every mesh in the
+    // same non-negative group is uniformly fitted about the spawn with ONE shared factor
+    // before large meshes are split. This avoids the torn/flattened skyline produced by
+    // the legacy per-mesh HSR_FITCLIP pass.
+    int backdropFitGroup = -1;
+    bool skybox = false;            // actual cubemap-only SkyboxPlatformComponent input; 2D backdrop geometry must use backdropFitGroup instead
     // V79 node Y-ROTATION (Outer Wilds skybox/Interloper) -> getTime() Y-rotation shader cooker/rot_<periodms>_<p|m>.surface.
     bool rotAnim = false; float rotOmega = 0.f; float rotAxis[3] = {0,1,0}; float rotPivot[3] = {0,0,0};   // ARBITRARY-axis spin: signed rad/s about rotAxis around rotPivot (node WORLD origin; children orbit it)
     bool rotReplay = false; int rotReplayN = 0; float rotLoopSec = 0.f; std::vector<float> rotQuats;   // EXACT per-frame QUATERNION replay (aurora): shadergen::ROTREPLAY, (rotReplayN+1)*4 relative quats over rotLoopSec about rotPivot (nlerp+rotate in the vertex shader)
@@ -1844,6 +1849,88 @@ inline bool detectAndCollapseFlipbook(std::vector<float>& pos, std::vector<float
     pos.swap(p2); uvs.swap(u2); idx.swap(i2);
     return true;
 }
+
+// Fit user-selected visual backdrop groups under the Quest shell's fixed far clip.
+// The legacy HSR_FITCLIP path scales each mesh independently. That preserves each
+// object's apparent size, but destroys the relative spacing of a multi-mesh skyline.
+// This pass deliberately runs before mesh splitting and applies one factor per group.
+inline bool backdropFitIsStatic(const ExportMesh& m) {
+    return m.hzJointCount == 0 && m.hzFrames <= 1 && m.vatFrames == 0 &&
+           !m.rotAnim && !m.rotReplay && !m.rotOsc && !m.transAnim &&
+           !m.scaleAnim && !m.poseAnim && !m.pulse;
+}
+
+inline float effectiveBackdropFitRadius(float requested, float configuredFar) {
+    if(!std::isfinite(requested)||requested<1.f)requested=3000.f;
+    if(!std::isfinite(configuredFar)||configuredFar<1.f)configuredFar=150000.f;
+    float limit=configuredFar<5000.f?configuredFar*0.95f:4900.f;
+    if(limit<1.f)limit=1.f; if(limit>4900.f)limit=4900.f;
+    return requested<limit?requested:limit;
+}
+
+inline int fitBackdropGroups(std::vector<ExportMesh>& meshes, const float origin[3], float radius) {
+    struct GroupStats { float maxD2 = 0.f; size_t meshes = 0; bool valid = true; };
+    std::unordered_map<int, GroupStats> groups;
+
+    if (!std::isfinite(radius) || radius < 1.f) radius = 3000.f;
+    if (radius > 4900.f) radius = 4900.f; // retain margin under the device's 5000m plane
+
+    for (const auto& m : meshes) {
+        if (m.backdropFitGroup < 0) continue;
+        GroupStats& g = groups[m.backdropFitGroup];
+        ++g.meshes;
+        if (!backdropFitIsStatic(m) || m.positions.size() < 3) {
+            g.valid = false;
+            continue;
+        }
+        for (size_t v = 0; v + 2 < m.positions.size(); v += 3) {
+            if (!std::isfinite(m.positions[v]) || !std::isfinite(m.positions[v + 1]) || !std::isfinite(m.positions[v + 2])) {
+                g.valid = false;
+                break;
+            }
+            float dx = m.positions[v] - origin[0];
+            float dy = m.positions[v + 1] - origin[1];
+            float dz = m.positions[v + 2] - origin[2];
+            float d2 = dx*dx + dy*dy + dz*dz;
+            if (d2 > g.maxD2) g.maxD2 = d2;
+        }
+    }
+
+    int fitted = 0;
+    for (const auto& entry : groups) {
+        const int group = entry.first;
+        const GroupStats& g = entry.second;
+        if (!g.valid) {
+            // Fully reject the mark. Leaving it set would still bypass legacy fitting and
+            // collision/nav paths even though no coherent transform was applied.
+            for (auto& m : meshes) if (m.backdropFitGroup == group) m.backdropFitGroup = -1;
+            fprintf(stderr, "[COOK] BACKDROP_FIT group %d rejected: all members must be finite static visual meshes (normal cook fallback restored)\n", group);
+            continue;
+        }
+        float maxD = sqrtf(g.maxD2);
+        if (maxD <= radius || maxD <= 0.f) {
+            if (std::getenv("HSR_VERBOSE")) fprintf(stderr,
+                "[COOK] BACKDROP_FIT group %d unchanged: %zu mesh(es), farthest %.0fm <= %.0fm\n",
+                group, g.meshes, maxD, radius);
+            continue;
+        }
+        const float factor = radius / maxD;
+        for (auto& m : meshes) {
+            if (m.backdropFitGroup != group) continue;
+            for (size_t v = 0; v + 2 < m.positions.size(); v += 3) {
+                m.positions[v]     = origin[0] + (m.positions[v]     - origin[0]) * factor;
+                m.positions[v + 1] = origin[1] + (m.positions[v + 1] - origin[1]) * factor;
+                m.positions[v + 2] = origin[2] + (m.positions[v + 2] - origin[2]) * factor;
+            }
+        }
+        ++fitted;
+        fprintf(stderr,
+            "[COOK] BACKDROP_FIT group %d: %zu mesh(es), shared scale %.6f, farthest %.0fm -> %.0fm\n",
+            group, g.meshes, factor, maxD, radius);
+    }
+    return fitted;
+}
+
 // Split a LARGE static mesh (>cap unique verts) into SEPARATE single-part meshes (each its own entity). MULTI-PART
 // static RENDMESHes pass the device verifier but DON'T RENDER (no official env ships a size-split static mesh; the
 // device only draws multi-part for skinned/multi-material). u32 single-part renders as GARBAGE (the device reads the
@@ -1860,7 +1947,8 @@ inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMe
         while (t < ntri) {
             ExportMesh c; c.name = m.name; c.blend = m.blend; c.alphaTest = m.alphaTest; c.alphaCutoff = m.alphaCutoff; c.additive = m.additive; c.w = m.w; c.h = m.h; c.rgba = m.rgba;
             c.srcAstc = m.srcAstc; c.srcAstcBw = m.srcAstcBw; c.srcAstcBh = m.srcAstcBh; c.srcAstcMips = m.srcAstcMips;   // split parts keep the lossless source-ASTC pass-through
-            c.skybox = m.skybox;   // split parts MUST inherit the skybox mark, else a big dome (>60k verts) loses it -> far-clipped/black
+            c.backdropFitGroup = m.backdropFitGroup; // split chunks remain visual-only members of the already-fitted group
+            c.skybox = m.skybox;   // actual cubemap chunks retain their component routing
             for (int k = 0; k < 4; k++) c.matTint[k] = m.matTint[k];
             c.tintAnim = m.tintAnim; c.tintFrames = m.tintFrames; c.tintN = m.tintN; c.tintLoop = m.tintLoop;   // split parts keep the tint cycle
             std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(cap + 16);
@@ -2176,11 +2264,11 @@ inline bool signApk(const std::string& unsignedApk, const std::string& signedApk
 // to the real renderer_module unlit.surface shader; Root entity + child relationships + spawn point.
 inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes, const std::string& nuxdApk,
                                            const std::vector<uint8_t>& vspv, const std::vector<uint8_t>& fspv,
-                                           bool locomotion = true, bool* ok = nullptr, const float* camPos = nullptr,
+                                           bool locomotion = true, bool* ok = nullptr, const float* legacyCamPos = nullptr,
                                            std::vector<uint8_t>* outSceneZip = nullptr,
                                            const std::vector<uint8_t>& bgOgg = {},
                                            const std::function<void(float,const char*)>& progress = {},
-                                           const std::vector<sitem::Item>& sceneItems = {},
+                                           std::vector<sitem::Item> sceneItems = {},
                                            const std::string& editorSession = {}) {   // .hsledit text -> embedded in the APK so an ORPHAN cook re-opens with its scene items
     auto prog = [&](float f, const char* s){ if (progress) progress(f, s); };
     prog(0.02f, "Preparing scene");
@@ -2191,7 +2279,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     auto ctrace = [&](const char* s){ if (ctOn) { double dt = std::chrono::duration<double>(std::chrono::steady_clock::now()-ctT0).count();
         fprintf(stderr, "[COOKTRACE] %8.2fs  %s\n", dt, s); fflush(stderr); } };
     if (ok) *ok = false;
-    (void)vspv; (void)fspv;
+    (void)vspv; (void)fspv; (void)legacyCamPos;   // retained only for source compatibility; cooks resolve the real spawn from scene data
     CookRng rng;
     std::vector<CookAsset> assets;
     // ⛔ CACHE-BUST: the device's AssetManager caches parsed assets by AssetKey (= hash of the asset PATH) and serves the
@@ -2220,7 +2308,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     // shell's depth-consuming passes — SSAO/fog/motion). FIX = per-mesh routing: near geometry keeps the NORMAL shaders
     // (byte-exact depth -> correct shading); ONLY meshes whose farthest vertex exceeds the 5000 clip use the REMAP variant
     // (infinite reversed-Z z=near/w) so they render past the clip, ordered among themselves; their depth-effects are wrong
-    // only in the far distance (invisible). camPos = the spawn. [[project_hsr_eye_subcamera_farclip]]
+    // only in the far distance (invisible). The actual spawn is resolved below. [[project_hsr_eye_subcamera_farclip]]
     auto shad      = readFileBytes("cooker/nuxd_unlit_shader.bin");        // NORMAL (near) — byte-exact
     auto shadBlend = readFileBytes("cooker/nuxd_unlitblend_shader.bin");
     auto shadDC      = dclamp ? readFileBytes("cooker/nuxd_unlit_depthclamp.bin")      : std::vector<uint8_t>{};   // REMAP (far only)
@@ -2380,6 +2468,90 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             if (aMin >= 250) { m.blend = false;
                 if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' OPAQUE-BLEND reclass (fully-opaque texture aMin=%u, blend -> OPAQUE depth-write)\n", mi, m.name.c_str(), aMin); }
         }
+    // User-selected distant scenery is fitted as a coherent visual group BEFORE
+    // splitting. Resolve the ACTUAL player eye, never the freely movable editor
+    // camera: camera-dependent geometry also conflicts with cookInputHash(), which
+    // intentionally excludes the CAM line.
+    float fitOrigin[3] = {0.f, 1.6f, 0.f};
+    int fitOriginSource = 0; // 2=user spawn, 1=user navmesh, 0=deterministic scene fallback
+    for (const auto& si : sceneItems) if (si.type==sitem::SPAWN && si.allowStart && si.isLocal) {
+        fitOrigin[0]=si.pos[0]; fitOrigin[1]=si.pos[1]+1.6f; fitOrigin[2]=si.pos[2]; fitOriginSource=2; break;
+    }
+    if (fitOriginSource==0) {
+        double ax=0.0, az=0.0; size_t an=0; float nmin=1e30f, nmax=-1e30f;
+        for (const auto& si : sceneItems) if (si.type==sitem::NAVMESH)
+            for (size_t v=0; v+2<si.navVerts.size(); v+=3) {
+                float x=si.navVerts[v], y=si.navVerts[v+1], z=si.navVerts[v+2];
+                if(!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)) continue;
+                ax+=x; az+=z; ++an; if(y<nmin)nmin=y; if(y>nmax)nmax=y;
+            }
+        if (an) {
+            float cx=(float)(ax/an), cz=(float)(az/an), band=nmin+(nmax-nmin)*0.4f, best=1e30f; bool got=false;
+            for (const auto& si : sceneItems) if (si.type==sitem::NAVMESH)
+                for (size_t v=0; v+2<si.navVerts.size(); v+=3) {
+                    float x=si.navVerts[v], y=si.navVerts[v+1], z=si.navVerts[v+2];
+                    if(!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||y>band) continue;
+                    float dx=x-cx,dz=z-cz,d=dx*dx+dz*dz; if(d<best){best=d;fitOrigin[0]=x;fitOrigin[1]=y+1.6f;fitOrigin[2]=z;got=true;}
+                }
+            if(!got){fitOrigin[0]=cx;fitOrigin[1]=nmin+1.6f;fitOrigin[2]=cz;}
+            fitOriginSource=1;
+        }
+    }
+    if (fitOriginSource==0) {
+        float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f}; bool got=false;
+        for (const auto& m : meshesPre) {
+            if((m.backdropFitGroup>=0 && backdropFitIsStatic(m)) || m.positions.size()<9 || m.blend) continue;
+            if(m.name.find("sky")!=std::string::npos || m.name.find("Sky")!=std::string::npos) continue;
+            for(size_t v=0;v+2<m.positions.size();v+=3){
+                float p[3]={m.positions[v],m.positions[v+1],m.positions[v+2]};
+                if(!std::isfinite(p[0])||!std::isfinite(p[1])||!std::isfinite(p[2]))continue;
+                for(int k=0;k<3;k++){if(p[k]<mn[k])mn[k]=p[k];if(p[k]>mx[k])mx[k]=p[k];} got=true;
+            }
+        }
+        if(got){fitOrigin[0]=(mn[0]+mx[0])*0.5f;fitOrigin[1]=mn[1]+1.6f;fitOrigin[2]=(mn[2]+mx[2])*0.5f;}
+    }
+    fprintf(stderr,"[COOK] BACKDROP_FIT origin = actual %s eye (%.2f, %.2f, %.2f)\n",
+            fitOriginSource==2?"user-spawn":(fitOriginSource==1?"navmesh-spawn":"automatic-spawn"), fitOrigin[0],fitOrigin[1],fitOrigin[2]);
+    float backdropFitRadius = 3000.f;
+    if (const char* fr = std::getenv("HSR_BACKDROP_FIT_R")) {
+        backdropFitRadius = (float)atof(fr);
+        if (!std::isfinite(backdropFitRadius) || backdropFitRadius < 1.f) backdropFitRadius = 3000.f;
+    }
+    float configuredFar = 150000.f;
+    if (const char* fc=std::getenv("HSR_FARCLIP")) { float v=(float)atof(fc); if(std::isfinite(v)&&v>1.f) configuredFar=v; }
+    float effectiveRadius=effectiveBackdropFitRadius(backdropFitRadius,configuredFar);
+    if (effectiveRadius < backdropFitRadius) {
+        fprintf(stderr,"[COOK] BACKDROP_FIT radius %.0fm clamped to %.0fm below farClippingPlane %.0fm\n", backdropFitRadius,effectiveRadius,configuredFar);
+    }
+    backdropFitRadius=effectiveRadius;
+    int fittedBackdropGroups = fitBackdropGroups(meshesPre, fitOrigin, backdropFitRadius);
+    // Valid fitted backdrops are visual-only. Editor cooks rebake NAVMESH items
+    // after filtering their source indices; this defensive path also neutralizes
+    // stale externally supplied collider geometry. Rejected animated groups had
+    // their marks reset above and therefore retain their normal collision path.
+    for(auto& si:sceneItems) if(si.type==sitem::NAVMESH && !si.srcMeshes.empty()) {
+        bool touched=false;
+        for(int mi:si.srcMeshes) if(mi>=0 && mi<(int)meshesPre.size() && meshesPre[(size_t)mi].backdropFitGroup>=0){touched=true;break;}
+        if(touched){
+            si.srcMeshes.erase(std::remove_if(si.srcMeshes.begin(),si.srcMeshes.end(),[&](int mi){return mi>=0&&mi<(int)meshesPre.size()&&meshesPre[(size_t)mi].backdropFitGroup>=0;}),si.srcMeshes.end());
+            si.navVerts.clear(); si.navIdx.clear();
+            fprintf(stderr,"[COOK] BACKDROP_FIT removed stale explicit collision/nav geometry referencing a visual backdrop; auto collision will cover remaining ground\n");
+        }
+    }
+    if (fittedBackdropGroups > 0) {
+        float fogDensity = 0.f, fogStart = 0.f;
+        if (const char* fd = std::getenv("HSR_FOGDENSITY")) fogDensity = (float)atof(fd);
+        if (const char* fs = std::getenv("HSR_FOGSTART")) fogStart = (float)atof(fs);
+        float fogDistance = backdropFitRadius > fogStart ? backdropFitRadius - fogStart : 0.f;
+        float estimatedVisibility = expf(-fogDensity * fogDistance);
+        if (fogDensity > 0.f && estimatedVisibility < 0.25f) {
+            fprintf(stderr,
+                "[COOK] BACKDROP_FIT warning: current fog may hide the fitted backdrop "
+                "(start %.0fm, density %.6f, estimated visibility %.0f%% at %.0fm). "
+                "Adjust fog in Scene settings if that is not intentional.\n",
+                fogStart, fogDensity, estimatedVisibility * 100.f, backdropFitRadius);
+        }
+    }
     ctrace("before splitLargeStaticMeshes");
     std::vector<ExportMesh> meshesV = splitLargeStaticMeshes(meshesPre);
     // Split >60000-vert SKINNED meshes the SAME way (multi-part skinned CRASHES the device — snakeway 5_Car dragon).
@@ -2392,10 +2564,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     // Only meshes whose farthest vertex exceeds R are touched; everything already inside is left EXACT. [[project_hsr_eye_subcamera_farclip]]
     if (fit) {
         float MAXR = 4500.f; if (const char* fr = std::getenv("HSR_FITCLIP_R")) { MAXR = (float)atof(fr); if (MAXR < 1.f) MAXR = 4500.f; }
-        float o[3] = { camPos?camPos[0]:0.f, camPos?camPos[1]:1.6f, camPos?camPos[2]:0.f };
+        const float* o = fitOrigin;
         int nfit = 0;
         for (size_t mi = 0; mi < meshesV.size(); ++mi) {
             ExportMesh& m = meshesV[mi];
+            if (m.backdropFitGroup >= 0) continue; // already fitted with its whole group; never tear it apart here
             const std::vector<float>& gp = (!m.hzRestPos.empty() && m.hzRestPos.size()==m.positions.size()) ? m.hzRestPos : m.positions;
             float maxD2 = 0.f;
             for (size_t v=0; v+2<gp.size(); v+=3){ float dx=gp[v]-o[0],dy=gp[v+1]-o[1],dz=gp[v+2]-o[2]; float d=dx*dx+dy*dy+dz*dz; if(d>maxD2)maxD2=d; }
@@ -2432,9 +2605,9 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
       autoMeshCollide = !std::getenv("HSR_NOAUTOFLOOR") && !userNavPre && !std::getenv("HSR_NOSMARTMESHCOL");
       if (autoMeshCollide) { size_t nCol=0;
           for (auto& mm : meshesV) {
-              bool geomAnim = (mm.hzFrames > 1) || mm.rotAnim || mm.rotReplay || mm.transAnim || mm.scaleAnim;
+              bool geomAnim = (mm.hzFrames > 1) || mm.rotAnim || mm.rotReplay || mm.transAnim || mm.scaleAnim || mm.pulse;
               bool isSky = mm.name.find("sky")!=std::string::npos || mm.name.find("Sky")!=std::string::npos;
-              if (!geomAnim && !isSky && mm.positions.size() >= 9 && mm.indices.size() >= 3) { mm.wantCollider = true; ++nCol; }
+              if (!geomAnim && !isSky && mm.backdropFitGroup < 0 && mm.positions.size() >= 9 && mm.indices.size() >= 3) { mm.wantCollider = true; ++nCol; }
           }
           if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] smart floor = AUTO MESH-COLLIDER: %zu static meshes -> SEBD trimesh colliders (no user navmesh)\n", nCol);
       }
@@ -2457,10 +2630,10 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             bimodalOccluder = (midF < 0.05f) && (opF > 0.004f);
         }
         // FAR-ONLY remap routing (HSR_DEPTHCLAMP): does this mesh poke past the 5000 clip from the spawn? If so it gets the
-        // remap shader (renders past the clip); near meshes stay byte-exact. camPos = spawn.
+        // remap shader (renders past the clip); near meshes stay byte-exact. Use the same resolved player spawn as fitting.
         bool meshFar = false;
         if (dclamp) {
-            float o[3] = { camPos?camPos[0]:0.f, camPos?camPos[1]:1.6f, camPos?camPos[2]:0.f };
+            const float* o = fitOrigin;
             float md2 = 0.f;
             for (size_t v=0; v+2<m.positions.size(); v+=3){ float dx=m.positions[v]-o[0],dy=m.positions[v+1]-o[1],dz=m.positions[v+2]-o[2]; float d=dx*dx+dy*dy+dz*dz; if(d>md2)md2=d; }
             meshFar = sqrtf(md2) > farMargin;
@@ -2481,8 +2654,8 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // Only OPAQUE ground/walls define the playable bounds (scale/spawn). Skip skyboxes AND transparent EFFECT meshes
         // (warp tunnel / nebula "Glow" / sliding screens are blend) — Star Trek's 286-unit-long warp glow was inflating the
         // bounds to ext=286 -> gs=47.7 -> the whole bridge cooked tiny (and the fog/everything shrank with it).
-        bool navCand = (navIdx >= 0) ? ((int)i == navIdx)
-                     : (mnv >= 100 && !m.blend && m.name.find("sky") == std::string::npos && m.name.find("Sky") == std::string::npos);
+        bool navCand = (navIdx >= 0) ? ((int)i == navIdx && m.backdropFitGroup < 0)
+                     : (mnv >= 100 && !m.blend && m.backdropFitGroup < 0 && m.name.find("sky") == std::string::npos && m.name.find("Sky") == std::string::npos);
         if (navCand) for (size_t v = 0; v + 2 < m.positions.size(); v += 3) for (int k = 0; k < 3; k++) { float p = m.positions[v + k]; if (p < smn[k]) smn[k] = p; if (p > smx[k]) smx[k] = p; }
         // Embed the SOURCE mesh name (m.name, e.g. "VE_WESTERN...fbx.comet_alpha.mat") into the cook asset id so
         // the on-device AssetRef name is SEARCHABLE — findmat/findmesh/envdump then show "m005_comet_alpha" instead
@@ -3612,14 +3785,14 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' CENTERED ctr=(%.2f,%.2f,%.2f) for %s\n",
                     i, m.name.c_str(), poseCtr[0],poseCtr[1],poseCtr[2], useRot ? "Y-rotation (pivot)" : usePulse ? "wispscale shader" : "poseAnimation");
         }
-        // DIAGNOSTIC/FIX: HSR_PULLIN=<dist> pulls FAR static geometry toward the view origin (camPos) so its centroid
+        // DIAGNOSTIC/FIX: HSR_PULLIN=<dist> pulls FAR static geometry toward the resolved player spawn so its centroid
         // lands within <dist>, PRESERVING its apparent size from the viewpoint. The shell's far clip plane is fixed and
         // hard-capped at 1000 (IDA: ViewCameraManager sub_20BC124) and NOT env-expandable; this fits the distant city
         // INSIDE it instead. Also a clean test: if the backdrop renders once pulled in, the "black dome" was the far clip.
         std::vector<float> pulledPos;
         if (const char* pe = std::getenv("HSR_PULLIN")) {
             float thr = (float)atof(pe); if (thr < 1.f) thr = 1.f;
-            float o[3] = { camPos?camPos[0]:0.f, camPos?camPos[1]:1.6f, camPos?camPos[2]:0.f };
+            const float* o = fitOrigin;
             const std::vector<float>& src = *staticPos; size_t np = src.size()/3; double c[3]={0,0,0};
             for (size_t v=0; v+2<src.size(); v+=3) for(int k=0;k<3;k++) c[k]+=src[v+k];
             if (np) { float cx=(float)(c[0]/np)-o[0], cy=(float)(c[1]/np)-o[1], cz=(float)(c[2]/np)-o[2];
@@ -3880,7 +4053,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // Far backdrop beyond this radius is drawn in the depth-clamped skybox pass, EXEMPT from the hard
             // PortalStereoCamera far=5000 clip (device-proven the only escape — official homes skybox their distance, see
             // [[project_hsr_eye_subcamera_farclip]]). Only plain STATIC meshes (animated/skinned keep the normal walkable path).
-            if (m.skybox) skybox = true;   // EXPLICIT per-mesh mark (editor right-click "Make skybox backdrop") — always wins
+            if (m.skybox) skybox = true;   // explicit cubemap/component input always wins; 2D editor backdrops use coherent fitting
             const char* sd = std::getenv("HSR_SKYBOX_DIST"); float thr = sd ? (float)atof(sd) : 0.f;
             if (!skybox && thr > 0) { size_t np = m.positions.size()/3; double cc[3]={0,0,0};
                 for (size_t v=0; v+2<m.positions.size(); v+=3) for(int k=0;k<3;k++) cc[k]+=m.positions[v+k];
@@ -4042,6 +4215,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     if (smx[0] < smn[0]) {
         for (const auto& m : meshesV) {
             if (m.positions.size() < 9) continue;
+            if (m.backdropFitGroup >= 0) continue;
             if (m.name.find("sky") != std::string::npos || m.name.find("Sky") != std::string::npos) continue;
             for (size_t v=0; v+2<m.positions.size(); v+=3) for(int k=0;k<3;k++){ float p=m.positions[v+k]; if(p<smn[k])smn[k]=p; if(p>smx[k])smx[k]=p; }
         }
@@ -4063,6 +4237,9 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             for (size_t v=0; v+2<si.navVerts.size(); v+=3){ float y=si.navVerts[v+1]; if (y>band) continue;   // floor band only (skip walls/upper)
                 float dx=si.navVerts[v]-cx, dz=si.navVerts[v+2]-cz, d=dx*dx+dz*dz; if (d<best){ best=d; gx=si.navVerts[v]; gy=y; gz=si.navVerts[v+2]; got=true; } }
         if (!got){ gx=cx; gz=cz; gy=nmin; } } }
+    // Keep the automatically emitted spawn exactly aligned with the origin used
+    // for backdrop fitting. A user-authored spawn is emitted independently below.
+    if (fitOriginSource != 2) { gx=fitOrigin[0]; gy=fitOrigin[1]-1.6f; gz=fitOrigin[2]; }
     float ex = smx[0]-smn[0], ez = smx[2]-smn[2], ext = ex > ez ? ex : ez;
     float gs = ext > 1.f ? (ext / 12.0f) * 2.0f : 8.0f;         // BIG invisible plane (nuxd circular floor ~12.8m x2 the scene)
     float spawnSurfY = gy;   // road/floor surface Y under the spawn (set from the heightfield) -> spawn ON it, not above
@@ -4088,6 +4265,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             std::vector<WT> wt; float wmnx=1e30f,wmnz=1e30f,wmxx=-1e30f,wmxz=-1e30f;
             for (const auto& m : meshesV) {
                 if (m.positions.size() < 9 || m.indices.size() < 3) continue;
+                if (m.backdropFitGroup >= 0) continue;
                 if (m.name.find("sky")!=std::string::npos || m.name.find("Sky")!=std::string::npos) continue;
                 for (size_t t=0; t+2<m.indices.size(); t+=3) {
                     uint32_t a=m.indices[t], b=m.indices[t+1], c=m.indices[t+2];
@@ -4418,8 +4596,8 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         rels += "," + relChildOf(audioId, rootId);
         if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[EXPORT] background audio: %zu KB ogg -> FMOD:SND SoundAsset (auto-start, loop)\n", bgOgg.size()/1024);
     }
-    fprintf(stderr, "[EXPORT] cam@(%.1f,%.1f,%.1f) navBounds=(%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f) ground@(%.1f,%.1f,%.1f) scale=%.1f spawn@(%.1f,%.1f,%.1f)\n",
-            camPos?camPos[0]:0,camPos?camPos[1]:0,camPos?camPos[2]:0, smn[0],smn[1],smn[2], smx[0],smx[1],smx[2], gx,gy,gz, gs, spawnPos[0],spawnPos[1],spawnPos[2]);
+    fprintf(stderr, "[EXPORT] spawnEye@(%.1f,%.1f,%.1f) navBounds=(%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f) ground@(%.1f,%.1f,%.1f) scale=%.1f spawn@(%.1f,%.1f,%.1f)\n",
+            fitOrigin[0],fitOrigin[1],fitOrigin[2], smn[0],smn[1],smn[2], smx[0],smx[1],smx[2], gx,gy,gz, gs, spawnPos[0],spawnPos[1],spawnPos[2]);
     std::string pContent = MH + "/content.hstf/template", pSpace = MH + "/space.hstf/template";
     AssetKey3 contentK = keyForPath(pContent), spaceK = keyForPath(pSpace);
     std::string content = templateJson(entities, rels);
