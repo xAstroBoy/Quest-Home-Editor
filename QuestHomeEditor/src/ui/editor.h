@@ -71,6 +71,7 @@ static inline void hsrSockTimeoutMs(SOCKET s, int ms) {
 #include <array>
 #include <tuple>
 #include <climits>
+#include <cstdint>
 
 struct Editor {
     // ── bindings ──
@@ -2423,7 +2424,7 @@ struct Editor {
     bool geomDirty = false;
     int  baseMeshCount = -1;   // how many meshes the ENV itself loaded (anything above = editor-created)
     std::thread geomThread; std::atomic<bool> geomSaving{false};
-    bool geomAuth = false;   // a v2 .geom was loaded: it is authoritative for created meshes (idx >= baseMeshCount) - stale session lines must not override it   // sidecar writes run OFF the UI thread (PNG-encoding a fused 4K atlas froze the app for seconds)
+    bool geomAuth = false;   // a v2+ .geom was loaded: it is authoritative for created meshes (idx >= baseMeshCount) - stale session lines must not override it   // sidecar writes run OFF the UI thread (PNG-encoding a fused 4K atlas froze the app for seconds)
     void saveGeomSidecar(const std::string& sessionFile){
         if (!r || !sceneMeshes || baseMeshCount < 0) return;
         // NEVER skip the write: the session .hsledit is written unconditionally and its MESH/DELETED lines
@@ -2434,7 +2435,7 @@ struct Editor {
         if (geomThread.joinable()) geomThread.join();
         std::string gp = sessionFile + ".geom";
         // SNAPSHOT the extra meshes fast (bulk vector copies), then encode + write on a WORKER thread.
-        struct GeoSnap { std::string name; u8 flags[4]; u8 del; float eT[3],eR[4],eS[3],eTint[4]; u32 texW,texH; std::vector<u8> texRGBA;
+        struct GeoSnap { std::string name; u8 flags[4]; u8 del; int32_t fitGroup; float eT[3],eR[4],eS[3],eTint[4]; u32 texW,texH; std::vector<u8> texRGBA;
                          std::vector<float> pos,uv,uv2; std::vector<u32> idx; std::string log; };
         auto snap = std::make_shared<std::vector<GeoSnap>>();
         for (int i=baseMeshCount; i<(int)sceneMeshes->size(); ++i){
@@ -2449,6 +2450,7 @@ struct Editor {
             // v2 state byte: bit0 = deleted (always 0 now — deleted records aren't written; kept for
             // compatibility with the first v2 files), bit1 = collision-excluded (walk-through)
             g.del = noColMeshes.count(i)?2:0;
+            g.fitGroup = (int32_t)backdropFitGroupForMesh(i);
             if ((size_t)i < r->gpuMeshes.size()) { const VkGpuMesh& gm=r->gpuMeshes[(size_t)i];
                 memcpy(g.eT,gm.editT,sizeof g.eT); memcpy(g.eR,gm.editR,sizeof g.eR);
                 memcpy(g.eS,gm.editS,sizeof g.eS); memcpy(g.eTint,gm.editTint,sizeof g.eTint); }
@@ -2468,7 +2470,7 @@ struct Editor {
             if (f) {
                 auto w32=[&](u32 v){ fwrite(&v,4,1,f); };
                 auto wstr=[&](const std::string& s){ w32((u32)s.size()); fwrite(s.data(),1,s.size(),f); };
-                fwrite("HSRGEOM2",8,1,f); w32((u32)snap->size());
+                fwrite("HSRGEOM3",8,1,f); w32((u32)snap->size());
                 // slice/copy families all share ONE source texture — encode + store each distinct texture
                 // ONCE; later records write the 0xFFFFFFFE marker + the record index that owns the pixels.
                 std::unordered_map<unsigned long long,u32> texSeen;
@@ -2476,6 +2478,7 @@ struct Editor {
                     auto& g = (*snap)[ri];
                     wstr(g.name); fwrite(g.flags,1,4,f);
                     fwrite(&g.del,1,1,f);
+                    fwrite(&g.fitGroup,4,1,f);
                     fwrite(g.eT,4,3,f); fwrite(g.eR,4,4,f); fwrite(g.eS,4,3,f); fwrite(g.eTint,4,4,f);
                     w32(g.texW); w32(g.texH);
                     if (g.texRGBA.empty() || !g.texW) { w32(0); }
@@ -2512,8 +2515,9 @@ struct Editor {
         if (!r || !sceneMeshes) return;
         std::string gp = sessionFile + ".geom";
         FILE* f = fopen(gp.c_str(), "rb"); if (!f) return;
-        char magic[8]; if (fread(magic,1,8,f)!=8 || memcmp(magic,"HSRGEOM",7)!=0 || (magic[7]!='1' && magic[7]!='2')){ fclose(f); return; }
-        bool v2 = magic[7]=='2';   // v2 records carry deleted/nocol + editT/R/S/Tint (self-contained; no session-index dependence)
+        char magic[8]; if (fread(magic,1,8,f)!=8 || memcmp(magic,"HSRGEOM",7)!=0 || (magic[7]!='1' && magic[7]!='2' && magic[7]!='3')){ fclose(f); return; }
+        bool v2 = magic[7]>='2';   // v2+ records carry deleted/nocol + editT/R/S/Tint (self-contained; no session-index dependence)
+        bool v3 = magic[7]>='3';   // v3 also carries the coherent-backdrop group of each compacted record
         // EVERY read is checked: a process killed mid-write used to leave a truncated file whose zero-filled
         // tail decoded as "empty mesh" records — uploadMesh(0 verts) crashed inside the driver. Any short or
         // insane read now stops the restore cleanly and keeps everything already loaded.
@@ -2528,8 +2532,8 @@ struct Editor {
             md.name = rstr();
             u8 flags[4]={0,0,0,0}; rd(flags,4);
             md.useBlend=flags[0]!=0; md.additive=flags[1]!=0; md.alphaTest=flags[2]!=0; md.doubleSided=flags[3]!=0;
-            u8 del=0; float eT[3]={0,0,0}, eR[4]={0,0,0,1}, eS[3]={1,1,1}, eTint[4]={1,1,1,1};
-            if (v2){ rd(&del,1); rd(eT,12); rd(eR,16); rd(eS,12); rd(eTint,16); }
+            u8 del=0; int32_t fitGroup=-1; float eT[3]={0,0,0}, eR[4]={0,0,0,1}, eS[3]={1,1,1}, eTint[4]={1,1,1,1};
+            if (v2){ rd(&del,1); if(v3)rd(&fitGroup,4); rd(eT,12); rd(eR,16); rd(eS,12); rd(eTint,16); }
             md.texW=r32(); md.texH=r32();
             u32 pn=r32();
             int texFrom=-1;
@@ -2563,6 +2567,7 @@ struct Editor {
                 memcpy(ng.editS,eS,sizeof eS); memcpy(ng.editTint,eTint,sizeof eTint);
                 recomputeModel(ng);
                 if (del&2) noColMeshes.insert((int)ni);
+                if (v3 && fitGroup>=0){ backdropFitGroups[(int)ni]=(int)fitGroup; if(fitGroup>=nextBackdropFitGroup)nextBackdropFitGroup=(int)fitGroup+1; }
             }
             if (!log.empty()) meshEditLog[(int)ni]=log;
             recScene.push_back((int)ni);
@@ -2570,7 +2575,7 @@ struct Editor {
         }
         fclose(f);
         r->hiddenMeshes.resize(r->gpuMeshes.size(), false); r->deletedMeshes.resize(r->gpuMeshes.size(), false);
-        if (v2) geomAuth = true;   // GEOM2 is AUTHORITATIVE for created meshes: session MESH/DELETED/MATF/
+        if (v2) geomAuth = true;   // GEOM2/3 is AUTHORITATIVE for created meshes: session MESH/DELETED/MATF/
                                    // TEXOVR/NOCOL lines with idx >= baseMeshCount are stale (the compacted
                                    // sidecar re-orders live meshes) and must not be applied over it.
         if (restored) fprintf(stderr,"[EDIT] geometry sidecar restored %d editor-created mesh(es) from %s\n", restored, gp.c_str());
@@ -2909,11 +2914,18 @@ struct Editor {
         r->uploadMesh(sceneMeshes->back());
         r->hiddenMeshes.resize(r->gpuMeshes.size(),false); r->deletedMeshes.resize(r->gpuMeshes.size(),false);
     }
-    // ── per-mesh "skybox backdrop" marks: cooked as SkyboxPlatformComponent (far-clip-EXEMPT, escapes the PortalStereoCamera
-    //    far=5000 clip). Set via right-click; multi-select applies to the whole selection. [[project_hsr_eye_subcamera_farclip]]
-    std::vector<int> skyboxMeshes;
-    bool isSkyboxMesh(int i) const { for (int s:skyboxMeshes) if(s==i) return true; return false; }
-    void toggleSkybox(int i){ if(i<0)return; for(size_t k=0;k<skyboxMeshes.size();++k) if(skyboxMeshes[k]==i){ skyboxMeshes.erase(skyboxMeshes.begin()+k); return; } skyboxMeshes.push_back(i); }
+    // Per-mesh coherent visual-backdrop marks. Multi-select creates one fit group;
+    // actual cubemap SkyboxPlatformComponent input remains a separate cooker path.
+    std::map<int,int> backdropFitGroups;   // mesh index -> independently fitted group id
+    int nextBackdropFitGroup = 0;
+    int backdropFitGroupForMesh(int i) const { auto it=backdropFitGroups.find(i); return it==backdropFitGroups.end() ? -1 : it->second; }
+    bool isBackdropFitMesh(int i) const { return backdropFitGroupForMesh(i)>=0; }
+    void setBackdropFit(const std::vector<int>& targets, bool enabled){
+        if(!enabled) for(int i:targets) backdropFitGroups.erase(i);
+        else { const int group=nextBackdropFitGroup++; for(int i:targets) if(i>=0) backdropFitGroups[i]=group; }
+        for(int i:targets) if(baseMeshCount>=0&&i>=baseMeshCount){geomDirty=true;break;}
+        for(auto& it:items) if(it.type==sitem::NAVMESH) bakeNavGeometry(it);   // live collision preview follows visual-only state immediately
+    }
     // ── rubber-band box select (Ctrl/Shift + left-drag in the viewport; plain left-drag stays camera-look) ──
     bool boxSel=false; float boxX0=0,boxY0=0;
     int  outlinerDragRow=-1;       // outliner drag-select: row where the left-drag started (-1 = none)
@@ -3168,7 +3180,11 @@ struct Editor {
             s+="\n";
         }
         if(!animColliders.empty()){ s+="COLLIDERS "+std::to_string(animColliders.size()); for(int m:animColliders){ snprintf(b,sizeof b," %d",m); s+=b; } s+="\n"; }
-        if(!skyboxMeshes.empty()){ s+="SKYBOX "+std::to_string(skyboxMeshes.size()); for(int m:skyboxMeshes){ snprintf(b,sizeof b," %d",m); s+=b; } s+="\n"; }
+        { std::map<int,std::vector<int>> groups;
+          for(const auto& kv:backdropFitGroups) if(kv.second>=0) groups[kv.second].push_back(kv.first);
+          for(const auto& g:groups){ s+="BACKDROP_FIT "+std::to_string(g.first)+" "+std::to_string(g.second.size());
+              for(int m:g.second){ snprintf(b,sizeof b," %d",m); s+=b; } s+="\n"; } }
+        snprintf(b,sizeof b,"BACKDROP_FIT_RADIUS %.1f\n", backdropFitRadius); s+=b;
         if(r->deletedCount()>0){ s+="DELETED "+std::to_string(r->deletedCount()); for(int i=0;i<(int)r->gpuMeshes.size();++i) if(r->isDeleted(i)){ snprintf(b,sizeof b," %d",i); s+=b; } s+="\n"; }
         for(auto& kv:texOverride){ s += "TEXOVR "+std::to_string(kv.first)+" "+kv.second+"\n"; }   // swapped mesh/skybox textures (re-loaded from the image path on open)
         if(skyColorSet()){ snprintf(b,sizeof b,"SKYCOL %.4f %.4f %.4f\n", skyColor[0],skyColor[1],skyColor[2]); s+=b; }   // general skybox background color
@@ -3237,9 +3253,13 @@ struct Editor {
     }
     // Parse + apply a .hsledit session text (shared by loadProject and the auto-save recovery banner).
     void applySessionText(const std::string& all, int& meshN, int& itemN){
-        items.clear(); selItem=-1; deselectAll(); animColliders.clear(); skyboxMeshes.clear();
+        items.clear(); selItem=-1; deselectAll(); animColliders.clear();
+        { // GEOM3 owns compacted editor-created mesh fit groups; keep them while session lines restore base meshes.
+          std::map<int,int> keep; if(geomAuth) for(const auto& kv:backdropFitGroups) if(kv.first>=baseMeshCount) keep.emplace(kv);
+          backdropFitGroups=std::move(keep); nextBackdropFitGroup=0;
+          for(const auto& kv:backdropFitGroups) if(kv.second>=nextBackdropFitGroup) nextBackdropFitGroup=kv.second+1; }
         matEdited.clear(); for(int k=0;k<4;k++) r->lightMul[k]=1.f;   // reset light/material/collision edits; LIGHT/MATF/NOCOL lines re-apply
-        { // created-mesh collision-excludes came from the GEOM2 sidecar (loaded BEFORE this) — keep those, reset the rest
+        { // created-mesh collision-excludes came from the GEOM2/3 sidecar (loaded BEFORE this) — keep those, reset the rest
           std::set<int> keep; for (int m : noColMeshes) if (geomAuth && m>=baseMeshCount) keep.insert(m);
           noColMeshes = std::move(keep); }
         clearAudioOverride();   // reset to the env's own theme; an AUDIOOVR line below re-applies the replacement (no-op when none was active)
@@ -3250,7 +3270,7 @@ struct Editor {
             auto t=tokenize(line); if(t.empty()) continue;
             if(t[0]=="CAM" && t.size()>=6){ r->cam.pos[0]=(float)atof(t[1].c_str()); r->cam.pos[1]=(float)atof(t[2].c_str()); r->cam.pos[2]=(float)atof(t[3].c_str()); r->cam.yaw=(float)atof(t[4].c_str()); r->cam.pitch=(float)atof(t[5].c_str()); }
             else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; /* t[15]=voxelSolid: NOT loaded — stays at the reverted default (false); old sessions saved 1 and would re-wall rooms */ if(t.size()>=20){ bgColorSet=atoi(t[16].c_str())!=0; bgColor[0]=(float)atof(t[17].c_str()); bgColor[1]=(float)atof(t[18].c_str()); bgColor[2]=(float)atof(t[19].c_str()); if(bgColorSet&&r){ r->clearRGB[0]=bgColor[0]; r->clearRGB[1]=bgColor[1]; r->clearRGB[2]=bgColor[2]; } } if(t.size()>=21) antiCull=atoi(t[20].c_str())!=0; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
-            else if(t[0]=="MESH" && t.size()>=14 && !cooked){ int idx=atoi(t[1].c_str()); if(geomAuth && idx>=baseMeshCount) continue;   /* GEOM2 owns created meshes; compacted sidecar re-orders them = stale indices */ if(idx>=0&&idx<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[idx];
+            else if(t[0]=="MESH" && t.size()>=14 && !cooked){ int idx=atoi(t[1].c_str()); if(geomAuth && idx>=baseMeshCount) continue;   /* GEOM2/3 owns created meshes; compacted sidecar re-orders them = stale indices */ if(idx>=0&&idx<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[idx];
                 gm.name=t[2]; gm.editT[0]=(float)atof(t[3].c_str()); gm.editT[1]=(float)atof(t[4].c_str()); gm.editT[2]=(float)atof(t[5].c_str());
                 gm.editR[0]=(float)atof(t[6].c_str()); gm.editR[1]=(float)atof(t[7].c_str()); gm.editR[2]=(float)atof(t[8].c_str()); gm.editR[3]=(float)atof(t[9].c_str());
                 gm.editS[0]=(float)atof(t[10].c_str()); gm.editS[1]=(float)atof(t[11].c_str()); gm.editS[2]=(float)atof(t[12].c_str());
@@ -3266,10 +3286,12 @@ struct Editor {
                 int nsrc=atoi(t[23].c_str()); for(int k=0;k<nsrc && 24+k<(int)t.size();++k) it.srcMeshes.push_back(atoi(t[24+k].c_str()));
                 if (24+nsrc   < (int)t.size()) it.iconY     = (float)atof(t[24+nsrc].c_str());     // optional (newer sessions)
                 if (24+nsrc+1 < (int)t.size()) it.iconScale = (float)atof(t[24+nsrc+1].c_str());
-                if(it.type==sitem::NAVMESH){ if(cooked){ it.srcMeshes.clear(); fillGroundMeshes(it.srcMeshes); } bakeNavGeometry(it); }   // cooked: re-pick ground by NAME (the cook re-ordered meshes -> the saved indices point at the wrong meshes)
+                if(it.type==sitem::NAVMESH && cooked){ it.srcMeshes.clear(); fillGroundMeshes(it.srcMeshes); }   // cooked: re-pick ground by NAME (the cook re-ordered meshes -> the saved indices point at the wrong meshes)
                 items.push_back(std::move(it)); itemN++; }
             else if(t[0]=="COLLIDERS" && !cooked){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) animColliders.push_back(atoi(t[2+k].c_str())); }
-            else if(t[0]=="SKYBOX" && !cooked){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k) skyboxMeshes.push_back(atoi(t[2+k].c_str())); }   // restore far-backdrop skybox marks
+            else if(t[0]=="BACKDROP_FIT" && t.size()>=3 && !cooked){ int group=atoi(t[1].c_str()), nc=atoi(t[2].c_str()); if(group<0)group=nextBackdropFitGroup; if(group>=nextBackdropFitGroup)nextBackdropFitGroup=group+1; for(int k=0;k<nc && 3+k<(int)t.size();++k){ int mi=atoi(t[3+k].c_str()); if(mi>=0 && !(geomAuth&&mi>=baseMeshCount)) backdropFitGroups[mi]=group; } }
+            else if(t[0]=="BACKDROP_FIT_RADIUS" && t.size()>=2){ backdropFitRadius=(float)atof(t[1].c_str()); if(backdropFitRadius<1.f)backdropFitRadius=3000.f; if(backdropFitRadius>4900.f)backdropFitRadius=4900.f; }
+            else if(t[0]=="SKYBOX" && !cooked){ int group=nextBackdropFitGroup++, nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k){ int mi=atoi(t[2+k].c_str()); if(mi>=0 && !(geomAuth&&mi>=baseMeshCount)) backdropFitGroups[mi]=group; } }   // migrate legacy 2D skybox marks to one coherent fit group
             else if(t[0]=="IHIDE"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k){ int idx=atoi(t[2+k].c_str()); if(idx>=0&&idx<(int)items.size()) items[idx].hidden=true; } }   // restore per-item visibility eyes
             else if(t[0]=="DELETED"){ int nc=atoi(t[1].c_str()); for(int k=0;k<nc && 2+k<(int)t.size();++k){ int idx=atoi(t[2+k].c_str()); if(idx>=0 && !(geomAuth && idx>=baseMeshCount)) r->setDeleted(idx,true); } }   // restore editor mesh deletions (dropped from render + cook)
             else if(t[0]=="TEXOVR" && (int)t.size()>=3){ int mi=atoi(t[1].c_str()); std::string p=t[2]; for(size_t k=3;k<t.size();++k) p+=" "+t[k]; if(mi>=0 && !(geomAuth && mi>=baseMeshCount)) texOverride[mi]=p; }   // remember swapped textures; applyTexOverrides() re-loads them below
@@ -3287,6 +3309,10 @@ struct Editor {
                         md.useBlend=gm.useBlend; md.additive=gm.additive; md.alphaTest=gm.alphaTest; md.doubleSided=!gm.cullBack; }
                     matEdited.insert(mi); } }
         }
+        // ITEM lines precede BACKDROP_FIT/NOCOL in the session. Bake only after
+        // the complete file is parsed so visual-only marks cannot leak into the
+        // restored collision preview or player simulator.
+        for(auto& it:items) if(it.type==sitem::NAVMESH) bakeNavGeometry(it);
     }
     // ── AUTO-SAVE (Phase-1 crash resistance): every autoSaveIntervalS seconds, if the session text changed since the
     //    last save/auto-save, write it to "<session>.hsledit.autosave". saveProject deletes the .autosave (state is now
@@ -3491,6 +3517,7 @@ struct Editor {
                                // proven: official homes/vistas escape the 5000 clip ONLY this way, NOT via a bigger far). The
                                // backdrop becomes camera-locked (fine at km range). -> HSR_SKYBOX_DIST. [[project_hsr_eye_subcamera_farclip]]
     float skyboxDist = 1500.f; // meters: meshes whose centroid is farther than this from origin -> skybox (else normal walkable mesh)
+    float backdropFitRadius = 3000.f; // coherent visual-backdrop radius; kept safely below the Quest shell's 5000m plane
     // ── HSL render config: previewed live (WYSIWYG) AND emitted into the cook's ScenePlatformComponent ──
     bool  cfgFog = false;             // distance fog: show in preview + ship in cook (fogColor/fogStart/fogDensity)
     float cfgFogColor[3] = {0.05f, 0.06f, 0.09f};
@@ -4161,7 +4188,7 @@ struct Editor {
             {"Geometry / repair",-2,1},
             {"Make component",-2,2},
             {std::string(noColMeshes.count(ctxMesh)?"Collision: INCLUDE again":"Collision: EXCLUDE (walk-through)")+suf,27,-1},
-            {std::string(isSkyboxMesh(ctxMesh)?"Unmark skybox backdrop":"Make skybox backdrop")+suf,6,-1},
+            {std::string(isBackdropFitMesh(ctxMesh)?"Remove coherent backdrop fit":"Fit as coherent backdrop")+suf,6,-1},
             {std::string("Reset transform")+suf,3,-1},
             {"Copy name",4,-1} };
         if (nHidden>0) main.push_back({std::string("Unhide ALL (")+std::to_string(nHidden)+")",7,-1});
@@ -4181,10 +4208,10 @@ struct Editor {
                     pushUndo(mm,bb,aa); }
                 else if (a==4) glfwSetClipboardString(win, gm.name.c_str());
                 else if (a==5) { for (int t:tg) addMeshCollider(t); }                             // collider on ALL selected
-                else if (a==6) {   // mark/unmark skybox backdrop on ALL selected
-                    bool makeSky = !isSkyboxMesh(ctxMesh);   // base the whole batch on the clicked mesh's new state (consistent toggle)
-                    for (int t : tg) { if (isSkyboxMesh(t) != makeSky) toggleSkybox(t); }
-                    setStatus(std::string(makeSky?"Marked ":"Unmarked ")+std::to_string(tg.size())+" mesh(es) as skybox backdrop (far-clip-exempt)");
+                else if (a==6) {   // mark/unmark coherent backdrop fitting on ALL selected
+                    bool makeFit = !isBackdropFitMesh(ctxMesh);
+                    setBackdropFit(tg, makeFit);   // each marking action is one coherent group; earlier groups stay independent
+                    setStatus(std::string(makeFit?"Marked ":"Unmarked ")+std::to_string(tg.size())+" mesh(es) for coherent backdrop fitting");
                 }
                 else if (a==7) { for (int i=0;i<(int)r->gpuMeshes.size();++i) r->setHidden(i,false); setStatus("Unhid ALL meshes"); }   // unhide everything
                 else if (a==8) { if (!inSel(ctxMesh)) selectOne(ctxMesh); duplicateSelected(); }   // clone selection (independent copy, cooks too)
@@ -4557,7 +4584,7 @@ struct Editor {
             if (!onScreen(ry)) { ry+=rowH; continue; }
             auto& gm = r->gpuMeshes[i];
             bool vis = !r->isHidden(i);
-            auto rr = cx.treeRow(ui::hashId(3000+i,11), x, ry, w, rowH, (gm.name+"  ["+std::to_string(i)+"]"+(isSkyboxMesh(i)?"  *SKY*":"")).c_str(), 0, false, false, inSel(i), vis);
+            auto rr = cx.treeRow(ui::hashId(3000+i,11), x, ry, w, rowH, (gm.name+"  ["+std::to_string(i)+"]"+(isBackdropFitMesh(i)?"  *FIT*":"")).c_str(), 0, false, false, inSel(i), vis);
             if (addMenuOpen || ctxOpen) rr = ui::Context::RowResult{};   // an open menu overlays the list -> ignore row clicks under it
             if (rr.clicked) { selItem=-1; if (cx.in.shift||cx.in.ctrl) toggleSel(i); else selectOne(i); }   // Ctrl/Shift = add to multi-selection
             if (rr.toggledVis) r->setHidden(i, vis);
@@ -5164,16 +5191,23 @@ struct Editor {
         cx.label(x,y,w,th.rowH,b,th.textDim); y+=th.rowH;
         snprintf(b,sizeof b,"skinned: %s   dynamic: %s", gm.isSkinned?"yes":"no", gm.dynamicVerts?"yes":"no");
         cx.label(x,y,w,th.rowH,b,th.textDim); y+=th.rowH;
-        // Skybox backdrop toggle — cooks this mesh as a SkyboxPlatformComponent (far-clip-EXEMPT, escapes PortalStereoCamera
-        // far=5000). Reflects/sets the per-mesh mark; if several meshes are selected it applies to the whole selection.
-        { bool sky = isSkyboxMesh(selected);
-          cx.checkbox(ui::hashId("meshsky"), x, y, "Skybox backdrop (escapes 5000 far-clip)", sky);
-          if (sky != isSkyboxMesh(selected)) {
+        // Coherent visual-backdrop fitting: one shared scale for the selected static meshes,
+        // preserving their relative layout while keeping them under the shell far clip.
+        { bool fitBackdrop = isBackdropFitMesh(selected);
+          cx.checkbox(ui::hashId("meshbackdropfit"), x, y, "Fit as coherent visual backdrop", fitBackdrop);
+          if (fitBackdrop != isBackdropFitMesh(selected)) {
               std::vector<int> tg=(sel.size()>1)?sel:std::vector<int>{selected};
-              for(int t:tg){ if(isSkyboxMesh(t)!=sky) toggleSkybox(t); }
-              setStatus(std::string(sky?"Marked ":"Unmarked ")+std::to_string(tg.size())+" mesh(es) as skybox backdrop");
+              setBackdropFit(tg, fitBackdrop);
+              setStatus(std::string(fitBackdrop?"Marked ":"Unmarked ")+std::to_string(tg.size())+" mesh(es) for coherent backdrop fitting");
           }
-          y+=th.rowH+6*uiScale; }
+          y+=th.rowH+2*uiScale;
+          if (fitBackdrop) {
+              cx.label(x,y,145*uiScale,th.rowH,"fit radius (m)",th.textDim);
+              char rb[32]; snprintf(rb,sizeof rb,"%.0f",backdropFitRadius); std::string rs=rb;
+              cx.textField(ui::hashId("backdropfitradius"),x+147*uiScale,y,w-147*uiScale,th.rowH,rs);
+              backdropFitRadius=(float)atof(rs.c_str()); if(backdropFitRadius<1.f)backdropFitRadius=3000.f; if(backdropFitRadius>4900.f)backdropFitRadius=4900.f;
+              y+=th.rowH+4*uiScale;
+          } else y+=4*uiScale; }
         drawComponentsSection(gm, x, y, w);   // generic inspect/edit of ALL hstf components on this entity
     }
     // GENERIC component inspector — lists EVERY hstf component on the selected entity + every field, editable.
@@ -6256,8 +6290,8 @@ struct Editor {
             em.alphaCutoff = md.alphaCutoff;   // AUTHORED 'alphatestthreshold' (zen tree 0.25) -> cook discards at the source's own threshold
             em.blend = (md.useBlend || md.additive) && !em.alphaTest;   // genuine alpha-blend from the authored flag (cutout is the opaque-pass discard shader)
             em.doubleSided = md.doubleSided;   // WAS DROPPED -> cooked single-sided -> flat/open doubleSided meshes (monitor screens, thin panels) back-face-culled on device = see-through HOLES. Carry it so the cook double-sides them (reversed tris). Renderer honors doubleSided (gm.cullBack=!doubleSided) so the live preview already looked right.
-            em.wantCollider = isAnimCollider((int)i);   // user marked this animated mesh -> same-entity kinematic collider
-            em.skybox = isSkyboxMesh((int)i);            // user marked this as far backdrop -> SkyboxPlatformComponent (far-clip-exempt)
+            em.backdropFitGroup = backdropFitGroupForMesh((int)i);
+            em.wantCollider = em.backdropFitGroup<0 && isAnimCollider((int)i);   // coherent backdrops are visual-only
             for (int k=0;k<4;k++) em.matTint[k]=md.tint[k];
             // EXPOSE-ALL: forward every decoded stream the cook can use (was dropped -> cooked envs lost lightmaps/
             // normals/uv1/per-instance-VAT/per-frame-tint). project_hsl_cooker_expose_all_audit.
@@ -6423,7 +6457,7 @@ struct Editor {
     // <env>.cooksig = a content hash of everything that affects the cooked output (the serialized session incl.
     // every cook toggle + material/transform/item edit, the created-mesh .geom sidecar, and the base env's
     // identity). "Install only" recomputes this and, if it matches the recorded sig AND an APK exists, installs
-    // the existing APK WITHOUT re-cooking. Camera orbit is excluded (the spawn is cosmetic, not a content change).
+    // the existing APK WITHOUT re-cooking. The free editor camera is excluded and never controls the player spawn.
     std::string cookStem() {
         std::string out=cookOutPath(); size_t d=out.rfind(".apk"); if(d!=std::string::npos) out=out.substr(0,d);
         if (out.size()>=7 && out.substr(out.size()-7)=="_cooked") out=out.substr(0,out.size()-7);
@@ -6490,7 +6524,7 @@ struct Editor {
     void setStatus(const std::string& s){ std::lock_guard<std::mutex> l(statusMx); cookStatus=s; fprintf(stderr,"[COOK] %s\n", s.c_str()); }
 
     // shared cook core (used by the worker AND the headless CLI). terminalBar = print a \r progress bar to stderr.
-    void runCook(std::vector<hslcook::ExportMesh> ems, std::array<float,3> camSpawn, std::string pkg, bool sign, bool spoof, bool terminalBar, std::vector<sitem::Item> sceneItems) {
+    void runCook(std::vector<hslcook::ExportMesh> ems, std::string pkg, bool sign, bool spoof, bool terminalBar, std::vector<sitem::Item> sceneItems) {
         using namespace hslcook;
         if (ems.empty()) { setStatus("ERROR: no exportable meshes"); cooking.store(false); return; }
         // BAKE each navmesh/mesh-collider's GIZMO transform (T·R·S) into its navVerts — the cook reads navVerts raw, so
@@ -6514,7 +6548,7 @@ struct Editor {
         std::string systemOut = stem + "_Rooted-System.apk";
         std::string spoofOut  = stem + "_NoRoot-Spoof.apk";
         auto progress = [this,terminalBar](float f, const char* s){ setStage(f,s); if (terminalBar) printBar(f,s); };
-        bool ok=false; std::vector<uint8_t> sceneZip; float spawn[3]={camSpawn[0],camSpawn[1],camSpawn[2]};
+        bool ok=false; std::vector<uint8_t> sceneZip;
         // package spoof for the unsigned/own-package APK uses the env's COOK_PKG; we override via the field
         setenv_("HSR_COOK_PKG", pkg.c_str());
         setenv_("HSR_HZANIM", animSkinned ? "1" : "");   // emit skeletal HZANIM clips so skinned meshes ANIMATE on device (clouds/koi/droids)
@@ -6534,8 +6568,9 @@ struct Editor {
         else setenv_("HSR_FOGDENSITY","0");               // fog disabled -> ship no visible distance fog
         { char fcl[24]; snprintf(fcl,sizeof fcl,"%.0f",cfgFar); setenv_("HSR_FARCLIP",fcl); }
         { char sd[32]; snprintf(sd,sizeof sd,"%.0f",skyboxDist); setenv_("HSR_SKYBOX_DIST", skybox ? sd : ""); }  // far backdrop -> skybox pass (escapes PortalStereoCamera far=5000)
+        { char br[32]; snprintf(br,sizeof br,"%.0f",backdropFitRadius); setenv_("HSR_BACKDROP_FIT_R",br); }
         std::vector<uint8_t> vspv, fspv;
-        auto apk = exportSceneAPK(ems, nuxd, vspv, fspv, true, &ok, spawn, &sceneZip, (cookAudio ? bgOgg : std::vector<uint8_t>{}), progress, sceneItems, serializeSession());
+        auto apk = exportSceneAPK(ems, nuxd, vspv, fspv, true, &ok, nullptr, &sceneZip, (cookAudio ? bgOgg : std::vector<uint8_t>{}), progress, std::move(sceneItems), serializeSession());
         if (!ok || apk.empty()) { setStatus("ERROR: cook failed (shell: "+nuxd+")"); cooking.store(false); return; }
         if (!writeFile(out, apk)) { setStatus("ERROR: cannot write "+out); cooking.store(false); return; }
         // ── ONE-CLICK COOK→PREVIEW (HSR_COOK_PREVIEW=1): spawn a fresh renderer on the just-cooked V205 APK, so the
@@ -7649,10 +7684,9 @@ struct Editor {
         if (cookThread.joinable()) cookThread.join();
         pendingCookSig = cookSignatureHex();   // snapshot the up-to-date signature (UI thread) — runCook writes it on success
         cooking.store(true); cookProg.store(0.f);
-        std::array<float,3> spawn{ r->cam.pos[0], r->cam.pos[1], r->cam.pos[2] };
         std::vector<sitem::Item> its=items; bakeNavmeshes(its);
-        cookThread = std::thread([this, ems=std::move(ems), spawn, pkg=cookPkg, sign=autoSign, spoof=spoofHaven, its=std::move(its)]() mutable {
-            runCook(std::move(ems), spawn, pkg, sign, spoof, false, std::move(its));
+        cookThread = std::thread([this, ems=std::move(ems), pkg=cookPkg, sign=autoSign, spoof=spoofHaven, its=std::move(its)]() mutable {
+            runCook(std::move(ems), pkg, sign, spoof, false, std::move(its));
         });
     }
     // headless / CLI entry (replaces HSR_EXPORT path): synchronous, with a terminal progress bar.
@@ -7664,17 +7698,20 @@ struct Editor {
         if (std::getenv("HSR_NOBOUNDSOVERRIDE")) antiCull=false;    // headless/CLI: honor "Anti-cull bounds" OFF (runCook re-derives it from antiCull, else the member default clobbers the env var)
         setenv_("HSR_HZANIM", animSkinned ? "1" : "");   // BEFORE buildExportMeshes (same as startCook): the extractor's RIGID+UV gates read it
         auto ems = buildExportMeshes();
-        std::array<float,3> spawn{ r->cam.pos[0], r->cam.pos[1], r->cam.pos[2] };
         std::vector<sitem::Item> its=items; bakeNavmeshes(its);
         pendingCookSig = cookSignatureHex();   // record for "Install only" change-detection
-        cooking.store(true); runCook(std::move(ems), spawn, cookPkg, autoSign, spoofHaven, true, std::move(its));
+        cooking.store(true); runCook(std::move(ems), cookPkg, autoSign, spoofHaven, true, std::move(its));
     }
     // The meshes a navmesh draws from: its explicit selection, else the whole walkable scene (non-backdrop, visible).
     std::vector<int> navSourceMeshes(const sitem::Item& si){
-        if (!si.srcMeshes.empty()) return si.srcMeshes;
+        if (si.navMode==2 || !si.srcMeshes.empty()) {
+            std::vector<int> explicitMeshes=si.srcMeshes;
+            explicitMeshes.erase(std::remove_if(explicitMeshes.begin(),explicitMeshes.end(),[&](int i){return isBackdropFitMesh(i);}),explicitMeshes.end());
+            return explicitMeshes;
+        }
         std::vector<int> all;
         for (int i=0;i<(int)r->gpuMeshes.size();++i){
-            if (r->isHidden(i) || isBackdrop(r->gpuMeshes[i].name)) continue;
+            if (r->isHidden(i) || isBackdropFitMesh(i) || isBackdrop(r->gpuMeshes[i].name)) continue;
             // SKIP backdrop-SCALE geometry by name-blind size: a vista/skybox dome or outer-structure mesh (the
             // spacestation's M_vista ±13000, stars, tubes) would make FLAT span the whole sky ("way too big") and
             // SMART "grab all meshes". Only meshes that fit the playable area (AABB extent < 2km) are walkable ground.
@@ -7770,7 +7807,10 @@ struct Editor {
     }
     // For each NAVMESH item, (re)bake its triangles so the cook has fresh world geometry.
     void bakeNavmeshes(std::vector<sitem::Item>& its) {
-        for (auto& si : its) if (si.type == sitem::NAVMESH) bakeNavGeometry(si);
+        for (auto& si : its) if (si.type == sitem::NAVMESH) {
+            si.srcMeshes.erase(std::remove_if(si.srcMeshes.begin(),si.srcMeshes.end(),[&](int i){return isBackdropFitMesh(i);}),si.srcMeshes.end());
+            bakeNavGeometry(si);
+        }
     }
     // Add a navmesh of the chosen mode, bake its preview geometry, select it, ensure its markers are visible.
     void addNavmesh(int mode){
@@ -7843,6 +7883,8 @@ struct Editor {
     void remapMeshComponents(int oldMi, const std::vector<int>& results){
         if (results.empty()) return;
         if (noColMeshes.count(oldMi)) for (int n2 : results) noColMeshes.insert(n2);
+        auto fitIt=backdropFitGroups.find(oldMi);
+        if(fitIt!=backdropFitGroups.end()) for(int n2:results) backdropFitGroups[n2]=fitIt->second;
         int touched=0;
         for (auto& it : items){
             if (it.type!=sitem::NAVMESH || it.srcMeshes.empty()) continue;
@@ -7871,7 +7913,7 @@ struct Editor {
     void buildSimGeometry(){
         simV.clear(); simI.clear();
         for (auto& it:items) if (it.type==sitem::NAVMESH && it.navVerts.size()>=9){ uint32_t b=(uint32_t)(simV.size()/3); for(float f:it.navVerts) simV.push_back(f); for(uint32_t k:it.navIdx) simI.push_back(b+k); }
-        if (simI.empty()) for (int m=0;m<(int)r->gpuMeshes.size();++m){ if(r->isHidden(m)||isBackdrop(r->gpuMeshes[m].name))continue; auto&gm=r->gpuMeshes[m]; const auto&P=gm.pickPos; const auto&I=gm.pickIdx; if(P.size()<9||I.size()<3)continue; uint32_t b=(uint32_t)(simV.size()/3);
+        if (simI.empty()) for (int m=0;m<(int)r->gpuMeshes.size();++m){ if(r->isHidden(m)||isBackdropFitMesh(m)||isBackdrop(r->gpuMeshes[m].name))continue; auto&gm=r->gpuMeshes[m]; const auto&P=gm.pickPos; const auto&I=gm.pickIdx; if(P.size()<9||I.size()<3)continue; uint32_t b=(uint32_t)(simV.size()/3);
             for(size_t v=0;v+2<P.size();v+=3){ float p[3]={P[v],P[v+1],P[v+2]},o[3]; xformPoint(gm.model,p,o); simV.push_back(o[0]);simV.push_back(o[1]);simV.push_back(o[2]); }
             for(size_t k=0;k+2<I.size();k+=3){ simI.push_back(b+I[k]);simI.push_back(b+I[k+1]);simI.push_back(b+I[k+2]); } }
     }
