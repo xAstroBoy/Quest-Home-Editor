@@ -76,6 +76,32 @@ static inline void hsrSockTimeoutMs(SOCKET s, int ms) {
 #include <climits>
 #include <cstdint>
 
+// Restores process-global cook switches even when a cook exits early. The
+// renderer reads some of these variables too, so leaking one cook's fallback
+// mode into the live preview or the next project would be a subtle bug.
+struct HsrScopedEnvironment {
+    struct Entry { std::string key, value; bool existed = false; };
+    std::vector<Entry> entries;
+    HsrScopedEnvironment(std::initializer_list<const char*> keys) {
+        entries.reserve(keys.size());
+        for (const char* key : keys) {
+            const char* value = std::getenv(key);
+            entries.push_back({key, value ? value : "", value != nullptr});
+        }
+    }
+    ~HsrScopedEnvironment() {
+        for (const auto& entry : entries) {
+#ifdef _WIN32
+            std::string assignment = entry.key + "=" + (entry.existed ? entry.value : std::string());
+            _putenv(assignment.c_str());
+#else
+            if (entry.existed) setenv(entry.key.c_str(), entry.value.c_str(), 1);
+            else unsetenv(entry.key.c_str());
+#endif
+        }
+    }
+};
+
 struct Editor {
     // ── bindings ──
     VkRenderer*  r = nullptr;
@@ -3164,10 +3190,10 @@ struct Editor {
         std::string s; char b[640];
         s += "HSLEDIT 2\n";
         snprintf(b,sizeof b,"CAM %.4f %.4f %.4f %.5f %.5f\n", r->cam.pos[0],r->cam.pos[1],r->cam.pos[2], r->cam.yaw, r->cam.pitch); s+=b;
-        snprintf(b,sizeof b,"CFG %d %.3f %.3f %.3f %.1f %.4f %.0f %d %.0f %d %d %d %d %d %d %d %.4f %.4f %.4f %d\n",
+        snprintf(b,sizeof b,"CFG %d %.3f %.3f %.3f %.1f %.4f %.0f %d %.0f %d %d %d %d %d %d %d %.4f %.4f %.4f %d %d\n",
             cfgFog?1:0, cfgFogColor[0],cfgFogColor[1],cfgFogColor[2], cfgFogStart, cfgFogDensity, cfgFar,
             skybox?1:0, skyboxDist, noCull?1:0, solidCollision?1:0, animSkinned?1:0, cookAudio?1:0, previewAudio?1:0, voxelSolid?1:0,
-            bgColorSet?1:0, bgColor[0], bgColor[1], bgColor[2], antiCull?1:0); s+=b;
+            bgColorSet?1:0, bgColor[0], bgColor[1], bgColor[2], antiCull?1:0, v206HavenCompat?1:0); s+=b;
         for(int i=0;i<(int)r->gpuMeshes.size();++i){ auto& gm=r->gpuMeshes[i];
             snprintf(b,sizeof b,"MESH %d %s %.5f %.5f %.5f %.6f %.6f %.6f %.6f %.5f %.5f %.5f %d\n", i, qstr(gm.name).c_str(),
                 gm.editT[0],gm.editT[1],gm.editT[2], gm.editR[0],gm.editR[1],gm.editR[2],gm.editR[3],
@@ -3257,6 +3283,9 @@ struct Editor {
     // Parse + apply a .hsledit session text (shared by loadProject and the auto-save recovery banner).
     void applySessionText(const std::string& all, int& meshN, int& itemN){
         items.clear(); selItem=-1; deselectAll(); animColliders.clear();
+        // The VrShell-206 workaround is deliberately opt-in. An older session
+        // without the new CFG token must never inherit it from the prior project.
+        v206HavenCompat = false;
         { // GEOM3 owns compacted editor-created mesh fit groups; keep them while session lines restore base meshes.
           std::map<int,int> keep; if(geomAuth) for(const auto& kv:backdropFitGroups) if(kv.first>=baseMeshCount) keep.emplace(kv);
           backdropFitGroups=std::move(keep); nextBackdropFitGroup=0;
@@ -3272,7 +3301,7 @@ struct Editor {
             size_t e=all.find('\n',p); std::string line=all.substr(p, e==std::string::npos?std::string::npos:e-p); p=(e==std::string::npos)?all.size():e+1;
             auto t=tokenize(line); if(t.empty()) continue;
             if(t[0]=="CAM" && t.size()>=6){ r->cam.pos[0]=(float)atof(t[1].c_str()); r->cam.pos[1]=(float)atof(t[2].c_str()); r->cam.pos[2]=(float)atof(t[3].c_str()); r->cam.yaw=(float)atof(t[4].c_str()); r->cam.pitch=(float)atof(t[5].c_str()); }
-            else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; /* t[15]=voxelSolid: NOT loaded — stays at the reverted default (false); old sessions saved 1 and would re-wall rooms */ if(t.size()>=20){ bgColorSet=atoi(t[16].c_str())!=0; bgColor[0]=(float)atof(t[17].c_str()); bgColor[1]=(float)atof(t[18].c_str()); bgColor[2]=(float)atof(t[19].c_str()); if(bgColorSet&&r){ r->clearRGB[0]=bgColor[0]; r->clearRGB[1]=bgColor[1]; r->clearRGB[2]=bgColor[2]; } } if(t.size()>=21) antiCull=atoi(t[20].c_str())!=0; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
+            else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; /* t[15]=voxelSolid: NOT loaded — stays at the reverted default (false); old sessions saved 1 and would re-wall rooms */ if(t.size()>=20){ bgColorSet=atoi(t[16].c_str())!=0; bgColor[0]=(float)atof(t[17].c_str()); bgColor[1]=(float)atof(t[18].c_str()); bgColor[2]=(float)atof(t[19].c_str()); if(bgColorSet&&r){ r->clearRGB[0]=bgColor[0]; r->clearRGB[1]=bgColor[1]; r->clearRGB[2]=bgColor[2]; } } if(t.size()>=21) antiCull=atoi(t[20].c_str())!=0; if(t.size()>=22) v206HavenCompat=atoi(t[21].c_str())!=0; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
             else if(t[0]=="MESH" && t.size()>=14 && !cooked){ int idx=atoi(t[1].c_str()); if(geomAuth && idx>=baseMeshCount) continue;   /* GEOM2/3 owns created meshes; compacted sidecar re-orders them = stale indices */ if(idx>=0&&idx<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[idx];
                 gm.name=t[2]; gm.editT[0]=(float)atof(t[3].c_str()); gm.editT[1]=(float)atof(t[4].c_str()); gm.editT[2]=(float)atof(t[5].c_str());
                 gm.editR[0]=(float)atof(t[6].c_str()); gm.editR[1]=(float)atof(t[7].c_str()); gm.editR[2]=(float)atof(t[8].c_str()); gm.editR[3]=(float)atof(t[9].c_str());
@@ -3463,7 +3492,7 @@ struct Editor {
     }
     bool previewAudio = true;          // DEFAULT ON: play the env's background loop HERE on the PC while previewing. Toggle off = mute desktop playback (drives g_audioMuted).
     bool solidCollision = true;        // DEFAULT ON: cook a REAL double-sided trimesh collider (floor+walls+columns, haven2025 SEBD format). Off = floor-only ColliderBox grid.
-    bool antiCull = true;              // DEFAULT ON: emit MeshPartBoundsOverride (scene-spanning bound) so animated meshes never frustum-cull. Turn OFF if a cook is REJECTED/black on an OLDER Quest OS that chokes on the component (drops HSR_NOBOUNDSOVERRIDE).
+    bool antiCull = true;              // DEFAULT ON: preserve established cook behavior; the optional VrShell-206 mode overrides this safely when enabled.
     bool prevSolidCol = true;          // tracks solidCollision so the navmesh gizmo re-bakes (walls appear/vanish in the preview) when it's toggled.
     bool voxelSolid = false;           // DEFAULT OFF (reverted): thick all-orientation voxel ColliderBoxes (voxelSolidBoxes)
                                        // gave walls real VOLUME so a teleported head can't clip a paper-thin wall — BUT thickening
@@ -3512,9 +3541,8 @@ struct Editor {
     bool animSkinned = true;   // HZANIM skinned + 1-joint rigid clips (door/discs/screens/cars/train/sphere). DEFAULT ON:
                                // the incredibles fixed-type-targetId fix ([[project_hsr_skinned_rendmesh_skinblock]]) made
                                // the clip cook stable on device (loads, no std::length_error). Opt-out: toggle / HSR_NOHZ.
-    bool noCull = true;        // DEFAULT ON: emit scene-spanning bounds so V205's frustum/occlusion/CLOD/size culler never
-                               // drops a mesh = V79-style "draw everything" (old homes had NO env culler). Fixes cooked-home
-                               // clipping/disappearing; trades the Quest's culling perf for full visibility. -> HSR_NOCULL
+    bool noCull = true;        // DEFAULT ON: preserve established V79-style draw-everything behavior. -> HSR_NOCULL
+    bool v206HavenCompat = false; // DEFAULT OFF: optional no-root fallback for affected VrShell-206/Haven installs only.
     bool skybox = false;       // DEFAULT OFF (camera-locked, fragile): route the FAR backdrop (centroid > skyboxDist) to the SkyboxPlatformComponent
                                // pass — depth-clamped, EXEMPT from the shell's hard PortalStereoCamera far=5000 clip (device-
                                // proven: official homes/vistas escape the 5000 clip ONLY this way, NOT via a bigger far). The
@@ -5614,6 +5642,8 @@ struct Editor {
           cx.label(x+14*uiScale, y, w, th.rowH, jt, js==2?ui::rgba(230,160,80):th.textDim); y+=th.rowH; }
         y0=y; cx.checkbox(ui::hashId("spoof"), x, y, "Emit haven2025 spoof (no-root install)", spoofHaven);
         cx.tip(x,y0,w,th.rowH,"Also build <env>_NoRoot-Spoof.apk, which masquerades as\nMeta's haven2025 home. This is the ONLY way to install on a\nNON-rooted Quest: it replaces haven2025, then you pick\n\"Haven 2025\" in the home menu. Keep this ON."); y+=th.rowH;
+        y0=y; cx.checkbox(ui::hashId("v206havencompat"), x, y, "VrShell 206 fallback (only if Home opens NUXD)", v206HavenCompat);
+        cx.tip(x,y0,w,th.rowH,"OPTIONAL and OFF by default. Enable only when a recent Quest update\nmakes a no-root haven2025 spoof open NUXD / the default Home. It\nmirrors content through the canonical Haven static-architecture\ntemplate and uses compatible tight bounds. Leave OFF when your\nexisting cooks already work."); y+=th.rowH;
         y0=y; cx.checkbox(ui::hashId("hzanim"), x, y, "Animate skinned meshes (HZANIM - EXPERIMENTAL)", animSkinned);
         cx.tip(x,y0,w,th.rowH,"Emit skeletal animation for skinned meshes (clouds/koi/\ndroids). EXPERIMENTAL: the clip cook can still crash the\nenvironment on the device. Leave OFF unless testing."); y+=th.rowH+6*uiScale;
         y0=y; cx.checkbox(ui::hashId("nocull"), x, y, "Draw everything - disable culling (fixes clipping, V79-style)", noCull);
@@ -6588,6 +6618,9 @@ struct Editor {
     void runCook(std::vector<hslcook::ExportMesh> ems, std::string pkg, bool sign, bool spoof, bool terminalBar, std::vector<sitem::Item> sceneItems) {
         using namespace hslcook;
         if (ems.empty()) { setStatus("ERROR: no exportable meshes"); cooking.store(false); return; }
+        HsrScopedEnvironment restoreCompatibilityEnv({
+            "HSR_V206_HAVEN_COMPAT", "HSR_NOCULL", "HSR_CULL", "HSR_NOBOUNDSOVERRIDE"
+        });
         // BAKE each navmesh/mesh-collider's GIZMO transform (T·R·S) into its navVerts — the cook reads navVerts raw, so
         // without this a navmesh you MOVED in the editor cooks at its ORIGINAL spot ("navmesh gizmo doesn't work").
         for (auto& it : sceneItems) if (it.type==sitem::NAVMESH && it.navVerts.size()>=9) {
@@ -6613,9 +6646,24 @@ struct Editor {
         // package spoof for the unsigned/own-package APK uses the env's COOK_PKG; we override via the field
         setenv_("HSR_COOK_PKG", pkg.c_str());
         setenv_("HSR_HZANIM", animSkinned ? "1" : "");   // emit skeletal HZANIM clips so skinned meshes ANIMATE on device (clouds/koi/droids)
-        setenv_("HSR_NOCULL", noCull ? "1" : "");         // scene-spanning bounds -> V205 never culls our meshes (V79-style draw-everything); fixes cooked-home clipping
+        const bool useV206HavenCompat = spoof && v206HavenCompat;
+        // The rooted APK is always cooked through the established path. When the
+        // optional fallback is enabled, only the no-root scene is cooked a second
+        // time with canonical Haven IDs + tight bounds.
+        auto configureCompatibility = [&](bool enabled) {
+            setenv_("HSR_V206_HAVEN_COMPAT", enabled ? "1" : "");
+            setenv_("HSR_NOCULL", (!enabled && noCull) ? "1" : "");
+            setenv_("HSR_CULL", (enabled || !noCull) ? "1" : "");
+            setenv_("HSR_NOBOUNDSOVERRIDE", (enabled || !antiCull) ? "1" : "");
+        };
+        std::vector<hslcook::ExportMesh> compatEms;
+        std::vector<sitem::Item> compatSceneItems;
+        if (useV206HavenCompat) {
+            compatEms = ems;
+            compatSceneItems = sceneItems;
+        }
+        configureCompatibility(false);
         setenv_("HSR_NOAUTOFLOOR", cookAutoFloor ? "" : "1");   // Cook-tab toggle: OFF = no generated floor/walls at all
-        setenv_("HSR_NOBOUNDSOVERRIDE", antiCull ? "" : "1");   // Cook-tab "Anti-cull bounds" toggle: OFF drops MeshPartBoundsOverride (fixes REJECT/black on older Quest OS that chokes on it)
         // real double-sided trimesh collider (haven2025 SEBD: 16-align manifest + 128-align RTree + count-shift); off -> ColliderBox grid.
         // SEBD holds on device (v206 confirmed). HSR_FORCE_NAVBOX = escape hatch to the always-compatible ColliderBox
         // tilted-box path (device builds it from halfExtents, no cooked RTree) if a future PhysX build ever rejects the RTree.
@@ -6634,6 +6682,23 @@ struct Editor {
         const size_t exportedMeshCount = ems.size();
         auto apk = exportSceneAPK(std::move(ems), nuxd, vspv, fspv, true, &ok, nullptr, &sceneZip, (cookAudio ? bgOgg : std::vector<uint8_t>{}), progress, std::move(sceneItems), serializeSession());
         if (!ok || apk.empty()) { setStatus("ERROR: cook failed (shell: "+nuxd+")"); cooking.store(false); return; }
+        if (useV206HavenCompat) {
+            configureCompatibility(true);
+            bool compatOk = false;
+            std::vector<uint8_t> compatSceneZip, compatVspv, compatFspv;
+            auto unusedCompatApk = exportSceneAPK(std::move(compatEms), nuxd, compatVspv, compatFspv,
+                true, &compatOk, nullptr, &compatSceneZip,
+                (cookAudio ? bgOgg : std::vector<uint8_t>{}), progress,
+                std::move(compatSceneItems), serializeSession());
+            if (!compatOk || unusedCompatApk.empty() || compatSceneZip.empty()) {
+                configureCompatibility(false);
+                setStatus("ERROR: VrShell 206 compatibility cook failed");
+                cooking.store(false);
+                return;
+            }
+            sceneZip = std::move(compatSceneZip);
+            configureCompatibility(false);
+        }
         if (!writeFile(out, apk)) { setStatus("ERROR: cannot write "+out); cooking.store(false); return; }
         // ── ONE-CLICK COOK→PREVIEW (HSR_COOK_PREVIEW=1): spawn a fresh renderer on the just-cooked V205 APK, so the
         //    cooked result (skinned + car HZANIM animation, max far-clip, materials) is validated FIRST-HAND IN THE
@@ -7758,6 +7823,9 @@ struct Editor {
         if (std::getenv("HSR_NOINSTALL")) installAfterCook=false;   // batch/CLI: cook the APK files only, don't touch the device
         if (std::getenv("HSR_NOAUTOFLOOR")) cookAutoFloor=false;   // headless/CLI: honor the no-generated-collision flag (runCook re-derives the env var from this)
         if (std::getenv("HSR_NOBOUNDSOVERRIDE")) antiCull=false;    // headless/CLI: honor "Anti-cull bounds" OFF (runCook re-derives it from antiCull, else the member default clobbers the env var)
+        if (std::getenv("HSR_NOCULL")) noCull=true;                 // explicit legacy escape hatch for old Homes
+        if (std::getenv("HSR_CULL")) noCull=false;                  // legacy spelling: force tight VrShell-206 bounds
+        if (std::getenv("HSR_V206_HAVEN_COMPAT")) v206HavenCompat=true; // opt-in only; default remains unchanged
         setenv_("HSR_HZANIM", animSkinned ? "1" : "");   // BEFORE buildExportMeshes (same as startCook): the extractor's RIGID+UV gates read it
         auto ems = buildExportMeshes();
         std::vector<sitem::Item> its=items; bakeNavmeshes(its);

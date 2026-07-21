@@ -117,7 +117,7 @@ inline void nocullBounds(float aabb[6], float& radius) {
     // Scene-spanning bounds make V205 treat every mesh as always-visible so it's never wrongly culled. HSR_CULL=1 opts back
     // into the (buggy-for-us) device culler. This is generic: ANY env's small/distant/animated meshes stop disappearing.
     const char* e = std::getenv("HSR_CULL");
-    if (e && *e && *e!='0') return;     // explicit opt-in to V205 culling -> keep the mesh's own tight bounds
+    if (e && *e && *e!='0') return;     // explicit opt-in to tight bounds (also used by optional VrShell-206 compatibility)
     aabb[0]=aabb[1]=aabb[2]=-1.0e5f; aabb[3]=aabb[4]=aabb[5]=1.0e5f; radius=1.74e5f;
 }
 inline std::vector<uint8_t> encodeRendMesh(const std::vector<float>& posXYZ, const std::vector<float>& uvUV, const std::vector<uint16_t>& idx, const std::vector<uint8_t>& embeddedMatl = {}) {
@@ -549,6 +549,16 @@ inline uint32_t subNameStringId(const std::string& sn) { return murmur3_x86_32(s
 // and computes the same hash for the same string, so the AssetRef matches). Unknown strings fall back to FNV
 // (won't resolve on-device until the u64 hash is cracked). [[project_hsl_ondevice_envload]]
 inline uint64_t pathStringId(const std::string& s, bool* known = nullptr) {
+    // Optional compatibility path only. Keeping this behind the explicit flag is
+    // important: older runtimes/cooks continue to use the editor's established
+    // manifest-local namespace unless the user has the VrShell-206 NUXD problem.
+    if (s == "meta/home_c25") {
+        const char* compat = std::getenv("HSR_V206_HAVEN_COMPAT");
+        if (compat && *compat && *compat != '0') {
+            if (known) *known = true;
+            return 12293612625969361106ull;
+        }
+    }
     static const std::pair<const char*, uint64_t> T[] = {
         {"meta/nux", 0x5F8B9CAF4B1FB752ull}, {"meta/renderer_module", 0x608B25CE5424598Dull}, {"meta/shell-env-nux-d", 0xFDA57FCF9EA7713Full},
         {"space.hstf", 0xD43FDE9CD96341FAull}, {"nux_d/nux_d.hstf", 0x8B19C4A3CFB24686ull},
@@ -2868,15 +2878,24 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     // rule: "any mesh EXCEPT animated ones"). Material-only anims (UV-scroll/flipbook) keep a collider — geometry is
     // static. Skyboxes skipped. HSR_NOAUTOFLOOR (editor "Auto floor collision" OFF) or HSR_NOSMARTMESHCOL disables.
     bool autoMeshCollide = false;
+    size_t autoMeshColliderRequested = 0;
+    size_t autoMeshColliderCooked = 0;
+    std::vector<uint8_t> autoMeshColliderMask(meshesV.size(), 0);
     { bool userNavPre = false;
       for (const auto& si : sceneItems) if (si.type == sitem::NAVMESH && si.navVerts.size() >= 9) { userNavPre = true; break; }
       autoMeshCollide = !std::getenv("HSR_NOAUTOFLOOR") && !userNavPre && !std::getenv("HSR_NOSMARTMESHCOL");
       if (autoMeshCollide) { size_t nCol=0;
-          for (auto& mm : meshesV) {
+          for (size_t mi = 0; mi < meshesV.size(); ++mi) {
+              auto& mm = meshesV[mi];
               bool geomAnim = (mm.hzFrames > 1) || mm.rotAnim || mm.rotReplay || mm.transAnim || mm.scaleAnim || mm.pulse;
               bool isSky = mm.name.find("sky")!=std::string::npos || mm.name.find("Sky")!=std::string::npos;
-              if (!geomAnim && !isSky && mm.backdropFitGroup < 0 && mm.positions.size() >= 9 && mm.indices.size() >= 3) { mm.wantCollider = true; ++nCol; }
-          }
+              if (!geomAnim && !isSky && mm.backdropFitGroup < 0 && mm.positions.size() >= 9 && mm.indices.size() >= 3) {
+                  mm.wantCollider = true;
+                  autoMeshColliderMask[mi] = 1;
+                  ++nCol;
+              }
+           }
+          autoMeshColliderRequested = nCol;
           if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] smart floor = AUTO MESH-COLLIDER: %zu static meshes -> SEBD trimesh colliders (no user navmesh)\n", nCol);
       }
     }
@@ -4260,6 +4279,8 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
                 if (sebd.size() > 64 && sebd[0]=='S'&&sebd[1]=='E'&&sebd[2]=='B'&&sebd[3]=='D') {
                     std::string pCol = std::string(base) + ".collider.phys/phys"; AssetKey3 colK = keyForPath(pCol);
                     assets.push_back({ pCol, colK.tgt, sebd, colK, TYPE_PHSX, TYPE_3MSH });
+                    if (autoMeshCollide && i < autoMeshColliderMask.size() && autoMeshColliderMask[i])
+                        ++autoMeshColliderCooked;
                     std::string colComp = comp("ColliderMeshPlatformComponent", 2, std::string("{\"meshAsset\":") + refJson(colK) + "}")
                                         + "," + comp("PhysicsBodyPlatformComponent", 7, "{\"type\":\"StaticCollision\"}");
                     // ── KINEMATIC-PROMOTION TRAP (the bluehills windmill_tails "stuck at spawn" bug) ──────────────────────
@@ -4553,7 +4574,21 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
                 }
             }
             if (userNav) { nTiles=1; if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] smart floor skipped (user navmesh is the ground)\n"); goto floorFallback; }
-            if (autoMeshCollide) { nTiles=1; if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] heightfield smart floor skipped (per-mesh SEBD colliders are the ground)\n"); goto floorFallback; }
+            // Skip the heightfield only when EVERY automatically requested per-mesh collider
+            // was actually cooked. Previously merely enabling autoMeshCollide skipped the
+            // fallback even when every PhysX cook failed, producing a visible Home with no
+            // usable floor. A partial failure also keeps the heightfield as gap coverage.
+            if (autoMeshCollide && autoMeshColliderRequested > 0 &&
+                autoMeshColliderCooked == autoMeshColliderRequested) {
+                nTiles=1;
+                if (std::getenv("HSR_VERBOSE")) fprintf(stderr,
+                    "[COOK] heightfield smart floor skipped (%zu/%zu per-mesh SEBD colliders cooked)\n",
+                    autoMeshColliderCooked, autoMeshColliderRequested);
+                goto floorFallback;
+            }
+            if (autoMeshCollide && std::getenv("HSR_VERBOSE")) fprintf(stderr,
+                "[COOK] per-mesh SEBD incomplete (%zu/%zu); keeping smart-floor fallback\n",
+                autoMeshColliderCooked, autoMeshColliderRequested);
             if (wt.empty() || wmxx<=wmnx || wmxz<=wmnz) goto floorFallback;
             {
             float ex2=wmxx-wmnx, ez2=wmxz-wmnz, ext2=ex2>ez2?ex2:ez2;
@@ -4929,7 +4964,40 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     ctrace("floor/navmesh done; packaging scene.zip");
     prog(0.80f, "Packaging scene.zip");
     auto sceneZip = assembleSceneZip(assets, shellcfg);
-    if (outSceneZip) *outSceneZip = sceneZip;     // expose so the caller can splice extra (spoofed) APKs without re-cooking
+    if (outSceneZip && !std::getenv("HSR_V206_HAVEN_COMPAT")) {
+        *outSceneZip = sceneZip;
+    } else if (outSceneZip) {
+        // OPTIONAL fallback: VrShell 206 classifies the replaceable Haven package as a
+        // Footprint even when its manifest says "combined". It then instantiates the
+        // canonical home_static_arch template from the paired Vista and no longer draws
+        // our manifest-local dynamic content path. Keep the normal content path as an
+        // older-runtime fallback, but mirror the same entities into the canonical stock
+        // template in the scene.zip used only for the no-root Haven spoof. This entire
+        // path is disabled unless HSR_V206_HAVEN_COMPAT was explicitly requested.
+        auto spoofAssets = assets;
+        const std::string staticArchPath = "meta/home_c25/templates/Quest3/home_static_arch.hstf/template";
+        bool patchedStaticArch = false;
+        // The compatibility scene must have exactly one copy of the environment.
+        // Keep the dynamic template resolvable but empty; VrShell 206 instantiates
+        // the real entities through the canonical static-architecture template.
+        const auto emptyDynamic = jbytes(templateJson(rootEntityJson(makeUuid(rng)), ""));
+        for (auto& asset : spoofAssets) {
+            if (asset.contentPath == pContent) {
+                asset.data = emptyDynamic;
+            } else if (asset.contentPath == staticArchPath) {
+                asset.data = jbytes(content);
+                patchedStaticArch = true;
+            }
+        }
+        if (!patchedStaticArch) {
+            // HSR_NOVISTASHADOW intentionally omits the other compatibility templates,
+            // but VrShell 206 still needs this one canonical entry to render a no-root
+            // Haven replacement. Its IDs are taken from the stock Haven manifest.
+            spoofAssets.push_back({ staticArchPath, TGT_TEMPLATE, jbytes(content),
+                AssetKey3{ 12293612625969361106ull, 11631735261009407721ull, TGT_TEMPLATE } });
+        }
+        *outSceneZip = assembleSceneZip(spoofAssets, shellcfg);
+    }
     ctrace("scene.zip packaged; splicing APK");
     prog(0.90f, "Building APK");
     // Package spoof: rename the shell's package to a chosen one so the port can MASQUERADE as an official env
