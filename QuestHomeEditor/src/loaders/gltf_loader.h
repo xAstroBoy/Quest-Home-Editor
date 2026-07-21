@@ -11,6 +11,7 @@
 #include "core/types.h"
 #include "core/load_progress.h"   // live stage/counter for the loading splash
 #include "core/tinyjson.h"
+#include "loaders/gltf_material_rules.h"
 #include "loaders/rendtxtr_parser.h"   // astc::decodeASTC
 #include "loaders/zip_reader_guard.h"
 #include "miniz.h"
@@ -785,10 +786,22 @@ public:
                         md.tint[0]=md.tint[1]=md.tint[2]=md.tint[3]=1.0f;
                         if (matIdx>=0 && root.has("materials") && (size_t)matIdx<root["materials"].size()) {
                             const auto& mm = root["materials"][matIdx];
+                            gltfmaterial::TextureTintInput ti;
+                            ti.usesBaseColorTexture = mm.has("pbrMetallicRoughness")
+                                && mm["pbrMetallicRoughness"].has("baseColorTexture");
+                            ti.usesEmissiveTexture = !ti.usesBaseColorTexture && mm.has("emissiveTexture");
                             if (mm.has("pbrMetallicRoughness") && mm["pbrMetallicRoughness"].has("baseColorFactor")) {
                                 const auto& bcf = mm["pbrMetallicRoughness"]["baseColorFactor"];
-                                for (int i=0;i<4 && i<(int)bcf.size();++i) md.tint[i]=(float)bcf[i].asFloat();
+                                ti.hasBaseColorFactor = true;
+                                for (int i=0;i<4 && i<(int)bcf.size();++i) ti.baseColorFactor[i]=(float)bcf[i].asFloat();
                             }
+                            if (mm.has("emissiveFactor")) {
+                                const auto& ef = mm["emissiveFactor"];
+                                ti.hasEmissiveFactor = true;
+                                for (int i=0;i<3 && i<(int)ef.size();++i) ti.emissiveFactor[i]=(float)ef[i].asFloat();
+                            }
+                            const auto tint = gltfmaterial::selectedTextureTint(ti);
+                            for (int i=0;i<4;++i) md.tint[i]=tint[i];
                         }
                         md.transform.rot[3]=1.f;  // identity (world already baked in)
                         meshes.push_back(std::move(md));

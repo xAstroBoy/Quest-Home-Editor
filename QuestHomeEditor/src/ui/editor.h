@@ -6631,6 +6631,7 @@ struct Editor {
         { char sd[32]; snprintf(sd,sizeof sd,"%.0f",skyboxDist); setenv_("HSR_SKYBOX_DIST", skybox ? sd : ""); }  // far backdrop -> skybox pass (escapes PortalStereoCamera far=5000)
         { char br[32]; snprintf(br,sizeof br,"%.0f",backdropFitRadius); setenv_("HSR_BACKDROP_FIT_R",br); }
         std::vector<uint8_t> vspv, fspv;
+        const size_t exportedMeshCount = ems.size();
         auto apk = exportSceneAPK(std::move(ems), nuxd, vspv, fspv, true, &ok, nullptr, &sceneZip, (cookAudio ? bgOgg : std::vector<uint8_t>{}), progress, std::move(sceneItems), serializeSession());
         if (!ok || apk.empty()) { setStatus("ERROR: cook failed (shell: "+nuxd+")"); cooking.store(false); return; }
         if (!writeFile(out, apk)) { setStatus("ERROR: cannot write "+out); cooking.store(false); return; }
@@ -6641,7 +6642,7 @@ struct Editor {
             std::string exe = AppConfig::exePath();   // portable (Win32/macOS/Linux)
             if (!exe.empty() && AppConfig::launchDetached(exe, out)) setStatus("Cooked + launched HSL preview: " + out);
         }
-        std::string finalSystem, finalSpoof, msg = "Cooked "+std::to_string(ems.size())+" meshes ("+std::to_string(apk.size()/1024)+"KB)";
+        std::string finalSystem, finalSpoof, msg = "Cooked "+std::to_string(exportedMeshCount)+" meshes ("+std::to_string(apk.size()/1024)+"KB)";
         // ── own-package APK (sign -> <env>_Rooted-System.apk; drop the unsigned intermediate on success) ──
         if (sign) {
             if (signApk(out, systemOut, progress)) { finalSystem=systemOut; std::remove(out.c_str()); msg += "  | system(rooted) APK: "+systemOut; }

@@ -16,3 +16,7 @@ add_test(NAME cook_preflight_tests COMMAND cook_preflight_tests)
 add_executable(archive_read_limits_tests archive_read_limits_tests.cpp)
 target_include_directories(archive_read_limits_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src")
 add_test(NAME archive_read_limits_tests COMMAND archive_read_limits_tests)
+
+add_executable(gltf_material_rules_tests gltf_material_rules_tests.cpp)
+target_include_directories(gltf_material_rules_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src")
+add_test(NAME gltf_material_rules_tests COMMAND gltf_material_rules_tests)
