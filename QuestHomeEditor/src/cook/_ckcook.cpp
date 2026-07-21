@@ -6,6 +6,7 @@
 //   usage: hsl_cook [Nuxd.apk] [out.apk] [shadersDir]
 #include "cook/hsl_cooker.h"
 #include "io/gltf_import.h"     // headless --cookglb repro: raw .glb/.gltf import -> exportSceneAPK
+#include "render/universal_shader.h"
 #include <cstdio>
 #include <vector>
 #include <string>
@@ -31,7 +32,14 @@ static int exportTest(int argc, char** argv) {
     auto rd = [](const std::string& p){ std::vector<uint8_t> b; FILE* f=fopen(p.c_str(),"rb"); if(!f) return b;
         fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ b.resize(n); size_t r=fread(b.data(),1,n,f); b.resize(r);} fclose(f); return b; };
     auto vspv = rd(shdir + "/myunlit.vert.spv"), fspv = rd(shdir + "/myunlit.frag.spv");
-    if (vspv.empty() || fspv.empty()) { fprintf(stderr, "[export-test] missing shaders in %s\n", shdir.c_str()); return 1; }
+    if (vspv.empty() || fspv.empty()) {
+        const auto* vert = reinterpret_cast<const uint8_t*>(kUnivVertSpirv);
+        const auto* frag = reinterpret_cast<const uint8_t*>(kUnivFragSpirv);
+        vspv.assign(vert, vert + kUnivVertSize);
+        fspv.assign(frag, frag + kUnivFragSize);
+        fprintf(stderr, "[export-test] external shaders not found in %s; using embedded universal shaders\n",
+                shdir.c_str());
+    }
 
     std::vector<ExportMesh> ems;
     // mesh 0: small quad

@@ -11,7 +11,9 @@
 #include "core/types.h"
 #include "core/load_progress.h"   // live stage/counter for the loading splash
 #include "core/tinyjson.h"
+#include "loaders/gltf_material_rules.h"
 #include "loaders/rendtxtr_parser.h"   // astc::decodeASTC
+#include "loaders/zip_reader_guard.h"
 #include "miniz.h"
 #define STBI_NO_STDIO
 #include "stb_image.h"         // JPEG skybox panoramas (impl in src/stb_image_impl.c)
@@ -94,6 +96,16 @@ public:
     }
 
     // ── small zip helper: read one entry from an in-memory zip ──
+    static bool zipIsSafe(const void* zipData, size_t zipSize,
+                          const hslcook::zipsafety::ArchiveReadLimits& limits,
+                          std::string* error = nullptr) {
+        mz_zip_archive z; memset(&z, 0, sizeof(z));
+        if (!mz_zip_reader_init_mem(&z, zipData, zipSize, 0)) return false;
+        const bool safe = zipread::validateArchive(z, limits, error);
+        mz_zip_reader_end(&z);
+        return safe;
+    }
+
     static std::vector<u8> zipRead(const void* zipData, size_t zipSize, const std::string& name) {
         mz_zip_archive z; memset(&z, 0, sizeof(z));
         if (!mz_zip_reader_init_mem(&z, zipData, zipSize, 0)) return {};
@@ -260,12 +272,24 @@ public:
     bool load(const std::string& apkPath) {
         mz_zip_archive apk; memset(&apk, 0, sizeof(apk));
         if (!mz_zip_reader_init_file(&apk, apkPath.c_str(), 0)) return false;
+        if (!zipread::validateArchive(apk, hslcook::zipsafety::kApkReadLimits)) {
+            mz_zip_reader_end(&apk);
+            return false;
+        }
         int si = mz_zip_reader_locate_file(&apk, "assets/scene.zip", nullptr, 0);
         if (si < 0) { mz_zip_reader_end(&apk); return false; }
         size_t scSz=0; void* scD = mz_zip_reader_extract_to_heap(&apk, si, &scSz, 0);
         mz_zip_reader_end(&apk);
         if (!scD) return false;
         std::vector<u8> sceneZip((u8*)scD,(u8*)scD+scSz); mz_free(scD);
+        {
+            std::string archiveError;
+            if (!zipIsSafe(sceneZip.data(), sceneZip.size(),
+                           hslcook::zipsafety::kSceneReadLimits, &archiveError)) {
+                log("rejected unsafe or oversized scene.zip: %s", archiveError.c_str());
+                return false;
+            }
+        }
 
         // Find the *.gltf.ovrscene inside scene.zip
         std::string ovrName;
@@ -275,6 +299,14 @@ public:
         log("V79 ovrscene: %s", ovrName.c_str());
         auto ovr = zipRead(sceneZip.data(), sceneZip.size(), ovrName);
         if (ovr.empty()) return false;
+        {
+            std::string archiveError;
+            if (!zipIsSafe(ovr.data(), ovr.size(),
+                           hslcook::zipsafety::kSceneReadLimits, &archiveError)) {
+                log("rejected unsafe or oversized ovrscene: %s", archiveError.c_str());
+                return false;
+            }
+        }
 
         // Inside the ovrscene zip: V9.gltf + V9.bin + *.ktx
         std::string gltfName, binName;
@@ -754,10 +786,22 @@ public:
                         md.tint[0]=md.tint[1]=md.tint[2]=md.tint[3]=1.0f;
                         if (matIdx>=0 && root.has("materials") && (size_t)matIdx<root["materials"].size()) {
                             const auto& mm = root["materials"][matIdx];
+                            gltfmaterial::TextureTintInput ti;
+                            ti.usesBaseColorTexture = mm.has("pbrMetallicRoughness")
+                                && mm["pbrMetallicRoughness"].has("baseColorTexture");
+                            ti.usesEmissiveTexture = !ti.usesBaseColorTexture && mm.has("emissiveTexture");
                             if (mm.has("pbrMetallicRoughness") && mm["pbrMetallicRoughness"].has("baseColorFactor")) {
                                 const auto& bcf = mm["pbrMetallicRoughness"]["baseColorFactor"];
-                                for (int i=0;i<4 && i<(int)bcf.size();++i) md.tint[i]=(float)bcf[i].asFloat();
+                                ti.hasBaseColorFactor = true;
+                                for (int i=0;i<4 && i<(int)bcf.size();++i) ti.baseColorFactor[i]=(float)bcf[i].asFloat();
                             }
+                            if (mm.has("emissiveFactor")) {
+                                const auto& ef = mm["emissiveFactor"];
+                                ti.hasEmissiveFactor = true;
+                                for (int i=0;i<3 && i<(int)ef.size();++i) ti.emissiveFactor[i]=(float)ef[i].asFloat();
+                            }
+                            const auto tint = gltfmaterial::selectedTextureTint(ti);
+                            for (int i=0;i<4;++i) md.tint[i]=tint[i];
                         }
                         md.transform.rot[3]=1.f;  // identity (world already baked in)
                         meshes.push_back(std::move(md));

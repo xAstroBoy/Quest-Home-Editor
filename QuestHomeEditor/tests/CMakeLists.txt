@@ -1,0 +1,22 @@
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    cmake_minimum_required(VERSION 3.16)
+    project(questhomeeditor_zip_safety_tests LANGUAGES CXX)
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    enable_testing()
+endif()
+add_executable(zip_safety_tests zip_safety_tests.cpp)
+target_include_directories(zip_safety_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src")
+add_test(NAME zip_safety_tests COMMAND zip_safety_tests)
+
+add_executable(cook_preflight_tests cook_preflight_tests.cpp)
+target_include_directories(cook_preflight_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src")
+add_test(NAME cook_preflight_tests COMMAND cook_preflight_tests)
+
+add_executable(archive_read_limits_tests archive_read_limits_tests.cpp)
+target_include_directories(archive_read_limits_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src")
+add_test(NAME archive_read_limits_tests COMMAND archive_read_limits_tests)
+
+add_executable(gltf_material_rules_tests gltf_material_rules_tests.cpp)
+target_include_directories(gltf_material_rules_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src")
+add_test(NAME gltf_material_rules_tests COMMAND gltf_material_rules_tests)

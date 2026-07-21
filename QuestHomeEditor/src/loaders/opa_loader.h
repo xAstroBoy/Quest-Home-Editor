@@ -36,6 +36,7 @@
 #include "core/types.h"
 #include "core/load_progress.h"       // live stage/counter for the loading splash
 #include "miniz.h"
+#include "loaders/zip_reader_guard.h"
 #include "loaders/rendtxtr_parser.h"   // astc::decodeASTC (KTX/ASTC -> RGBA)
 #include "render/ibl.h"               // SpecIbl diffuse irradiance cubemap (RGBA16F KTX)
 #include "cook/node_rot_fit.h"      // shared spin/sway fitter (V79->V203 cook) — same core the glTF loader uses
@@ -1780,6 +1781,18 @@ public:
     bool load(const std::string& apkPath) {
         std::vector<uint8_t> sceneZip;
         if (!extractSceneZip(apkPath, sceneZip)) return false;
+        {
+            mz_zip_archive z; memset(&z, 0, sizeof(z));
+            if (!mz_zip_reader_init_mem(&z, sceneZip.data(), sceneZip.size(), 0)) return false;
+            std::string archiveError;
+            const bool safe = zipread::validateArchive(
+                z, hslcook::zipsafety::kSceneReadLimits, &archiveError);
+            mz_zip_reader_end(&z);
+            if (!safe) {
+                log("rejected unsafe or oversized scene.zip: %s", archiveError.c_str());
+                return false;
+            }
+        }
         // Enumerate geometry *.fbx.opa. A COMPOSED multi-asset scene (underwater/oceanarium) ships
         // MANY world-baked single-mesh *.fbx.opa placed by per-entity files (no instance list /
         // one main model); a normal home ships ONE baked *.fbx.opa with an instance list. Materials
@@ -2186,6 +2199,10 @@ private:
     static bool extractSceneZip(const std::string& apkPath, std::vector<uint8_t>& out) {
         mz_zip_archive z; memset(&z, 0, sizeof(z));
         if (!mz_zip_reader_init_file(&z, apkPath.c_str(), 0)) return false;
+        if (!zipread::validateArchive(z, hslcook::zipsafety::kApkReadLimits)) {
+            mz_zip_reader_end(&z);
+            return false;
+        }
         int idx = mz_zip_reader_locate_file(&z, "assets/scene.zip", nullptr, 0);
         if (idx < 0) { mz_zip_reader_end(&z); return false; }
         size_t sz = 0; void* d = mz_zip_reader_extract_to_heap(&z, idx, &sz, 0);
@@ -2774,6 +2791,13 @@ private:
         static int novat = -1; if (novat<0) novat = std::getenv("HSR_NOVAT") ? 1 : 0;
         const VatData* curVat = (!novat && vatByBase.count(curOpaBase)) ? &vatByBase[curOpaBase] : nullptr;
 
+        // OPA scenes frequently instance the same material and texture across many nodes. Large
+        // legacy scenes can otherwise retain hundreds of identical decoded 2K/4K RGBA buffers and
+        // exhaust memory before Vulkan or the cooker is initialized. Keep one owner for plain,
+        // immutable opaque base textures and let subsequent meshes borrow it via texShareSrc.
+        // Materials whose pixels can differ stay on the independent path.
+        std::unordered_map<const Tex*, int> opaqueBaseTextureOwner;
+
         // ── emit one renderable MeshData per (instance, submesh) ──
         for (auto& inst : instances) {
             uint32_t nodeIdx = inst.node, meshIdx = inst.mesh;
@@ -3128,6 +3152,21 @@ private:
                         if(nP){cx/=nP;cy/=nP;cz/=nP;}
                         float wc[3]; xform(world,(float)cx,(float)cy,(float)cz,wc);
                         log("  VATDBG mesh#%zu '%s' UV0 u[%.3f,%.3f] v[%.3f,%.3f] verts=%zu worldC=(%.2f,%.2f,%.2f)", meshes.size(), curOpaBase.c_str(), u0,u1,v0,v1, nP, wc[0],wc[1],wc[2]);
+                    }
+                }
+                const bool shareOpaqueBase = tex && md.hasTexture && !md.useBlend && !md.additive &&
+                    !md.alphaTest && !md.hasLightmap && !md.hasNormal && !md.hasOrm &&
+                    !md.hasEmissive && !md.hasVat && md.normalRGBA.empty() && md.ormRGBA.empty() &&
+                    md.emissiveRGBA.empty() && md.lmRGBA.empty() && md.vatRaw.empty();
+                if (shareOpaqueBase) {
+                    auto owner = opaqueBaseTextureOwner.find(tex);
+                    if (owner == opaqueBaseTextureOwner.end()) {
+                        opaqueBaseTextureOwner.emplace(tex, static_cast<int>(meshes.size()));
+                    } else {
+                        md.texShareSrc = owner->second;
+                        std::vector<u8>().swap(md.texRGBA);
+                        std::vector<u8>().swap(md.srcAstc);
+                        std::vector<u8>().swap(md.astcRaw);
                     }
                 }
                 meshes.push_back(std::move(md));

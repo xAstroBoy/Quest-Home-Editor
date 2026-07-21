@@ -7,6 +7,7 @@
 #include "loaders/matlmatl_parser.h"
 #include "loaders/hstf_parser.h"
 #include "loaders/rendshad_parser.h"   // parseRendShadForward -> faithful transparent-pass (f4-omitted) detection
+#include "loaders/zip_reader_guard.h"
 
 #include "miniz.h"
 
@@ -226,6 +227,14 @@ public:
             log("  mz_zip_get_error_string: %s", mz_zip_get_error_string(mz_zip_get_last_error(&apkZip)));
             return false;
         }
+        {
+            std::string archiveError;
+            if (!zipread::validateArchive(apkZip, hslcook::zipsafety::kApkReadLimits, &archiveError)) {
+                log("FATAL: Unsafe or oversized APK archive: %s", archiveError.c_str());
+                mz_zip_reader_end(&apkZip);
+                return false;
+            }
+        }
 
         // Find scene.zip inside APK
         int sceneIdx = mz_zip_reader_locate_file(&apkZip, "assets/scene.zip", nullptr, 0);
@@ -262,6 +271,15 @@ public:
             log("  szip error: %s", mz_zip_get_error_string(mz_zip_get_last_error(&sceneZip)));
             free(sceneZipData);
             return false;
+        }
+        {
+            std::string archiveError;
+            if (!zipread::validateArchive(sceneZip, hslcook::zipsafety::kSceneReadLimits, &archiveError)) {
+                log("FATAL: Unsafe or oversized scene.zip: %s", archiveError.c_str());
+                mz_zip_reader_end(&sceneZip);
+                free(sceneZipData);
+                return false;
+            }
         }
 
         // List all files in scene.zip for debugging
@@ -539,6 +557,12 @@ public:
         }
 
         // ── Helper: load + decode texture via AssetKey
+        // Only legacy/test scenes without MaterialPlatformComponent need the expensive fallback
+        // material cycle below. Normal cooked scenes reference their material per entity, so
+        // pre-decoding every fallback texture would keep a second complete scene copy in memory.
+        const bool allEntitiesNoMat = std::all_of(entities.begin(), entities.end(),
+            [](const DrawableEntity& e){ return e.matRefs.empty(); });
+
         auto loadTexture = [&](const AssetKey& texKey, MeshData& md) -> bool {
             const std::string* tp = resolve(texKey);
             if (!tp) {
@@ -677,8 +701,9 @@ public:
                                sp->find("_b.surface") != std::string::npos || sp->find("wispscale") != std::string::npos))
                         me.useBlend = true;
                 }
-                // Pre-decode texture
-                const std::string* tp = resolve(me.texKey);
+                // Only all-no-material test scenes need the fallback pixel buffers. Production
+                // scenes load referenced materials lazily through applyMat/loadTexture.
+                const std::string* tp = allEntitiesNoMat ? resolve(me.texKey) : nullptr;
                 if (tp) {
                     auto texData = readAsset(*tp);
                     if (!texData.empty()) {
@@ -956,11 +981,8 @@ public:
             return ok;
         };
 
-        // Determine if ALL entities lack material refs (test envs like v79_test).
-        // In that case cycle fallback materials across all entities so textures are visible.
-        // If SOME entities have matRefs (prod envs), unmaterialed entities get neutral white.
-        bool allEntitiesNoMat = std::all_of(entities.begin(), entities.end(),
-            [](const DrawableEntity& e){ return e.matRefs.empty(); });
+        // In all-no-material test scenes, cycle fallback materials across the entities.
+        // Normal production/cooked scenes use their per-entity material references.
         log("  allEntitiesNoMat=%d — %s fallback cycling",
             (int)allEntitiesNoMat, allEntitiesNoMat ? "ENABLING" : "disabling");
 

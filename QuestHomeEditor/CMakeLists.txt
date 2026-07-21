@@ -41,6 +41,11 @@ target_include_directories(miniz PUBLIC "${MINIZ_DIR}")
 #    -DHSR_AVX2=ON opts back into the ~1.3x faster AVX2 encoder for your own machine. ──
 option(HSR_AVX2 "Build astcenc with AVX2 (faster cooks; needs a 2013+ CPU — crashes older ones)" OFF)
 include(FetchContent)
+# astcenc includes CTest and enables the global BUILD_TESTING cache option by default;
+# Opus interprets that as a request to register its own upstream test executables. We
+# build only selected product targets in CI, so those unbuilt vendor tests make CTest
+# fail spuriously. Keep dependency test suites off and register our tests explicitly.
+set(BUILD_TESTING OFF CACHE BOOL "Build third-party test suites" FORCE)
 FetchContent_Declare(astcenc
     GIT_REPOSITORY https://github.com/ARM-software/astc-encoder.git
     GIT_TAG 4.8.0
@@ -60,6 +65,14 @@ else()
     set(ASTCENC_LIB astcenc-sse4.1-static)
 endif()
 FetchContent_MakeAvailable(astcenc)
+
+# astcenc 4.8 enables -Werror and supplies both -ffp-model=precise and an explicit
+# -ffp-contract setting. Clang 22 diagnoses that intentional combination as an
+# overriding option, which otherwise prevents MinGW/Clang builds before our code is
+# compiled. Keep vendor warnings strict while allowing this one toolchain diagnostic.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 22)
+    target_compile_options(${ASTCENC_LIB} PRIVATE -Wno-error=overriding-option)
+endif()
 
 # ── libopus (xiph) — DECODER for Ogg-Opus env audio. Half the official V79 envs (storybook,
 #    polarvillage, underwater, ...) ship their background loop as Ogg-OPUS, which stb_vorbis can't
@@ -162,7 +175,7 @@ if(HSR_HAVE_PHYSX)
 endif()
 
 # ── Platform-specific ───────────────────────────────────────────
-if(MSVC)
+if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_compile_options(questhomeeditor PRIVATE /Zc:__cplusplus)  # ACL checks __cplusplus for the C++ level
     target_compile_options(questhomeeditor PRIVATE /Zi)              # debug symbols (PDB) for the crash-handler stack traces
     target_compile_options(questhomeeditor PRIVATE /bigobj)          # main.cpp TU exceeds the 64k COFF section limit (big inline cook/shadergen headers)
@@ -218,8 +231,16 @@ if(HSR_HAVE_PHYSX)
 endif()
 if(WIN32)
     target_compile_definitions(hsl_cook PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(hsl_cook PRIVATE /Zc:__cplusplus)  # ACL checks __cplusplus for the C++ level
+    if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_compile_options(hsl_cook PRIVATE /Zc:__cplusplus)  # ACL checks __cplusplus for the C++ level
+    endif()
     target_link_libraries(hsl_cook PRIVATE bcrypt crypt32)   # self-contained APK v2 signing (next increment)
 else()
     target_link_libraries(hsl_cook PRIVATE Threads::Threads m)
+endif()
+
+option(HSR_BUILD_TESTS "Build Quest Home Editor regression tests" ON)
+if(HSR_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
 endif()

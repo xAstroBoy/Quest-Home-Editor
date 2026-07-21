@@ -43,10 +43,12 @@ Grab a build from **[Releases](../../releases)**:
 
 | File | For |
 | --- | --- |
-| `Quest-Home-Editor-windows-x64.exe` | Windows, any 64-bit CPU (Vulkan GPU) |
-| `Quest-Home-Editor-windows-x64.zip` | Same exe + bundled UI font |
-| `Quest-Home-Editor-linux-x64` / `.tar.gz` | Linux x86-64 (the `.tar.gz` bundles the UI font). Community build 🙏 |
-| `Quest-Home-Editor-macos-*.dmg` | macOS, MoltenVK bundled (CI — once Actions is live) |
+| `Quest-Home-Editor-windows-x64.exe` | Windows editor, any 64-bit CPU (Vulkan GPU) |
+| `Quest-Home-Editor-windows-x64.zip` | Windows editor + `hsl_cook` CLI + bundled UI font |
+| `Quest-Home-Editor-linux-x64` / `.tar.gz` | Linux x86-64 editor; the archive also bundles `hsl_cook` + UI font |
+| `Quest-Home-Editor-linux-x64.AppImage` | Portable Linux editor (with `hsl_cook` included in the image) |
+| `Quest-Home-Editor-macos-*.dmg` | macOS app + `hsl_cook`, with MoltenVK bundled |
+| `hsl-cook-*` | Standalone CLI cooker for the named platform/architecture |
 
 A GPU with **Vulkan** support is required on every OS (macOS via MoltenVK, which the `.dmg` bundles).
 
@@ -138,10 +140,13 @@ against your own headset's VrShell.
 Vendored deps (Vulkan headers, volk, miniz, miniaudio, stb, ACL/RTM) are in-tree; CMake fetches
 GLFW, astc-encoder and Opus. No Vulkan SDK needed (volk loads at runtime). PhysX is off by default.
 
+For the large-scene memory model, archive-safety guarantees, practical limits, and the complete
+local verification matrix, see **[Reliability and scaling](docs/RELIABILITY_AND_SCALING.md)**.
+
 ```bash
 # Windows (from an "x64 Native Tools for VS" prompt)
 cmake -S QuestHomeEditor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target questhomeeditor
+cmake --build build --target questhomeeditor hsl_cook
 
 # Linux (Option 1: One-command Makefile)
 make                    # builds both Editor GUI and CLI Cooker into ./build/
@@ -161,14 +166,16 @@ cmake --build build -j$(nproc)
 # macOS (MoltenVK)
 brew install molten-vk ninja
 cmake -S QuestHomeEditor -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target questhomeeditor
+cmake --build build --target questhomeeditor hsl_cook
 ```
 
 - Texture encoding defaults to **SSE4.1** (runs anywhere); add `-DHSR_AVX2=ON` on a 2013+ CPU for
   ~1.3× faster cooks.
 - Keep `third_party/fonts/` reachable from the binary (the packaged builds bundle it as `fonts/`);
   the UI also falls back to your OS system fonts.
-- CI (`.github/workflows/build.yml`) builds all platforms and attaches artifacts to `v*` tag releases.
+- CI (`.github/workflows/build.yml`) builds the editor and CLI cooker on every platform, runs any
+  CTest tests registered by the project, and is the only workflow that attaches artifacts to `v*`
+  tag releases.
 
 ## Sign a shared APK (no re-cook)
 
@@ -186,6 +193,7 @@ cmake --build build --target questhomeeditor
 | `QuestHomeEditor/src/` | Renderer + editor + cooker (C++17, mostly headers) |
 | `QuestHomeEditor/tools/` | Shader decompile/recompile helpers (spirv-cross, glslang) |
 | `QuestHomeEditor/third_party/` | Vendored deps (volk, Vulkan headers, miniz, stb, ACL/RTM, fonts) |
+| `docs/RELIABILITY_AND_SCALING.md` | Memory, archive-safety, testing, and practical-limit notes |
 | `Makefile` / `build_linux.sh` / `Dockerfile.linux` | One-command native, AppImage, and container builds for Linux |
 | `.github/workflows/build.yml` | 3-OS CI → prebuilt binaries |
 

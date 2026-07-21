@@ -8,28 +8,41 @@ Usage:
   python build.py          # build; auto-kill+retry only IF the exe is locked
   python build.py --kill   # kill any running instance FIRST, then build
 """
-import subprocess, sys, os, time
+import os
+import shutil
+import subprocess
+import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXE  = "Quest Home Editor.exe"
 
 def run_build():
     bat = os.path.join(HERE, "do_build.bat")
-    r = subprocess.run(["cmd", "/c", bat], cwd=HERE, capture_output=True, text=True)
-    return (r.stdout or "") + (r.stderr or "")
+    return subprocess.run(["cmd", "/c", bat], cwd=HERE, capture_output=True, text=True)
+
+def powershell():
+    return shutil.which("pwsh") or shutil.which("powershell")
 
 def count_instances():
-    r = subprocess.run(["powershell", "-NoProfile", "-Command",
+    shell = powershell()
+    if not shell:
+        return -1
+    r = subprocess.run([shell, "-NoProfile", "-Command",
         "(Get-Process 'Quest Home Editor' -ErrorAction SilentlyContinue | Measure-Object).Count"],
         capture_output=True, text=True)
     try:    return int((r.stdout or "0").strip().splitlines()[-1])
     except: return -1
 
 def kill_instances():
+    shell = powershell()
+    if not shell:
+        print("[build.py] WARNING: PowerShell not found; cannot stop a locked editor instance")
+        return False
     for _ in range(6):
         if count_instances() == 0:
             return True
-        subprocess.run(["powershell", "-NoProfile", "-Command",
+        subprocess.run([shell, "-NoProfile", "-Command",
             "Get-Process 'Quest Home Editor' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"],
             capture_output=True, text=True)
         time.sleep(0.4)
@@ -43,18 +56,20 @@ def main():
         print("[build.py] killing running instances first...")
         kill_instances()
 
-    out = run_build()
+    result = run_build()
+    out = (result.stdout or "") + (result.stderr or "")
     if "LNK1104" in out and EXE in out:
         print(f"[build.py] {EXE} locked by a running instance -> killing it and retrying the link...")
         kill_instances()
-        out = run_build()
+        result = run_build()
+        out = (result.stdout or "") + (result.stderr or "")
 
     # FULL build output, no trimming.
     sys.stdout.write(out)
     if not out.endswith("\n"):
         sys.stdout.write("\n")
 
-    ok = ("NINJA_EXIT=0" in out) and ("error LNK" not in out) and (": error" not in out) and ("FAILED:" not in out)
+    ok = result.returncode == 0
     print("[build.py] BUILD " + ("OK" if ok else "FAILED"))
     sys.exit(0 if ok else 1)
 

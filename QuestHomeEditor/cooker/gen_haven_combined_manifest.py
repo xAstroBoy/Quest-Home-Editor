@@ -3,14 +3,25 @@
 # com.meta.shell.env.footprint.haven2025, and HARDCODE the finished AXML into src/cook/nuxd_manifest_axml.h.
 # The cook uses these bytes verbatim (no runtime patchAxml) so an unrooted user replaces the haven2025 package
 # but the shell reads a plain combined Environment -> no footprint, no vista. [[project_hsr_unrooted_footprint_vista_fix]]
-import os, struct, zipfile
+# Usage: python gen_haven_combined_manifest.py path/to/Nuxd.apk
+import argparse
+import os
+import struct
+import zipfile
 
-NUXD = r"D:\Quest Stuff\Restore Old Envs\Envs To check\v203 Ufficial Envs\Nuxd.apk"
-OUT  = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "cook", "nuxd_manifest_axml.h")
+DEFAULT_OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "cook", "nuxd_manifest_axml.h")
 OLD  = "com.meta.environment.prod.nuxd"
 NEW  = "com.meta.shell.env.footprint.haven2025"
 
-d = bytearray(zipfile.ZipFile(NUXD).read("AndroidManifest.xml"))
+parser = argparse.ArgumentParser(
+    description="Generate nuxd_manifest_axml.h from a Nuxd APK you already own."
+)
+parser.add_argument("nuxd_apk", help="path to the source Nuxd APK")
+parser.add_argument("--output", "-o", default=DEFAULT_OUT, help="generated header path")
+args = parser.parse_args()
+
+with zipfile.ZipFile(args.nuxd_apk) as apk:
+    d = bytearray(apk.read("AndroidManifest.xml"))
 
 # ── AXML string-pool package rewrite (port of the C++ patchAxml; substring replace on every pooled string) ──
 assert struct.unpack_from("<H", d, 0)[0] == 3, "not AXML"
@@ -117,5 +128,6 @@ for bb in out:
 if line.strip(): hdr.append(line)
 hdr.append("};")
 hdr.append("static const size_t NUXD_MANIFEST_AXML_LEN = %d;" % len(out))
-open(OUT, "w", newline="\n").write("\n".join(hdr) + "\n")
-print("wrote", OUT)
+with open(args.output, "w", newline="\n") as generated:
+    generated.write("\n".join(hdr) + "\n")
+print("wrote", args.output)
