@@ -68,6 +68,9 @@ static inline void hsrSockTimeoutMs(SOCKET s, int ms) {
 #include <filesystem>
 #include <set>
 #include <map>
+#include <unordered_map>
+#include <unordered_set>
+#include <memory>
 #include <array>
 #include <tuple>
 #include <climits>
@@ -6219,6 +6222,24 @@ struct Editor {
         using namespace hslcook; std::vector<ExportMesh> ems;
         if (!r || !sceneMeshes) return ems;
         size_t n = std::min(sceneMeshes->size(), r->gpuMeshes.size());
+        auto textureRoot = [&](int idx) {
+            int guard = 0;
+            while (idx >= 0 && static_cast<size_t>(idx) < sceneMeshes->size() && guard++ < 32) {
+                const int next = (*sceneMeshes)[static_cast<size_t>(idx)].texShareSrc;
+                if (next < 0 || next == idx || static_cast<size_t>(next) >= sceneMeshes->size()) break;
+                idx = next;
+            }
+            return idx;
+        };
+        std::unordered_set<int> sharedTextureRoots;
+        for (size_t i = 0; i < n; ++i)
+            if ((*sceneMeshes)[i].texShareSrc >= 0) sharedTextureRoots.insert(textureRoot(static_cast<int>(i)));
+        struct SharedBaseTexture {
+            std::shared_ptr<const std::vector<u8>> rgba;
+            std::shared_ptr<const std::vector<u8>> astc;
+            uint32_t w = 0, h = 0, astcBw = 0, astcBh = 0, astcMips = 0;
+        };
+        std::unordered_map<int, SharedBaseTexture> sharedTextures;
         for (size_t i=0;i<n;i++){
             // isHidden is the EDITOR-ONLY visibility eye (a working aid) — hidden meshes MUST still ship in the cook
             // (user-confirmed). Deleted/removed items are already absent from sceneMeshes, so there's nothing to skip
@@ -6230,7 +6251,7 @@ struct Editor {
             const MeshData& mdRaw=(*sceneMeshes)[i];
             MeshData mdShared; const MeshData* mdp=&mdRaw;
             if (mdRaw.texShareSrc>=0 && (size_t)mdRaw.texShareSrc<sceneMeshes->size()){
-                const MeshData& s2=(*sceneMeshes)[(size_t)mdRaw.texShareSrc]; mdShared=mdRaw;
+                const MeshData& s2=(*sceneMeshes)[(size_t)textureRoot((int)i)]; mdShared=mdRaw;
                 mdShared.texRGBA=s2.texRGBA; mdShared.texW=s2.texW; mdShared.texH=s2.texH; mdShared.hasTexture=s2.hasTexture;
                 mdShared.astcRaw=s2.astcRaw; mdShared.astcBw=s2.astcBw; mdShared.astcBh=s2.astcBh;
                 mdShared.srcAstc=s2.srcAstc; mdShared.srcAstcBw=s2.srcAstcBw; mdShared.srcAstcBh=s2.srcAstcBh; mdShared.srcAstcMips=s2.srcAstcMips;
@@ -6326,6 +6347,7 @@ struct Editor {
                    if (hzAnimExtractor) hzAnimExtractor((int)i,64,em); }
             if (md.hasTexture && md.texRGBA.size()>=(size_t)md.texW*md.texH*4){ em.rgba=md.texRGBA; em.w=md.texW; em.h=md.texH;
                 em.srcAstc=md.srcAstc; em.srcAstcBw=md.srcAstcBw; em.srcAstcBh=md.srcAstcBh; em.srcAstcMips=md.srcAstcMips; }
+            bool textureModified = false;
             // ATLAS SUB-RECT CROP (the "balloons should be NITID and visible from far" fix — fidelity, not a
             // cap): a card that samples ONE CELL of a shared multi-design atlas (each balloon = 1 of 5 in the
             // sheet) inherits the WHOLE sheet's mip chain — the deep mips average every design = a muddy
@@ -6351,6 +6373,7 @@ struct Editor {
                         for (int y=0;y<ch;y++) memcpy(&crop[(size_t)y*cw*4], &em.rgba[((size_t)(y0+y)*W + x0)*4], (size_t)cw*4);
                         em.rgba.swap(crop); em.w=cw; em.h=ch;
                         em.srcAstc.clear(); em.srcAstcBw=em.srcAstcBh=em.srcAstcMips=0;   // cropped -> re-encode (source footprint + quality kept by the cook)
+                        textureModified = true;
                         for (size_t k=0;k+1<em.uvs.size();k+=2){
                             em.uvs[k]   = (em.uvs[k]  *W - (float)x0) / (float)cw;
                             em.uvs[k+1] = (em.uvs[k+1]*H - (float)y0) / (float)ch;
@@ -6365,7 +6388,6 @@ struct Editor {
             // BLOCKY cutout edges show THROUGH it -> "leaves back to being blocky". Shrinking the cutout doesn't help
             // (it's still visible through the transparent leaf). The only real smooth+depth path is alpha-to-coverage.
             bool foliage2pass = em.alphaTest && em.hzJointCount > 0 && !em.blend && !em.additive && std::getenv("HSR_FOLIAGE_2PASS");
-            hslcook::ExportMesh prepass; if (foliage2pass) prepass = em;   // copy BEFORE the move (keeps all skinning)
             // ── ANIM-AUDIT: per-mesh SOURCE anim channels vs what the cook ACTUALLY ships. A mesh the source
             //    animates but whose ExportMesh carries no anim representation is a SILENT DROP — the exact class of
             //    bug the batch env audit greps for (`<< UNPORTED`). animSourceProbe is per-format and independent
@@ -6427,6 +6449,45 @@ struct Editor {
                             em.blend?"BLEND":"", em.alphaTest?"MASK":"", (!em.blend&&!em.alphaTest)?(em.additive?"ADDITIVE":"OPAQUE"):(em.additive?"+ADD":""),
                             em.alphaCutoff, shipTintA, dMn, dVar, flags.c_str());
             }
+            // Freeze final (already cropped, if applicable) base-color pixels in shared storage.
+            // ExportMesh copies made by split/cook stages then copy two shared_ptr values instead
+            // of another 16-64 MB decoded atlas.
+            if (!em.rgba.empty()) {
+                const int root = textureRoot(static_cast<int>(i));
+                bool reuseLoaderGroup = !textureModified && sharedTextureRoots.count(root) != 0;
+                const auto existing = sharedTextures.find(root);
+                if (reuseLoaderGroup && existing != sharedTextures.end()) {
+                    const SharedBaseTexture& source = existing->second;
+                    if (source.w != em.w || source.h != em.h || !source.rgba ||
+                        source.rgba->size() != em.rgba.size() || source.astcBw != em.srcAstcBw ||
+                        source.astcBh != em.srcAstcBh || source.astcMips != em.srcAstcMips) {
+                        reuseLoaderGroup = false;
+                    }
+                }
+                if (reuseLoaderGroup) {
+                    SharedBaseTexture& slot = sharedTextures[root];
+                    if (!slot.rgba) {
+                        slot.w = em.w; slot.h = em.h;
+                        slot.astcBw = em.srcAstcBw; slot.astcBh = em.srcAstcBh; slot.astcMips = em.srcAstcMips;
+                        slot.rgba = std::make_shared<const std::vector<u8>>(std::move(em.rgba));
+                        if (!em.srcAstc.empty())
+                            slot.astc = std::make_shared<const std::vector<u8>>(std::move(em.srcAstc));
+                    } else {
+                        std::vector<u8>().swap(em.rgba);
+                        std::vector<u8>().swap(em.srcAstc);
+                    }
+                    em.sharedRgba = slot.rgba;
+                    em.sharedSrcAstc = slot.astc;
+                    em.w = slot.w; em.h = slot.h;
+                    em.srcAstcBw = slot.astcBw; em.srcAstcBh = slot.astcBh; em.srcAstcMips = slot.astcMips;
+                } else {
+                    em.sharedRgba = std::make_shared<const std::vector<u8>>(std::move(em.rgba));
+                    if (!em.srcAstc.empty())
+                        em.sharedSrcAstc = std::make_shared<const std::vector<u8>>(std::move(em.srcAstc));
+                }
+            }
+            hslcook::ExportMesh prepass;
+            if (foliage2pass) prepass = em;   // shared texture payloads keep this copy cheap
             ems.push_back(std::move(em));
             if (foliage2pass) {
                 prepass.depthPrepass = true; prepass.name += "_depthwr";
@@ -6570,7 +6631,7 @@ struct Editor {
         { char sd[32]; snprintf(sd,sizeof sd,"%.0f",skyboxDist); setenv_("HSR_SKYBOX_DIST", skybox ? sd : ""); }  // far backdrop -> skybox pass (escapes PortalStereoCamera far=5000)
         { char br[32]; snprintf(br,sizeof br,"%.0f",backdropFitRadius); setenv_("HSR_BACKDROP_FIT_R",br); }
         std::vector<uint8_t> vspv, fspv;
-        auto apk = exportSceneAPK(ems, nuxd, vspv, fspv, true, &ok, nullptr, &sceneZip, (cookAudio ? bgOgg : std::vector<uint8_t>{}), progress, std::move(sceneItems), serializeSession());
+        auto apk = exportSceneAPK(std::move(ems), nuxd, vspv, fspv, true, &ok, nullptr, &sceneZip, (cookAudio ? bgOgg : std::vector<uint8_t>{}), progress, std::move(sceneItems), serializeSession());
         if (!ok || apk.empty()) { setStatus("ERROR: cook failed (shell: "+nuxd+")"); cooking.store(false); return; }
         if (!writeFile(out, apk)) { setStatus("ERROR: cannot write "+out); cooking.store(false); return; }
         // ── ONE-CLICK COOK→PREVIEW (HSR_COOK_PREVIEW=1): spawn a fresh renderer on the just-cooked V205 APK, so the

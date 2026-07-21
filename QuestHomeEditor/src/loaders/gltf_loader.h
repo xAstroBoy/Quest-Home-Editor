@@ -12,6 +12,7 @@
 #include "core/load_progress.h"   // live stage/counter for the loading splash
 #include "core/tinyjson.h"
 #include "loaders/rendtxtr_parser.h"   // astc::decodeASTC
+#include "loaders/zip_reader_guard.h"
 #include "miniz.h"
 #define STBI_NO_STDIO
 #include "stb_image.h"         // JPEG skybox panoramas (impl in src/stb_image_impl.c)
@@ -94,6 +95,16 @@ public:
     }
 
     // ── small zip helper: read one entry from an in-memory zip ──
+    static bool zipIsSafe(const void* zipData, size_t zipSize,
+                          const hslcook::zipsafety::ArchiveReadLimits& limits,
+                          std::string* error = nullptr) {
+        mz_zip_archive z; memset(&z, 0, sizeof(z));
+        if (!mz_zip_reader_init_mem(&z, zipData, zipSize, 0)) return false;
+        const bool safe = zipread::validateArchive(z, limits, error);
+        mz_zip_reader_end(&z);
+        return safe;
+    }
+
     static std::vector<u8> zipRead(const void* zipData, size_t zipSize, const std::string& name) {
         mz_zip_archive z; memset(&z, 0, sizeof(z));
         if (!mz_zip_reader_init_mem(&z, zipData, zipSize, 0)) return {};
@@ -260,12 +271,24 @@ public:
     bool load(const std::string& apkPath) {
         mz_zip_archive apk; memset(&apk, 0, sizeof(apk));
         if (!mz_zip_reader_init_file(&apk, apkPath.c_str(), 0)) return false;
+        if (!zipread::validateArchive(apk, hslcook::zipsafety::kApkReadLimits)) {
+            mz_zip_reader_end(&apk);
+            return false;
+        }
         int si = mz_zip_reader_locate_file(&apk, "assets/scene.zip", nullptr, 0);
         if (si < 0) { mz_zip_reader_end(&apk); return false; }
         size_t scSz=0; void* scD = mz_zip_reader_extract_to_heap(&apk, si, &scSz, 0);
         mz_zip_reader_end(&apk);
         if (!scD) return false;
         std::vector<u8> sceneZip((u8*)scD,(u8*)scD+scSz); mz_free(scD);
+        {
+            std::string archiveError;
+            if (!zipIsSafe(sceneZip.data(), sceneZip.size(),
+                           hslcook::zipsafety::kSceneReadLimits, &archiveError)) {
+                log("rejected unsafe or oversized scene.zip: %s", archiveError.c_str());
+                return false;
+            }
+        }
 
         // Find the *.gltf.ovrscene inside scene.zip
         std::string ovrName;
@@ -275,6 +298,14 @@ public:
         log("V79 ovrscene: %s", ovrName.c_str());
         auto ovr = zipRead(sceneZip.data(), sceneZip.size(), ovrName);
         if (ovr.empty()) return false;
+        {
+            std::string archiveError;
+            if (!zipIsSafe(ovr.data(), ovr.size(),
+                           hslcook::zipsafety::kSceneReadLimits, &archiveError)) {
+                log("rejected unsafe or oversized ovrscene: %s", archiveError.c_str());
+                return false;
+            }
+        }
 
         // Inside the ovrscene zip: V9.gltf + V9.bin + *.ktx
         std::string gltfName, binName;

@@ -17,11 +17,14 @@
 #include <cmath>
 #include <string>
 #include <map>
+#include <set>
+#include <tuple>
 #include <unordered_set>                 // voxelSolidBoxes cell occupancy
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <functional>   // exportSceneAPK progress callback
+#include <memory>       // immutable decoded texture payloads shared by repeated meshes
 #include <chrono>       // [COOKTRACE] stage timing to pinpoint cook hangs
 #include <cstdlib>
 #include <ctime>
@@ -33,6 +36,8 @@
 #include "cook/embedded_assets.h"   // STANDALONE: cooker templates + Nuxd donor files baked into the binary
 #include "cook/hzanim_acl.h"  // hzAclEncode (HZANIM ACL clip) — only the declaration; ACL lives in hzanim_acl.cpp
 #include "cook/cook_verify.h"  // cook-time FlatBuffer verifier (device's stock-flatbuffers structural check, schema from Meta assets)
+#include "cook/zip_safety.h"   // safe canonical ZIP names + classic-ZIP overflow preflight
+#include "cook/cook_preflight.h" // deterministic geometry validation before expensive encoding
 
 namespace hslcook {
 
@@ -1192,12 +1197,47 @@ inline std::string readAxmlPackage(const std::vector<uint8_t>& axml) {
 
 // ── ZIP/APK assembly (miniz) ──────────────────────────────────────────────────────────────────────────
 typedef std::pair<std::string,std::vector<uint8_t>> CookFile;
+inline bool zipAddMemChecked(mz_zip_archive& zip, zipsafety::EntryNameRegistry& names,
+                             const std::string& rawName, const void* data, size_t size,
+                             mz_uint flags) {
+    if (size > zipsafety::kZip32Max) return false;
+    std::string name;
+    if (names.add(rawName, &name) != zipsafety::NameStatus::Ok) return false;
+    return mz_zip_writer_add_mem(&zip, name.c_str(), data, size, flags) != 0;
+}
+
+inline bool zipFinalizeHeapChecked(mz_zip_archive& zip, std::vector<uint8_t>& bytes) {
+    void* data = nullptr;
+    size_t size = 0;
+    if (!mz_zip_writer_finalize_heap_archive(&zip, &data, &size)) {
+        if (data) mz_free(data);
+        return false;
+    }
+    if ((size != 0 && data == nullptr) || size > zipsafety::kZip32Max || size > bytes.max_size()) {
+        if (data) mz_free(data);
+        return false;
+    }
+    bytes.resize(size);
+    if (size) memcpy(bytes.data(), data, size);
+    if (data) mz_free(data);
+    return true;
+}
+
 inline std::vector<uint8_t> buildZip(const std::vector<CookFile>& files, bool compress = true) {
-    mz_zip_archive zip; memset(&zip,0,sizeof zip); mz_zip_writer_init_heap(&zip,0,0);
-    for (auto& f : files)
-        mz_zip_writer_add_mem(&zip, f.first.c_str(), f.second.data(), f.second.size(), compress?MZ_DEFAULT_COMPRESSION:MZ_NO_COMPRESSION);
-    void* p=nullptr; size_t n=0; mz_zip_writer_finalize_heap_archive(&zip,&p,&n);
-    std::vector<uint8_t> out((uint8_t*)p,(uint8_t*)p+n); mz_free(p); mz_zip_writer_end(&zip); return out;
+    mz_zip_archive zip; memset(&zip,0,sizeof zip);
+    if (!mz_zip_writer_init_heap(&zip,0,0)) return {};
+    zipsafety::EntryNameRegistry names;
+    for (const auto& f : files) {
+        if (!zipAddMemChecked(zip, names, f.first, f.second.data(), f.second.size(),
+                              compress ? MZ_DEFAULT_COMPRESSION : MZ_NO_COMPRESSION)) {
+            mz_zip_writer_end(&zip);
+            return {};
+        }
+    }
+    std::vector<uint8_t> out;
+    const bool finalized = zipFinalizeHeapChecked(zip, out);
+    mz_zip_writer_end(&zip);
+    return finalized ? out : std::vector<uint8_t>{};
 }
 
 // ⛔ scene.zip MUST be written this way (NOT miniz): all entries STORED with the CRC + sizes in the LOCAL file
@@ -1208,11 +1248,29 @@ inline std::vector<uint8_t> buildZip(const std::vector<CookFile>& files, bool co
 inline void zput16(std::vector<uint8_t>& b, uint16_t v) { b.push_back(v & 0xff); b.push_back((v >> 8) & 0xff); }
 inline void zput32(std::vector<uint8_t>& b, uint32_t v) { for (int i = 0; i < 4; i++) b.push_back((v >> (8*i)) & 0xff); }
 inline std::vector<uint8_t> buildStoredZip(const std::vector<CookFile>& files) {
+    zipsafety::EntryNameRegistry names;
+    std::vector<std::string> normalizedNames;
+    std::vector<zipsafety::StoredEntrySize> entrySizes;
+    normalizedNames.reserve(files.size());
+    entrySizes.reserve(files.size());
+    for (const auto& f : files) {
+        std::string normalized;
+        if (names.add(f.first, &normalized) != zipsafety::NameStatus::Ok) return {};
+        normalizedNames.push_back(std::move(normalized));
+        entrySizes.push_back({ normalizedNames.back().size(), f.second.size() });
+    }
+    zipsafety::StoredZipLayout layout;
+    if (!zipsafety::computeStoredZipLayout(entrySizes, layout)) return {};
+
     std::vector<uint8_t> out;
+    out.reserve((size_t)layout.totalBytes);
     struct CDirEnt { std::string name; uint32_t crc, size, off; };
     std::vector<CDirEnt> cd;
+    cd.reserve(files.size());
     const uint16_t DOS_TIME = 0, DOS_DATE = 0x0021;   // 1985-02-01 (cosmetic; loader ignores it)
-    for (const auto& f : files) {
+    for (size_t i = 0; i < files.size(); ++i) {
+        const auto& f = files[i];
+        const std::string& name = normalizedNames[i];
         uint32_t crc  = (uint32_t)mz_crc32(MZ_CRC32_INIT, (const unsigned char*)f.second.data(), f.second.size());
         uint32_t size = (uint32_t)f.second.size();
         uint32_t off  = (uint32_t)out.size();
@@ -1222,12 +1280,13 @@ inline std::vector<uint8_t> buildStoredZip(const std::vector<CookFile>& files) {
         zput16(out, 0);                     // method = 0 (STORED)
         zput16(out, DOS_TIME); zput16(out, DOS_DATE);
         zput32(out, crc); zput32(out, size); zput32(out, size);   // crc, csz, usz — ALL in the local header
-        zput16(out, (uint16_t)f.first.size()); zput16(out, 0);    // name len, extra len
-        out.insert(out.end(), f.first.begin(), f.first.end());
+        zput16(out, (uint16_t)name.size()); zput16(out, 0);       // name len, extra len
+        out.insert(out.end(), name.begin(), name.end());
         out.insert(out.end(), f.second.begin(), f.second.end());
-        cd.push_back({ f.first, crc, size, off });
+        cd.push_back({ name, crc, size, off });
     }
     uint32_t cdStart = (uint32_t)out.size();
+    if (cdStart != layout.centralDirectoryOffset) return {};
     for (const auto& c : cd) {
         zput32(out, 0x02014b50);            // central directory header signature
         zput16(out, 20); zput16(out, 20);   // version made by, version needed
@@ -1240,11 +1299,13 @@ inline std::vector<uint8_t> buildStoredZip(const std::vector<CookFile>& files) {
         out.insert(out.end(), c.name.begin(), c.name.end());
     }
     uint32_t cdSize = (uint32_t)out.size() - cdStart;
+    if (cdSize != layout.centralDirectoryBytes) return {};
     zput32(out, 0x06054b50);                // end of central directory signature
     zput16(out, 0); zput16(out, 0);         // disk number, cd start disk
     zput16(out, (uint16_t)cd.size()); zput16(out, (uint16_t)cd.size());
     zput32(out, cdSize); zput32(out, cdStart);
     zput16(out, 0);                         // comment length
+    if (out.size() != layout.totalBytes) return {};
     return out;
 }
 
@@ -1257,14 +1318,19 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
                                       bool footprintIdentity = false) {
     (void)baseApk; (void)oldPkg;
     if (ok) *ok = false;
-    mz_zip_archive out; memset(&out,0,sizeof out); mz_zip_writer_init_heap(&out,0,0);
+    if (sceneZip.empty()) return {};
+    mz_zip_archive out; memset(&out,0,sizeof out);
+    if (!mz_zip_writer_init_heap(&out,0,0)) return {};
+    zipsafety::EntryNameRegistry names;
     auto donor = embassets::nuxdDonor();   // every kept Nuxd file (scene.zip + AndroidManifest are added below, not here)
     if (donor.empty()) { mz_zip_writer_end(&out); return {}; }
-    auto addFile = [&](const std::string& name, std::vector<uint8_t> data){
+    bool writerOk = true;
+    auto addFile = [&](const std::string& name, const std::vector<uint8_t>& data){
+        if (!writerOk) return;
         mz_uint fl = (name=="resources.arsc")?MZ_NO_COMPRESSION:MZ_DEFAULT_COMPRESSION;
-        mz_zip_writer_add_mem(&out,name.c_str(),data.data(),data.size(),fl);
+        writerOk = zipAddMemChecked(out, names, name, data.data(), data.size(), fl);
     };
-    for (auto& kv : donor) addFile(kv.first, std::move(kv.second));   // donor excludes scene.zip / manifest / META-INF
+    for (const auto& kv : donor) addFile(kv.first, kv.second);       // donor excludes scene.zip / manifest / META-INF
     addFile("assets/scene.zip", sceneZip);
     if (!editorSession.empty())   // self-contained round-trip: the editor reads this back when a cooked APK has no source .hsledit
         addFile("assets/_editor_session.hsledit", std::vector<uint8_t>(editorSession.begin(), editorSession.end()));
@@ -1302,9 +1368,13 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
         }
         addFile(name, std::move(data));
     }
-    void* op=nullptr; size_t on=0; mz_zip_writer_finalize_heap_archive(&out,&op,&on);
-    std::vector<uint8_t> apk((uint8_t*)op,(uint8_t*)op+on); mz_free(op); mz_zip_writer_end(&out);
-    if (ok) *ok=true; return apk;
+    if (!writerOk) { mz_zip_writer_end(&out); return {}; }
+    std::vector<uint8_t> apk;
+    const bool finalized = zipFinalizeHeapChecked(out, apk);
+    mz_zip_writer_end(&out);
+    if (!finalized) return {};
+    if (ok) *ok=true;
+    return apk;
 }
 
 // ── High-level "Export APK" — the editor calls this. Pass the cooked scene assets; get an unsigned APK. ──
@@ -1315,12 +1385,26 @@ inline std::vector<uint8_t> assembleSceneZip(std::vector<CookAsset>& assets,
                                              const std::vector<uint8_t>& shellConfig) {
     std::vector<CookFile> files;
     std::vector<AsmhEntry> man;
+    zipsafety::EntryNameRegistry names;
+    std::set<std::tuple<uint64_t, uint64_t, uint32_t>> assetKeys;
     for (auto& a : assets) {
-        files.push_back({ "content/" + a.contentPath, a.data });
-        man.push_back({ a.key.pkg, a.key.ing, a.key.tgt, a.contentPath, a.cat ? a.cat : assetFourcc(a.data), a.sub ? a.sub : assetSubtype(a.data), (uint32_t)a.data.size() });
+        std::string normalizedPath;
+        if (zipsafety::normalizeEntryName(a.contentPath, normalizedPath) != zipsafety::NameStatus::Ok)
+            return {};
+        std::string archivePath;
+        if (names.add("content/" + normalizedPath, &archivePath) != zipsafety::NameStatus::Ok ||
+            !assetKeys.emplace(a.key.pkg, a.key.ing, a.key.tgt).second ||
+            a.data.size() > zipsafety::kZip32Max)
+            return {};
+        files.push_back({ std::move(archivePath), a.data });
+        man.push_back({ a.key.pkg, a.key.ing, a.key.tgt, normalizedPath, a.cat ? a.cat : assetFourcc(a.data), a.sub ? a.sub : assetSubtype(a.data), (uint32_t)a.data.size() });
     }
-    files.push_back({ "content/assets.manifest", buildAsmh(man) });
-    files.push_back({ "content/configs/shellconfig.jsonc", shellConfig });
+    std::string manifestPath, configPath;
+    if (names.add("content/assets.manifest", &manifestPath) != zipsafety::NameStatus::Ok ||
+        names.add("content/configs/shellconfig.jsonc", &configPath) != zipsafety::NameStatus::Ok)
+        return {};
+    files.push_back({ std::move(manifestPath), buildAsmh(man) });
+    files.push_back({ std::move(configPath), shellConfig });
     // scene.zip MUST use the hand-rolled STORED writer (sizes/CRC in the local header, flag=0) — see buildStoredZip.
     return buildStoredZip(files);
 }
@@ -1375,28 +1459,62 @@ inline std::vector<uint8_t> emptyOutVistaApk(const std::vector<uint8_t>& realApk
     if (ok) *ok = false;
     mz_zip_archive in; memset(&in,0,sizeof in);
     if (!mz_zip_reader_init_mem(&in, realApk.data(), realApk.size(), 0)) return {};
-    mz_zip_archive out; memset(&out,0,sizeof out); mz_zip_writer_init_heap(&out,0,0);
+    const mz_uint n = mz_zip_reader_get_num_files(&in);
+    zipsafety::ArchiveReadBudget readBudget(zipsafety::kApkReadLimits);
+    std::vector<std::string> inputNames(n);
+    for (mz_uint i = 0; i < n; ++i) {
+        mz_zip_archive_file_stat st{};
+        if (!mz_zip_reader_file_stat(&in, i, &st)) { mz_zip_reader_end(&in); return {}; }
+        const mz_uint nameSize = mz_zip_reader_get_filename(&in, i, nullptr, 0);
+        if (nameSize == 0 || nameSize > zipsafety::kZip16Max + 1) {
+            mz_zip_reader_end(&in); return {};
+        }
+        std::vector<char> rawName(nameSize);
+        if (mz_zip_reader_get_filename(&in, i, rawName.data(), nameSize) == 0) {
+            mz_zip_reader_end(&in); return {};
+        }
+        const bool directory = mz_zip_reader_is_file_a_directory(&in, i) != 0;
+        const auto readResult = readBudget.add(
+            std::string_view(rawName.data(), nameSize - 1),
+            static_cast<uint64_t>(st.m_uncomp_size), directory, &inputNames[i]);
+        if (readResult.status != zipsafety::ArchiveReadStatus::Ok) {
+            mz_zip_reader_end(&in); return {};
+        }
+    }
+
+    mz_zip_archive out; memset(&out,0,sizeof out);
+    if (!mz_zip_writer_init_heap(&out,0,0)) { mz_zip_reader_end(&in); return {}; }
+    zipsafety::EntryNameRegistry names;
     auto emptyScene = emptyVistaSceneZip();
-    mz_uint n = mz_zip_reader_get_num_files(&in);
+    if (emptyScene.empty()) { mz_zip_reader_end(&in); mz_zip_writer_end(&out); return {}; }
     bool sawScene=false;
     for (mz_uint i=0;i<n;i++){
-        mz_zip_archive_file_stat st; if(!mz_zip_reader_file_stat(&in,i,&st)) { mz_zip_reader_end(&in); mz_zip_writer_end(&out); return {}; }
+        const std::string& name = inputNames[i];
         if (mz_zip_reader_is_file_a_directory(&in,i)) continue;
-        std::string name = st.m_filename;
         if (name=="META-INF/MANIFEST.MF" || name.rfind("META-INF/",0)==0) continue;   // drop any old JAR signature (we re-sign v2)
         if (name=="assets/scene.zip"){ sawScene=true;
-            mz_zip_writer_add_mem(&out, name.c_str(), emptyScene.data(), emptyScene.size(), MZ_DEFAULT_COMPRESSION); continue; }
+            if (!zipAddMemChecked(out, names, name, emptyScene.data(), emptyScene.size(), MZ_DEFAULT_COMPRESSION)) {
+                mz_zip_reader_end(&in); mz_zip_writer_end(&out); return {};
+            }
+            continue;
+        }
         size_t sz=0; void* d = mz_zip_reader_extract_to_heap(&in, i, &sz, 0);
         if (!d){ mz_zip_reader_end(&in); mz_zip_writer_end(&out); return {}; }
         mz_uint fl = (name=="resources.arsc")?MZ_NO_COMPRESSION:MZ_DEFAULT_COMPRESSION;
-        mz_zip_writer_add_mem(&out, name.c_str(), d, sz, fl);
+        const bool added = zipAddMemChecked(out, names, name, d, sz, fl);
         mz_free(d);
+        if (!added) { mz_zip_reader_end(&in); mz_zip_writer_end(&out); return {}; }
     }
-    if (!sawScene) mz_zip_writer_add_mem(&out, "assets/scene.zip", emptyScene.data(), emptyScene.size(), MZ_DEFAULT_COMPRESSION);
+    if (!sawScene && !zipAddMemChecked(out, names, "assets/scene.zip", emptyScene.data(), emptyScene.size(), MZ_DEFAULT_COMPRESSION)) {
+        mz_zip_reader_end(&in); mz_zip_writer_end(&out); return {};
+    }
     mz_zip_reader_end(&in);
-    void* op=nullptr; size_t on=0; mz_zip_writer_finalize_heap_archive(&out,&op,&on);
-    std::vector<uint8_t> apk((uint8_t*)op,(uint8_t*)op+on); mz_free(op); mz_zip_writer_end(&out);
-    if (ok) *ok=true; return apk;
+    std::vector<uint8_t> apk;
+    const bool finalized = zipFinalizeHeapChecked(out, apk);
+    mz_zip_writer_end(&out);
+    if (!finalized) return {};
+    if (ok) *ok=true;
+    return apk;
 }
 // FALLBACK invisible-vista path (device pull failed): SYNTHESIZE an empty environment APK under the vista
 // package name from the embedded nuxd donor + the haven manifest patched to vistaPkg (flipped to 'combined').
@@ -1710,6 +1828,11 @@ struct ExportMesh {
     uint32_t w = 0, h = 0;
     std::vector<uint8_t> srcAstc;   // LOSSLESS pass-through: source ASTC mip chain (blocks) if the base tex is a plain KTX-ASTC and UNMODIFIED
     uint32_t srcAstcBw = 0, srcAstcBh = 0, srcAstcMips = 0;
+    // Large legacy scenes can bind one decoded atlas to hundreds of meshes. Keep the
+    // post-edit payload immutable and shared so export/split copies remain cheap. rgba/srcAstc
+    // stay supported for standalone and small callers.
+    std::shared_ptr<const std::vector<uint8_t>> sharedRgba;
+    std::shared_ptr<const std::vector<uint8_t>> sharedSrcAstc;
     bool depthPrepass = false;      // TWO-PASS foliage: this copy is the DEPTH-WRITE cutout sibling (opaque pass, occludes);
                                     // the paired blend copy draws the smooth color on top. Gives smooth edges AND correct depth.
     std::vector<uint8_t> iblVertCol; // FAITHFUL SpecIbl diffuse-irradiance per-vertex RGBA = diffuseCube(worldN)·ambientIBLTint, baked in buildExportMeshes (the renderer's exact uploadMesh bake). Device base·vertexColor0 = env-lit lake water, NOT the dark basecolor (the "black lake" bug). Empty for non-specibl meshes.
@@ -1775,6 +1898,12 @@ struct ExportMesh {
     float curTint[4]={1,1,1,1};                              // per-frame mat.sanim MaterialTint (fog/dust/foam opacity)
     float vatInstTrackIndex=-1, vatInstRateFactor=-1, vatInstTimeOffset=-1, atlasCellIndex=-1;   // per-instance VAT -> `instance` UBO (set2 bind1)
 };
+inline const std::vector<uint8_t>& meshRgba(const ExportMesh& mesh) {
+    return mesh.sharedRgba ? *mesh.sharedRgba : mesh.rgba;
+}
+inline const std::vector<uint8_t>& meshSrcAstc(const ExportMesh& mesh) {
+    return mesh.sharedSrcAstc ? *mesh.sharedSrcAstc : mesh.srcAstc;
+}
 inline std::vector<uint8_t> readFileBytes(const std::string& p) {
     { std::vector<uint8_t> e; if (embassets::get(p, e)) return e; }   // STANDALONE: cooker/*.bin templates are baked in
     std::vector<uint8_t> b; FILE* f = fopen(p.c_str(), "rb"); if (!f) return b;
@@ -1936,17 +2065,23 @@ inline int fitBackdropGroups(std::vector<ExportMesh>& meshes, const float origin
 // device only draws multi-part for skinned/multi-material). u32 single-part renders as GARBAGE (the device reads the
 // RENDMESH index buffer as u16). So the only faithful path for a >65535-vert static mesh (erebor Statues 91306 / Halls
 // 87956, moria Pillar 235183) is many SINGLE-PART (u16) meshes. Chunks share the source texture (dedup'd in the cook).
-inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMesh>& in, size_t cap = 60000) {
+inline std::vector<ExportMesh> splitLargeStaticMeshes(std::vector<ExportMesh> in, size_t cap = 60000) {
     std::vector<ExportMesh> out;
-    for (const auto& m : in) {
+    out.reserve(in.size());
+    for (auto& m : in) {
         size_t nv = m.positions.size() / 3;
         bool skinnedOrVat = m.hzJointCount > 0 || m.vatFrames > 0 || !m.hzBoneIdx.empty();
-        if (nv <= cap || skinnedOrVat || m.indices.size() < 3) { out.push_back(m); continue; }
+        if (nv <= cap || skinnedOrVat || m.indices.size() < 3) { out.push_back(std::move(m)); continue; }
+        if (!m.sharedRgba && !m.rgba.empty())
+            m.sharedRgba = std::make_shared<const std::vector<uint8_t>>(std::move(m.rgba));
+        if (!m.sharedSrcAstc && !m.srcAstc.empty())
+            m.sharedSrcAstc = std::make_shared<const std::vector<uint8_t>>(std::move(m.srcAstc));
         bool haveUv = m.uvs.size() >= nv * 2;
         size_t ntri = m.indices.size() / 3, t = 0;
         while (t < ntri) {
-            ExportMesh c; c.name = m.name; c.blend = m.blend; c.alphaTest = m.alphaTest; c.alphaCutoff = m.alphaCutoff; c.additive = m.additive; c.w = m.w; c.h = m.h; c.rgba = m.rgba;
-            c.srcAstc = m.srcAstc; c.srcAstcBw = m.srcAstcBw; c.srcAstcBh = m.srcAstcBh; c.srcAstcMips = m.srcAstcMips;   // split parts keep the lossless source-ASTC pass-through
+            ExportMesh c; c.name = m.name; c.blend = m.blend; c.alphaTest = m.alphaTest; c.alphaCutoff = m.alphaCutoff; c.additive = m.additive; c.w = m.w; c.h = m.h;
+            c.sharedRgba = m.sharedRgba; c.sharedSrcAstc = m.sharedSrcAstc;
+            c.srcAstcBw = m.srcAstcBw; c.srcAstcBh = m.srcAstcBh; c.srcAstcMips = m.srcAstcMips;   // split parts keep the lossless source-ASTC pass-through
             c.backdropFitGroup = m.backdropFitGroup; // split chunks remain visual-only members of the already-fitted group
             c.skybox = m.skybox;   // actual cubemap chunks retain their component routing
             for (int k = 0; k < 4; k++) c.matTint[k] = m.matTint[k];
@@ -1954,6 +2089,12 @@ inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMe
             std::unordered_map<uint32_t, uint32_t> remap; remap.reserve(cap + 16);
             while (t < ntri) {
                 uint32_t tri[3] = { m.indices[t*3], m.indices[t*3+1], m.indices[t*3+2] };
+                if (tri[0] >= nv || tri[1] >= nv || tri[2] >= nv) {
+                    fprintf(stderr, "[COOK] STATIC-SPLIT '%s': dropping invalid triangle %zu (%u,%u,%u), vertex count=%zu\n",
+                            m.name.c_str(), t, tri[0], tri[1], tri[2], nv);
+                    ++t;
+                    continue;
+                }
                 int newv = 0; for (uint32_t g : tri) if (!remap.count(g)) newv++;
                 if (!remap.empty() && remap.size() + (size_t)newv > cap) break;
                 for (uint32_t g : tri) {
@@ -1984,7 +2125,7 @@ inline std::vector<ExportMesh> splitLargeStaticMeshes(const std::vector<ExportMe
 // they dedup to one shared asset every piece's AnimatorPlatformComponent points at (nuxd prism_wave + motes prove a
 // shared skeleton/anim across entities). Splitting by triangle preserves each vertex's skin weights, so all pieces
 // deform + animate together as one dragon. HSR_NOSKINSPLIT = keep the (crashing) multi-part path for diagnostics.
-inline std::vector<ExportMesh> splitLargeSkinnedMeshes(const std::vector<ExportMesh>& in, size_t cap = 60000) {
+inline std::vector<ExportMesh> splitLargeSkinnedMeshes(std::vector<ExportMesh> in, size_t cap = 60000) {
     if (std::getenv("HSR_NOSKINSPLIT")) return in;
     // DEVICE-PROVEN: MeshAssetBuilder::updateAsset (Clay) over-allocates building a LARGE SKINNED mesh — its per-part
     // skinning buffer scales ~O(verts²) so a 60000-vert part balloons to gigabytes ("Requested new size exceeds size
@@ -1999,10 +2140,14 @@ inline std::vector<ExportMesh> splitLargeSkinnedMeshes(const std::vector<ExportM
     if (const char* e = std::getenv("HSR_SKINCAP")) { long c = atol(e); if (c >= 1000) cap = (size_t)c; }
     else cap = 16000;
     std::vector<ExportMesh> out;
-    for (const auto& m : in) {
+    for (auto& m : in) {
         size_t nv = m.positions.size() / 3;
         bool skinned = m.hzJointCount > 0 && m.hzBoneIdx.size() >= nv * 4;
-        if (!skinned || nv <= cap || m.indices.size() < 3) { out.push_back(m); continue; }
+        if (!skinned || nv <= cap || m.indices.size() < 3) { out.push_back(std::move(m)); continue; }
+        if (!m.sharedRgba && !m.rgba.empty())
+            m.sharedRgba = std::make_shared<const std::vector<uint8_t>>(std::move(m.rgba));
+        if (!m.sharedSrcAstc && !m.srcAstc.empty())
+            m.sharedSrcAstc = std::make_shared<const std::vector<uint8_t>>(std::move(m.srcAstc));
         bool haveUv   = m.uvs.size()       >= nv * 2;
         bool haveUv2  = m.uvs2.size()      >= nv * 2;
         bool haveRest = m.hzRestPos.size() >= nv * 3;
@@ -2061,17 +2206,65 @@ inline bool httpDownload(const std::string& url, const std::string& outPath,
 }
 
 inline bool extractZipTo(const std::string& zipPath, const std::string& destDir) {
-    namespace fs = std::filesystem; std::error_code ec; fs::create_directories(destDir, ec);
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(destDir, ec);
+    if (ec) return false;
+    const fs::path root = fs::weakly_canonical(fs::path(destDir), ec);
+    if (ec || root.empty()) return false;
+
+    auto isWithinRoot = [](const fs::path& candidate, const fs::path& expectedRoot) {
+        auto child = candidate.begin();
+        for (auto parent = expectedRoot.begin(); parent != expectedRoot.end(); ++parent, ++child)
+            if (child == candidate.end() || *child != *parent) return false;
+        return true;
+    };
+
     mz_zip_archive z; memset(&z, 0, sizeof z);
     if (!mz_zip_reader_init_file(&z, zipPath.c_str(), 0)) return false;
-    mz_uint n = mz_zip_reader_get_num_files(&z); bool ok = true;
+    const mz_uint n = mz_zip_reader_get_num_files(&z);
+    hslcook::zipsafety::ArchiveReadBudget budget(hslcook::zipsafety::kSceneReadLimits);
+    std::vector<std::string> normalizedNames(n);
+    bool ok = true;
+
+    // Preflight every name and declared size before the first filesystem write.
+    // mz_zip_archive_file_stat::m_filename is fixed-size, so retrieve the full
+    // central-directory name explicitly instead of relying on a truncated copy.
     for (mz_uint i = 0; i < n; ++i) {
-        mz_zip_archive_file_stat st;
+        mz_zip_archive_file_stat st{};
         if (!mz_zip_reader_file_stat(&z, i, &st)) { ok = false; break; }
-        std::string outp = destDir + "/" + st.m_filename;
-        if (mz_zip_reader_is_file_a_directory(&z, i)) { fs::create_directories(outp, ec); continue; }
-        fs::create_directories(fs::path(outp).parent_path(), ec);
-        if (!mz_zip_reader_extract_to_file(&z, i, outp.c_str(), 0)) { ok = false; break; }
+        const mz_uint nameSize = mz_zip_reader_get_filename(&z, i, nullptr, 0);
+        if (nameSize == 0 || nameSize > hslcook::zipsafety::kZip16Max + 1) { ok = false; break; }
+        std::vector<char> name(nameSize);
+        if (mz_zip_reader_get_filename(&z, i, name.data(), nameSize) == 0) { ok = false; break; }
+        const bool directory = mz_zip_reader_is_file_a_directory(&z, i) != 0;
+        const auto result = budget.add(std::string_view(name.data(), nameSize - 1),
+                                       static_cast<uint64_t>(st.m_uncomp_size), directory,
+                                       &normalizedNames[i]);
+        if (result.status != hslcook::zipsafety::ArchiveReadStatus::Ok) { ok = false; break; }
+    }
+
+    for (mz_uint i = 0; ok && i < n; ++i) {
+        const fs::path outPath = root / fs::path(normalizedNames[i]);
+        const fs::path canonicalTarget = fs::weakly_canonical(outPath, ec);
+        if (ec || !isWithinRoot(canonicalTarget, root)) { ok = false; break; }
+
+        if (mz_zip_reader_is_file_a_directory(&z, i)) {
+            fs::create_directories(outPath, ec);
+            if (ec) { ok = false; break; }
+            continue;
+        }
+        fs::create_directories(outPath.parent_path(), ec);
+        if (ec) { ok = false; break; }
+
+        // Re-resolve after creating parents: an existing symlink anywhere in
+        // the path must still remain inside the extraction root.
+        const fs::path resolvedAfterCreate = fs::weakly_canonical(outPath, ec);
+        if (ec || !isWithinRoot(resolvedAfterCreate, root) ||
+            !mz_zip_reader_extract_to_file(&z, i, outPath.string().c_str(), 0)) {
+            ok = false;
+            break;
+        }
     }
     mz_zip_reader_end(&z); return ok;
 }
@@ -2262,7 +2455,7 @@ inline bool signApk(const std::string& unsignedApk, const std::string& signedApk
 // Port ANY decoded scene (e.g. a V79 .ovrscene loaded by the renderer) to a bootable V203 APK: per-mesh RENDMESH
 // (struct-bounds, embedded material) + RENDTXTR + the floor MATL template patched to that mesh's texture, all bound
 // to the real renderer_module unlit.surface shader; Root entity + child relationships + spawn point.
-inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes, const std::string& nuxdApk,
+inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const std::string& nuxdApk,
                                            const std::vector<uint8_t>& vspv, const std::vector<uint8_t>& fspv,
                                            bool locomotion = true, bool* ok = nullptr, const float* legacyCamPos = nullptr,
                                            std::vector<uint8_t>* outSceneZip = nullptr,
@@ -2280,6 +2473,80 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         fprintf(stderr, "[COOKTRACE] %8.2fs  %s\n", dt, s); fflush(stderr); } };
     if (ok) *ok = false;
     (void)vspv; (void)fspv; (void)legacyCamPos;   // retained only for source compatibility; cooks resolve the real spawn from scene data
+    // Fail malformed source geometry before loading shader templates or encoding
+    // textures. This is intentionally read-only: valid scene data flows into the
+    // existing cook unchanged. In particular there is no legacy 1000-mesh cap.
+    std::vector<preflight::GeometryView> preflightMeshes;
+    preflightMeshes.reserve(meshes.size());
+    for (const auto& mesh : meshes) {
+        preflightMeshes.push_back({
+            mesh.name.c_str(),
+            mesh.positions.data(), mesh.positions.size(),
+            mesh.uvs.data(), mesh.uvs.size(),
+            mesh.indices.data(), mesh.indices.size()
+        });
+    }
+    const auto preflightReport = preflight::validateScene(
+        preflightMeshes.data(), preflightMeshes.size());
+    if (!preflightReport.ok()) {
+        fprintf(stderr,
+                "[COOK-PREFLIGHT] FAILED: %zu issue(s), %zu mesh(es), %llu vertices, %llu triangles\n",
+                preflightReport.issueCount, preflightReport.meshCount,
+                (unsigned long long)preflightReport.vertexCount,
+                (unsigned long long)preflightReport.triangleCount);
+        for (const auto& issue : preflightReport.issues) {
+            fprintf(stderr, "[COOK-PREFLIGHT] mesh %zu '%s': %s",
+                    issue.meshIndex, issue.meshName.c_str(),
+                    preflight::issueCodeName(issue.code));
+            switch (issue.code) {
+                case preflight::IssueCode::NonFinitePosition:
+                case preflight::IssueCode::NonFiniteUv:
+                    fprintf(stderr, " (component %zu)", issue.elementIndex);
+                    break;
+                case preflight::IssueCode::IndexOutOfRange:
+                    fprintf(stderr, " (index[%zu]=%llu, vertex count=%llu)",
+                            issue.elementIndex,
+                            (unsigned long long)issue.actual,
+                            (unsigned long long)issue.expectedOrLimit);
+                    break;
+                case preflight::IssueCode::TooManyMeshes:
+                case preflight::IssueCode::TooManyVertices:
+                case preflight::IssueCode::TooManyIndices:
+                    fprintf(stderr, " (%llu, limit %llu)",
+                            (unsigned long long)issue.actual,
+                            (unsigned long long)issue.expectedOrLimit);
+                    break;
+                case preflight::IssueCode::PositionComponentCount:
+                    fprintf(stderr, " (components=%llu, required multiple=%llu)",
+                            (unsigned long long)issue.actual,
+                            (unsigned long long)issue.expectedOrLimit);
+                    break;
+                case preflight::IssueCode::IndexCountNotTriangles:
+                    fprintf(stderr, " (indices=%llu, required multiple=%llu)",
+                            (unsigned long long)issue.actual,
+                            (unsigned long long)issue.expectedOrLimit);
+                    break;
+                case preflight::IssueCode::TooFewVertices:
+                case preflight::IssueCode::TooFewIndices:
+                    fprintf(stderr, " (got %llu, minimum %llu)",
+                            (unsigned long long)issue.actual,
+                            (unsigned long long)issue.expectedOrLimit);
+                    break;
+            }
+            fputc('\n', stderr);
+        }
+        if (preflightReport.omittedIssueCount() != 0)
+            fprintf(stderr, "[COOK-PREFLIGHT] ... %zu additional issue(s) omitted\n",
+                    preflightReport.omittedIssueCount());
+        prog(1.0f, "Cook preflight failed; see the log for the broken mesh and index");
+        return {};
+    }
+    if (std::getenv("HSR_VERBOSE"))
+        fprintf(stderr,
+                "[COOK-PREFLIGHT] OK: %zu mesh(es), %llu vertices, %llu triangles\n",
+                preflightReport.meshCount,
+                (unsigned long long)preflightReport.vertexCount,
+                (unsigned long long)preflightReport.triangleCount);
     CookRng rng;
     std::vector<CookAsset> assets;
     // ⛔ CACHE-BUST: the device's AssetManager caches parsed assets by AssetKey (= hash of the asset PATH) and serves the
@@ -2457,14 +2724,15 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
     // intentional (ghost/fading cards keep BLEND). MUST run BEFORE the >60k splitters: split parts don't all
     // carry m.rgba (the planet split into 11 parts; only the rgba-bearing one reclassified = 10 still ghosted).
     // HSR_NOOPAQUEBLEND reverts.
-    std::vector<ExportMesh> meshesPre = meshes;
+    std::vector<ExportMesh> meshesPre = std::move(meshes);
     if (!std::getenv("HSR_NOOPAQUEBLEND"))
         for (size_t mi = 0; mi < meshesPre.size(); ++mi) {
             ExportMesh& m = meshesPre[mi];
-            if (!m.blend || m.additive || m.alphaTest || m.rgba.size() < 4) continue;
+            const auto& rgba = meshRgba(m);
+            if (!m.blend || m.additive || m.alphaTest || rgba.size() < 4) continue;
             if (m.fadeAnim || m.tintAnim || m.curTint[3] < 0.999f || m.matTint[3] < 0.999f) continue;
             uint8_t aMin = 255;
-            for (size_t k = 3; k < m.rgba.size(); k += 4) { if (m.rgba[k] < aMin) { aMin = m.rgba[k]; if (aMin < 250) break; } }
+            for (size_t k = 3; k < rgba.size(); k += 4) { if (rgba[k] < aMin) { aMin = rgba[k]; if (aMin < 250) break; } }
             if (aMin >= 250) { m.blend = false;
                 if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' OPAQUE-BLEND reclass (fully-opaque texture aMin=%u, blend -> OPAQUE depth-write)\n", mi, m.name.c_str(), aMin); }
         }
@@ -2553,9 +2821,9 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         }
     }
     ctrace("before splitLargeStaticMeshes");
-    std::vector<ExportMesh> meshesV = splitLargeStaticMeshes(meshesPre);
+    std::vector<ExportMesh> meshesV = splitLargeStaticMeshes(std::move(meshesPre));
     // Split >60000-vert SKINNED meshes the SAME way (multi-part skinned CRASHES the device — snakeway 5_Car dragon).
-    meshesV = splitLargeSkinnedMeshes(meshesV);
+    meshesV = splitLargeSkinnedMeshes(std::move(meshesV));
     ctrace("after split; entering per-mesh cook loop");
     // ── HSR_FITCLIP: scale EVERY mesh under the shell's fixed far-clip plane (default R=4500, margin under 5000) ──
     // Per-mesh UNIFORM scale ABOUT THE SPAWN: each vertex keeps its DIRECTION (angular position) and the mesh keeps its
@@ -2617,15 +2885,17 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         if (ctOn) { char sb[128]; snprintf(sb, sizeof sb, "  mesh %zu/%zu '%s' (%zu verts, %zu tris)", i, meshesV.size(), meshesV[i].name.c_str(), meshesV[i].positions.size()/3, meshesV[i].indices.size()/3); ctrace(sb); }
         const ExportMesh& m = meshesV[i];
         if (m.positions.size() < 9 || m.indices.size() < 3) continue;   // skip empty
+        const auto& rgba = meshRgba(m);
+        const auto& srcAstc = meshSrcAstc(m);
         // GENERIC depth-write discriminator (V79 MeshShellEnvMaskDepthWrite + HAS_ALPHACUTOFF): a HARD-EDGED / BIMODAL
         // transparent card — pixels are ~all opaque or fully transparent (midF~0) with real opaque content — must OCCLUDE.
         // Cook it with alpha-cutoff DISCARD + DEPTH-WRITE on WHICHEVER path the mesh takes (static OR skinned/rigid-hzanim:
         // the moving train card). Soft-gradient transparents (fog/smoke/glow/aurora/ice: midF high) stay alpha BLEND.
         // Texture-driven, no material names. Computed once so every path (below) agrees.
         bool bimodalOccluder = false;
-        if (m.blend && !m.additive && m.rgba.size() >= 4) {
-            size_t nt=m.rgba.size()/4, opq=0, mid=0;
-            for (size_t k=3;k<m.rgba.size();k+=4){ uint8_t a=m.rgba[k]; if(a>=230)opq++; if(a>=40&&a<=215)mid++; }
+        if (m.blend && !m.additive && rgba.size() >= 4) {
+            size_t nt=rgba.size()/4, opq=0, mid=0;
+            for (size_t k=3;k<rgba.size();k+=4){ uint8_t a=rgba[k]; if(a>=230)opq++; if(a>=40&&a<=215)mid++; }
             float opF = nt?(float)opq/(float)nt:0.f, midF = nt?(float)mid/(float)nt:1.f;
             bimodalOccluder = (midF < 0.05f) && (opF > 0.004f);
         }
@@ -2684,22 +2954,22 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         // OPAQUE for ANY opaque skinned-source mesh — NOT gated behind HSR_HZANIM (the static cook needs it too; that gate
         // was THE bug that made the static droid invisible on-device while the sim's alpha-ignoring fallback still showed it).
         bool skinnedOpaque = haveSkin && m.hzJointCount > 0 && !m.blend;
-        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' skinnedOpaque=%d blend=%d hzJoints=%d haveSkin=%d w=%d h=%d rgba=%zu\n", i, m.name.c_str(), skinnedOpaque, (int)m.blend, m.hzJointCount, (int)haveSkin, m.w, m.h, m.rgba.size());
-        std::vector<uint8_t> texOpaque; const uint8_t* texSrc = m.rgba.data();
-        if (skinnedOpaque && !m.alphaTest && m.rgba.size() >= (size_t)m.w * m.h * 4) {
+        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' skinnedOpaque=%d blend=%d hzJoints=%d haveSkin=%d w=%d h=%d rgba=%zu\n", i, m.name.c_str(), skinnedOpaque, (int)m.blend, m.hzJointCount, (int)haveSkin, m.w, m.h, rgba.size());
+        std::vector<uint8_t> texOpaque; const uint8_t* texSrc = rgba.data();
+        if (skinnedOpaque && !m.alphaTest && rgba.size() >= (size_t)m.w * m.h * 4) {
             // (MASKED skinned foliage keeps its REAL alpha — the skinned-CUTOUT shader below discards on it.
             //  Forcing alpha=255 here rendered the stinson materialsplit trees' transparent leaf gaps SOLID
             //  = "tree leaves in cook are all blocky".)
-            texOpaque = m.rgba; for (size_t k = 3; k < texOpaque.size(); k += 4) texOpaque[k] = 255; texSrc = texOpaque.data();
+            texOpaque = rgba; for (size_t k = 3; k < texOpaque.size(); k += 4) texOpaque[k] = 255; texSrc = texOpaque.data();
         }
         else if (m.additive && m.uvScroll) {
             // FOAM (lake_foam Additive:true + mat.sanim): a BRIGHT-rgb foam texture with a LOW NATIVE ALPHA (the alpha IS
             // the subtle foam coverage). Use the texture VERBATIM (no premultiply, no luminance) on the PROVEN alpha-blend
             // path -> the device alpha-blends base·alpha over the lake = the faithful subtle translucent white foam. (Both
             // the additive-MATL enum trick = dark sheet, AND alpha=luminance = an opaque white sheet, were wrong.)
-            texSrc = m.rgba.data();
+            texSrc = rgba.data();
         }
-        else if (m.additive && m.rgba.size() >= (size_t)m.w * m.h * 4) {
+        else if (m.additive && rgba.size() >= (size_t)m.w * m.h * 4) {
             // ADDITIVE glow → ALPHA conversion (the storybook godRays "still black" fix). GROUND TRUTH from the
             // official V205 files: the additive flipbook .surface forward pass is BYTE-IDENTICAL in state to the
             // OPAQUE one, and the official flame(additive)/mist(alpha) MATLs both carry field2=2 — so there is NO
@@ -2712,7 +2982,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // falloff (Star Trek warp: soft edge in alpha, non-uniform) keep alpha' = a·max(rgb) — same formula,
             // their authored falloff still multiplies in. Cache key (rh below) hashes texSrc, so this variant
             // dedups correctly and never collides with a straight tex.
-            texOpaque = m.rgba;
+            texOpaque = rgba;
             for (size_t k = 0; k + 3 < texOpaque.size(); k += 4) {
                 uint32_t lum = texOpaque[k+0]; if (texOpaque[k+1] > lum) lum = texOpaque[k+1]; if (texOpaque[k+2] > lum) lum = texOpaque[k+2];
                 texOpaque[k+3] = (uint8_t)(lum * texOpaque[k+3] / 255);   // a' = max(rgb)·a  (uniform-alpha glows -> pure luminance mask)
@@ -2761,7 +3031,7 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] m%03zu '%s' CELL-CLAMP %dx%d pad=(%.4f,%.4f) uv[%.3f..%.3f, %.3f..%.3f] (shader-side seam fix)\n",
                                                     i, m.name.c_str(), capCols, capRows, padU, padV, umin, umax, vmin, vmax);
         }
-        if (m.rgba.size() >= (size_t)m.w * m.h * 4 && m.w && m.h && !droidWhite) {
+        if (rgba.size() >= (size_t)m.w * m.h * 4 && m.w && m.h && !droidWhite) {
             uint64_t rh = murmur64A(texSrc, (size_t)m.w * m.h * 4);   // dedup identical textures (esp. the chunks a big mesh was split into)
             rh ^= (uint64_t)(uint32_t)(capCols*73856093 ^ capRows*19349663);   // spritesheet cap is part of the encoded chain -> distinct entry
             if (m.alphaTest && !m.blend) rh ^= 0xC07C07u ^ (uint64_t)(uint32_t)(m.alphaCutoff*1000.f);   // coverage-preserved chain at THIS cutoff = distinct entry
@@ -2774,13 +3044,13 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                   // VERBATIM instead of decode→re-encode (double ASTC at MEDIUM softens every texture). Byte-exact
                   // source quality + faster (no encode) + the ORIGINAL Meta mips (authoritative). Skip for
                   // spritesheets (need the per-cell mip cap). HSR_NOTEXPASS forces re-encode.
-                  bool unmodified = (texSrc == m.rgba.data());
+                  bool unmodified = (texSrc == rgba.data());
                   // MASKED foliage -> coverage-preserving re-encode (alpha-weighted RGB + CLAMPED per-mip alpha
                   // rescale at the AUTHORED cutoff). With the discard finally RUNNING on the drawn pass (the
                   // forwardSkinned fix), the source KTX's plain box-filtered mips collapse the canopy's alpha
                   // below the cutoff at range = "now is all sticks". The earlier BLACK-blotch regression was the
                   // UNBOUNDED rescale (now clamped to 2x). HSR_FOLIAGE_SRCMIPS restores the verbatim pass-through.
-                  bool canPass = unmodified && !m.srcAstc.empty() && capCols==1 && capRows==1
+                  bool canPass = unmodified && !srcAstc.empty() && capCols==1 && capRows==1
                                && !(m.alphaTest && !m.blend && !std::getenv("HSR_FOLIAGE_SRCMIPS"))
                                && !std::getenv("HSR_NOTEXPASS")
                                && ((m.srcAstcBw==8&&m.srcAstcBh==8)||(m.srcAstcBw==6&&m.srcAstcBh==6)||(m.srcAstcBw==12&&m.srcAstcBh==12));
@@ -2799,10 +3069,10 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
                       int extMips = 0;
                       std::vector<uint8_t> ext;
                       if (!(m.alphaTest && !m.blend))
-                          ext = extendAstcMipChain(m.srcAstc, m.rgba.data(), (int)m.w, (int)m.h,
+                          ext = extendAstcMipChain(srcAstc, rgba.data(), (int)m.w, (int)m.h,
                                                    (int)m.srcAstcBw, (int)m.srcAstcBh, (int)m.srcAstcMips, extMips);
                       if (!ext.empty()) { tex = encodeRendTxtrFromAstc(ext, (int)m.w, (int)m.h, (int)m.srcAstcBw, (int)m.srcAstcBh, extMips); passMips = extMips; }
-                      else               tex = encodeRendTxtrFromAstc(m.srcAstc, (int)m.w, (int)m.h, (int)m.srcAstcBw, (int)m.srcAstcBh, (int)m.srcAstcMips);
+                      else               tex = encodeRendTxtrFromAstc(srcAstc, (int)m.w, (int)m.h, (int)m.srcAstcBw, (int)m.srcAstcBh, (int)m.srcAstcMips);
                   }
                   if (tex.empty()) {   // pass-through N/A or unsupported footprint -> re-encode
                       // alpha-test foliage (masked trees/leaves): alpha-weight the mip RGB (no transparent-bg bleed halo) AND
@@ -3057,11 +3327,11 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
         //    m.blend HZANIM card whose alpha is bimodal OR solid-bodied (and is NOT an additive glow or an
         //    animated soft-FX card) gets the depth-writing skinned CUTOUT below. HSR_NOSOLIDSIL restores BLEND.
         bool solidSilhouette = false;
-        if (useHz && m.blend && !m.additive && !m.alphaTest && !std::getenv("HSR_NOSOLIDSIL") && m.rgba.size() >= 4) {
+        if (useHz && m.blend && !m.additive && !m.alphaTest && !std::getenv("HSR_NOSOLIDSIL") && rgba.size() >= 4) {
             bool softFx = m.tintAnim || m.fadeAnim || m.flipbook || m.uvScroll;   // animated soft FX card -> keep BLEND
             if (!softFx) {
-                size_t nt = m.rgba.size()/4, opq=0, mid=0;
-                for (size_t k=3; k<m.rgba.size(); k+=4){ uint8_t a=m.rgba[k]; if (a>=230) opq++; if (a>=40 && a<=215) mid++; }
+                size_t nt = rgba.size()/4, opq=0, mid=0;
+                for (size_t k=3; k<rgba.size(); k+=4){ uint8_t a=rgba[k]; if (a>=230) opq++; if (a>=40 && a<=215) mid++; }
                 float opF = nt ? (float)opq/(float)nt : 0.f, midF = nt ? (float)mid/(float)nt : 1.f;
                 bool bimodal  = (midF < 0.05f) && (opF > 0.004f);       // hard-edged mask (no soft gradient)
                 bool solidBody= (opF > 0.25f) && (midF < 0.18f);        // solid body wearing an anti-aliased edge
@@ -3590,9 +3860,9 @@ inline std::vector<uint8_t> exportSceneAPK(const std::vector<ExportMesh>& meshes
             // wasn't already in the framebuffer (BLACK background). Clean split at opaque>~35% (terrain >=47% vs foliage <=22%).
             bool cutoutOK = (m.alphaTest && !m.additive && haveCutout && !meshFar);   // authored MASK
             bool isTreeCutout = false;   // sparse tree-line card -> use the LOW-threshold cutout (keeps foliage, still depth-writes)
-            if (!cutoutOK && m.blend && !m.additive && haveCutout && !meshFar && m.rgba.size() >= 4) {
-                size_t nt = m.rgba.size()/4, opq=0, mid=0;
-                for (size_t k=3; k<m.rgba.size(); k+=4){ uint8_t a=m.rgba[k]; if (a>=230) opq++; if (a>=40 && a<=215) mid++; }
+            if (!cutoutOK && m.blend && !m.additive && haveCutout && !meshFar && rgba.size() >= 4) {
+                size_t nt = rgba.size()/4, opq=0, mid=0;
+                for (size_t k=3; k<rgba.size(); k+=4){ uint8_t a=rgba[k]; if (a>=230) opq++; if (a>=40 && a<=215) mid++; }
                 float opF = nt ? (float)opq/(float)nt : 0.f, midF = nt ? (float)mid/(float)nt : 1.f;
                 // (a) mostly-opaque silhouette cards (mountains/cliffs/lakeshore: opaque>35%); (b) distant TREE-LINE cards
                 // (LakeTrees etc.: sparser ~22% opaque + soft edges, so the opaque-fraction test misses them) — the user
