@@ -5755,6 +5755,13 @@ struct Editor {
                 restoreThread = std::thread([this]{ uninstallHaven(); restoring.store(false); });
             }
             cx.tip(x,y0,w,th.rowH,"Uninstall whatever Haven 2025 is installed on the headset (your spoof,\nor a different Meta version) - no root needed, if it's a store app.\nDetects the installed version first. Then \"Restore original Haven 2025\"\nputs Meta's back, or just re-cook + install."); y += th.rowH+3*uiScale;
+            // One-click vrshell state reset: pm clear + relaunch (off the UI thread like the other maintenance buttons).
+            y0=y; if (cx.button(ui::hashId("clearvrshell"), x, y, w, th.rowH, "Clear VrShell app data (reset home state)")) {
+                if (restoreThread.joinable()) restoreThread.join();
+                restoring.store(true);
+                restoreThread = std::thread([this]{ clearVrShellData(); restoring.store(false); });
+            }
+            cx.tip(x,y0,w,th.rowH,"pm clear com.oculus.vrshell: wipe the home's saved data (env\nselection, caches) and relaunch it factory-fresh. Use when the home\nis stuck or corrupted after experiments. Tries no-root first, falls\nback to su on rooted headsets. Installed env APKs are NOT touched;\na rooted headset must re-select the env afterwards (re-cook or\nInstall only does it)."); y += th.rowH+3*uiScale;
             // Standalone vista-neutralize (no re-cook): install an invisible vista over every installed vista package.
             y0=y; if (cx.button(ui::hashId("killvistabtn"), x, y, w, th.rowH, "Neutralize vistas now (invisible vista over each)")) neutralizeVistasButton();
             cx.tip(x,y0,w,th.rowH,"Right now (no re-cook): replace every installed com.meta.shell.env.vista.*\npackage with an INVISIBLE 0-mesh environment, so a force-paired vista\nrenders nothing. Use this if a vista shows behind your ported home.\nUpdatable vistas are replaced without root; system-app vistas are\nreported (need root). Restore a vista by reinstalling it from the store."); y += th.rowH+8*uiScale;
@@ -7266,6 +7273,28 @@ struct Editor {
         // a rooted su-kill of the exact pid is a cleaner bonus when available.
         if (!pid.empty()) runAdb(ADB, sel, "shell su -c \"kill "+pid+"\"");   // rooted (best-effort, cleaner)
         runAdb(ADB, sel, "shell am force-stop com.oculus.vrshell");           // universal no-root reload
+    }
+    // Wipe com.oculus.vrshell's app data (`pm clear`) and relaunch the home, for a home stuck on stale/corrupted
+    // state after env experiments. Tries the plain shell-uid clear first; if the build denies it, retries via su
+    // (rooted headsets). Installed env APKs are untouched — only vrshell's saved data/caches go.
+    void clearVrShellData() {
+        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+#ifdef _WIN32
+            for(char&c:p) if(c=='/')c='\\';
+#endif
+            return p; };
+        std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
+        if (!deviceConnected()) { setStatus("Clear VrShell data: NO device connected - plug in USB or use Wi-Fi Connect first."); return; }
+        std::string out = adbCapture(ADB, sel, "shell pm clear com.oculus.vrshell");
+        bool ok = out.find("Success")!=std::string::npos;
+        if (!ok) {   // shell uid denied (some builds) -> rooted fallback
+            out = adbCapture(ADB, sel, "shell su -c \"pm clear com.oculus.vrshell\"");
+            ok = out.find("Success")!=std::string::npos;
+        }
+        if (ok) relaunchShell(ADB, sel);   // bring the home back up fresh right away
+        std::string first = out.substr(0, out.find_first_of("\r\n"));
+        setStatus(ok ? "VrShell app data CLEARED + home relaunched - it restarts with factory-fresh state."
+                     : "Clear VrShell data FAILED (device said: "+(first.empty()?std::string("no output"):first)+").");
     }
     // ── env-reject REASON classifier (shared by the live diag + the exported report) ────────────────────────────
     // Pull the ONE line that actually explains a nuxd fallback. Two hard-won rules from device logs:
