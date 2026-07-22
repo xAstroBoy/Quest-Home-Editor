@@ -175,6 +175,11 @@ if(HSR_HAVE_PHYSX)
 endif()
 
 # ── Platform-specific ───────────────────────────────────────────
+if(NOT WIN32)
+    # hsl_cook links Threads::Threads on every non-Windows platform (line ~239), so the
+    # imported target must exist on macOS too — not just in the Linux else() branch below.
+    find_package(Threads REQUIRED)
+endif()
 if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     target_compile_options(questhomeeditor PRIVATE /Zc:__cplusplus)  # ACL checks __cplusplus for the C++ level
     target_compile_options(questhomeeditor PRIVATE /Zi)              # debug symbols (PDB) for the crash-handler stack traces
@@ -192,7 +197,6 @@ elseif(APPLE)
     find_library(IOKIT_LIBRARY IOKit REQUIRED)
     target_link_libraries(questhomeeditor PRIVATE ${COCOA_LIBRARY} ${IOKIT_LIBRARY})
 else()
-    find_package(Threads REQUIRED)
     find_package(Vulkan QUIET)
     if(Vulkan_FOUND)
         target_link_libraries(questhomeeditor PRIVATE Vulkan::Vulkan Threads::Threads ${CMAKE_DL_LIBS} m)
