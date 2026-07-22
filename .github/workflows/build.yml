@@ -41,7 +41,6 @@ jobs:
           Copy-Item "build/hsl_cook.exe" pkg/
           Copy-Item QuestHomeEditor/third_party/fonts/* pkg/fonts/
           Copy-Item "build/Quest Home Editor.exe" Quest-Home-Editor-windows-x64.exe
-          Copy-Item "build/hsl_cook.exe" hsl-cook-windows-x64.exe
           Compress-Archive -Path pkg/* -DestinationPath Quest-Home-Editor-windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
@@ -49,7 +48,6 @@ jobs:
           path: |
             Quest-Home-Editor-windows-x64.exe
             Quest-Home-Editor-windows-x64.zip
-            hsl-cook-windows-x64.exe
 
   linux:
     runs-on: ubuntu-22.04 # Older glibc keeps the archive and AppImage broadly compatible.
@@ -69,14 +67,13 @@ jobs:
         run: cmake --build build --parallel
       - name: Run registered tests
         run: ctest --test-dir build -C Release --output-on-failure --no-tests=ignore
-      - name: Package archive and standalone binaries
+      - name: Package archive and standalone binary
         run: |
           mkdir -p pkg/fonts
           cp "build/Quest Home Editor" pkg/
           cp build/hsl_cook pkg/
           cp QuestHomeEditor/third_party/fonts/* pkg/fonts/
           cp "build/Quest Home Editor" Quest-Home-Editor-linux-x64
-          cp build/hsl_cook hsl-cook-linux-x64
           tar -czf Quest-Home-Editor-linux-x64.tar.gz -C pkg .
       - name: Package AppImage
         run: |
@@ -109,7 +106,6 @@ jobs:
             Quest-Home-Editor-linux-x64
             Quest-Home-Editor-linux-x64.tar.gz
             Quest-Home-Editor-linux-x64.AppImage
-            hsl-cook-linux-x64
 
   macos:
     strategy:
@@ -135,7 +131,7 @@ jobs:
         run: cmake --build build --parallel
       - name: Run registered tests
         run: ctest --test-dir build -C Release --output-on-failure --no-tests=ignore
-      - name: Package DMG and standalone CLI cooker
+      - name: Package DMG
         run: |
           APP="Quest Home Editor.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/fonts"
@@ -144,7 +140,6 @@ jobs:
           cp "$(brew --prefix molten-vk)/lib/libMoltenVK.dylib" "$APP/Contents/MacOS/"
           cp QuestHomeEditor/app.png "$APP/Contents/Resources/"
           cp QuestHomeEditor/third_party/fonts/* "$APP/Contents/Resources/fonts/"
-          cp build/hsl_cook hsl-cook-macos-${{ matrix.arch }}
           cat > "$APP/Contents/Info.plist" <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -160,9 +155,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Quest-Home-Editor-macos-${{ matrix.arch }}
-          path: |
-            Quest-Home-Editor-macos-${{ matrix.arch }}.dmg
-            hsl-cook-macos-${{ matrix.arch }}
+          path: Quest-Home-Editor-macos-${{ matrix.arch }}.dmg
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -182,12 +175,8 @@ jobs:
           files: |
             Quest-Home-Editor-windows-x64.exe
             Quest-Home-Editor-windows-x64.zip
-            hsl-cook-windows-x64.exe
             Quest-Home-Editor-linux-x64
             Quest-Home-Editor-linux-x64.tar.gz
             Quest-Home-Editor-linux-x64.AppImage
-            hsl-cook-linux-x64
             Quest-Home-Editor-macos-arm64.dmg
-            hsl-cook-macos-arm64
             Quest-Home-Editor-macos-x64.dmg
-            hsl-cook-macos-x64

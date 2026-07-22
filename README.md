@@ -48,7 +48,6 @@ Grab a build from **[Releases](../../releases)**:
 | `Quest-Home-Editor-linux-x64` / `.tar.gz` | Linux x86-64 editor; the archive also bundles `hsl_cook` + UI font |
 | `Quest-Home-Editor-linux-x64.AppImage` | Portable Linux editor (with `hsl_cook` included in the image) |
 | `Quest-Home-Editor-macos-*.dmg` | macOS app + `hsl_cook`, with MoltenVK bundled |
-| `hsl-cook-*` | Standalone CLI cooker for the named platform/architecture |
 
 A GPU with **Vulkan** support is required on every OS (macOS via MoltenVK, which the `.dmg` bundles).
 
