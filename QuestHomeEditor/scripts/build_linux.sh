@@ -3,8 +3,10 @@
 # Installs the system dev packages GLFW/Vulkan need (Debian/Ubuntu apt, Fedora dnf, Arch pacman),
 # then configures with CMake (FetchContent auto-downloads GLFW + astcenc; Vulkan headers are
 # vendored in third_party/) and builds Release.
-# PhysX solid-collision cooking is Windows-only vendored libs -> OFF here; the cooker falls back
-# to the device-compatible ColliderBox grid, so the build is fully functional.
+# PhysX solid-collision cooking is REQUIRED for correct collision (without it no mesh colliders are
+# cooked at all and the floor degrades to a coarse box grid), so build_physx.sh builds PhysX 4.1.2
+# from source first. That step is slow (~10 min) but only runs once — it is skipped when the libs
+# are already there.
 set -e
 SDIR="$(cd "$(dirname "$0")/.." && pwd)"
 BDIR="$SDIR/build"
@@ -30,8 +32,17 @@ else
   echo "Unknown distro — install manually: cmake, ninja, a C++17 compiler, Vulkan loader dev, X11/Wayland dev headers"
 fi
 
+# ── PhysX static libs (once per machine) ──
+PHYSX_TAG="$(bash "$SDIR/scripts/build_physx.sh" --print-tag)"
+if ls "$SDIR/third_party/physx/lib/$PHYSX_TAG"/libPhysXCooking*.a >/dev/null 2>&1; then
+  echo "PhysX already built for $PHYSX_TAG — skipping"
+else
+  echo "Building PhysX 4.1.2 (checked) for $PHYSX_TAG — this takes a while, once..."
+  bash "$SDIR/scripts/build_physx.sh"
+fi
+
 echo "Configuring..."
-cmake -S "$SDIR" -B "$BDIR" -G Ninja -DCMAKE_BUILD_TYPE=Release -DHSR_HAVE_PHYSX=OFF
+cmake -S "$SDIR" -B "$BDIR" -G Ninja -DCMAKE_BUILD_TYPE=Release -DHSR_HAVE_PHYSX=ON
 
 echo "Building..."
 cmake --build "$BDIR"

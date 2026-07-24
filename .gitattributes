@@ -1,0 +1,23 @@
+# CI executes these on Linux/macOS runners (scripts/build_physx.sh builds the PhysX static libs the
+# collision cook needs). With core.autocrlf=true on a Windows clone and no rule here, a shell script
+# can be committed with CRLF, and bash then dies on the stray \r. Force LF for everything executable.
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# Windows-only launchers stay CRLF so cmd.exe is happy.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Vendored PhysX static libs (and every other binary) must never be line-ending mangled.
+*.lib   binary
+*.a     binary
+*.so    binary
+*.dylib binary
+*.dll   binary
+*.exe   binary
+*.png   binary
+*.ttf   binary
+*.ttc   binary
+*.apk   binary
+*.zip   binary
+*.bin   binary

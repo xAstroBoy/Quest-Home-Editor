@@ -109,19 +109,92 @@ set(STB_DIR       "${CMAKE_SOURCE_DIR}/third_party/stb")
 # ── Editor UI = a from-scratch custom C++ toolkit (src/ui/), NOT Dear ImGui. Drawn through the renderer's
 #    own Vulkan; text via stb_truetype (impl in its own TU, like stb_image/stb_vorbis). No external UI libs. ──
 
-# ── PhysX 4.x (OPTIONAL, vendored Windows static libs). OFF by default: the cooked SEBD trimesh is binary-
-#    incompatible with the device PhysX (crashes its BVH33 narrow-phase), so the real walkable collision is the
-#    ColliderBox grid (no cooked data). With it off, physx_navmesh.cpp is a stub and the build is PhysX-free, so it
-#    compiles on Linux/macOS — not just Windows. Turn ON with -DHSR_HAVE_PHYSX=ON if you have the vendored libs. ──
-option(HSR_HAVE_PHYSX "Cook PhysX SEBD trimesh navmesh (needs the vendored Windows PhysX static libs)" OFF)
+# ── PhysX 4.1.2 (CHECKED, static) — the collision cook. ON EVERYWHERE. ─────────────────────────────────────
+#    cookNavmeshSEBD() IS PhysX. With it compiled out, physx_navmesh.cpp is the #else stub returning {}, and the
+#    cooker then: emits NO mesh collider at all (hsl_cooker.h — the auto/animated collider path has no fallback,
+#    it just logs "PhysX cook FAILED"), and degrades the smart floor to a coarse ColliderBox grid. That is a
+#    SILENT downgrade — the build succeeds and every test passes — so this is ON by default and a missing lib set
+#    is a hard configure error, never a quiet fallback.
+#      Windows      : the static libs are committed under third_party/physx/lib/ — nothing to do.
+#      Linux/macOS  : run `bash scripts/build_physx.sh` once (builds PhysX 4.1.2 config `checked` from source
+#                     into third_party/physx/lib/<os>-<arch>/). Headers are shared: the vendored
+#                     third_party/physx/include + pxshared/include are the same 4.1.2 for every platform.
+#    PX_CHECKED=1 is NOT optional: the device PhysX is a checked build (proven by byte-diffing haven2025's working
+#    SEBD), and a release-config PhysX serializes a different struct layout = collision that loads but does nothing. ──
+option(HSR_HAVE_PHYSX "Cook PhysX SEBD trimesh colliders (Windows: committed libs; Linux/macOS: scripts/build_physx.sh)" ON)
 set(PHYSX_DIR "${CMAKE_SOURCE_DIR}/third_party/physx")
-set(PHYSX_LIBS
-    "${PHYSX_DIR}/lib/PhysXExtensions_static.lib"
-    "${PHYSX_DIR}/lib/PhysXCooking_static.lib"
-    "${PHYSX_DIR}/lib/PhysX_static.lib"
-    "${PHYSX_DIR}/lib/PhysXCommon_static.lib"
-    "${PHYSX_DIR}/lib/PhysXPvdSDK_static.lib"
-    "${PHYSX_DIR}/lib/PhysXFoundation_static.lib")
+
+if(HSR_HAVE_PHYSX)
+    if(WIN32)
+        set(HSR_PHYSX_TAG "windows-x64")
+        set(HSR_PHYSX_LIBDIR "${PHYSX_DIR}/lib")
+        set(PHYSX_LIBS
+            "${HSR_PHYSX_LIBDIR}/PhysXExtensions_static.lib"
+            "${HSR_PHYSX_LIBDIR}/PhysXCooking_static.lib"
+            "${HSR_PHYSX_LIBDIR}/PhysX_static.lib"
+            "${HSR_PHYSX_LIBDIR}/PhysXCommon_static.lib"
+            "${HSR_PHYSX_LIBDIR}/PhysXPvdSDK_static.lib"
+            "${HSR_PHYSX_LIBDIR}/PhysXFoundation_static.lib")
+        foreach(_pxlib IN LISTS PHYSX_LIBS)
+            if(NOT EXISTS "${_pxlib}")
+                message(FATAL_ERROR
+                    "HSR_HAVE_PHYSX=ON but ${_pxlib} is missing.\n"
+                    "These libs are committed to the repo — a partial clone or a stripped checkout will lack them.")
+            endif()
+        endforeach()
+    else()
+        # Tag MUST mirror the one scripts/build_physx.sh writes.
+        if(APPLE)
+            set(_hsr_px_os "macos")
+        else()
+            set(_hsr_px_os "linux")
+        endif()
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+            set(_hsr_px_cpu "arm64")
+        else()
+            set(_hsr_px_cpu "x86_64")
+        endif()
+        set(HSR_PHYSX_TAG "${_hsr_px_os}-${_hsr_px_cpu}")
+        set(HSR_PHYSX_LIBDIR "${PHYSX_DIR}/lib/${HSR_PHYSX_TAG}")
+        set(PHYSX_LIBS "")
+        # Link order below is the dependency order; the archive suffix depends on how PhysX was configured
+        # (NV_FORCE_64BIT_SUFFIX), so accept either spelling rather than hardcoding one.
+        foreach(_pxcomp PhysXExtensions PhysXCooking PhysX PhysXCommon PhysXPvdSDK PhysXFoundation)
+            unset(_pxfound CACHE)
+            find_library(_pxfound
+                NAMES ${_pxcomp}_static_64 ${_pxcomp}_static ${_pxcomp}_64 ${_pxcomp}
+                PATHS "${HSR_PHYSX_LIBDIR}" NO_DEFAULT_PATH)
+            if(NOT _pxfound)
+                message(FATAL_ERROR
+                    "HSR_HAVE_PHYSX=ON but lib${_pxcomp}*.a was not found in ${HSR_PHYSX_LIBDIR}.\n"
+                    "Build the PhysX static libs for this platform first:\n"
+                    "    bash scripts/build_physx.sh\n"
+                    "Or configure with -DHSR_HAVE_PHYSX=OFF to accept DEGRADED collision "
+                    "(no mesh colliders cooked, coarse ColliderBox floor only).")
+            endif()
+            list(APPEND PHYSX_LIBS "${_pxfound}")
+        endforeach()
+        unset(_pxfound CACHE)
+    endif()
+
+    # One interface target so the editor and hsl_cook link PhysX identically (they must: both run the same cook).
+    add_library(hsr_physx INTERFACE)
+    target_compile_definitions(hsr_physx INTERFACE HSR_HAVE_PHYSX PX_PHYSX_STATIC_LIB PX_CHECKED=1)
+    target_include_directories(hsr_physx INTERFACE "${PHYSX_DIR}/include" "${PHYSX_DIR}/pxshared/include")
+    if(WIN32 OR APPLE)
+        # link.exe and ld64 both resolve static archives without needing an explicit group.
+        target_link_libraries(hsr_physx INTERFACE ${PHYSX_LIBS})
+    else()
+        # GNU ld walks archives in one pass and the six PhysX archives reference each other both ways,
+        # so any single ordering leaves undefined symbols. Group them.
+        target_link_libraries(hsr_physx INTERFACE -Wl,--start-group ${PHYSX_LIBS} -Wl,--end-group ${CMAKE_DL_LIBS})
+    endif()
+    message(STATUS "PhysX: ON (4.1.2 checked, ${HSR_PHYSX_TAG}) from ${HSR_PHYSX_LIBDIR}")
+else()
+    message(WARNING
+        "HSR_HAVE_PHYSX=OFF — cookNavmeshSEBD() is a STUB. No mesh colliders will be cooked and the smart floor "
+        "falls back to a coarse ColliderBox grid. Do not ship release binaries built this way.")
+endif()
 
 # ── Executable ──────────────────────────────────────────────────
 add_executable(questhomeeditor
@@ -167,11 +240,9 @@ target_link_libraries(questhomeeditor PRIVATE
     opus
 )
 
-# ── PhysX (optional) — only when -DHSR_HAVE_PHYSX=ON + the vendored libs are present ──
+# ── PhysX — the collision cook (defines/includes/libs all come from the hsr_physx interface target) ──
 if(HSR_HAVE_PHYSX)
-    target_compile_definitions(questhomeeditor PRIVATE HSR_HAVE_PHYSX PX_PHYSX_STATIC_LIB PX_CHECKED=1)
-    target_include_directories(questhomeeditor PRIVATE "${PHYSX_DIR}/include" "${PHYSX_DIR}/pxshared/include")
-    target_link_libraries(questhomeeditor PRIVATE ${PHYSX_LIBS})
+    target_link_libraries(questhomeeditor PRIVATE hsr_physx)
 endif()
 
 # ── Platform-specific ───────────────────────────────────────────
@@ -229,9 +300,7 @@ target_include_directories(hsl_cook PRIVATE
 )
 target_link_libraries(hsl_cook PRIVATE miniz ${ASTCENC_LIB})
 if(HSR_HAVE_PHYSX)
-    target_compile_definitions(hsl_cook PRIVATE HSR_HAVE_PHYSX PX_PHYSX_STATIC_LIB PX_CHECKED=1)
-    target_include_directories(hsl_cook PRIVATE "${PHYSX_DIR}/include" "${PHYSX_DIR}/pxshared/include")
-    target_link_libraries(hsl_cook PRIVATE ${PHYSX_LIBS})
+    target_link_libraries(hsl_cook PRIVATE hsr_physx)   # same PhysX as the editor — both run the same cook
 endif()
 if(WIN32)
     target_compile_definitions(hsl_cook PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)

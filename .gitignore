@@ -46,6 +46,13 @@ v203_shaders/
 .claude/
 _audio_tmp/
 
+# PhysX built from source by scripts/build_physx.sh (Linux/macOS). Regenerable and ~150MB per
+# platform, so only the Windows .lib set stays committed. Source checkout + build tree too.
+QuestHomeEditor/third_party/physx/lib/linux-*/
+QuestHomeEditor/third_party/physx/lib/macos-*/
+QuestHomeEditor/third_party/physx/_src/
+QuestHomeEditor/third_party/physx/_build/
+
 # Auto-downloaded signing toolchain (build-tools / JRE) — fetched beside the exe at runtime, never committed
 android-build-tools/
 jre/

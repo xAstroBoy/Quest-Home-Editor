@@ -3,7 +3,8 @@ REM Quest Home Editor / editor - one-command Windows build.
 REM Auto-locates MSVC (any VS edition, via vswhere), configures with Ninja, builds Release.
 REM Dependencies (GLFW, astcenc) are auto-fetched by CMake FetchContent; Vulkan headers +
 REM everything else are vendored in third_party/ - no SDKs to install.
-REM PhysX solid-collision cooking uses vendored Windows-only libs -> ON here (build_linux/macos turn it OFF).
+REM PhysX solid-collision cooking uses the static libs committed in third_party\physx\lib -> nothing to build.
+REM (build_linux.sh / build_macos.sh build the same PhysX 4.1.2 from source first; PhysX is ON everywhere.)
 
 setlocal enabledelayedexpansion
 set "SDIR=%~dp0.."

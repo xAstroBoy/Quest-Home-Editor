@@ -1,6 +1,14 @@
 # Cross-platform CI and the single release publisher for Quest Home Editor.
-# AVX2 and PhysX are disabled for portable release binaries. Local Windows
-# builds can opt into them when the required CPU and vendored libraries exist.
+# AVX2 stays OFF everywhere: the AVX2 astcenc encoder crashes with 0xc000001d on
+# pre-2013 CPUs (issue #1), and it only changes cook SPEED, never cook OUTPUT.
+# PhysX is ON for EVERY platform. Without it cookNavmeshSEBD() is a stub that
+# returns {}, so every mesh collider is silently DROPPED and the smart floor
+# degrades to a coarse ColliderBox grid — a released binary that cooks different
+# collision than a local build, with a green build and green tests to hide it.
+# Windows links the committed MSVC static libs; Linux/macOS build the same PhysX
+# 4.1.2 in config `checked` from source via scripts/build_physx.sh (cached, so it
+# only pays the ~10 min build when the script or the pinned source changes).
+# Every job then greps the linked binaries for PxTriangleMesh and fails if absent.
 name: build
 
 on:
@@ -27,12 +35,29 @@ jobs:
         run: >-
           cmake -S QuestHomeEditor -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
-          -DHSR_HAVE_PHYSX=OFF
+          -DHSR_HAVE_PHYSX=ON
           -DHSR_AVX2=OFF
       - name: Build editor, CLI cooker, and regression tests
         run: cmake --build build --parallel
       - name: Run registered tests
         run: ctest --test-dir build -C Release --output-on-failure --no-tests=ignore
+      # Guard: a PhysX-less .exe still builds and still passes every test — it just
+      # silently cooks no mesh colliders. Fail the job instead of shipping that.
+      - name: Verify PhysX is linked into the release binaries
+        shell: pwsh
+        run: |
+          $bad = $false
+          foreach ($f in @("build/Quest Home Editor.exe", "build/hsl_cook.exe")) {
+            $bytes = [System.IO.File]::ReadAllBytes($f)
+            $text  = [System.Text.Encoding]::ASCII.GetString($bytes)
+            if ($text.Contains("PxTriangleMesh")) {
+              Write-Host "OK   $f - PhysX linked"
+            } else {
+              Write-Host "FAIL $f - no PhysX symbols; collision cooking would be a stub"
+              $bad = $true
+            }
+          }
+          if ($bad) { exit 1 }
       - name: Package
         shell: pwsh
         run: |
@@ -56,17 +81,38 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build xorg-dev libwayland-dev libxkbcommon-dev libvulkan-dev
+          sudo apt-get install -y ninja-build xorg-dev libwayland-dev libxkbcommon-dev libvulkan-dev clang
+      - name: Cache PhysX 4.1.2 checked static libs
+        id: physx
+        uses: actions/cache@v4
+        with:
+          path: QuestHomeEditor/third_party/physx/lib/linux-x86_64
+          key: physx-4.1.2-checked-linux-x86_64-${{ hashFiles('QuestHomeEditor/scripts/build_physx.sh') }}
+      - name: Build PhysX from source
+        if: steps.physx.outputs.cache-hit != 'true'
+        run: bash QuestHomeEditor/scripts/build_physx.sh
       - name: Configure
         run: >-
           cmake -S QuestHomeEditor -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
-          -DHSR_HAVE_PHYSX=OFF
+          -DHSR_HAVE_PHYSX=ON
           -DHSR_AVX2=OFF
       - name: Build editor, CLI cooker, and regression tests
         run: cmake --build build --parallel
       - name: Run registered tests
         run: ctest --test-dir build -C Release --output-on-failure --no-tests=ignore
+      - name: Verify PhysX is linked into the release binaries
+        run: |
+          bad=0
+          for f in "build/Quest Home Editor" build/hsl_cook; do
+            if grep -qa PxTriangleMesh "$f"; then
+              echo "OK   $f - PhysX linked"
+            else
+              echo "FAIL $f - no PhysX symbols; collision cooking would be a stub"
+              bad=1
+            fi
+          done
+          exit $bad
       - name: Package archive and standalone binary
         run: |
           mkdir -p pkg/fonts
@@ -114,23 +160,46 @@ jobs:
         include:
           - runner: macos-14
             arch: arm64
+            libtag: macos-arm64      # must match the tag scripts/build_physx.sh derives from uname -m
           - runner: macos-15-intel
             arch: x64
+            libtag: macos-x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies
         run: brew install ninja molten-vk
+      - name: Cache PhysX 4.1.2 checked static libs
+        id: physx
+        uses: actions/cache@v4
+        with:
+          path: QuestHomeEditor/third_party/physx/lib/${{ matrix.libtag }}
+          key: physx-4.1.2-checked-${{ matrix.libtag }}-${{ hashFiles('QuestHomeEditor/scripts/build_physx.sh') }}
+      - name: Build PhysX from source
+        if: steps.physx.outputs.cache-hit != 'true'
+        run: bash QuestHomeEditor/scripts/build_physx.sh
       - name: Configure
         run: >-
           cmake -S QuestHomeEditor -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
-          -DHSR_HAVE_PHYSX=OFF
+          -DHSR_HAVE_PHYSX=ON
           -DHSR_AVX2=OFF
       - name: Build editor, CLI cooker, and regression tests
         run: cmake --build build --parallel
       - name: Run registered tests
         run: ctest --test-dir build -C Release --output-on-failure --no-tests=ignore
+      - name: Verify PhysX is linked into the release binaries
+        run: |
+          bad=0
+          for f in "build/Quest Home Editor" build/hsl_cook; do
+            if grep -qa PxTriangleMesh "$f"; then
+              echo "OK   $f - PhysX linked"
+            else
+              echo "FAIL $f - no PhysX symbols; collision cooking would be a stub"
+              bad=1
+            fi
+          done
+          exit $bad
       - name: Package DMG
         run: |
           APP="Quest Home Editor.app"
@@ -168,6 +237,23 @@ jobs:
         with:
           pattern: Quest-Home-Editor-*
           merge-multiple: true
+      # LAST LINE OF DEFENCE before anything reaches a release page. The build jobs already verify
+      # their own binaries, but this job publishes whatever the artifacts contain — so re-check the
+      # downloaded assets here too. That way a future edit to a build job can never quietly put a
+      # PhysX-less binary (no mesh colliders, coarse box floor) in front of a user again.
+      # NOT covered: the .AppImage (compressed squashfs) and the .dmg (compressed UDZO) can't be
+      # grepped without mounting; both are packed from the exact build/ binaries their job verified.
+      - name: Verify every shipped binary has PhysX linked
+        run: |
+          bad=0
+          check() { if grep -qa PxTriangleMesh; then echo "OK   $1"; else echo "FAIL $1 - no PhysX symbols"; bad=1; fi; }
+          cat Quest-Home-Editor-windows-x64.exe            | check "windows-x64.exe"
+          cat Quest-Home-Editor-linux-x64                  | check "linux-x64"
+          unzip -p Quest-Home-Editor-windows-x64.zip "Quest Home Editor.exe" | check "windows-x64.zip -> editor"
+          unzip -p Quest-Home-Editor-windows-x64.zip hsl_cook.exe            | check "windows-x64.zip -> hsl_cook"
+          tar -xzOf Quest-Home-Editor-linux-x64.tar.gz "./Quest Home Editor" | check "linux-x64.tar.gz -> editor"
+          tar -xzOf Quest-Home-Editor-linux-x64.tar.gz ./hsl_cook            | check "linux-x64.tar.gz -> hsl_cook"
+          exit $bad
       - name: Attach all platform packages to the tagged release
         uses: softprops/action-gh-release@v2
         with:
