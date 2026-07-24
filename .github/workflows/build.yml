@@ -6,8 +6,8 @@
 # degrades to a coarse ColliderBox grid — a released binary that cooks different
 # collision than a local build, with a green build and green tests to hide it.
 # Windows links the committed MSVC static libs; Linux/macOS build the same PhysX
-# 4.1.2 in config `checked` from source via scripts/build_physx.sh (cached, so it
-# only pays the ~10 min build when the script or the pinned source changes).
+# 4.1.2 in config `checked` from source via scripts/build_physx.sh (~2.5 min, and
+# cached, so it only rebuilds when the script or the pinned source changes).
 # Every job then greps the linked binaries for PxTriangleMesh and fails if absent.
 name: build
 

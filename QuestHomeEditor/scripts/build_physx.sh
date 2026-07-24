@@ -167,13 +167,29 @@ if [ "$found" -eq 0 ]; then
 fi
 
 # The six archives cookNavmeshSEBD() actually needs. Missing any = link failure later, so fail now.
+# PhysX decorates archive names with a bitness/config suffix that varies by platform and by how it
+# was configured — Linux/macOS emit libPhysX_x64.a while the Windows set is PhysX_static.lib. Match
+# any suffix, but ANCHOR it: a loose lib${want}*.a would let libPhysXCommon_x64.a satisfy "PhysX".
 for want in PhysXFoundation PhysXCommon PhysX PhysXCooking PhysXExtensions PhysXPvdSDK; do
-  if ! ls "$LIBOUT" | grep -qE "^lib${want}(_static)?(_64)?\.a$"; then
+  if ! ls "$LIBOUT" | grep -qE "^lib${want}(_[A-Za-z0-9]+)*\.a$"; then
     echo "ERROR: required archive lib${want}*.a missing from $LIBOUT" >&2
     ls -la "$LIBOUT" >&2
     exit 1
   fi
 done
+
+# The `_x64` in the filename is PhysX's 64-BIT tag, not an x86 tag — an Apple Silicon build is also
+# named _x64. So confirm the real Mach-O arch instead of trusting the name: a silent x86_64 build on
+# an arm64 host would only surface later as a confusing link error against the editor.
+if [ "$PLATFORM" = macos ] && command -v lipo >/dev/null; then
+  got="$(lipo -archs "$LIBOUT"/libPhysXCooking*.a 2>/dev/null || true)"
+  case " $got " in
+    *" $ARCH "*) echo "Mach-O arch check OK: $got" ;;
+    *) echo "ERROR: built PhysX is '$got' but this host is $ARCH." >&2
+       echo "       PX_OUTPUT_ARCH=$PX_OUTPUT_ARCH did not take effect — is the source the Apple fork?" >&2
+       exit 1 ;;
+  esac
+fi
 
 echo ""
 echo "================================================"

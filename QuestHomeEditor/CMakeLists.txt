@@ -157,13 +157,21 @@ if(HSR_HAVE_PHYSX)
         set(HSR_PHYSX_TAG "${_hsr_px_os}-${_hsr_px_cpu}")
         set(HSR_PHYSX_LIBDIR "${PHYSX_DIR}/lib/${HSR_PHYSX_TAG}")
         set(PHYSX_LIBS "")
-        # Link order below is the dependency order; the archive suffix depends on how PhysX was configured
-        # (NV_FORCE_64BIT_SUFFIX), so accept either spelling rather than hardcoding one.
+        # PhysX decorates archive names with a suffix that varies by platform/config (Linux and macOS
+        # both emit libPhysX_x64.a — that _x64 is the 64-BIT tag, so an arm64 build carries it too).
+        # Rather than guess every spelling, glob and match with an ANCHORED regex: a plain
+        # find_library(NAMES PhysX ...) would happily return libPhysXCommon_x64.a for "PhysX".
+        file(GLOB _pxarchives "${HSR_PHYSX_LIBDIR}/libPhysX*.a")
+        # Link order below is the dependency order (only matters for ld; grouped for GNU ld anyway).
         foreach(_pxcomp PhysXExtensions PhysXCooking PhysX PhysXCommon PhysXPvdSDK PhysXFoundation)
-            unset(_pxfound CACHE)
-            find_library(_pxfound
-                NAMES ${_pxcomp}_static_64 ${_pxcomp}_static ${_pxcomp}_64 ${_pxcomp}
-                PATHS "${HSR_PHYSX_LIBDIR}" NO_DEFAULT_PATH)
+            set(_pxfound "")
+            foreach(_pxcand IN LISTS _pxarchives)
+                get_filename_component(_pxname "${_pxcand}" NAME)
+                if(_pxname MATCHES "^lib${_pxcomp}(_[A-Za-z0-9]+)*\\.a$")
+                    set(_pxfound "${_pxcand}")
+                    break()
+                endif()
+            endforeach()
             if(NOT _pxfound)
                 message(FATAL_ERROR
                     "HSR_HAVE_PHYSX=ON but lib${_pxcomp}*.a was not found in ${HSR_PHYSX_LIBDIR}.\n"
@@ -174,7 +182,6 @@ if(HSR_HAVE_PHYSX)
             endif()
             list(APPEND PHYSX_LIBS "${_pxfound}")
         endforeach()
-        unset(_pxfound CACHE)
     endif()
 
     # One interface target so the editor and hsl_cook link PhysX identically (they must: both run the same cook).
