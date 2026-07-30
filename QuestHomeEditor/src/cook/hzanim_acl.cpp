@@ -136,7 +136,7 @@ std::vector<uint8_t> hzAclEncode(const float* trs, const int* parents, int joint
     uint32_t aclOff = ((channelMapOff + (uint32_t)jointCount) + 15u) & ~15u;   // ACL blocks 16-aligned, after the channel map
     uint32_t s1a = (S1 + 15u) & ~15u;
     uint32_t blockSize = s1a + S2;                         // @0x14 = align16(jointClipSize) + floatClipSize
-    // ⚠ CRASH FIX (THE lakesidepeak length_error — IDA-proven @0x1617f4c + ground-truth-verified vs official clips):
+    // CRASH FIX (IDA-proven @0x1617f4c and verified against official clips):
     // version>=4 HzAnim clips carry a TRAILING channel-name table AFTER the ACL blocks (past aclOff+blockSize):
     // a u32 count (+1 byte), then `count` u16-length-prefixed channel-name strings. The device's
     // HzAnimAssetInitializer_deserialize reads that u32 count and, if non-zero, loops `std::string::resize(len-1)` +

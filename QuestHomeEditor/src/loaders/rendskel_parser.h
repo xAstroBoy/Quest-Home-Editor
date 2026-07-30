@@ -182,7 +182,6 @@ inline bool parseRendClip(const std::vector<u8>& d, int nJoints, RendClip& c) {
     size_t H = rd32(16); if (H==0 || H+96>=d.size()) H=160;    // keyframe block / track header
     size_t obase = H + 32;                                     // offset-table base
     c.fps = rdf(H+24); if (c.fps<1.f||c.fps>240.f) c.fps=24.0f;
-    int frameCount = (int)rd32(H+40); if (frameCount<1) frameCount=1;
     size_t baseQ = obase + rd32(H+80);                         // planar-SoA base quaternions
     int nj = nJoints; if (hdrJoints>0 && hdrJoints<=nj) nj = hdrJoints;
     // Each group of 4 joints = 24 floats: [base x0..3,y0..3,z0..3][range x0..3,y0..3,z0..3].

@@ -387,7 +387,7 @@ inline bool exportEnvFull(const std::vector<hslcook::ExportMesh>& meshes, const 
                 std::string ch; for(size_t k=0;k<kids[j].size();++k){ if(k)ch+=","; ch+=std::to_string(kids[j][k]); }
                 // Build the joint node with an UNBOUNDED std::string: a hub joint can parent dozens of children,
                 // and the old fixed char[320] snprintf TRUNCATED the "children":[...] list for such joints -> the
-                // closing ]} was lost -> invalid glTF JSON (cyberhome: joint "j6" parents ~40 joints). Only the
+                // closing ]} was lost -> invalid glTF JSON in deep joint hierarchies. Only the
                 // fixed-width numeric prefix goes through snprintf; the variable-length children append as a string.
                 char nb[224]; snprintf(nb,sizeof nb,"{\"name\":\"j%d\",\"translation\":[%g,%g,%g],\"rotation\":[%g,%g,%g,%g],\"scale\":[%g,%g,%g]",
                     j,p[0],p[1],p[2],q[0],q[1],q[2],q[3],s[0],s[1],s[2]);

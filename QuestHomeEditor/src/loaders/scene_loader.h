@@ -21,6 +21,7 @@
 #include <set>
 #include <map>
 #include <cctype>
+#include <cmath>
 
 
 // ──────────────────────────────────────────────────────────────
@@ -589,6 +590,15 @@ public:
                 return false;
             }
             md.texW = ti.width; md.texH = ti.height; md.hasTexture = true;
+            // Preserve cooked RENDTXTR blocks exactly, just like the OPA/KTX
+            // loader already does. A no-edit re-cook can now splice these bytes
+            // directly instead of paying for a full decode -> ASTC encode cycle.
+            if (isExactAstcPayload(ti)) {
+                md.srcAstc.assign(texData.begin() + ti.rawDataOffset,
+                                  texData.begin() + ti.rawDataOffset + ti.rawDataLen);
+                md.srcAstcBw = ti.blockW; md.srcAstcBh = ti.blockH;
+                md.srcAstcMips = ti.mipCount;
+            }
             log("  Texture: %s (%ux%u fmt=%u)", tp->c_str(), ti.width, ti.height, ti.formatCode);
             return true;
         };
@@ -1212,6 +1222,64 @@ public:
             }
             md.hasBones = envHasSkeleton && !md.boneIndices.empty();
             if (!md.hasBones) { md.boneIndices.clear(); md.boneWeights.clear(); }
+
+            // Re-importing one of our own older cooks must not treat its synthetic
+            // skinned anti-cull geometry as part of the environment.  Those cooks
+            // append six tiny triangles (18 vertices) at the +/-100 km axis
+            // extremes.  They are intentionally invisible on-device, but if they
+            // survive a second cook they poison scene bounds, auto-floor and spawn
+            // placement (for example, a perfectly valid home gets a Y=-99,998 m
+            // spawn).  Match the exact legacy suffix and remove it before any
+            // bounds/navigation calculation.  Genuine large environments are not
+            // affected because the indices and 18-vertex axis signature must both
+            // match exactly.
+            if (md.hasBones && md.positions.size() / 3 >= 18 && md.indices.size() >= 18) {
+                const size_t oldNv = md.positions.size() / 3;
+                const size_t base = oldNv - 18;
+                const float C = 1.0e5f;
+                const float ext[6][3] = {
+                    { C,0,0 }, { -C,0,0 }, { 0,C,0 },
+                    { 0,-C,0 }, { 0,0,C }, { 0,0,-C }
+                };
+                bool signature = true;
+                for (int e = 0; e < 6 && signature; ++e) for (int t = 0; t < 3; ++t) {
+                    const size_t v = base + (size_t)e * 3 + (size_t)t;
+                    const float expected[3] = {
+                        ext[e][0] + (t == 1 ? 1.0f : 0.0f),
+                        ext[e][1] + (t == 2 ? 1.0f : 0.0f),
+                        ext[e][2]
+                    };
+                    for (int a = 0; a < 3; ++a)
+                        if (std::fabs(md.positions[v * 3 + (size_t)a] - expected[a]) > 0.25f)
+                            signature = false;
+                }
+                const size_t idxBase = md.indices.size() - 18;
+                for (size_t i = 0; i < 18 && signature; ++i)
+                    if (md.indices[idxBase + i] != base + i) signature = false;
+
+                if (signature) {
+                    md.positions.resize(base * 3);
+                    md.indices.resize(idxBase);
+                    auto trimFloat = [oldNv, base](std::vector<float>& v, size_t width) {
+                        if (v.size() >= oldNv * width) v.resize(base * width);
+                    };
+                    auto trimByte = [oldNv, base](std::vector<u8>& v, size_t width) {
+                        if (v.size() >= oldNv * width) v.resize(base * width);
+                    };
+                    trimFloat(md.uvs, 2); trimFloat(md.uvs2, 2);
+                    trimFloat(md.uvs3, 2); trimFloat(md.uvs4, 2);
+                    trimByte(md.colors, 4); trimByte(md.boneIndices, 4);
+                    trimByte(md.boneWeights, 4);
+
+                    size_t usedPalette = 0;
+                    for (size_t i = 0; i < md.boneIndices.size() && i < md.boneWeights.size(); ++i)
+                        if (md.boneWeights[i] != 0)
+                            usedPalette = std::max(usedPalette, (size_t)md.boneIndices[i] + 1);
+                    if (usedPalette && md.bonePalette.size() > usedPalette)
+                        md.bonePalette.resize(usedPalette);
+                    log("  [RECOOK] stripped 18 legacy +/-100 km anti-cull vertices from '%s'", md.name.c_str());
+                }
+            }
             md.nVerts = (u32)(md.positions.size() / 3);
             md.nIdx   = (u32)md.indices.size();
             log("  RENDMESH: %u verts, %u idx (%u tris)", md.nVerts, md.nIdx, md.nIdx/3);

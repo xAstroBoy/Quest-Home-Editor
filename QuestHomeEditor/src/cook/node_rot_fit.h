@@ -49,7 +49,7 @@ inline Result fit(const std::vector<const float*>& frames, size_t nv, const floa
     float bodySpan=0.f; for(size_t v=0;v<nv;v++){float d[3]={P0f[v*3]-Cc[0],P0f[v*3+1]-Cc[1],P0f[v*3+2]-Cc[2]}; float s=dot(d,d); if(s>bodySpan)bodySpan=s;} bodySpan=std::sqrt(bodySpan);
     float ax[3]={0,0,0};
     // ORBIT only when the centroid's travel is MUCH larger than the body: a real orbit (King Kai planet circling
-    // a distant center) has orbitSpan >> bodySpan. A PENDULUM hinged just OUTSIDE the mesh (storybook torch flame
+    // a distant center) has orbitSpan >> bodySpan. A PENDULUM hinged just outside the mesh (for example a torch flame
     // rocking about its wick node: centroid arc ≈ body size) tripped the old `>` test -> pivot=centroid -> the
     // cooked sway wobbled the flame about its own MIDDLE instead of the hinge ("flame anim not correct").
     bool orbit = orbitSpan > 2.f*bodySpan && orbitSpan > 1e-2f;

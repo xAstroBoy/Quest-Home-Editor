@@ -48,13 +48,83 @@ struct AppConfig {
     // keystore can live right next to the exe, so a machine with NO Android SDK installed just needs the signing
     // tools dropped beside the exe — no env vars, no SDK install. exeRel() resolves a path relative to it.
     static inline std::string s_exeDir;
+    static inline std::string s_homeLibrary;
     static std::string exeRel(const std::string& rel) { return s_exeDir.empty() ? rel : (s_exeDir + "/" + rel); }
+    static std::string homeRel(const std::string& rel) {
+        return s_homeLibrary.empty() ? rel : (s_homeLibrary + "/" + rel);
+    }
+    static bool iequals(std::string a, std::string b) {
+        if (a.size()!=b.size()) return false;
+        for (size_t i=0;i<a.size();++i)
+            if (std::tolower(static_cast<unsigned char>(a[i])) !=
+                std::tolower(static_cast<unsigned char>(b[i]))) return false;
+        return true;
+    }
+    // One portable library owns source Homes, saved editor sessions, cooked
+    // outputs, Loft profiles, rollback APKs and pristine carriers. Loading an
+    // APK from an existing "Quest Homes" tree adopts that tree automatically;
+    // otherwise the remembered path or Documents/Quest Homes is used.
+    static std::string initializeHomeLibrary(const std::string& loadedHome = {}) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::path detected;
+        if (!loadedHome.empty()) {
+            fs::path p=fs::absolute(fs::path(loadedHome),ec).parent_path();
+            for (; !p.empty(); ) {
+                if (iequals(p.filename().string(),"Quest Homes")) { detected=p; break; }
+                fs::path up=p.parent_path(); if(up==p) break; p=up;
+            }
+        }
+        const std::string rememberedFile=exeRel("home_library_path.txt");
+        if (detected.empty()) {
+            FILE* f=fopen(rememberedFile.c_str(),"rb");
+            if(f) {
+                char line[2048]={0};
+                if(fgets(line,sizeof line,f)) {
+                    std::string saved(line);
+                    while(!saved.empty() && (saved.back()=='\r'||saved.back()=='\n')) saved.pop_back();
+                    if(!saved.empty()) detected=fs::path(saved);
+                }
+                fclose(f);
+            }
+        }
+        if (detected.empty()) {
+#ifdef _WIN32
+            const char* user=std::getenv("USERPROFILE");
+            detected=fs::path(user?user:".")/"Documents"/"Quest Homes";
+#else
+            const char* home=std::getenv("HOME");
+            detected=fs::path(home?home:".")/"Documents"/"Quest Homes";
+#endif
+        }
+        fs::create_directories(detected,ec);
+        if(ec) return "";
+        for(const char* child : {"saved","cooked","profiles","backups","carriers"})
+            fs::create_directories(detected/child,ec);
+        s_homeLibrary=detected.lexically_normal().string();
+        const fs::path profiles=detected/"profiles"/"loft-profiles.toml";
+        if(!fs::exists(profiles,ec)) {
+            if(FILE* f=fopen(profiles.string().c_str(),"wb")) {
+                fputs("schema = 1\n\n"
+                      "[slots.calming]\npackage = \"com.meta.shell.env.vista.calming\"\n\n"
+                      "[slots.focused]\npackage = \"com.meta.shell.env.vista.focused\"\n\n"
+                      "[slots.oceanarium]\npackage = \"com.meta.shell.env.vista.oceanarium\"\n\n"
+                      "[slots.horror]\npackage = \"com.meta.shell.env.vista.horror\"\n",f);
+                fclose(f);
+            }
+        }
+        if(FILE* f=fopen(rememberedFile.c_str(),"wb")) {
+            fwrite(s_homeLibrary.data(),1,s_homeLibrary.size(),f);
+            fputc('\n',f); fclose(f);
+        }
+        return s_homeLibrary;
+    }
 
     // ── build version + host machine specs ────────────────────────────────────────────────────────────────────
     // Bump on every release. Printed at the top of each run's `Quest Home Editor.log`, shown in the window title,
     // and prepended to every logcat/diag EXPORT — so a shared log or bug report always states WHICH build produced
     // it and on WHAT hardware. s_gpuName is filled in by the renderer once a Vulkan device is picked.
-    static constexpr const char* s_version = "0.10.22";
+    static constexpr const char* s_version = "0.10.20";
     static inline std::string s_gpuName;
 
     static std::string sysInfo() {   // multi-line: version + OS + CPU + RAM + GPU

@@ -73,7 +73,7 @@ inline std::string comp(const char* cls, int ver, const std::string& data) {
     return std::string("{\"data\":{\"class\":\"")+cls+"\",\"version\":"+std::to_string(ver)+",\"data\":{"+data+
            "}},\"dataType\":\"horizon::DataDefinitionAsset\"}";
 }
-inline std::string transformComp(const Item& it) {   // localRotation = EULER RADIANS (haven convention)
+inline std::string transformComp(const Item& it, int version = 2) {   // localRotation = EULER RADIANS (haven convention)
     float r[3] = { it.rot[0]*0.01745329f, it.rot[1]*0.01745329f, it.rot[2]*0.01745329f };
     std::string data = vec3("localPosition", it.pos)+","+vec3("localRotation", r)+","+vec3("localScale", it.scale);
     if (it.quat[0]||it.quat[1]||it.quat[2]||it.quat[3]) {   // tilted nav collider: emit the AUTHORITATIVE quaternion
@@ -81,7 +81,7 @@ inline std::string transformComp(const Item& it) {   // localRotation = EULER RA
             it.quat[0],it.quat[1],it.quat[2],it.quat[3]);
         data += qb;
     }
-    return comp("horizon::platform_api::TransformPlatformComponent", 2, data);
+    return comp("horizon::platform_api::TransformPlatformComponent", version, data);
 }
 
 // Entity JSON for one item. `meshAssetJson` (for NAVMESH) = the cook-provided {"packageOrRemoteId":..} ref string
@@ -121,9 +121,12 @@ inline std::string itemEntityJson(const Item& it, int idx, const std::string& me
             break;
         }
         case BOXCOL:
-            comps = comp("horizon::platform_api::ColliderBoxPlatformComponent", 1, vec3("halfExtents", it.half))
-                + "," + comp("horizon::platform_api::PhysicsBodyPlatformComponent", 6, "\"type\":\"StaticCollision\"")
-                + "," + transformComp(it);
+            // v206 Vista-native recipe, verified against Focused's official
+            // Invisible_FrontEdgeBackupCollision. The legacy v1/v6 pair can be
+            // accepted by the parser yet silently omitted from player physics.
+            comps = transformComp(it, 3)
+                + "," + comp("horizon::platform_api::ColliderBoxPlatformComponent", 3, vec3("halfExtents", it.half))
+                + "," + comp("horizon::platform_api::PhysicsBodyPlatformComponent", 9, "\"type\":\"StaticCollision\"");
             break;
         case NAVMESH:
             if (meshAssetJson.empty()) return "";   // the cook bakes the ColliderMesh + supplies the ref

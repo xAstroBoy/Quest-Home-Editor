@@ -328,13 +328,19 @@ struct MeshData {
 // RENDTXTR format codes → ASTC block sizes
 inline void astcBlockSize(u8 fmtCode, u32& bw, u32& bh) {
     switch (fmtCode) {
+        // Current Meta RENDTXTR enum pairs: linear / sRGB.
+        case 15: case 16: bw = 4;  bh = 4;  break;
+        case 17: case 18: bw = 6;  bh = 6;  break;
+        case 19: case 20: bw = 8;  bh = 8;  break;
+        case 21: case 22: bw = 10; bh = 10; break;
+        case 23: case 24: bw = 12; bh = 12; break;
+        // Older aliases retained for source compatibility.
         case  8: bw = 8;  bh = 8;  break;
         case 10: bw = 4;  bh = 4;  break;
         case 11: bw = 8;  bh = 8;  break;
         case 12: bw = 6;  bh = 6;  break;
         case 13: bw = 12; bh = 12; break;
         case 14: bw = 4;  bh = 4;  break;
-        case 20: bw = 8;  bh = 8;  break;
         default: bw = 8;  bh = 8;  break;
     }
 }

@@ -73,6 +73,41 @@ inline u32 astcMip0Bytes(u32 w, u32 h, u32 bw, u32 bh) {
     return ((w + bw - 1) / bw) * ((h + bh - 1) / bh) * 16;
 }
 
+inline u32 astcFullMipCount(u32 w, u32 h) {
+    if (!w || !h) return 0;
+    u32 count = 1;
+    while (w > 1 || h > 1) {
+        w = w > 1 ? w / 2 : 1;
+        h = h > 1 ? h / 2 : 1;
+        ++count;
+    }
+    return count;
+}
+
+// Exact byte count for a reported prefix of an ASTC mip chain. Cooked Homes
+// commonly retain only part of the full chain, so checking only "full" or
+// "mip0" loses otherwise byte-perfect source payloads on the next cook.
+inline u32 astcMipBytesForCount(u32 w, u32 h, u32 bw, u32 bh, u32 mipCount) {
+    if (!w || !h || !bw || !bh || !mipCount) return 0;
+    u64 total = 0;
+    for (u32 level = 0; level < mipCount; ++level) {
+        const u64 cols = (w + bw - 1) / bw;
+        const u64 rows = (h + bh - 1) / bh;
+        total += cols * rows * 16;
+        if (total > 0xFFFFFFFFull) return 0;
+        if (w == 1 && h == 1) break;
+        w = w > 1 ? w / 2 : 1;
+        h = h > 1 ? h / 2 : 1;
+    }
+    return (u32)total;
+}
+
+inline bool isExactAstcPayload(const RendtxtrInfo& info) {
+    if (!info.blockW || !info.blockH || !info.mipCount || !info.rawDataLen) return false;
+    return astcMipBytesForCount(info.width, info.height, info.blockW, info.blockH,
+                                info.mipCount) == info.rawDataLen;
+}
+
 inline bool parseRendtxtrHeader(const std::vector<u8>& data, RendtxtrInfo& info) {
     if (data.size() < 16) return false;
     if (memcmp(data.data() + 4, "TXTR", 4) != 0) return false;
@@ -92,8 +127,10 @@ inline bool parseRendtxtrHeader(const std::vector<u8>& data, RendtxtrInfo& info)
 
     info.width      = sW ? *reinterpret_cast<const u16*>(d + sW) : 0;
     info.height     = sH ? *reinterpret_cast<const u16*>(d + sH) : 0;
-    info.formatCode = sF ? d[sF] : 0;
-    info.mipCount   = sMip ? *reinterpret_cast<const u16*>(d + sMip) : 1;
+    const u32 field6 = sF ? d[sF] : 0;
+    const u32 field7 = sMip ? *reinterpret_cast<const u16*>(d + sMip) : 0;
+    info.formatCode = (u8)field6;
+    info.mipCount = 1;
     if (info.width == 0 || info.height == 0) return false;
 
     // f9 is a FlatBuffer vector: indirect uoffset -> [u32 count][bytes...].
@@ -115,18 +152,33 @@ inline bool parseRendtxtrHeader(const std::vector<u8>& data, RendtxtrInfo& info)
 
     u32 rawLen = info.rawDataLen;
 
-    // Pick the block footprint whose FULL mip-chain length equals the payload.
+    // Two RENDTXTR layouts exist in the wild. Older readers treated f6 as a
+    // format and f7 as mipCount; the current Meta-compatible writer stores the
+    // mip count in f6 and a constant in f7. Resolve this from the payload rather
+    // than trusting either field blindly.
     info.blockW = 0;
-    for (auto& b : kAstcBlocks) {
+    const u32 fullMipCount = astcFullMipCount(info.width, info.height);
+    auto tryMipCount = [&](u32 candidate) {
+        if (info.blockW || candidate < 1 || candidate > fullMipCount) return;
+        for (auto& b : kAstcBlocks) {
+            if (astcMipBytesForCount(info.width, info.height, b[0], b[1], candidate) == rawLen) {
+                info.blockW = b[0]; info.blockH = b[1]; info.mipCount = candidate; return;
+            }
+        }
+    };
+    tryMipCount(field7);       // legacy layout
+    tryMipCount(field6);       // current writer/layout
+    // Older assets sometimes omit or misreport f7; retain the full-chain probe.
+    if (info.blockW == 0) for (auto& b : kAstcBlocks) {
         if (astcMipChainBytes(info.width, info.height, b[0], b[1]) == rawLen) {
-            info.blockW = b[0]; info.blockH = b[1]; break;
+            info.blockW = b[0]; info.blockH = b[1]; info.mipCount = fullMipCount; break;
         }
     }
     // Fallback: maybe only mip0 is present (no chain).
     if (info.blockW == 0) {
         for (auto& b : kAstcBlocks) {
             if (astcMip0Bytes(info.width, info.height, b[0], b[1]) == rawLen) {
-                info.blockW = b[0]; info.blockH = b[1]; break;
+                info.blockW = b[0]; info.blockH = b[1]; info.mipCount = 1; break;
             }
         }
     }
@@ -191,7 +243,7 @@ inline bool decodeASTC(const u8* rawMips, u32 rawLen, u32 width, u32 height,
     if (const char* e = std::getenv("HSR_ASTC_THREADS")) { int v = atoi(e); if (v >= 1) N = (unsigned)v; }
 
     astcenc_context* ctx = nullptr;
-    err = astcenc_context_alloc(&cfg, N, &ctx);
+    err = astcenc_context_alloc(&cfg, N, &ctx, nullptr);
     if (err != ASTCENC_SUCCESS) return false;
 
     outRGBA.resize(width * height * 4);

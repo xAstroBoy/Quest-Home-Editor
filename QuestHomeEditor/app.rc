@@ -5,3 +5,6 @@
 // fully offline machine still gets adb: the editor extracts these beside itself if no external adb is found and
 // there's no network to download. adb is redistributable (SideQuest/scrcpy bundle it too). See editor.h ensureAdb.
 ADBWINZIP RCDATA "embed/adb-win.zip"
+
+// Original Oculus horizontal wordmark used as optional nostalgic Standard-workspace branding.
+OCULUSLOGO RCDATA "embed/oculus-logo.png"

@@ -17,7 +17,9 @@
 #include <functional>
 #include <filesystem>
 
+#ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
+#endif
 #include <vulkan/vulkan.h>
 #include <volk.h>
 #ifdef __linux__
@@ -2157,6 +2159,7 @@ private:
     }
 
     bool instanceExtAvailable(const char* name) {
+        if (!vkEnumerateInstanceExtensionProperties) return false;
         u32 na = 0; vkEnumerateInstanceExtensionProperties(nullptr, &na, nullptr);
         std::vector<VkExtensionProperties> avail(na);
         if (na) vkEnumerateInstanceExtensionProperties(nullptr, &na, avail.data());

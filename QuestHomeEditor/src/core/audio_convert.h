@@ -1,7 +1,7 @@
 #pragma once
 // Audio conversion: decode ANY common audio container (ogg-vorbis / ogg-OPUS / wav / mp3 / flac) from
 // memory to interleaved s16 PCM, and (for the cook) re-wrap to a WAV the device's FMOD auto-detects.
-// ogg-vorbis goes through the proven stb_vorbis path; ogg-OPUS (HALF the official V79 envs: storybook,
+// ogg-vorbis goes through the proven stb_vorbis path; ogg-OPUS (used by many official V79 environments,
 // polarvillage, underwater, ...) through libopus with a hand-rolled Ogg page demux; wav/mp3/flac through
 // miniaudio's built-in decoders (impl already linked via miniaudio_impl.c).
 #include <vector>
@@ -10,7 +10,7 @@
 #include <string>
 #include "miniaudio.h"
 #include <opus.h>
-#include <opus_multistream.h>   // official env loops are often MULTICHANNEL opus (storybook = 4ch ambisonic)
+#include <opus_multistream.h>   // official environment loops are often multichannel Opus (including 4ch ambisonic)
 
 extern "C" int stb_vorbis_decode_memory(const unsigned char* mem, int len,
                                         int* channels, int* sample_rate, short** output);
@@ -53,7 +53,7 @@ inline bool fmodNative(const char* fmt) {
 // <255. Packet 1 = "OpusHead": ver@8, channels@9, pre-skip@10..11 LE, inputRate@12..15, gain@16..17,
 // mappingFamily@18 (+ streamCount@19, coupledCount@20, mapping[ch]@21 when family != 0). Packet 2 =
 // "OpusTags"; every later packet is an Opus frame. Opus always decodes at 48 kHz. The MULTISTREAM
-// decoder is required: official env loops are often >2 channels (storybook = 4ch), and plain
+// decoder is required: official environment loops are often >2 channels, and plain
 // opus_decoder_create rejects those. >2ch is downmixed to stereo for playback + the WAV cook.
 inline bool decodeOpusOgg(const uint8_t* in, size_t len, Pcm& out, std::string* err) {
     int channels = 0, preSkip = 0;

@@ -21,6 +21,7 @@
 #include <cstring>
 #include <iostream>
 #include <thread>   // background scene-load worker (the window/UI stay live while parsing)
+#include <algorithm>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -156,10 +157,14 @@ static void hsrHttpServer(int port) {
     }
 }
 
+#ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
+#endif
 #include <vulkan/vulkan.h>
 #include <volk.h>
+#ifndef GLFW_INCLUDE_VULKAN
 #define GLFW_INCLUDE_VULKAN
+#endif
 #include <GLFW/glfw3.h>
 #ifdef _WIN32
 #define GLFW_EXPOSE_NATIVE_WIN32
@@ -522,6 +527,294 @@ int main(int argc, char** argv) {
         return fails ? 1 : 0;
     }
 
+    // Small read-only manifest diagnostic used while validating official v206 Vista wrappers.
+    // It intentionally prints only real package keys (parseAsmh also creates pkg=0 aliases).
+    if (argc >= 3 && std::string(argv[1]) == "--dump-asmh") {
+        const std::string manifestPath = argv[2];
+        const std::string filter = argc >= 4 ? argv[3] : std::string();
+        const std::string outputPath = argc >= 5 ? argv[4] : std::string();
+        FILE* f = fopen(manifestPath.c_str(), "rb");
+        if (!f) { fprintf(stderr, "cannot open ASMH: %s\n", manifestPath.c_str()); return 2; }
+        fseek(f, 0, SEEK_END); const long sz = ftell(f); rewind(f);
+        if (sz <= 0) { fclose(f); fprintf(stderr, "empty ASMH: %s\n", manifestPath.c_str()); return 2; }
+        std::vector<uint8_t> bytes(static_cast<size_t>(sz));
+        const size_t got = fread(bytes.data(), 1, bytes.size(), f); fclose(f);
+        if (got != bytes.size()) { fprintf(stderr, "short read: %s\n", manifestPath.c_str()); return 2; }
+        std::vector<AsmhRecord> records;
+        if (!parseAsmhRecords(bytes, records)) { fprintf(stderr, "invalid ASMH: %s\n", manifestPath.c_str()); return 2; }
+        std::vector<AsmhRecord> rows;
+        for (const auto& row : records) {
+            if (!filter.empty() && row.path.find(filter) == std::string::npos) continue;
+            rows.push_back(row);
+        }
+        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.path < b.path; });
+        FILE* output = outputPath.empty() ? stdout : fopen(outputPath.c_str(), "wb");
+        if (!output) { fprintf(stderr, "cannot create ASMH dump: %s\n", outputPath.c_str()); return 2; }
+        for (const auto& row : rows) {
+            fprintf(output, "pkg=%llu ing=%llu tgt=%u type=%08x:%08x size=%u path=%s\n",
+                   static_cast<unsigned long long>(row.pkg),
+                   static_cast<unsigned long long>(row.ing), row.tgt,
+                   row.fourcc, row.subtype, row.size, row.path.c_str());
+        }
+        if (output != stdout) fclose(output);
+        return 0;
+    }
+
+    // Repack an already-cooked scene into the proven standalone-Haven carrier:
+    // embedded combined Environment runtime plus Haven's combined manifest.
+    // The carrier argument remains required for CLI compatibility and as an
+    // explicit assertion that an Original Haven backup exists, but its
+    // footprint runtime is deliberately not copied into the custom Home.
+    if (argc >= 2 && std::string(argv[1]) == "--v206-carrier") {
+        if (argc < 4) {
+            fprintf(stderr, "usage: Quest Home Editor --v206-carrier <cooked.apk> <official-haven.apk> [out.apk]\n");
+            return 2;
+        }
+        const std::string input = argv[2];
+        const std::string carrierPath = argv[3];
+        const std::string output = argc >= 5
+            ? argv[4]
+            : input.substr(0, input.size() > 4 ? input.size() - 4 : input.size()) + "_v206.apk";
+        const std::vector<uint8_t> source=hslcook::readFileBytes(input);
+        const std::vector<uint8_t> carrier=hslcook::readFileBytes(carrierPath);
+        if (carrier.empty()) {
+            fprintf(stderr,"[V206] official Haven backup missing or unreadable\n");
+            return 1;
+        }
+        std::vector<uint8_t> scene;
+        if(!hslcook::extractZipEntryBytes(
+                source,"assets/scene.zip",
+                hslcook::zipsafety::kSceneReadLimits.maxTotalUncompressedBytes,
+                scene)) {
+            fprintf(stderr,"[V206] cooked source scene missing or unsafe\n");
+            return 1;
+        }
+        bool cloned = false;
+        constexpr auto havenPlan=standalonehaven::plan(false);
+        auto apk = hslcook::spliceAPK(
+            input,scene,"com.meta.environment.prod.nuxd",
+            "com.meta.shell.env.footprint.haven2025",&cloned,{},
+            havenPlan.nuxdManifestIdentity,
+            havenPlan.footprintManifestIdentity);
+        if (cloned && !hslcook::validateProvenCombinedHavenCarrier(apk)) {
+            fprintf(stderr, "[V206] combined Haven carrier validation failed\n");
+            return 1;
+        }
+        if (!cloned || apk.empty()) { fprintf(stderr, "[V206] carrier clone failed\n"); return 1; }
+        const bool signedOk = hslcook::signApkData(
+            apk, output,
+            [](float f, const char* m){ fprintf(stderr, "  [%3d%%] %s\n", (int)(f * 100.f), m); });
+        if (!signedOk) { fprintf(stderr, "[V206] sign failed\n"); return 1; }
+        fprintf(stderr, "[V206] OK -> %s\n", output.c_str());
+        return 0;
+    }
+
+    // Put an already-cooked Home scene behind one of Horizon v206's official
+    // Loft Vista menu slots.  The official Vista APK is used as the carrier so
+    // its package identity/resources stay intact; only the scene and an
+    // explicit version bump change.  Diagnostic/prototype CLI until the
+    // four-slot workflow has been proven on-device.
+    if (argc >= 2 && std::string(argv[1]) == "--v206-vista-slot") {
+        if (argc < 7) {
+            fprintf(stderr,
+                "usage: Quest Home Editor --v206-vista-slot <home.apk> <official-vista.apk> <out.apk> <old-version-code> <new-version-code>\n");
+            return 2;
+        }
+        auto readWholeFile = [](const std::string& path, std::vector<uint8_t>& bytes) {
+            FILE* f = fopen(path.c_str(), "rb");
+            if (!f) return false;
+            fseek(f, 0, SEEK_END); const long size = ftell(f); fseek(f, 0, SEEK_SET);
+            if (size <= 0) { fclose(f); return false; }
+            bytes.resize(static_cast<size_t>(size));
+            const bool read = fread(bytes.data(), 1, bytes.size(), f) == bytes.size();
+            fclose(f);
+            return read;
+        };
+        const std::string homePath = argv[2], vistaPath = argv[3], output = argv[4];
+        const uint32_t oldCode = static_cast<uint32_t>(strtoul(argv[5], nullptr, 10));
+        const uint32_t newCode = static_cast<uint32_t>(strtoul(argv[6], nullptr, 10));
+        std::vector<uint8_t> home, vista;
+        if (!readWholeFile(homePath, home) || !readWholeFile(vistaPath, vista)) {
+            fprintf(stderr, "[VISTA-SLOT] input read failed\n"); return 1;
+        }
+        bool cloned = false;
+        auto apk = hslcook::cloneVistaSlotWithScene(home, vista, oldCode, newCode,
+                                                     "206.0.0.0.70", "206.0.0.0.71", &cloned);
+        if (!cloned || apk.empty()) { fprintf(stderr, "[VISTA-SLOT] clone failed\n"); return 1; }
+        const bool signedOk = hslcook::signApkData(
+            apk, output,
+            [](float f, const char* m){ fprintf(stderr, "  [%3d%%] %s\n", (int)(f * 100.f), m); });
+        if (!signedOk) { fprintf(stderr, "[VISTA-SLOT] sign failed\n"); return 1; }
+        fprintf(stderr, "[VISTA-SLOT] OK -> %s\n", output.c_str());
+        return 0;
+    }
+
+    // Safe v206 custom-Vista prototype.  Unlike --v206-vista-slot this keeps
+    // Meta's official transition/lifecycle wrapper and mounts only the exact
+    // source Home render closure behind it.  It is deliberately build-only:
+    // installation remains a separate, explicit test step after verification.
+    if (argc >= 2 && (std::string(argv[1]) == "--v206-vista-wrapper" ||
+                      std::string(argv[1]) == "--v206-vista-wrapper-auto")) {
+        const bool automaticVersion = std::string(argv[1]) == "--v206-vista-wrapper-auto";
+        if ((!automaticVersion && argc < 7) || (automaticVersion && argc < 5)) {
+            fprintf(stderr,
+                "usage: Quest Home Editor --v206-vista-wrapper <home.apk> <official-vista.apk> <out.apk> <old-version-code> <new-version-code> [old-version-name new-version-name]\n"
+                "   or: Quest Home Editor --v206-vista-wrapper-auto <home.apk> <official-vista.apk> <out.apk> [installed-version-code installed-version-name]\n");
+            return 2;
+        }
+        auto readWholeFile = [](const std::string& path, std::vector<uint8_t>& bytes) {
+            FILE* f = fopen(path.c_str(), "rb");
+            if (!f) return false;
+            fseek(f, 0, SEEK_END); const long size = ftell(f); fseek(f, 0, SEEK_SET);
+            if (size <= 0) { fclose(f); return false; }
+            bytes.resize(static_cast<size_t>(size));
+            const bool read = fread(bytes.data(), 1, bytes.size(), f) == bytes.size();
+            fclose(f);
+            return read;
+        };
+        const std::string homePath = argv[2], vistaPath = argv[3], output = argv[4];
+        std::vector<uint8_t> home, vista, scene;
+        if (!readWholeFile(homePath, home) || !readWholeFile(vistaPath, vista)) {
+            fprintf(stderr, "[VISTA-WRAPPER] input read failed\n"); return 1;
+        }
+        uint32_t oldCode = 0, newCode = 0;
+        std::string oldName, newName;
+        hslcook::ApkManifestIdentity carrierIdentity;
+        if (!hslcook::readApkManifestIdentity(vista, carrierIdentity)) {
+            fprintf(stderr, "[VISTA-WRAPPER] carrier manifest identity could not be read\n"); return 1;
+        }
+        if (automaticVersion) {
+            oldCode = carrierIdentity.versionCode;
+            uint64_t baseCode = oldCode;
+            std::string baseName = carrierIdentity.versionName;
+            if (argc >= 7) {
+                char* end = nullptr;
+                const unsigned long long installed = strtoull(argv[5], &end, 10);
+                if (!end || *end || installed > UINT32_MAX) {
+                    fprintf(stderr, "[VISTA-WRAPPER] invalid installed version code\n"); return 2;
+                }
+                if (installed > baseCode) {
+                    baseCode = installed;
+                    baseName = argv[6];
+                }
+            }
+            if (baseCode >= UINT32_MAX) {
+                fprintf(stderr, "[VISTA-WRAPPER] version code overflow\n"); return 2;
+            }
+            newCode = static_cast<uint32_t>(baseCode + 1);
+            oldName = carrierIdentity.versionName;
+            newName = hslcook::incrementDottedVersionName(baseName);
+        } else {
+            oldCode = static_cast<uint32_t>(strtoul(argv[5], nullptr, 10));
+            newCode = static_cast<uint32_t>(strtoul(argv[6], nullptr, 10));
+            oldName = argc >= 9 ? argv[7] : "206.0.0.0.70";
+            newName = argc >= 9 ? argv[8] : "206.0.0.0.71";
+        }
+        if (oldCode == 0 || newCode == 0 || oldCode == newCode ||
+            oldName.empty() || newName.empty() || oldName == newName) {
+            fprintf(stderr, "[VISTA-WRAPPER] invalid or non-incrementable version identity\n"); return 2;
+        }
+        std::string report;
+        if (!hslcook::buildHomeVistaScene(home, vista, scene, &report)) {
+            const std::string diagnostic = output + ".error.txt";
+            if (FILE* log = fopen(diagnostic.c_str(), "wb")) {
+                fwrite(report.data(), 1, report.size(), log);
+                fclose(log);
+            }
+            fprintf(stderr, "[VISTA-WRAPPER] scene build failed: %s\n", report.c_str()); return 1;
+        }
+        std::vector<uint8_t> editorSession;
+        // Preserve the source Home's round-trip metadata (manual spawn, chairs,
+        // collision provenance and other edits) in the finished Vista APK.
+        // It lives beside scene.zip, not inside it.
+        hslcook::extractZipEntryBytes(
+            home, "assets/_editor_session.hsledit",
+            hslcook::zipsafety::kApkReadLimits.maxTotalUncompressedBytes,
+            editorSession);
+        std::vector<uint8_t> sourceNavmesh;
+        hslcook::extractZipEntryBytes(
+            home, "assets/navmesh",
+            hslcook::zipsafety::kApkReadLimits.maxTotalUncompressedBytes,
+            sourceNavmesh);
+        bool repacked = false;
+        auto apk = hslcook::repackOfficialVistaWithScene(
+            vista, scene, oldCode, newCode, oldName, newName,
+            editorSession, sourceNavmesh, &repacked);
+        if (!repacked || apk.empty()) {
+            const std::string diagnostic = output + ".error.txt";
+            if (FILE* log = fopen(diagnostic.c_str(), "wb")) {
+                const char* reason = "official carrier repack failed";
+                fwrite(reason, 1, strlen(reason), log);
+                fclose(log);
+            }
+            fprintf(stderr, "[VISTA-WRAPPER] official carrier repack failed\n"); return 1;
+        }
+        const bool signedOk = hslcook::signApkData(
+            apk, output,
+            [](float f, const char* m){ fprintf(stderr, "  [%3d%%] %s\n", (int)(f * 100.f), m); });
+        if (!signedOk) { fprintf(stderr, "[VISTA-WRAPPER] sign failed\n"); return 1; }
+        // Signing is the final mutation. Re-open the exact artifact that will be
+        // handed to the user and fail closed if its carrier identity, version,
+        // or scene payload differs from what was constructed above.
+        std::vector<uint8_t> signedApk, signedScene;
+        hslcook::ApkManifestIdentity signedIdentity;
+        std::vector<uint8_t> signedSession;
+        std::vector<uint8_t> signedNavmesh;
+        const bool readSigned = readWholeFile(output, signedApk);
+        const bool sessionValid =
+            editorSession.empty() ||
+            (hslcook::extractZipEntryBytes(
+                 signedApk, "assets/_editor_session.hsledit",
+                 hslcook::zipsafety::kApkReadLimits.maxTotalUncompressedBytes,
+                 signedSession) &&
+             signedSession == editorSession);
+        const bool navmeshValid =
+            sourceNavmesh.empty() ||
+            (hslcook::extractZipEntryBytes(
+                 signedApk, "assets/navmesh",
+                 hslcook::zipsafety::kApkReadLimits.maxTotalUncompressedBytes,
+                 signedNavmesh) &&
+             signedNavmesh == sourceNavmesh);
+        const bool finalValid =
+            readSigned &&
+            hslcook::readApkManifestIdentity(signedApk, signedIdentity) &&
+            signedIdentity.packageName == carrierIdentity.packageName &&
+            signedIdentity.versionCode == newCode &&
+            signedIdentity.versionName == newName &&
+            hslcook::extractZipEntryBytes(
+                signedApk, "assets/scene.zip",
+                hslcook::zipsafety::kApkReadLimits.maxTotalUncompressedBytes,
+                signedScene) &&
+            signedScene == scene &&
+            sessionValid &&
+            navmeshValid;
+        if (!finalValid) {
+            const std::string diagnostic = output + ".error.txt";
+            const std::string reason =
+                "post-sign validation failed: carrier package, version identity, or assets/scene.zip changed";
+            if (FILE* log = fopen(diagnostic.c_str(), "wb")) {
+                fwrite(reason.data(), 1, reason.size(), log);
+                fclose(log);
+            }
+            fprintf(stderr, "[VISTA-WRAPPER] %s\n", reason.c_str());
+            return 1;
+        }
+        std::remove((output + ".error.txt").c_str()); // clear only this build's stale failure diagnostic
+        const std::string successReport = output + ".wrapper.txt";
+        if (FILE* log = fopen(successReport.c_str(), "wb")) {
+            const std::string details =
+                report + "\ncarrierPackage=" + carrierIdentity.packageName +
+                "\noldVersion=" + std::to_string(oldCode) + " / " + oldName +
+                "\nnewVersion=" + std::to_string(newCode) + " / " + newName + "\n";
+            fwrite(details.data(), 1, details.size(), log);
+            fclose(log);
+        }
+        fprintf(stderr, "[VISTA-WRAPPER] %s\n[VISTA-WRAPPER] version %u / %s -> %u / %s\n"
+                        "[VISTA-WRAPPER] OK -> %s\n",
+                report.c_str(), oldCode, oldName.c_str(), newCode, newName.c_str(), output.c_str());
+        return 0;
+    }
+
     // `Quest Home Editor --restore-haven` puts the ORIGINAL Meta Haven 2025 back from the auto-backup the cooker made
     // (folder "Haven2025_Backup" beside the exe) before it installed a spoof, then relaunches the shell.
     if (argc >= 2 && std::string(argv[1]) == "--restore-haven") {
@@ -567,8 +860,28 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // `Quest Home Editor --fetch-tools` pre-downloads the Android signing toolchain (Google build-tools + a Temurin JRE
-    // if no Java) right beside the exe, so later --sign / Cook works on a clean machine with no SDK and no JDK.
+    // `Quest Home Editor --suppress-vista-visuals <real-vista.apk> [out.apk]` keeps the real v206 Vista's
+    // top-level ScenePlatform/runtime layer, but replaces every visible sub-template with a valid no-mesh Root.
+    // Unlike --empty-vista this does not remove the Scene layer the shell needs to render the paired Home.
+    if (argc >= 2 && std::string(argv[1]) == "--suppress-vista-visuals") {
+        if (argc < 3) { fprintf(stderr, "usage: Quest Home Editor --suppress-vista-visuals <real-vista.apk> [out.apk]\n"); return 2; }
+        std::string inp = argv[2];
+        std::vector<uint8_t> real; { FILE* f=fopen(inp.c_str(),"rb"); if(!f){ fprintf(stderr,"[VISTA] cannot open %s\n", inp.c_str()); return 1; }
+            fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ real.resize((size_t)n); if(fread(real.data(),1,(size_t)n,f)!=(size_t)n){ fclose(f); return 1; } } fclose(f); }
+        std::string out = argc >= 4 ? argv[3] : (inp.substr(0, inp.size()>4?inp.size()-4:inp.size()) + "_visuals-suppressed.apk");
+        bool ok=false; size_t suppressed=0; auto apk = hslcook::suppressVistaVisualsApk(real, &ok, &suppressed);
+        if (!ok || apk.empty()) { fprintf(stderr, "[VISTA] visual suppression FAILED (bad/non-v206 Vista APK?)\n"); return 1; }
+        std::string tmp = out + ".unsigned"; { FILE* f=fopen(tmp.c_str(),"wb"); if(!f) return 1; fwrite(apk.data(),1,apk.size(),f); fclose(f); }
+        fprintf(stderr, "[VISTA] suppressed %zu visible sub-templates; kept the real top-level Scene layer\n", suppressed);
+        bool s = hslcook::signApk(tmp, out, [](float f,const char* m){ fprintf(stderr,"  [%3d%%] %s\n",(int)(f*100.f),m); });
+        if (!std::getenv("HSR_KEEP_UNSIGNED")) std::remove(tmp.c_str());
+        if (!s) { fprintf(stderr, "[VISTA] sign FAILED\n"); return 1; }
+        fprintf(stderr, "[VISTA] OK -> %s\n", out.c_str());
+        return 0;
+    }
+
+    // Legacy compatibility helper. Normal builds and --sign use the built-in
+    // Android-v2 signer and need neither these tools nor Java.
     if (argc >= 2 && std::string(argv[1]) == "--fetch-tools") {
         auto p = [](float f, const char* s){ fprintf(stderr, "  [%3d%%] %s\n", (int)(f * 100.f), s); };
         std::string bt = hslcook::downloadBuildTools(p);
@@ -581,6 +894,18 @@ int main(int argc, char** argv) {
 
     std::string apkPath;
     if (argc >= 2) apkPath = argv[1];
+    // Reproducible responsive-UI captures and kiosk setups. Normal launches keep 1280x720 and
+    // can still be freely resized/maximized by the window manager.
+    if (const char* size=std::getenv("HSR_WINDOW_SIZE")) {
+        int w=0,h=0;
+        if (sscanf(size,"%dx%d",&w,&h)==2 && w>=800 && h>=600 && w<=7680 && h<=4320) {
+            g_winW=w; g_winH=h;
+        }
+    }
+    const std::string homeLibrary = AppConfig::initializeHomeLibrary(apkPath);
+    if (!homeLibrary.empty())
+        fprintf(stderr, "[LIBRARY] Quest Homes: %s (saved/cooked/profiles/backups/carriers ready)\n",
+                homeLibrary.c_str());
 
     // ── ONE window, alive from t=0 ─────────────────────────────────────────────────────────────
     // Interactive sessions create the REAL main window IMMEDIATELY — before any scene parsing —
@@ -624,7 +949,7 @@ int main(int argc, char** argv) {
     // reloads in place too (no new process, no focus steal). Everything from scene load to the
     // render loop lives inside this loop; a swap tears down renderer+editor (the window survives)
     // and goes around again with the new path.
-    const std::string sourceEnvPath = apkPath;   // the original source env ("Back to source" target)
+    std::string sourceEnvPath = apkPath;   // authoritative raw env; updated by raw in-place Library/drop swaps
     std::string nextEnv;                          // set by a swap request; empty = normal exit
     for (;;) {
     nextEnv.clear();
@@ -1089,25 +1414,16 @@ int main(int argc, char** argv) {
     if (!loadOk) {
         fprintf(stderr, "\n[MAIN] scene load failed for %s\n", apkPath.c_str());
         if (!interactive) return 1;   // headless/scripted modes: exit with an error, as before
-        // INTERACTIVE: NEVER take the whole editor down because one env failed to parse (a bad/unsupported
-        // APK dropped or passed on the command line). Return to the drop-zone and wait for a valid env — the
-        // window stays alive so the user can drop another environment. (looksLikeLoadableEnv rejects most bad
-        // drops earlier; this catches env-shaped APKs that still fail deeper in the loader.)
-        glfwSetWindowTitle(g_window, ("HSR Renderer - couldn't load " + envBaseName + " - drag an environment .apk here").c_str());
-        g_doReload = false; g_dropPath.clear();
-#ifdef _WIN32
-        HWND failHwnd = glfwGetWin32Window(g_window);
-#endif
-        while (!glfwWindowShouldClose(g_window) && !g_doReload) {
-#ifdef _WIN32
-            paintLoadSplash(failHwnd, nullptr, /*waitingForDrop=*/true);
-#endif
-            glfwWaitEventsTimeout(0.05);
-        }
-        if (!g_doReload || g_dropPath.empty()) { glfwDestroyWindow(g_window); glfwTerminate(); return 0; }
-        apkPath = g_dropPath; g_doReload = false; g_dropPath.clear();
-        envBaseName = apkPath; { size_t sl = envBaseName.find_last_of("/\\"); if (sl != std::string::npos) envBaseName = envBaseName.substr(sl + 1); }
-        continue;   // re-enter the load loop with the newly dropped env
+        // A stale/invalid command-line path used to strand the user in a
+        // separate legacy "Drop an environment here" wait screen. The modern
+        // empty editor already has Browse, Library and in-window drag/drop, so
+        // recover into that full UI instead.
+        apkPath.clear();
+        envBaseName.clear();
+        g_doReload=false;g_dropPath.clear();
+        glfwSetWindowTitle(g_window,(std::string("Quest Home Editor v")+
+            AppConfig::s_version+" - choose a Home from the menu").c_str());
+        continue;
     }
 
     // ── Step B: Init GLFW + Vulkan ─────────────────────────────
@@ -1357,6 +1673,11 @@ int main(int argc, char** argv) {
     int  shotAtFrame = 150;
     if (const char* sf = std::getenv("HSR_SHOT_FRAMES")) { int v=atoi(sf); if (v>0) shotAtFrame=v; }
     bool shotQuit = std::getenv("HSR_SHOT_QUIT") != nullptr;
+    int resizeTestW=0,resizeTestH=0,resizeTestFrame=10;
+    if(const char* rs=std::getenv("HSR_RESIZE_TO"))
+        if(sscanf(rs,"%dx%d",&resizeTestW,&resizeTestH)!=2 || resizeTestW<800 || resizeTestH<600)
+            resizeTestW=resizeTestH=0;
+    if(const char* rf=std::getenv("HSR_RESIZE_FRAME")) {int v=atoi(rf);if(v>0)resizeTestFrame=v;}
     if (const char* solo = std::getenv("HSR_SOLO")) { vkRenderer.soloMesh = atoi(solo); }
     if (const char* sel = std::getenv("HSR_SELECT")) { vkRenderer.selectedMesh = atoi(sel); }  // headless test of selection-highlight (Pass 3)
     if (std::getenv("HSR_SHOWOVERLAY")) { vkRenderer.showNavmesh = vkRenderer.showCollision = vkRenderer.showSpawn = true; }  // headless overlay test
@@ -1634,7 +1955,7 @@ int main(int argc, char** argv) {
                             for (int c = 0; c < 3; c++){
                                 float rep = em.transFrames[(size_t)i0*3+c]*(1.f-fr) + em.transFrames[(size_t)i1*3+c]*fr;
                                 float e2 = std::fabs(rep - fine[(size_t)i2*3+c]); if (e2 > maxe) maxe = e2; } }
-                        // Threshold was span>0.5 && err>max(0.5, 10%): the Star Trek sliding screens (span 0.43,
+                        // Threshold was span>0.5 && err>max(0.5, 10%): short sliding-screen tracks (span 0.43,
                         // STEP-keyed — the 16-point LINEAR replay smears the steps, verify err 0.22 = half the
                         // slide) and the bubbles ambient skyboxes (span 0.95-1.77, err up to 0.42) sat UNDER it
                         // and shipped visibly wrong. Any track the 16-frame lerp can't reproduce within 10% (or
@@ -1727,6 +2048,65 @@ int main(int argc, char** argv) {
                 if (md > 60.f) { int n=opa.animNodeOf((int)mi); if (n>=0){ g_syncNodes.insert(n); int p=opa.animNodeParentOf(n); if(p>=0) g_syncNodes.insert(p); } } } }
         editor.hzAnimExtractor = [&g_opaRot,&g_opaUv,&g_opaFlip,&opa,&g_syncNodes](int meshIdx, int frames, hslcook::ExportMesh& em){
             (void)frames;
+            std::string animSemantic = em.name;
+            std::transform(animSemantic.begin(), animSemantic.end(), animSemantic.begin(),
+                           [](unsigned char c){ return (char)std::tolower(c); });
+            auto semanticHas = [&](const char* s){ return animSemantic.find(s) != std::string::npos; };
+            // OPA scenes may key an entire parent group although some children
+            // are authored as distant architectural scenery. Turning those
+            // children into independent V206 Animator entities makes their pose
+            // depend on VrShell pause/resume events (panels, menus and input-mode
+            // changes). Keep solid backdrop architecture at the authored t=0
+            // pose; explicit moving/effect semantics retain their animation.
+            const bool architectureBackdrop =
+                (semanticHas("city") || semanticHas("skyline") ||
+                 semanticHas("building") || semanticHas("tower") ||
+                 semanticHas("skyscraper") || semanticHas("terrace")) &&
+                !(semanticHas("light") || semanticHas("screen") ||
+                  semanticHas("beam") || semanticHas("train") ||
+                  semanticHas("car") || semanticHas("vehicle") ||
+                  semanticHas("ufo") || semanticHas("balloon") ||
+                  semanticHas("firework") || semanticHas("fog") ||
+                  semanticHas("smoke") || semanticHas("mist") ||
+                  semanticHas("haze") || semanticHas("cloud"));
+            const bool atmosphereCard =
+                semanticHas("fog") || semanticHas("mist") || semanticHas("haze") ||
+                semanticHas("smoke") || semanticHas("cloud");
+            if (architectureBackdrop && !opa.isSkinnedMesh(meshIdx)) {
+                if (std::getenv("HSR_VERBOSE"))
+                    fprintf(stderr, "[OPA-STABILITY] m%d '%s' inherited group track -> fixed architecture pose\n",
+                            meshIdx, em.name.c_str());
+                return;
+            }
+            // Large one-way rigid translation meshes are vulnerable to the static
+            // vertex-limit splitter: converting them to HZANIM creates independently
+            // clocked pieces that can diverge at the route reset. Detect the case from
+            // geometry and the authored track itself, without Home or node names, and
+            // keep one unsplit native-period translation table.
+            std::vector<float> largeOneWayFrames;
+            float largeOneWayLoop = 0.f;
+            bool largeOneWayRigidTrack = false;
+            if (em.positions.size() / 3 >= 30000 &&
+                opa.cookExtractNodeTranslateFrames(
+                    meshIdx, 64, largeOneWayFrames, largeOneWayLoop) &&
+                largeOneWayFrames.size() >= 6) {
+                const size_t last = largeOneWayFrames.size() - 3;
+                const float dx = largeOneWayFrames[last]     - largeOneWayFrames[0];
+                const float dy = largeOneWayFrames[last + 1] - largeOneWayFrames[1];
+                const float dz = largeOneWayFrames[last + 2] - largeOneWayFrames[2];
+                const float endDrift = std::sqrt(dx*dx + dy*dy + dz*dz);
+                float maxExcursion = 0.f;
+                for (size_t k = 0; k + 2 < largeOneWayFrames.size(); k += 3) {
+                    const float ex = largeOneWayFrames[k]     - largeOneWayFrames[0];
+                    const float ey = largeOneWayFrames[k + 1] - largeOneWayFrames[1];
+                    const float ez = largeOneWayFrames[k + 2] - largeOneWayFrames[2];
+                    maxExcursion = std::max(maxExcursion, std::sqrt(ex*ex + ey*ey + ez*ez));
+                }
+                largeOneWayRigidTrack = endDrift > 5.f && maxExcursion > 60.f;
+            }
+            if (largeOneWayRigidTrack) {
+                em.preserveOneWayPeriod = true;
+            }
             // MaterialTint FULL-RGBA cycle (stinson fireworks flash colors / city window-light flicker) — filled
             // FIRST, independent of the motion routing below (shader branches chain a TINTREPLAY frag stage).
             // The baked COLOR_0 already carries the t=0 tint (animate(0) -> md.curTint folded into em.curTint), so
@@ -1825,7 +2205,7 @@ int main(int argc, char** argv) {
                       }
                   }
                   // KEEP the AUTHORED blend (set from md.useBlend/additive in buildExportMeshes): fog/steam are
-                  // authored Transparent:true and stay BLEND, but the storybook River waterCards are authored
+                  // authored Transparent:true and stay BLEND, but some river water cards are authored
                   // OPAQUE (Transparent:false) — the old forced em.blend=true made them alpha-blend with NO depth
                   // write, so overlapping river cards z-fought/sorted wrong and composited darker than OPA
                   // ("not in sync, wrong placements, wrong lighting"). OPA renders them opaque with depth-write.
@@ -1839,6 +2219,24 @@ int main(int argc, char** argv) {
                   if (!std::getenv("HSR_FLIPNOFADE")) { std::vector<float> fa; float floop=0.f;
                       if (opa.cookExtractTintAlpha((int)meshIdx, fa, floop) && fa.size()>=2) {
                           em.fadeAnim=true; em.fadeN=(int)fa.size(); em.fadeFrames=std::move(fa); em.fadeLoop = mLoop; } }
+                  // Full-view atmosphere cards frequently combine node motion with a
+                  // counter-moving UV mask. Porting only one side of that pair makes
+                  // the transparent coverage drift and intermittently exposes holes
+                  // which the authored fog was meant to conceal. Keep the complete
+                  // card at its authored frame-0 state. This also removes both the
+                  // restartable Animator clock and the independently advancing shader
+                  // clock from panel/input-mode transitions.
+                  if (atmosphereCard) {
+                      em.flipbook=false; em.flipOffset=false; em.fadeAnim=false;
+                      em.flipUVMats.clear(); em.flipN=0; em.flipLoop=0.f;
+                      em.fadeFrames.clear(); em.fadeN=0; em.fadeLoop=0.f;
+                      em.uvScroll=false; em.uvRate[0]=em.uvRate[1]=0.f;
+                      em.hzJointCount=0; em.hzFrames=0; em.transAnim=false;
+                      if (std::getenv("HSR_VERBOSE"))
+                          fprintf(stderr, "[OPA-STABILITY] m%d '%s' atmosphere card fixed at authored frame 0\n",
+                                  meshIdx, em.name.c_str());
+                      return;
+                  }
                   // ── MOTION (NO EXCLUSION) ────────────────────────────────────────────────────────────────────────
                   // An effect card whose node ROTATES or SCALES (fog_01 = full T+R+S) can't be faithfully ported by the
                   // getTime TRANSLATE shader alone (a hierarchical / far-pivot / rotating transform would FLING the card —
@@ -1872,11 +2270,11 @@ int main(int argc, char** argv) {
                           // UV/puff mLoop made the steam race along the track and detach from the cart = the regression.
                           em.transAnim=true; em.transN=24; em.transFrames=std::move(tof); em.transLoop=tloop;
                       } else if (md > 1.f) {
-                          // CONVEYOR card (storybook river waterCards: drift ~23u downstream then TELEPORT back upstream
+                          // CONVEYOR card (river water cards: drift downstream then teleport back upstream
                           // MID-loop): the 24-sample getTime TRANSLATE smears that instant teleport across a whole sample
                           // interval (17s/24 ≈ 0.7s) — the card visibly ZIPS back and TEARS the river ("not synced", the
                           // black sliver through the water). RIGID-HZANIM replays the EXACT per-frame node path at native
-                          // resolution with the exclusive-endpoint wrap (instant seam — the cyberhome cars "speed backward"
+                          // resolution with the exclusive-endpoint wrap (instant seam instead of a backward sweep
                           // fix), and the UV flipbook + fade ride the skinned material shader exactly like the fog cards.
                           // VEHICLES (>60u) stay on the getTime TRANSLATE clock — their sibling BODY meshes sync to it.
                           if (!std::getenv("HSR_FLIPNOHZ") && std::getenv("HSR_HZANIM")) {
@@ -1900,8 +2298,13 @@ int main(int argc, char** argv) {
               } }
             // OPA skeletal/rigid HZANIM port — DEFAULT ON (faithful animation). Was gated after an early cooked APK
             // crashed, but the incredibles skinned fix ([[project_hsr_skinned_rendmesh_skinblock]]) made HZANIM stable
-            // on device (cyberhome: loads, no crash, ErrorNotReady only transient). Opt-out via HSR_NOOPAHZ.
+            // on device across large animated Homes. Opt-out via HSR_NOOPAHZ.
             if (!std::getenv("HSR_NOOPAHZ")) {
+            if (std::getenv("HSR_VERBOSE")) {
+                const char* nodeName = opa.animNodeNameOf(meshIdx);
+                if (nodeName && *nodeName)
+                    fprintf(stderr, "[OPA-ANIM-MAP] sourceMesh=%d node='%s'\n", meshIdx, nodeName);
+            }
             // SKINNED HZANIM (door/discs/screens — ALL skinned meshes). Faithful hierarchical → HZAN:SKEL + ACL clip.
             auto e = opa.extractHzAnim(meshIdx);
             if (e.ok()) {
@@ -1925,8 +2328,9 @@ int main(int argc, char** argv) {
             // TRANSLATE clock as the steam so they stay attached (NOT useHz, whose animator clock drifts vs getTime).
             { int myNode = opa.animNodeOf(meshIdx);
               if (myNode>=0 && g_syncNodes.count(myNode)) { std::vector<float> tof; float tloop=0.f;
-                  if (opa.cookExtractNodeTranslateFrames(meshIdx, 24, tof, tloop)) {
-                      em.transAnim=true; em.transN=24; em.transFrames=std::move(tof); em.transLoop=tloop;
+                  constexpr int kVehicleTranslationSamples=24;
+                  if (opa.cookExtractNodeTranslateFrames(meshIdx,kVehicleTranslationSamples,tof,tloop)) {
+                      em.transAnim=true; em.transN=kVehicleTranslationSamples; em.transFrames=std::move(tof); em.transLoop=tloop;
                       em.hzJointCount=0; em.hzFrames=0; em.rotAnim=false; em.uvScroll=false; em.vatOffsets.clear(); em.vatFrames=0;
                       return; } } }
             // NON-skinned node TRANSLATION (cars, comet STREAK) -> 1-joint RIGID HZANIM (DEFAULT, device-proven:
@@ -1937,7 +2341,18 @@ int main(int argc, char** argv) {
             // animator so EVERY skinned mesh (owl/chicken/horses) moves RANDOMLY. Keep node-translations as
             // RIGID-HZANIM. (Earlier "HzAnim skinning is dead/frozen" reading was WRONG HOOKS — env skinning is the
             // HSR MeshShellEnv/JointMatrices path, not the MHE sbSkinningMatrices my hooks watched.)
-            // HSR_NODETRANSLATE = opt-in experiment to reroute to getTime TRANSLATE (BREAKS the animator — debug only).
+            // HSR_NODETRANSLATE remains the all-mesh debug experiment; never enable it implicitly.
+            // Keep the detected large one-way object on one shader clock and one
+            // native-period table; smaller arbitrary movers retain the normal
+            // rigid-HZANIM path below.
+            if (largeOneWayRigidTrack) {
+                em.transAnim=true; em.transN=64;
+                em.transFrames=std::move(largeOneWayFrames);
+                em.transLoop=largeOneWayLoop;
+                em.hzJointCount=0; em.hzFrames=0; em.rotAnim=false; em.uvScroll=false;
+                em.vatOffsets.clear(); em.vatFrames=0;
+                return;
+            }
             if (!std::getenv("HSR_NODETRANSLATE")) {
                 auto rg = opa.extractNodeRigidHzAnim(meshIdx);
                 if (rg.ok()) {
@@ -2040,9 +2455,40 @@ int main(int argc, char** argv) {
     // with HSR_EXPORT_QUIT, exits — lets the editor's Export path run batch / from the command line.
     if (std::getenv("HSR_EXPORT")) {
         if (editor.projectPath.empty()) { editor.projectPath = apkPath; editor.loadProject(); }   // headless cook includes the saved session
+        // Optional batch navigation pass. Use the exact same Smart NavMesh path as the editor button,
+        // but never stack a second walkable collider on a restored session: rebake the existing one
+        // so its already-correct floor remains authoritative. Per-object "Collider (...)" items are
+        // deliberately not treated as a scene navmesh.
+        if (const char* autoNav = std::getenv("HSR_AUTONAV")) {
+            std::string mode(autoNav);
+            for (char& c : mode) c = (char)std::tolower((unsigned char)c);
+            int navMode = (mode == "smart" || mode == "1") ? 1 :
+                          (mode == "flat"  || mode == "0") ? 0 : -1;
+            if (navMode < 0) {
+                fprintf(stderr, "[AUTONAV] invalid HSR_AUTONAV='%s' (expected smart/1 or flat/0)\n", autoNav);
+                return 2;
+            }
+            sitem::Item* walkNav = nullptr;
+            for (auto& it : editor.items) {
+                if (it.type == sitem::NAVMESH && !editor.isMeshColliderItem(it)) {
+                    walkNav = &it;
+                    break;
+                }
+            }
+            if (walkNav) {
+                editor.bakeNavGeometry(*walkNav);
+                fprintf(stderr, "[AUTONAV] preserved + rebaked existing '%s': %zu verts, %zu tris\n",
+                        walkNav->name.c_str(), walkNav->navVerts.size() / 3, walkNav->navIdx.size() / 3);
+            } else {
+                editor.addNavmesh(navMode);
+                const auto& it = editor.items.back();
+                fprintf(stderr, "[AUTONAV] added %s navmesh: %zu verts, %zu tris\n",
+                        navMode == 1 ? "smart" : "flat", it.navVerts.size() / 3, it.navIdx.size() / 3);
+            }
+        }
         // Populate md.positions at the t=0 REST frame (the render loop hasn't run yet). REST (not mid-anim) is REQUIRED:
         // node-anim meshes are dynamicVerts so md.positions is what gets baked, and the getTime TRANSLATE/ROTATE shaders add
-        // their offset RELATIVE TO t=0 — baking a mid-anim frame double-applied the motion (Star Trek screens "go beyond").
+        // their offset RELATIVE TO t=0 — baking a mid-animation frame double-applied the motion.
         // Skinned FLIPBOOKS still collapse here: at t=0 the loop's first cell is the only one ON (others scaled to 0).
         if (isV79 && gltf.hasAnimation()) gltf.animate(0.f);
         else if (isOpa) opa.animate(0.f);   // OPA SKINNED meshes: the skin loader stores PRE-skin (joint-local) basePos, so md.positions
@@ -2056,12 +2502,43 @@ int main(int argc, char** argv) {
         if (std::getenv("HSR_ANIMAUDIT")) {
             editor.setenv_("HSR_HZANIM", editor.animSkinned ? "1" : "");   // same gate setup as exportAPKSync
             auto ems = editor.buildExportMeshes();
+            // Read-only topology audit for mixed source meshes. Connected components are derived solely from
+            // shared triangle vertices and reported with their authored bounds; no geometry is modified.
+            if (const char* topo = std::getenv("HSR_TOPOAUDIT")) {
+                int wanted = atoi(topo);
+                for (const auto& em : ems) if (em.srcMeshIdx == wanted && em.positions.size() >= 9) {
+                    const size_t nv = em.positions.size()/3;
+                    std::vector<uint32_t> parent(nv), rank(nv,0);
+                    for (uint32_t i=0;i<(uint32_t)nv;i++) parent[i]=i;
+                    auto find=[&](uint32_t x){ uint32_t r=x; while(parent[r]!=r)r=parent[r];
+                        while(parent[x]!=x){uint32_t n=parent[x];parent[x]=r;x=n;} return r; };
+                    auto join=[&](uint32_t a,uint32_t b){a=find(a);b=find(b);if(a==b)return;
+                        if(rank[a]<rank[b])std::swap(a,b);parent[b]=a;if(rank[a]==rank[b])rank[a]++;};
+                    for(size_t i=0;i+2<em.indices.size();i+=3){uint32_t a=em.indices[i],b=em.indices[i+1],c=em.indices[i+2];
+                        if(a<nv&&b<nv&&c<nv){join(a,b);join(a,c);}}
+                    struct C { size_t verts=0,tris=0; float mn[3]={1e30f,1e30f,1e30f},mx[3]={-1e30f,-1e30f,-1e30f}; };
+                    std::unordered_map<uint32_t,C> cs;
+                    for(uint32_t v=0;v<(uint32_t)nv;v++){C&c=cs[find(v)];c.verts++;
+                        for(int k=0;k<3;k++){float p=em.positions[(size_t)v*3+k];if(p<c.mn[k])c.mn[k]=p;if(p>c.mx[k])c.mx[k]=p;}}
+                    for(size_t i=0;i+2<em.indices.size();i+=3)if(em.indices[i]<nv)cs[find(em.indices[i])].tris++;
+                    std::vector<C> cv; for(auto&kv:cs)if(kv.second.tris)cv.push_back(kv.second);
+                    std::sort(cv.begin(),cv.end(),[](const C&a,const C&b){return a.tris>b.tris;});
+                    fprintf(stderr,"[TOPO] source m%d '%s': %zu connected components\n",wanted,em.name.c_str(),cv.size());
+                    for(size_t ci=0;ci<cv.size();ci++){const C&c=cv[ci]; if(c.tris<4)continue;
+                        fprintf(stderr,"[TOPO] c%03zu v=%zu t=%zu B=(%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f) C=(%.1f,%.1f,%.1f)\n",
+                            ci,c.verts,c.tris,c.mn[0],c.mn[1],c.mn[2],c.mx[0],c.mx[1],c.mx[2],
+                            (c.mn[0]+c.mx[0])*.5f,(c.mn[1]+c.mx[1])*.5f,(c.mn[2]+c.mx[2])*.5f);
+                    }
+                }
+            }
             // ── [ANIM-VERIFY]: per-ANIMATION numeric fidelity — emulate the DEVICE's replay math from the
             //    baked tables the cook ships (HZANIM joint clip / TRANSLATE / ROTREPLAY / SPIN / SWAY / SCALE)
             //    and diff predicted WORLD probe verts against the source ground truth (gltf.animate(t), the
             //    same positions the desktop preview draws) at NT times across the loop. maxErr>tolerance =
             //    the cooked data does NOT reproduce the source motion — the "trust no label" check.
-            if (isV79 && gltf.hasAnimation() && sceneMeshes && !std::getenv("HSR_NOANIMVERIFY")) {
+            const bool verifyGltfAnim = isV79 && gltf.hasAnimation();
+            const bool verifyOpaAnim = isOpa && opa.animDuration() > 1e-3f;
+            if ((verifyGltfAnim || verifyOpaAnim) && sceneMeshes && !std::getenv("HSR_NOANIMVERIFY")) {
                 struct Probe { size_t emIdx; int mi; const char* repr; float dur; std::vector<u32> vidx; std::vector<float> truth; };
                 std::vector<Probe> probes;
                 float longest = 0.f;
@@ -2091,16 +2568,19 @@ int main(int argc, char** argv) {
                 // truth-comparing beyond it flags faithful clips (shark_reef whale: exact through its own
                 // 15.97s wrap, "wrong" only after the 26.25s master reset the device correctly doesn't have).
                 const int NT = 83;
-                float tEnd = std::min(2.5f * longest, gltf.animDuration > 1e-3f ? gltf.animDuration - 1e-3f : 2.5f*longest);
+                const float sourceAnimDuration = verifyOpaAnim ? opa.animDuration() : gltf.animDuration;
+                float tEnd = std::min(2.5f * longest, sourceAnimDuration > 1e-3f ? sourceAnimDuration - 1e-3f : 2.5f*longest);
                 for (int ti = 0; ti < NT && !probes.empty(); ti++) {
                     float t = tEnd * (float)ti / (float)NT;
-                    gltf.animate(t);   // ground truth: the preview's own CPU pose (world space, chTime per-node wrap)
+                    if (verifyOpaAnim) opa.animate(t);
+                    else gltf.animate(t);   // ground truth: the preview's own CPU pose (world space, per-node wrap)
                     for (auto& p : probes) {
                         const MeshData& md = (*sceneMeshes)[p.mi];
                         for (u32 vi : p.vidx) { p.truth.push_back(md.positions[vi*3]); p.truth.push_back(md.positions[vi*3+1]); p.truth.push_back(md.positions[vi*3+2]); }
                     }
                 }
-                gltf.animate(0.f);   // restore the t=0 rest bake
+                if (verifyOpaAnim) opa.animate(0.f);
+                else gltf.animate(0.f);   // restore the t=0 rest bake
                 // quat->3x3 (xyzw), TRS compose, rigid-TRS invert — the device-side math, reimplemented independently.
                 auto q2m = [](const float* q, float* m){ float x=q[0],y=q[1],z=q[2],w=q[3];
                     m[0]=1-2*(y*y+z*z); m[1]=2*(x*y+w*z);   m[2]=2*(x*z-w*y);
@@ -2294,8 +2774,8 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[ANIM-AUDIT] DONE %zu export meshes\n", ems.size());
             return 0;
         }
-        editor.exportAPKSync();   // synchronous cook + auto-sign with a terminal progress bar
-        if (std::getenv("HSR_EXPORT_QUIT")) return 0;
+        const bool exportOk=editor.exportAPKSync();   // synchronous cook + auto-sign with a terminal progress bar
+        if (std::getenv("HSR_EXPORT_QUIT")) return exportOk ? 0 : 1;
     }
 
     // One-shot Blender export: HSR_BLENDER_EXPORT writes the loaded env to a glTF 2.0 project (meshes + materials +
@@ -2314,6 +2794,10 @@ int main(int argc, char** argv) {
     }
 
     while (!glfwWindowShouldClose(g_window)) {
+        if(resizeTestW>0 && totalFrames==resizeTestFrame) {
+            glfwSetWindowSize(g_window,resizeTestW,resizeTestH);
+            fprintf(stderr,"[UI TEST] live resize -> %dx%d at frame %ld\n",resizeTestW,resizeTestH,totalFrames);
+        }
         auto now = std::chrono::high_resolution_clock::now();
         float dt = std::chrono::duration<float>(now - lastTime).count();
         lastTime = now;
@@ -2881,6 +3365,12 @@ int main(int argc, char** argv) {
     if (!nextEnv.empty() && interactive) {
         // IN-PLACE SWAP: same window, fresh renderer/editor/scene on the new env. The GDI loading
         // splash takes over the window again while the new env parses on the worker thread.
+        const std::string nextName=std::filesystem::path(nextEnv).filename().string();
+        // A raw APK is a new cook base. Finished Rooted/Haven/Vista artifacts
+        // are previews/delivery variants and must keep the prior raw base.
+        if(homelibrary::classifyFileName(nextName).kind==
+               homelibrary::Kind::Unknown)
+            sourceEnvPath=nextEnv;
         apkPath = nextEnv;
         envBaseName = apkPath;
         { size_t sl = envBaseName.find_last_of("/\\"); if (sl != std::string::npos) envBaseName = envBaseName.substr(sl + 1); }

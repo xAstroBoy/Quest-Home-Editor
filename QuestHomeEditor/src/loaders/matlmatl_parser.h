@@ -39,12 +39,12 @@ struct MatlmatlInfo {
     // This MATL is a clone of OUR cook's TRANSPARENT template (cooker/realdome_mat.bin = the unlitblend
     // MATL): the cook only ever patches asset REFS into it, so bytes [0..48) (root offset + magic + vtable)
     // are template-constant. The HSL preview uses this as the FAITHFUL blend signal — paired with an
-    // opaque-family shader it is the cook's ADDITIVE-GLOW signature (storybook godRays "full dark" fix).
+    // opaque-family shader it is the cook's ADDITIVE-GLOW signature.
     bool isCookBlendTpl = false;
     // This MATL is a clone of OUR cook's OPAQUE SKINNED template (cooker/skinned_mat_v2.bin, matSkin2):
     // authoritative "render OPAQUE with depth-write". Needed because parseRendShadForward's f4-omission
     // heuristic MISREADS skinned surfaces (skinuv/unlitdoublesidedskinned report transp=1) -> every cooked
-    // skinned mesh classified alpha-blend/no-depth-write -> the storybook river's overlapping cards
+    // skinned mesh classified alpha-blend/no-depth-write -> overlapping river cards
     // z-fought and composited dark ("wrong placements / wrong lighting"). The cook contract wins.
     bool isCookOpaqueSkinTpl = false;
 };

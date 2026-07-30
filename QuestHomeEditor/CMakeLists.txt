@@ -4,8 +4,13 @@ if(WIN32)
     enable_language(RC)   # compile app.rc -> the .exe file icon
 endif()
 
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ── Bundled Vulkan headers (no SDK needed) ──────────────────────
 set(VULKAN_HEADERS_DIR "${CMAKE_SOURCE_DIR}/third_party/Vulkan-Headers/include")
@@ -48,7 +53,7 @@ include(FetchContent)
 set(BUILD_TESTING OFF CACHE BOOL "Build third-party test suites" FORCE)
 FetchContent_Declare(astcenc
     GIT_REPOSITORY https://github.com/ARM-software/astc-encoder.git
-    GIT_TAG 4.8.0
+    GIT_TAG 5.6.0
     GIT_SHALLOW TRUE
 )
 set(ASTCENC_DECOMPRESSOR OFF CACHE BOOL "" FORCE)
@@ -66,7 +71,7 @@ else()
 endif()
 FetchContent_MakeAvailable(astcenc)
 
-# astcenc 4.8 enables -Werror and supplies both -ffp-model=precise and an explicit
+# astcenc enables -Werror and supplies both -ffp-model=precise and an explicit
 # -ffp-contract setting. Clang 22 diagnoses that intentional combination as an
 # overriding option, which otherwise prevents MinGW/Clang builds before our code is
 # compiled. Keep vendor warnings strict while allowing this one toolchain diagnostic.
@@ -74,23 +79,29 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_
     target_compile_options(${ASTCENC_LIB} PRIVATE -Wno-error=overriding-option)
 endif()
 
-# ── libopus (xiph) — DECODER for Ogg-Opus env audio. Half the official V79 envs (storybook,
+# ── libopus (xiph) — DECODER for Ogg-Opus environment audio. Many official V79 environments
 #    polarvillage, underwater, ...) ship their background loop as Ogg-OPUS, which stb_vorbis can't
 #    decode (PC preview silent + "0 Hz" cook). The tiny Ogg page demux is hand-rolled in
 #    audio_convert.h; opus itself does the packet decode. ──
 FetchContent_Declare(opus
     GIT_REPOSITORY https://github.com/xiph/opus.git
-    GIT_TAG v1.5.2
+    GIT_TAG v1.6
     GIT_SHALLOW TRUE
 )
 set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
 set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(opus)
 
 # ── GLFW — FetchContent or find ─────────────────────────────────
 find_package(glfw3 QUIET)
 if(NOT glfw3_FOUND)
+    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(glfw
         GIT_REPOSITORY https://github.com/glfw/glfw.git
         GIT_TAG 3.4
@@ -317,6 +328,13 @@ if(WIN32)
     target_link_libraries(hsl_cook PRIVATE bcrypt crypt32)   # self-contained APK v2 signing (next increment)
 else()
     target_link_libraries(hsl_cook PRIVATE Threads::Threads m)
+endif()
+
+option(HSR_ENABLE_CLANG_TIDY "Run the curated project clang-tidy checks while compiling" OFF)
+if(HSR_ENABLE_CLANG_TIDY)
+    find_program(HSR_CLANG_TIDY_EXECUTABLE NAMES clang-tidy REQUIRED)
+    set_target_properties(questhomeeditor hsl_cook PROPERTIES
+        CXX_CLANG_TIDY "${HSR_CLANG_TIDY_EXECUTABLE};--config-file=${CMAKE_SOURCE_DIR}/.clang-tidy")
 endif()
 
 option(HSR_BUILD_TESTS "Build Quest Home Editor regression tests" ON)

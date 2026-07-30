@@ -7,6 +7,7 @@
 #include "core/types.h"
 #include "core/config.h"                 // AppConfig::detectBuildTools() — portable Android SDK auto-detect for signing
 #include "core/scene_items.h"           // editor-authored haven2025 components (spawn/chair/collider/wall/hotspot)
+#include "loaders/asmh_parser.h"        // lossless source/carrier ASMH record import for Vista wrappers
 #include "cook/physx_navmesh.h"          // INTEGRATED PhysX navmesh cook (cookNavmeshSEBD — links the vendored PhysX libs)
 #include "cook/haven_manifest_axml.h"   // haven2025's AndroidManifest.xml (binary AXML), hardcoded; the cook rewrites its package
 #include "cook/nuxd_manifest_axml.h"    // nuxd's AndroidManifest.xml (combined NON-footprint env); spoof uses it under the haven package name -> no vista
@@ -19,6 +20,8 @@
 #include <map>
 #include <set>
 #include <tuple>
+#include <algorithm>
+#include <unordered_map>
 #include <unordered_set>                 // voxelSolidBoxes cell occupancy
 #include <cstring>
 #include <cstdint>
@@ -38,6 +41,8 @@
 #include "cook/cook_verify.h"  // cook-time FlatBuffer verifier (device's stock-flatbuffers structural check, schema from Meta assets)
 #include "cook/zip_safety.h"   // safe canonical ZIP names + classic-ZIP overflow preflight
 #include "cook/cook_preflight.h" // deterministic geometry validation before expensive encoding
+#include "cook/cook_quality.h"   // one policy shared by editor, CLI, encoder and cache
+#include "cook/scenery_alpha_policy.h" // pure/tested blend-vs-depth routing for legacy scenery cards
 
 namespace hslcook {
 
@@ -92,6 +97,21 @@ inline uint64_t murmur64A(const uint8_t* data, size_t n, uint64_t seed = 0) {
 
 inline uint16_t f32_to_f16(float f) { uint32_t x; memcpy(&x, &f, 4); uint32_t s = (x >> 16) & 0x8000; int e = ((x >> 23) & 0xff) - 112; uint32_t m = x & 0x7fffff; if (e <= 0) return (uint16_t)s; if (e >= 31) return (uint16_t)(s | 0x7c00); return (uint16_t)(s | (e << 10) | (m >> 13)); }
 
+inline unsigned astcCookThreadCount() {
+    // astcenc owns a sizeable scratch arena per worker. A full hardware thread
+    // count can fragment the Windows heap across a long Home with many 2K/4K
+    // cutout atlases and make a later, otherwise small allocation throw
+    // std::bad_alloc. One worker is the reliable default for large Homes; the
+    // measured end-to-end cook remains dominated by decode/package/PhysX work.
+    // Expert/benchmark override.
+    unsigned n = 1;
+    if (const char* e = std::getenv("HSR_ASTC_THREADS")) {
+        const long requested = std::strtol(e, nullptr, 10);
+        if (requested >= 1 && requested <= 64) n = static_cast<unsigned>(requested);
+    }
+    return n;
+}
+
 // ── RENDMESH (file_id "MESH"): fully replicate nuxd's mesh so the device MeshAssetBuilder accepts it. Vertex
 //    format = nuxd's common stride-20 layout (POS f32x3@0, TEXCOORD0 f16x2@12, NORMAL fmt0x13@16=0xFFFFFFFF).
 //    Structure: VS{ field0=format-hash const, 1=count, 2=VB, 3=attrs(3), 4=content-hash } ; part{ 0=VS,1=IB,
@@ -113,7 +133,7 @@ inline uint16_t f32_to_f16(float f) { uint32_t x; memcpy(&x, &f, 4); uint32_t s 
 // the Quest's culling perf for V79-style "draw everything," which is exactly what porting old homes wants.
 inline void nocullBounds(float aabb[6], float& radius) {
     // DEFAULT ON (V79-faithful "draw everything"): V205's GPU frustum/Hi-Z-occlusion/CLOD/size culler drops cooked-home
-    // meshes that V79 always drew — e.g. cyberhome's flying CARS vanish the moment you look at them (occlusion/size cull).
+    // meshes that V79 always drew — small fast-moving scenery can otherwise vanish under occlusion/size culling.
     // Scene-spanning bounds make V205 treat every mesh as always-visible so it's never wrongly culled. HSR_CULL=1 opts back
     // into the (buggy-for-us) device culler. This is generic: ANY env's small/distant/animated meshes stop disappearing.
     const char* e = std::getenv("HSR_CULL");
@@ -279,7 +299,78 @@ enum : uint32_t { TGT_MESH = 0x4D455348, TGT_TEX = 0x6E4CC522, TGT_SURFACE = 0xA
 // formatCode = color/pixel format enum (11 = sRGB albedo, like nuxd's tx_dome). f2 = ASTC block enum
 // (6x6->18, 8x8->20, 12x12->24). The device GPU-uploads the full mip chain (ErrorInvalidArg without it / with a
 // bad format). A box-filtered RGBA mip chain down to 1x1, each level ASTC-encoded and concatenated into f9.
-inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, int bw = 8, int bh = 8, uint8_t formatCode = 11, bool alphaWeighted = false, int capCols = 1, int capRows = 1, bool coveragePreserve = false, float covCut = 0.5f) {
+inline float astcEncoderQuality(CookEncoderPreset preset) {
+    switch (preset) {
+        case CookEncoderPreset::Fast:       return ASTCENC_PRE_FAST;
+        case CookEncoderPreset::Thorough:   return ASTCENC_PRE_THOROUGH;
+        case CookEncoderPreset::Exhaustive: return ASTCENC_PRE_EXHAUSTIVE;
+        case CookEncoderPreset::Medium:
+        default:                            return ASTCENC_PRE_MEDIUM;
+    }
+}
+
+inline size_t astcMipChainBytes(int w, int h, int bw, int bh, int mipCount) {
+    if (w < 1 || h < 1 || bw < 1 || bh < 1 || mipCount < 1) return 0;
+    size_t bytes = 0;
+    for (int level = 0; level < mipCount; ++level) {
+        const size_t cols = (size_t)(w + bw - 1) / (size_t)bw;
+        const size_t rows = (size_t)(h + bh - 1) / (size_t)bh;
+        if (cols > (SIZE_MAX / 16) / rows) return 0;
+        bytes += cols * rows * 16;
+        w = w > 1 ? w / 2 : 1;
+        h = h > 1 ? h / 2 : 1;
+    }
+    return bytes;
+}
+
+// Performance-profile resize.  Repeated 2x area filtering avoids aliasing and
+// performs RGB averaging in linear light; transparent texels are alpha-weighted
+// so foliage/effects do not gain bright or dark fringes.
+inline std::vector<uint8_t> downscaleRgbaForCook(const uint8_t* src, int srcW, int srcH,
+                                                int maxEdge, bool alphaWeighted,
+                                                int& outW, int& outH) {
+    outW = srcW; outH = srcH;
+    if (!src || srcW < 1 || srcH < 1 || maxEdge < 1 || std::max(srcW, srcH) <= maxEdge) return {};
+    static const std::array<float,256> toLinear = []{
+        std::array<float,256> table{};
+        for (int i=0;i<256;++i) {
+            const float c=(float)i/255.0f;
+            table[(size_t)i] = c <= 0.04045f ? c/12.92f : std::pow((c+0.055f)/1.055f, 2.4f);
+        }
+        return table;
+    }();
+    auto toSrgb=[](float c)->uint8_t{
+        c=std::max(0.0f,std::min(1.0f,c));
+        const float s=c<=0.0031308f ? c*12.92f : 1.055f*std::pow(c,1.0f/2.4f)-0.055f;
+        return (uint8_t)std::max(0,std::min(255,(int)std::lround(s*255.0f)));
+    };
+    std::vector<uint8_t> cur(src, src+(size_t)srcW*srcH*4);
+    int cw=srcW,ch=srcH;
+    while (std::max(cw,ch)>maxEdge) {
+        const int nw=std::max(1,cw/2), nh=std::max(1,ch/2);
+        std::vector<uint8_t> next((size_t)nw*nh*4);
+        for(int y=0;y<nh;++y) for(int x=0;x<nw;++x){
+            const int sx=std::min(cw-1,x*2), sy=std::min(ch-1,y*2);
+            const int sx1=std::min(cw-1,sx+1), sy1=std::min(ch-1,sy+1);
+            const uint8_t* p[4]={&cur[((size_t)sy*cw+sx)*4],&cur[((size_t)sy*cw+sx1)*4],
+                                 &cur[((size_t)sy1*cw+sx)*4],&cur[((size_t)sy1*cw+sx1)*4]};
+            uint8_t* o=&next[((size_t)y*nw+x)*4];
+            const float a[4]={p[0][3]/255.f,p[1][3]/255.f,p[2][3]/255.f,p[3][3]/255.f};
+            o[3]=(uint8_t)std::lround((a[0]+a[1]+a[2]+a[3])*63.75f);
+            const float aw=alphaWeighted ? (a[0]+a[1]+a[2]+a[3]) : 4.0f;
+            for(int c=0;c<3;++c){
+                float linear=0.f;
+                for(int k=0;k<4;++k) linear += toLinear[p[k][c]] * (alphaWeighted?a[k]:1.f);
+                o[c]=aw>1e-6f ? toSrgb(linear/aw) : 0;
+            }
+        }
+        cur.swap(next); cw=nw; ch=nh;
+    }
+    outW=cw; outH=ch;
+    return cur;
+}
+
+inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, int bw = 8, int bh = 8, uint8_t formatCode = 11, bool alphaWeighted = false, int capCols = 1, int capRows = 1, bool coveragePreserve = false, float covCut = 0.5f, CookEncoderPreset encoderPreset = CookEncoderPreset::Medium, uint64_t cachePolicyKey = 0) {
     // capCols/capRows > 1: SPRITESHEET flipbook atlas (capCols×capRows cells). CAP the mip chain so coarse mips never
     // AVERAGE ADJACENT CELLS (device "borders around the animated cards": at distance the GPU picks a coarse mip where
     // all cells blur together, bleeding the neighbour frame in as a rectangular border; desktop uses mip0 so it's clean).
@@ -290,8 +381,8 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
     // small mips, so the device draws a bright halo tracing the card silhouette at minified/grazing
     // edges (the "white border"). Alpha-weighting gives invisible texels ZERO color weight = no bleed.
     // Matches the desktop renderer's createTextureImageAW so cook (device) == preview.
-    // ── CONTENT-HASH DISK CACHE: re-encoding the same texture every re-cook is the dominant cost (lakeside = many
-    //    2048² ASTC encodes ≈ the whole ~10min). Cache the ASTC mip chain by an FNV-1a hash of the FINAL RGBA (+dims+
+    // ── CONTENT-HASH DISK CACHE: re-encoding the same large textures every re-cook is the dominant cost.
+    //    Cache the ASTC mip chain by an FNV-1a hash of the FINAL RGBA (+dims+
     //    block), so re-cooks that change shaders/routing but NOT textures (i.e. every iteration here) skip the encode
     //    entirely -> near-instant re-cooks. HSR_NOTEXCACHE disables it. ──
     uint64_t hsh = 1469598103934665603ull; auto mix=[&](uint64_t v){ hsh=(hsh^v)*1099511628211ull; };
@@ -300,7 +391,9 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
       mix(((uint64_t)(uint32_t)w<<32)|(uint32_t)h); mix(((uint64_t)bw<<8)|(uint32_t)bh); mix(alphaWeighted?0x4157u:0u);
       mix(coveragePreserve?0xC0FFu:0u);   // coverage-preserving alpha mips = distinct chain (bumped: THOROUGH re-encode invalidates old MEDIUM caches)
       if (coveragePreserve) mix((uint64_t)(uint32_t)(covCut*1000.f));   // per-cutoff coverage target = distinct chain
-      mix(((uint64_t)(uint32_t)capCols<<32)|(uint32_t)capRows); }   // cap is part of the mip chain -> distinct cache entry
+      mix(((uint64_t)(uint32_t)capCols<<32)|(uint32_t)capRows);   // cap is part of the mip chain -> distinct cache entry
+      mix(static_cast<uint64_t>(encoderPreset));
+      mix(cachePolicyKey); }
     std::error_code _ec; std::filesystem::path cdir = std::filesystem::temp_directory_path()/"hsr_texcache";
     bool useCache = !std::getenv("HSR_NOTEXCACHE");
     if (useCache) std::filesystem::create_directories(cdir,_ec);
@@ -316,17 +409,24 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
         int lvls = 1; while (lvls < mipCount && (minCell >> lvls) >= 4*blk) lvls++;   // coarsest level keeping cell >= 4 blocks
         if (lvls < mipCount) mipCount = lvls;
     }
-    if (useCache) { std::ifstream f(cf,std::ios::binary); if (f){ data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()); } }
+    const size_t expectedBytes = astcMipChainBytes(w, h, bw, bh, mipCount);
+    if (useCache && expectedBytes) {
+        std::ifstream f(cf,std::ios::binary);
+        if (f) {
+            data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            if (data.size() != expectedBytes) data.clear();  // interrupted/old cache entry: never feed it to the device
+        }
+    }
     if (data.empty()) {                                        // cache miss -> ENCODE (multi-threaded by default)
         astcenc_config cfg{};
         // Masked (coverage-preserved) textures encode at THOROUGH: their mip0 is a re-encode (the coverage
         // chain replaces the byte-exact pass-through) and MEDIUM softened it — balloons "don't look high
         // res". Few masked textures per env, so the extra effort is affordable; everything else stays MEDIUM.
-        float q = coveragePreserve ? ASTCENC_PRE_THOROUGH : ASTCENC_PRE_MEDIUM;
+        float q = astcEncoderQuality(encoderPreset);
         if (astcenc_config_init(ASTCENC_PRF_LDR, (unsigned)bw, (unsigned)bh, 1, q, 0, &cfg) != ASTCENC_SUCCESS) return {};
         const astcenc_swizzle swz = { ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
-        unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());   // ASTC compress parallelizes across all cores
-        astcenc_context* ctx = nullptr; if (astcenc_context_alloc(&cfg, nthreads, &ctx) != ASTCENC_SUCCESS) return {};
+        unsigned nthreads = astcCookThreadCount();
+        astcenc_context* ctx = nullptr; if (astcenc_context_alloc(&cfg, nthreads, &ctx, nullptr) != ASTCENC_SUCCESS) return {};
         std::vector<uint8_t> cur(rgba, rgba + (size_t)w * h * 4); int cw = w, ch = h; bool fail=false; int genLvl = 0;
         // ALPHA-TEST COVERAGE TARGET: the fraction of mip0 texels with alpha >= 128 (the shader's 0.5 discard).
         // Box-averaging alpha down the chain SHRINKS this coverage every level (leaf silhouettes thin, then the
@@ -386,9 +486,24 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
         }
         astcenc_context_free(ctx);
         if (fail) return {};
-        if (useCache) { std::ofstream f(cf,std::ios::binary); f.write((const char*)data.data(),(std::streamsize)data.size()); }
+        if (useCache && data.size() == expectedBytes) {
+            // Write-then-rename keeps a cancelled process from leaving a valid-looking partial entry.
+            std::filesystem::path tmp = cf;
+            tmp += ".tmp." + std::to_string((unsigned long long)std::hash<std::thread::id>{}(std::this_thread::get_id()));
+            {
+                std::ofstream f(tmp,std::ios::binary|std::ios::trunc);
+                if (f) { f.write((const char*)data.data(),(std::streamsize)data.size()); f.flush(); }
+            }
+            std::error_code rec;
+            if (std::filesystem::file_size(tmp, rec) == expectedBytes) {
+                rec.clear(); std::filesystem::remove(cf, rec);
+                rec.clear(); std::filesystem::rename(tmp, cf, rec);
+            }
+            rec.clear(); std::filesystem::remove(tmp, rec);
+        }
     }
-    uint8_t blkEnum = (bw == 6 && bh == 6) ? 18 : (bw == 12 && bh == 12) ? 24 : 20;   // 8x8 default = 20
+    const uint8_t blkEnum = cookAstcSrgbFormatEnum(bw, bh);
+    if (blkEnum == 0) return {};   // never mislabel an unsupported footprint as 8x8
     FB b(data.size() + 512);
     int dv = b.createByteVector(data.data(), data.size());
     b.startObject(10);
@@ -410,7 +525,7 @@ inline std::vector<uint8_t> encodeRendTxtr(const uint8_t* rgba, int w, int h, in
 //    single-face KTX-ASTC whose footprint the device supports (6x6/8x8/12x12 enum). ──
 inline std::vector<uint8_t> encodeRendTxtrFromAstc(const std::vector<uint8_t>& astcMips, int w, int h, int bw, int bh, int mipCount) {
     if (astcMips.empty() || w < 1 || h < 1 || mipCount < 1) return {};
-    uint8_t blkEnum = (bw == 6 && bh == 6) ? 18 : (bw == 12 && bh == 12) ? 24 : (bw == 8 && bh == 8) ? 20 : 0;
+    const uint8_t blkEnum = cookAstcSrgbFormatEnum(bw, bh);
     if (blkEnum == 0) return {};   // unsupported footprint -> caller re-encodes
     FB b(astcMips.size() + 512);
     int dv = b.createByteVector(astcMips.data(), astcMips.size());
@@ -464,8 +579,8 @@ inline std::vector<uint8_t> extendAstcMipChain(const std::vector<uint8_t>& srcAs
     // mid distance; they're tiny (mip1+ of the source count) so the extra encode effort costs ~nothing.
     if (astcenc_config_init(ASTCENC_PRF_LDR, (unsigned)bw, (unsigned)bh, 1, ASTCENC_PRE_THOROUGH, 0, &cfg) != ASTCENC_SUCCESS) return {};
     const astcenc_swizzle swz = { ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
-    unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());
-    astcenc_context* ctx = nullptr; if (astcenc_context_alloc(&cfg, nthreads, &ctx) != ASTCENC_SUCCESS) return {};
+    unsigned nthreads = astcCookThreadCount();
+    astcenc_context* ctx = nullptr; if (astcenc_context_alloc(&cfg, nthreads, &ctx, nullptr) != ASTCENC_SUCCESS) return {};
     std::vector<uint8_t> out = srcAstc; int mips = srcMips; bool fail = false;
     while (true) {
         int cols=(dw+bw-1)/bw, rows=(dh+bh-1)/bh;
@@ -776,9 +891,17 @@ inline std::string spawnPointEntityJson(const std::string& id, const float pos[3
 }
 // Environment ROOT entity — every scene needs one (locomotion: "Invalid environment root cannot teleport player"
 // without it). Identity transform, empty data {}; the scene entities parent to it via RelationChildOf.
-inline std::string rootEntityJson(const std::string& id) {
+inline std::string rootEntityJson(const std::string& id, float xOffset = 0.f,
+                                  float yOffset = 0.f, float zOffset = 0.f) {
+    std::string transform = "{}";
+    if (std::fabs(xOffset) > 1e-6f || std::fabs(yOffset) > 1e-6f || std::fabs(zOffset) > 1e-6f) {
+        char tb[192]; snprintf(tb, sizeof tb,
+            "{\"localPosition\":{\"x\":%.6g,\"y\":%.6g,\"z\":%.6g},\"localRotation\":{\"x\":0,\"y\":0,\"z\":0},\"localScale\":{\"x\":1,\"y\":1,\"z\":1}}",
+            xOffset, yOffset, zOffset);
+        transform = tb;
+    }
     return std::string("{\"id\":\"") + id + "\",\"name\":\"Root\",\"components\":[" +
-        comp("TransformPlatformComponent", 1, "{}") + "],\"attributes\":[]}";
+        comp("TransformPlatformComponent", 1, transform) + "],\"attributes\":[]}";
 }
 // Background music: an entity whose SoundPlatformComponent (v14) AUTO-STARTs + LOOPs a SoundAsset. The asset is the
 // V79 `_BACKGROUND_LOOP.ogg` shipped RAW (manifest type FMOD:SND -> AudioFmodSoundAssetInitializer -> FMOD
@@ -1216,6 +1339,105 @@ inline bool zipAddMemChecked(mz_zip_archive& zip, zipsafety::EntryNameRegistry& 
     return mz_zip_writer_add_mem(&zip, name.c_str(), data, size, flags) != 0;
 }
 
+struct ApkManifestIdentity {
+    std::string packageName;
+    uint32_t versionCode = 0;
+    std::string versionName;
+};
+
+// Read the identity fields from the manifest start element. Unlike the old
+// version patching API this does not require callers to guess the carrier's
+// current revision.
+inline bool readAxmlManifestIdentity(const std::vector<uint8_t>& axml,
+                                     ApkManifestIdentity& identity) {
+    identity = {};
+    auto u16=[&](size_t o){ uint16_t v=0; if(o+2<=axml.size()) memcpy(&v,&axml[o],2); return v; };
+    auto u32=[&](size_t o){ uint32_t v=0; if(o+4<=axml.size()) memcpy(&v,&axml[o],4); return v; };
+    if (axml.size()<8 || u16(0)!=0x0003) return false;
+    const size_t sp=8;
+    if (sp+28>axml.size() || u16(sp)!=0x0001) return false;
+    const uint16_t spHdr=u16(sp+2);
+    const uint32_t spSize=u32(sp+4), strCount=u32(sp+8), flags=u32(sp+16), stringsStart=u32(sp+20);
+    if (spSize<spHdr || sp+spSize>axml.size()) return false;
+    const bool utf8=(flags&0x100)!=0;
+    const size_t off0=sp+spHdr, sbase=sp+stringsStart;
+    if (off0+static_cast<size_t>(strCount)*4>sp+spSize || sbase>sp+spSize) return false;
+    auto getStr=[&](uint32_t idx)->std::string {
+        if(idx>=strCount) return "";
+        const size_t offsetAt=off0+static_cast<size_t>(idx)*4;
+        const size_t p=sbase+u32(offsetAt);
+        if(p>=sp+spSize) return "";
+        if(utf8) {
+            auto len=[&](size_t& q, uint32_t& n)->bool {
+                if(q>=sp+spSize) return false;
+                n=axml[q++];
+                if(n&0x80) { if(q>=sp+spSize) return false; n=((n&0x7f)<<8)|axml[q++]; }
+                return true;
+            };
+            size_t q=p; uint32_t chars=0, bytes=0;
+            if(!len(q,chars) || !len(q,bytes) || q+bytes>sp+spSize) return "";
+            return std::string(reinterpret_cast<const char*>(&axml[q]), bytes);
+        }
+        if(p+2>sp+spSize) return "";
+        uint32_t chars=u16(p); size_t q=p+2;
+        if(chars&0x8000) { if(q+2>sp+spSize) return ""; chars=((chars&0x7fff)<<16)|u16(q); q+=2; }
+        if(q+static_cast<size_t>(chars)*2>sp+spSize) return "";
+        std::string s; s.reserve(chars);
+        for(uint32_t i=0;i<chars;++i) s.push_back(static_cast<char>(u16(q+i*2)&0xff));
+        return s;
+    };
+    size_t chunk=sp+spSize;
+    while(chunk+36<=axml.size()) {
+        const uint16_t type=u16(chunk); const uint32_t bytes=u32(chunk+4);
+        if(bytes<8 || chunk+bytes>axml.size()) return false;
+        if(type==0x0102 && getStr(u32(chunk+20))=="manifest") {
+            const uint16_t stride=u16(chunk+26), count=u16(chunk+28);
+            size_t attr=chunk+16+u16(chunk+24);
+            if(stride<20 || attr+static_cast<size_t>(count)*stride>chunk+bytes) return false;
+            for(uint16_t i=0;i<count;++i,attr+=stride) {
+                const std::string name=getStr(u32(attr+4));
+                const uint32_t raw=u32(attr+8), typed=u32(attr+16);
+                const uint8_t dataType=axml[attr+15];
+                auto stringValue=[&](){ return raw!=0xffffffffu ? getStr(raw) : getStr(typed); };
+                if(name=="package") identity.packageName=stringValue();
+                else if(name=="versionName") identity.versionName=stringValue();
+                else if(name=="versionCode" && (dataType==0x10 || dataType==0x11))
+                    identity.versionCode=typed;
+            }
+            return !identity.packageName.empty() && identity.versionCode!=0 && !identity.versionName.empty();
+        }
+        chunk+=bytes;
+    }
+    return false;
+}
+
+inline bool extractZipEntryBytes(const std::vector<uint8_t>& archive,
+                                 const char* entryName,
+                                 uint64_t maxBytes,
+                                 std::vector<uint8_t>& bytes);
+
+inline bool readApkManifestIdentity(const std::vector<uint8_t>& apk,
+                                    ApkManifestIdentity& identity) {
+    std::vector<uint8_t> manifest;
+    return extractZipEntryBytes(apk, "AndroidManifest.xml",
+                                zipsafety::kApkReadLimits.maxTotalUncompressedBytes,
+                                manifest) &&
+           readAxmlManifestIdentity(manifest, identity);
+}
+
+inline std::string incrementDottedVersionName(const std::string& current) {
+    const size_t dot=current.find_last_of('.');
+    const size_t begin=dot==std::string::npos ? 0 : dot+1;
+    if(begin>=current.size()) return "";
+    uint64_t tail=0;
+    for(size_t i=begin;i<current.size();++i) {
+        if(current[i]<'0' || current[i]>'9') return "";
+        tail=tail*10+static_cast<unsigned>(current[i]-'0');
+        if(tail>=UINT32_MAX) return "";
+    }
+    return current.substr(0,begin)+std::to_string(tail+1);
+}
+
 inline bool zipFinalizeHeapChecked(mz_zip_archive& zip, std::vector<uint8_t>& bytes) {
     void* data = nullptr;
     size_t size = 0;
@@ -1319,6 +1541,82 @@ inline std::vector<uint8_t> buildStoredZip(const std::vector<CookFile>& files) {
     return out;
 }
 
+// Patch integer-valued attributes in binary Android XML without rebuilding the
+// XML tree.  Android stores both manifest android:versionCode and Meta's
+// com.facebook.build_id as TYPE_INT_DEC values.  Keeping the old NUXD v82
+// values made Horizon OS v206 immediately replace a freshly installed no-root
+// carrier with the newer official Haven package.  Only matching typed integer
+// attribute payloads are changed; resource ids and unrelated chunk data stay
+// byte-for-byte intact.
+inline std::vector<uint8_t> patchAxmlTypedInt(const std::vector<uint8_t>& axml,
+                                             uint32_t oldValue,
+                                             uint32_t newValue) {
+    std::vector<uint8_t> out = axml;
+    auto u16 = [&](size_t o) -> uint16_t {
+        uint16_t v = 0;
+        if (o + sizeof(v) <= out.size()) memcpy(&v, out.data() + o, sizeof(v));
+        return v;
+    };
+    auto u32 = [&](size_t o) -> uint32_t {
+        uint32_t v = 0;
+        if (o + sizeof(v) <= out.size()) memcpy(&v, out.data() + o, sizeof(v));
+        return v;
+    };
+    if (out.size() < 16 || u16(0) != 0x0003) return axml;
+    size_t chunk = 8;
+    if (u16(chunk) != 0x0001) return axml;
+    const uint32_t stringPoolBytes = u32(chunk + 4);
+    if (stringPoolBytes < 8 || chunk + stringPoolBytes > out.size()) return axml;
+    chunk += stringPoolBytes;
+
+    while (chunk + 8 <= out.size()) {
+        const uint16_t type = u16(chunk);
+        const uint32_t bytes = u32(chunk + 4);
+        if (bytes < 8 || chunk + bytes > out.size()) return axml;
+        if (type == 0x0102 && chunk + 36 <= out.size()) { // RES_XML_START_ELEMENT_TYPE
+            const size_t attrs = chunk + 16 + u16(chunk + 24);
+            const uint16_t count = u16(chunk + 28);
+            const uint16_t stride = u16(chunk + 26);
+            if (stride < 20 || attrs + static_cast<size_t>(count) * stride > chunk + bytes)
+                return axml;
+            for (uint16_t i = 0; i < count; ++i) {
+                const size_t attr = attrs + static_cast<size_t>(i) * stride;
+                const uint8_t dataType = out[attr + 15];
+                if ((dataType == 0x10 || dataType == 0x11) && u32(attr + 16) == oldValue)
+                    memcpy(out.data() + attr + 16, &newValue, sizeof(newValue));
+            }
+        }
+        chunk += bytes;
+    }
+    return out;
+}
+
+inline std::vector<uint8_t> v206NoRootCarrierManifest() {
+    constexpr uint32_t kNuxdV82Build = 765641119u;
+    constexpr uint32_t kHavenV206BuildPlusOne = 974700779u;
+    std::vector<uint8_t> data(NUXD_MANIFEST_AXML,
+                              NUXD_MANIFEST_AXML + NUXD_MANIFEST_AXML_LEN);
+    data = patchAxml(data, "82.0.0.0.277", "206.0.0.0.71", /*exact=*/true);
+    return patchAxmlTypedInt(data, kNuxdV82Build, kHavenV206BuildPlusOne);
+}
+
+inline std::vector<uint8_t> buildEnvironmentManifest(const std::string& newPkg,
+                                                     bool nuxdIdentity,
+                                                     bool footprintIdentity) {
+    if (footprintIdentity) {
+        std::vector<uint8_t> hm(HAVEN_MANIFEST_AXML,
+                                HAVEN_MANIFEST_AXML + HAVEN_MANIFEST_AXML_LEN);
+        return patchAxml(hm, "com.meta.shell.env.footprint.haven2025", newPkg);
+    }
+    if (nuxdIdentity) {
+        return v206NoRootCarrierManifest();
+    }
+    std::vector<uint8_t> hm(HAVEN_MANIFEST_AXML,
+                            HAVEN_MANIFEST_AXML + HAVEN_MANIFEST_AXML_LEN);
+    auto data = patchAxml(hm, "com.meta.shell.env.footprint.haven2025", newPkg);
+    return patchAxml(data, "footprint", "combined", /*exact=*/true);
+}
+
 // Splice a freshly-cooked scene.zip into the V203 shell. STANDALONE: the donor files (classes.dex / resources.arsc /
 // kotlin builtins / res / assets) are EMBEDDED (no external Nuxd.apk); the AndroidManifest is hardcoded (haven), the
 // scene.zip is the env's. Returns the unsigned APK bytes. `baseApk` is ignored (kept for signature compatibility).
@@ -1326,7 +1624,7 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
                                       const std::string& oldPkg, const std::string& newPkg, bool* ok = nullptr,
                                       const std::string& editorSession = {}, bool nuxdIdentity = false,
                                       bool footprintIdentity = false) {
-    (void)baseApk; (void)oldPkg;
+    (void)oldPkg;
     if (ok) *ok = false;
     if (sceneZip.empty()) return {};
     mz_zip_archive out; memset(&out,0,sizeof out);
@@ -1334,13 +1632,39 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
     zipsafety::EntryNameRegistry names;
     auto donor = embassets::nuxdDonor();   // every kept Nuxd file (scene.zip + AndroidManifest are added below, not here)
     if (donor.empty()) { mz_zip_writer_end(&out); return {}; }
+    std::vector<uint8_t> sourceNavmesh;
+    if (!baseApk.empty()) {
+        FILE* f=fopen(baseApk.c_str(),"rb");
+        if(f){
+            fseek(f,0,SEEK_END);const long n=ftell(f);fseek(f,0,SEEK_SET);
+            if(n>0){
+                std::vector<uint8_t> sourceApk((size_t)n);
+                if(fread(sourceApk.data(),1,sourceApk.size(),f)==sourceApk.size())
+                    extractZipEntryBytes(sourceApk,"assets/navmesh",
+                        zipsafety::kApkReadLimits.maxTotalUncompressedBytes,sourceNavmesh);
+            }
+            fclose(f);
+        }
+    }
     bool writerOk = true;
     auto addFile = [&](const std::string& name, const std::vector<uint8_t>& data){
         if (!writerOk) return;
-        mz_uint fl = (name=="resources.arsc")?MZ_NO_COMPRESSION:MZ_DEFAULT_COMPRESSION;
+        // scene.zip is a large nested archive. Re-running the default/high-effort
+        // Deflate pass for both APK variants dominated cold builds. Level 1 keeps
+        // the useful size reduction while avoiding that disproportionate CPU cost.
+        mz_uint fl = name=="resources.arsc" ? MZ_NO_COMPRESSION
+                   : name=="assets/scene.zip" ? MZ_BEST_SPEED
+                   : MZ_DEFAULT_COMPRESSION;
         writerOk = zipAddMemChecked(out, names, name, data.data(), data.size(), fl);
     };
-    for (const auto& kv : donor) addFile(kv.first, kv.second);       // donor excludes scene.zip / manifest / META-INF
+    for (const auto& kv : donor) {
+        if(!sourceNavmesh.empty()&&kv.first=="assets/navmesh")continue;
+        addFile(kv.first, kv.second);
+    }
+    if(!sourceNavmesh.empty()){
+        addFile("assets/navmesh",sourceNavmesh);
+        fprintf(stderr,"[COOK] preserved authoritative source assets/navmesh (%zu bytes)\n",sourceNavmesh.size());
+    }
     addFile("assets/scene.zip", sceneZip);
     if (!editorSession.empty())   // self-contained round-trip: the editor reads this back when a cooked APK has no source .hsledit
         addFile("assets/_editor_session.hsledit", std::vector<uint8_t>(editorSession.begin(), editorSession.end()));
@@ -1368,7 +1692,7 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
             // HARDCODED nuxd combined-env manifest with the package name ALREADY rewritten to haven2025 offline
             // (cooker/gen_haven_combined_manifest.py). Used verbatim — no runtime AXML surgery. newPkg is ignored.
             (void)newPkg;
-            data.assign(NUXD_MANIFEST_AXML, NUXD_MANIFEST_AXML + NUXD_MANIFEST_AXML_LEN);
+            data = v206NoRootCarrierManifest();
         }
         if (data.empty()) {
             // Fallback (nuxd manifest unreadable): hardcoded haven manifest, package renamed + package_type flipped.
@@ -1376,7 +1700,7 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
             data = patchAxml(hm, "com.meta.shell.env.footprint.haven2025", newPkg);
             data = patchAxml(data, "footprint", "combined", /*exact=*/true);
         }
-        addFile(name, std::move(data));
+        addFile(name, data);
     }
     if (!writerOk) { mz_zip_writer_end(&out); return {}; }
     std::vector<uint8_t> apk;
@@ -1388,6 +1712,1544 @@ inline std::vector<uint8_t> spliceAPK(const std::string& baseApk, const std::vec
 }
 
 // ── High-level "Export APK" — the editor calls this. Pass the cooked scene assets; get an unsigned APK. ──
+// Build a second package identity without recompressing the already-compressed
+// scene.zip. Every unchanged entry is copied in its compressed form and only
+// AndroidManifest.xml is regenerated. Both APK variants therefore contain
+// identical cooked scene bytes.
+inline std::vector<uint8_t> cloneApkWithManifest(const std::vector<uint8_t>& sourceApk,
+                                                 const std::string& newPkg,
+                                                 bool nuxdIdentity,
+                                                 bool footprintIdentity,
+                                                 bool* ok = nullptr) {
+    if (ok) *ok = false;
+    if (sourceApk.empty()) return {};
+
+    mz_zip_archive in{};
+    if (!mz_zip_reader_init_mem(&in, sourceApk.data(), sourceApk.size(), 0)) return {};
+    mz_zip_archive out{};
+    if (!mz_zip_writer_init_heap(&out, 0, 0)) {
+        mz_zip_reader_end(&in);
+        return {};
+    }
+
+    zipsafety::ArchiveReadBudget budget(zipsafety::kApkReadLimits);
+    zipsafety::EntryNameRegistry outputNames;
+    const mz_uint count = mz_zip_reader_get_num_files(&in);
+    bool copied = true;
+    bool sawManifest = false;
+
+    for (mz_uint i = 0; copied && i < count; ++i) {
+        mz_zip_archive_file_stat stat{};
+        if (!mz_zip_reader_file_stat(&in, i, &stat)) { copied = false; break; }
+        const mz_uint nameBytes = mz_zip_reader_get_filename(&in, i, nullptr, 0);
+        if (nameBytes == 0 || nameBytes > zipsafety::kZip16Max + 1) { copied = false; break; }
+        std::vector<char> raw(nameBytes);
+        if (!mz_zip_reader_get_filename(&in, i, raw.data(), nameBytes)) { copied = false; break; }
+        const bool directory = mz_zip_reader_is_file_a_directory(&in, i) != 0;
+        std::string normalized;
+        const auto read = budget.add(std::string_view(raw.data(), nameBytes - 1),
+                                     static_cast<uint64_t>(stat.m_uncomp_size),
+                                     directory, &normalized);
+        if (read.status != zipsafety::ArchiveReadStatus::Ok) { copied = false; break; }
+        if (directory) continue;
+        const std::string original(raw.data(), nameBytes - 1);
+        if (original != normalized) { copied = false; break; }
+        if (normalized == "AndroidManifest.xml") { sawManifest = true; continue; }
+        if (outputNames.add(normalized) != zipsafety::NameStatus::Ok ||
+            !mz_zip_writer_add_from_zip_reader(&out, &in, i)) {
+            copied = false;
+            break;
+        }
+    }
+
+    const auto manifest = buildEnvironmentManifest(newPkg, nuxdIdentity, footprintIdentity);
+    if (!copied || !sawManifest || manifest.empty() ||
+        !zipAddMemChecked(out, outputNames, "AndroidManifest.xml",
+                         manifest.data(), manifest.size(), MZ_DEFAULT_COMPRESSION)) {
+        mz_zip_writer_end(&out);
+        mz_zip_reader_end(&in);
+        return {};
+    }
+
+    std::vector<uint8_t> apk;
+    const bool finalized = zipFinalizeHeapChecked(out, apk);
+    mz_zip_writer_end(&out);
+    mz_zip_reader_end(&in);
+    if (!finalized) return {};
+    if (ok) *ok = true;
+    return apk;
+}
+
+inline bool extractZipEntryBytes(const std::vector<uint8_t>& archive,
+                                 const char* entryName,
+                                 uint64_t maxBytes,
+                                 std::vector<uint8_t>& out) {
+    out.clear();
+    if (archive.empty() || !entryName) return false;
+    mz_zip_archive zip{};
+    if (!mz_zip_reader_init_mem(&zip, archive.data(), archive.size(), 0)) return false;
+    const int index = mz_zip_reader_locate_file(&zip, entryName, nullptr, 0);
+    if (index < 0) { mz_zip_reader_end(&zip); return false; }
+    mz_zip_archive_file_stat stat{};
+    if (!mz_zip_reader_file_stat(&zip, static_cast<mz_uint>(index), &stat) ||
+        stat.m_uncomp_size == 0 || stat.m_uncomp_size > maxBytes ||
+        stat.m_uncomp_size > out.max_size()) {
+        mz_zip_reader_end(&zip);
+        return false;
+    }
+    size_t bytes = 0;
+    void* raw = mz_zip_reader_extract_to_heap(&zip, static_cast<mz_uint>(index), &bytes, 0);
+    if (raw && bytes == stat.m_uncomp_size)
+        out.assign(static_cast<const uint8_t*>(raw), static_cast<const uint8_t*>(raw) + bytes);
+    if (raw) mz_free(raw);
+    mz_zip_reader_end(&zip);
+    return !out.empty();
+}
+
+// Fail closed if the standalone-Haven carrier drifts away from AstroBoy's
+// device-proven NUXD-combined runtime/manifest pairing. On VrShell 206 this
+// works when Calming is the active transition slot. The former Haven-static
+// compatibility carrier installs cleanly but renders black.
+inline bool validateProvenCombinedHavenCarrier(const std::vector<uint8_t>& apk) {
+    std::vector<uint8_t> manifest, dex;
+    if (!extractZipEntryBytes(apk, "AndroidManifest.xml",
+                              zipsafety::kApkReadLimits.maxTotalUncompressedBytes,
+                              manifest) ||
+        !extractZipEntryBytes(apk, "classes.dex",
+                              zipsafety::kApkReadLimits.maxTotalUncompressedBytes,
+                              dex))
+        return false;
+
+    const auto expectedManifest = buildEnvironmentManifest(
+        "com.meta.shell.env.footprint.haven2025",
+        /*nuxdIdentity=*/true,
+        /*footprintIdentity=*/false);
+    if (manifest != expectedManifest) return false;
+
+    const auto donor = embassets::nuxdDonor();
+    for (const auto& entry : donor)
+        if (entry.first == "classes.dex") return dex == entry.second;
+    return false;
+}
+
+// Materialize a scene archive with strict name/size accounting.  Vista wrapper
+// construction needs to preserve every official file while replacing only two
+// HSTF templates and the ASMH manifest.
+inline bool readSceneArchiveFiles(const std::vector<uint8_t>& sceneZip,
+                                  std::vector<CookFile>& files) {
+    files.clear();
+    mz_zip_archive zip{};
+    if (sceneZip.empty() || !mz_zip_reader_init_mem(&zip, sceneZip.data(), sceneZip.size(), 0))
+        return false;
+    zipsafety::ArchiveReadBudget budget(zipsafety::kSceneReadLimits);
+    zipsafety::EntryNameRegistry names;
+    const mz_uint count = mz_zip_reader_get_num_files(&zip);
+    bool good = true;
+    for (mz_uint i = 0; good && i < count; ++i) {
+        mz_zip_archive_file_stat stat{};
+        if (!mz_zip_reader_file_stat(&zip, i, &stat)) { good = false; break; }
+        const mz_uint nameBytes = mz_zip_reader_get_filename(&zip, i, nullptr, 0);
+        if (nameBytes == 0 || nameBytes > zipsafety::kZip16Max + 1) { good = false; break; }
+        std::vector<char> rawName(nameBytes);
+        if (!mz_zip_reader_get_filename(&zip, i, rawName.data(), nameBytes)) { good = false; break; }
+        const bool directory = mz_zip_reader_is_file_a_directory(&zip, i) != 0;
+        std::string normalized;
+        const auto read = budget.add(std::string_view(rawName.data(), nameBytes - 1),
+                                     static_cast<uint64_t>(stat.m_uncomp_size), directory, &normalized);
+        if (read.status != zipsafety::ArchiveReadStatus::Ok) { good = false; break; }
+        if (directory) continue;
+        if (std::string(rawName.data(), nameBytes - 1) != normalized ||
+            names.add(normalized) != zipsafety::NameStatus::Ok) { good = false; break; }
+        size_t bytes = 0;
+        void* raw = mz_zip_reader_extract_to_heap(&zip, i, &bytes, 0);
+        if (!raw || bytes != stat.m_uncomp_size) {
+            if (raw) mz_free(raw);
+            good = false;
+            break;
+        }
+        files.push_back({ normalized,
+                          std::vector<uint8_t>(static_cast<const uint8_t*>(raw),
+                                               static_cast<const uint8_t*>(raw) + bytes) });
+        mz_free(raw);
+    }
+    mz_zip_reader_end(&zip);
+    if (!good) files.clear();
+    return good;
+}
+
+inline bool jsonObjectArray(const std::string& json, const std::string& key,
+                            std::vector<std::string>& objects) {
+    objects.clear();
+    const size_t keyAt = json.find("\"" + key + "\"");
+    const size_t arrayAt = keyAt == std::string::npos ? std::string::npos : json.find('[', keyAt);
+    if (arrayAt == std::string::npos) return false;
+    size_t p = arrayAt + 1;
+    while (p < json.size()) {
+        while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\r' ||
+                                   json[p] == '\n' || json[p] == ',')) ++p;
+        if (p >= json.size()) return false;
+        if (json[p] == ']') return true;
+        if (json[p] != '{') return false;
+        const size_t begin = p;
+        int depth = 0;
+        bool quoted = false, escaped = false;
+        for (; p < json.size(); ++p) {
+            const char ch = json[p];
+            if (quoted) {
+                if (escaped) escaped = false;
+                else if (ch == '\\') escaped = true;
+                else if (ch == '"') quoted = false;
+                continue;
+            }
+            if (ch == '"') { quoted = true; continue; }
+            if (ch == '{') ++depth;
+            else if (ch == '}' && --depth == 0) {
+                objects.push_back(json.substr(begin, p - begin + 1));
+                ++p;
+                break;
+            }
+        }
+        if (depth != 0) return false;
+    }
+    return false;
+}
+
+inline std::string jsonStringValue(const std::string& json,
+                                   const std::string& key);
+
+// Remove generated helper entities from a compact HSTF template without
+// reserializing the surviving entities.  Keeping their original JSON bytes is
+// important because these legacy templates are otherwise already known-good.
+inline bool stripNamedHstfEntities(std::vector<uint8_t>& bytes,
+                                   const std::string& exactName,
+                                   size_t& removedCount) {
+    removedCount = 0;
+    if (bytes.empty()) return false;
+    const std::string input(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    std::vector<std::string> entities, relationships;
+    if (!jsonObjectArray(input, "entities", entities) ||
+        !jsonObjectArray(input, "relationships", relationships)) return false;
+
+    const size_t versionKey = input.find("\"version\"");
+    const size_t versionColon = versionKey == std::string::npos
+                              ? std::string::npos : input.find(':', versionKey);
+    if (versionColon == std::string::npos) return false;
+    size_t versionFirst = versionColon + 1;
+    while (versionFirst < input.size() &&
+           (input[versionFirst] == ' ' || input[versionFirst] == '\t')) ++versionFirst;
+    size_t versionLast = versionFirst;
+    while (versionLast < input.size() &&
+           input[versionLast] >= '0' && input[versionLast] <= '9') ++versionLast;
+    if (versionLast == versionFirst) return false;
+    const std::string version = input.substr(versionFirst, versionLast - versionFirst);
+
+    std::unordered_set<std::string> removedIds;
+    std::vector<std::string> keptEntities;
+    keptEntities.reserve(entities.size());
+    for (const auto& entity : entities) {
+        const std::string name = jsonStringValue(entity, "name");
+        const bool matchesGeneratedFamily =
+            name == exactName ||
+            (name.size() > exactName.size() &&
+             name.compare(0, exactName.size(), exactName) == 0 &&
+             name[exactName.size()] == ' ');
+        if (!matchesGeneratedFamily) {
+            keptEntities.push_back(entity);
+            continue;
+        }
+        const std::string id = jsonStringValue(entity, "id");
+        if (id.empty() || !removedIds.emplace(id).second) return false;
+        ++removedCount;
+    }
+
+    std::vector<std::string> keptRelationships;
+    keptRelationships.reserve(relationships.size());
+    for (const auto& relationship : relationships) {
+        const std::string source = jsonStringValue(relationship, "source");
+        const std::string destination = jsonStringValue(relationship, "destination");
+        if (removedIds.count(source) || removedIds.count(destination)) continue;
+        keptRelationships.push_back(relationship);
+    }
+
+    std::string output = "{\"version\":" + version + ",\"entities\":[";
+    for (size_t i = 0; i < keptEntities.size(); ++i) {
+        if (i) output.push_back(',');
+        output += keptEntities[i];
+    }
+    output += "],\"relationships\":[";
+    for (size_t i = 0; i < keptRelationships.size(); ++i) {
+        if (i) output.push_back(',');
+        output += keptRelationships[i];
+    }
+    output += "]}";
+    bytes.assign(output.begin(), output.end());
+    return !bytes.empty();
+}
+
+inline bool replaceJsonNumberAfter(std::string& json, size_t begin,
+                                   const std::string& key, const std::string& value) {
+    const size_t keyAt = json.find("\"" + key + "\"", begin);
+    const size_t colon = keyAt == std::string::npos ? std::string::npos : json.find(':', keyAt);
+    if (colon == std::string::npos) return false;
+    size_t first = colon + 1;
+    while (first < json.size() && (json[first] == ' ' || json[first] == '\t')) ++first;
+    size_t last = first;
+    while (last < json.size() && (json[last] == '-' || json[last] == '+' || json[last] == '.' ||
+                                  json[last] == 'e' || json[last] == 'E' ||
+                                  (json[last] >= '0' && json[last] <= '9'))) ++last;
+    if (last == first) return false;
+    json.replace(first, last - first, value);
+    return true;
+}
+
+inline bool jsonNumberAfter(const std::string& json, size_t begin,
+                            const std::string& key, double& value) {
+    const size_t keyAt = json.find("\"" + key + "\"", begin);
+    const size_t colon = keyAt == std::string::npos ? std::string::npos : json.find(':', keyAt);
+    if (colon == std::string::npos) return false;
+    const char* first = json.c_str() + colon + 1;
+    char* last = nullptr;
+    value = std::strtod(first, &last);
+    return last && last != first && std::isfinite(value);
+}
+
+// Smart-nav fallback floors are emitted as overlapping vertical columns. Their
+// top faces are useful, but a six-metre-deep column exposes tall invisible side
+// walls wherever adjacent samples have different heights. Preserve every top
+// face exactly while shortening only the depth below it.
+inline bool thinNavBoxSupports(std::vector<uint8_t>& bytes, size_t& changed) {
+    changed = 0;
+    const std::string input(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    std::vector<std::string> entities, relationships;
+    if (!jsonObjectArray(input, "entities", entities) ||
+        !jsonObjectArray(input, "relationships", relationships)) return false;
+    for (auto& entity : entities) {
+        if (jsonStringValue(entity, "name") != "NavBox") continue;
+        const size_t transform =
+            entity.find("horizon::platform_api::TransformPlatformComponent");
+        const size_t collider =
+            entity.find("horizon::platform_api::ColliderBoxPlatformComponent");
+        const size_t position = entity.find("\"localPosition\"", transform);
+        const size_t half = entity.find("\"halfExtents\"", collider);
+        double centerY = 0.0, halfY = 0.0;
+        if (transform == std::string::npos || collider == std::string::npos ||
+            position == std::string::npos || half == std::string::npos ||
+            !jsonNumberAfter(entity, position, "y", centerY) ||
+            !jsonNumberAfter(entity, half, "y", halfY) ||
+            std::fabs(halfY - 3.0) > 0.001)
+            return false;
+        constexpr double kThinHalfHeight = 0.35;
+        const double raisedCenter = centerY + halfY - kThinHalfHeight;
+        if (!replaceJsonNumberAfter(entity, position, "y", std::to_string(raisedCenter))) return false;
+        const size_t updatedCollider =
+            entity.find("horizon::platform_api::ColliderBoxPlatformComponent");
+        const size_t updatedHalf = entity.find("\"halfExtents\"", updatedCollider);
+        if (updatedHalf == std::string::npos ||
+            !replaceJsonNumberAfter(entity, updatedHalf, "y", "0.35")) return false;
+        ++changed;
+    }
+    if (changed == 0) return false;
+    auto join = [](const std::vector<std::string>& values) {
+        std::string out;
+        for (const auto& value : values) {
+            if (!out.empty()) out.push_back(',');
+            out += value;
+        }
+        return out;
+    };
+    const std::string output = "{\"version\":6,\"entities\":[" + join(entities) +
+                               "],\"relationships\":[" + join(relationships) + "]}";
+    bytes.assign(output.begin(), output.end());
+    return !bytes.empty();
+}
+
+inline bool replaceJsonObjectAfter(std::string& json, size_t begin,
+                                   const std::string& key, const std::string& value) {
+    const size_t keyAt = json.find("\"" + key + "\"", begin);
+    const size_t first = keyAt == std::string::npos ? std::string::npos : json.find('{', keyAt);
+    if (first == std::string::npos) return false;
+    int depth = 0;
+    bool quoted = false, escaped = false;
+    for (size_t p = first; p < json.size(); ++p) {
+        const char ch = json[p];
+        if (quoted) {
+            if (escaped) escaped = false;
+            else if (ch == '\\') escaped = true;
+            else if (ch == '"') quoted = false;
+            continue;
+        }
+        if (ch == '"') { quoted = true; continue; }
+        if (ch == '{') ++depth;
+        else if (ch == '}' && --depth == 0) {
+            json.replace(first, p - first + 1, value);
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool replaceJsonArrayAfter(std::string& json, size_t begin,
+                                  const std::string& key, const std::string& value) {
+    const size_t keyAt = json.find("\"" + key + "\"", begin);
+    const size_t first = keyAt == std::string::npos ? std::string::npos : json.find('[', keyAt);
+    if (first == std::string::npos) return false;
+    int depth = 0;
+    bool quoted = false, escaped = false;
+    for (size_t p = first; p < json.size(); ++p) {
+        const char ch = json[p];
+        if (quoted) {
+            if (escaped) escaped = false;
+            else if (ch == '\\') escaped = true;
+            else if (ch == '"') quoted = false;
+            continue;
+        }
+        if (ch == '"') { quoted = true; continue; }
+        if (ch == '[') ++depth;
+        else if (ch == ']' && --depth == 0) {
+            json.replace(first, p - first + 1, value);
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool replaceFirstExact(std::string& text, const std::string& oldValue,
+                              const std::string& newValue) {
+    const size_t at = text.find(oldValue);
+    if (at == std::string::npos) return false;
+    text.replace(at, oldValue.size(), newValue);
+    return true;
+}
+
+inline std::string jsonStringValue(const std::string& json, const std::string& key) {
+    const size_t keyAt = json.find("\"" + key + "\"");
+    const size_t colon = keyAt == std::string::npos ? std::string::npos : json.find(':', keyAt);
+    size_t quote = colon == std::string::npos ? std::string::npos : json.find('"', colon + 1);
+    if (quote == std::string::npos) return {};
+    std::string out;
+    bool escaped = false;
+    for (size_t p = quote + 1; p < json.size(); ++p) {
+        const char ch = json[p];
+        if (escaped) { out.push_back(ch); escaped = false; continue; }
+        if (ch == '\\') { escaped = true; continue; }
+        if (ch == '"') return out;
+        out.push_back(ch);
+    }
+    return {};
+}
+
+inline bool jsonUint64Value(const std::string& json, const std::string& key, uint64_t& value) {
+    const size_t keyAt = json.find("\"" + key + "\"");
+    const size_t colon = keyAt == std::string::npos ? std::string::npos : json.find(':', keyAt);
+    if (colon == std::string::npos) return false;
+    size_t p = colon + 1;
+    while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
+    const bool quoted = p < json.size() && json[p] == '"';
+    if (quoted) ++p;
+    const size_t begin = p;
+    while (p < json.size() && std::isdigit(static_cast<unsigned char>(json[p]))) ++p;
+    if (p == begin || (quoted && (p >= json.size() || json[p] != '"'))) return false;
+    try {
+        size_t used = 0;
+        value = std::stoull(json.substr(begin, p - begin), &used, 10);
+        return used == p - begin;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Keep the official v206 Vista transition root only as a lifecycle/collision
+// carrier. A source Home's shellconfig already points at its original space.hstf,
+// which mounts the visual content with its native root and transforms. Mounting
+// the same content here as well creates a second world-root path; on-device that
+// presents as buildings/animations shifted away from their authored positions.
+inline bool makeVistaCarrierSpace(const std::vector<uint8_t>& officialSpace,
+                                  const AsmhRecord* mountedContent,
+                                  std::vector<uint8_t>& patchedSpace) {
+    const std::string input(reinterpret_cast<const char*>(officialSpace.data()), officialSpace.size());
+    std::vector<std::string> entities;
+    if (!jsonObjectArray(input, "entities", entities)) return false;
+    std::string root, backup, floorBackup, rootId, backupId, floorBackupId;
+    size_t rootCount = 0, backupCount = 0, floorBackupCount = 0;
+    for (const auto& entity : entities) {
+        if (entity.find("horizon::platform_api::ScenePlatformComponent") != std::string::npos) {
+            root = entity;
+            rootId = jsonStringValue(entity, "id");
+            ++rootCount;
+        }
+        const std::string name = jsonStringValue(entity, "name");
+        const bool namedBackup =
+            name.find("BackupCollision") != std::string::npos ||
+            name.find("Backup Collision") != std::string::npos;
+        const bool namedFloorBackup =
+            name.find("Back Up Collision") != std::string::npos;
+        const bool collisionEntity =
+            entity.find("horizon::platform_api::TransformPlatformComponent") != std::string::npos &&
+            entity.find("horizon::platform_api::ColliderBoxPlatformComponent") != std::string::npos &&
+            entity.find("horizon::platform_api::PhysicsBodyPlatformComponent") != std::string::npos;
+        if (namedFloorBackup && collisionEntity) {
+            floorBackup = entity;
+            floorBackupId = jsonStringValue(entity, "id");
+            ++floorBackupCount;
+        }
+        if (namedBackup &&
+            collisionEntity) {
+            backup = entity;
+            backupId = jsonStringValue(entity, "id");
+            ++backupCount;
+        }
+    }
+    if (rootCount != 1 || backupCount != 1 ||
+        rootId.empty() || backupId.empty() || rootId == backupId) return false;
+
+    const size_t scene = root.find("horizon::platform_api::ScenePlatformComponent");
+    if (scene == std::string::npos ||
+        !replaceJsonNumberAfter(root, scene, "nearClippingPlane", "0.1") ||
+        !replaceJsonNumberAfter(root, scene, "farClippingPlane", "150000.0")) return false;
+
+    // A wrapped legacy Home may need the carrier-owned emergency collision as
+    // its authoritative floor: Vista ignores some collision hierarchies mounted
+    // from a converted Home even though it renders them. Keep this opt-in so
+    // already-proven slots retain their exact authored backup wall/floor.
+    if (std::getenv("HSR_VISTA_BACKUP_FLOOR")) {
+        // Prefer the carrier's genuine horizontal Vista floor. Focused also has
+        // an Invisible_FrontEdgeBackupCollision wall; stretching that wall was
+        // the earlier carrier-floor experiment and is not equivalent
+        // to retaining the slot's native floor entity.
+        if (floorBackupCount == 1 && !floorBackupId.empty()) {
+            backup = floorBackup;
+            backupId = floorBackupId;
+        }
+        const size_t half = backup.find("\"halfExtents\"");
+        const size_t pos = backup.find("\"localPosition\"");
+        if (half == std::string::npos || pos == std::string::npos ||
+            !replaceJsonObjectAfter(backup, half, "halfExtents", "{\"x\":50.0,\"y\":0.5,\"z\":50.0}") ||
+            !replaceJsonObjectAfter(backup, pos, "localPosition", "{\"x\":0.0,\"y\":-0.5,\"z\":0.0}"))
+            return false;
+    }
+    // Horror uses a thin horizontal emergency floor and needs its top aligned
+    // with the wrapped Home's Y=0 floor. Other Vista slots use tall edge walls;
+    // preserve those authored transforms instead of incorrectly lifting them.
+    const size_t halfExtents = backup.find("\"halfExtents\"");
+    const size_t thinFloorY = halfExtents == std::string::npos
+                            ? std::string::npos : backup.find("\"y\":0.5", halfExtents);
+    if (thinFloorY != std::string::npos) {
+        const size_t backupPosition = backup.find("\"localPosition\"");
+        if (backupPosition == std::string::npos ||
+            !replaceJsonNumberAfter(backup, backupPosition, "y", "-0.5")) return false;
+    }
+
+    // A native-space Home loads its own collision hierarchy from shellconfig.
+    // Keeping the slot's authored edge/backup wall in the otherwise unused
+    // carrier can still leak an invisible blocker on some Vista revisions.
+    // Retain it only when content is actually mounted under this carrier (or
+    // when an explicit emergency carrier floor was requested).
+    const bool keepCarrierCollision =
+        mountedContent != nullptr || std::getenv("HSR_VISTA_BACKUP_FLOOR");
+    std::string entityList = root;
+    std::string relationships;
+    if (keepCarrierCollision) {
+        entityList += "," + backup;
+        relationships =
+            "{\"relationshipType\":\"RelationChildOf\",\"source\":\"" + backupId +
+            "\",\"destination\":\"" + rootId + "\"}";
+    }
+    if (mountedContent) {
+        constexpr const char* kMountedHomeChild = "5eba5ae2-84a0-43d7-b01e-5e0ab730d307";
+        entityList += ",{\"id\":\"" + std::string(kMountedHomeChild) +
+                      "\",\"name\":\"Wrapped Home\",\"type\":{\"packageOrRemoteId\":\"" +
+                      std::to_string(mountedContent->pkg) + "\",\"ingestionId\":\"" +
+                      std::to_string(mountedContent->ing) + "\",\"targetId\":\"" +
+                      std::to_string(mountedContent->tgt) +
+                      "\"},\"deltas\":[],\"attributes\":[]}";
+        if (!relationships.empty()) relationships += ",";
+        relationships +=
+            "{\"relationshipType\":\"RelationChildOf\",\"source\":\"" +
+            std::string(kMountedHomeChild) +
+            "\",\"destination\":\"" + rootId + "\"}";
+    }
+    const std::string output = "{\"version\":6,\"entities\":[" + entityList +
+                               "],\"relationships\":[" + relationships + "]}";
+    patchedSpace.assign(output.begin(), output.end());
+    return !patchedSpace.empty();
+}
+
+// When a converted Home supplies its own space.hstf, its shellconfig is the
+// first-world authority and the official Vista carrier space is never loaded.
+// Put the carrier's proven native floor directly into that actually-loaded
+// source space instead of patching an unreachable template.
+inline bool injectVistaFloorIntoSourceSpace(const std::vector<uint8_t>& sourceSpace,
+                                            const std::vector<uint8_t>& officialSpace,
+                                            std::vector<uint8_t>& patchedSource) {
+    const std::string source(reinterpret_cast<const char*>(sourceSpace.data()), sourceSpace.size());
+    const std::string official(reinterpret_cast<const char*>(officialSpace.data()), officialSpace.size());
+    std::vector<std::string> sourceEntities, sourceRels, officialEntities;
+    if (!jsonObjectArray(source, "entities", sourceEntities) ||
+        !jsonObjectArray(source, "relationships", sourceRels) ||
+        !jsonObjectArray(official, "entities", officialEntities)) return false;
+
+    std::string rootId, floor;
+    size_t roots = 0, floors = 0;
+    for (const auto& entity : sourceEntities) {
+        if (entity.find("horizon::platform_api::ScenePlatformComponent") != std::string::npos) {
+            rootId = jsonStringValue(entity, "id");
+            ++roots;
+        }
+    }
+    for (const auto& entity : officialEntities) {
+        const std::string name = jsonStringValue(entity, "name");
+        if (name.find("Back Up Collision") == std::string::npos ||
+            entity.find("horizon::platform_api::TransformPlatformComponent") == std::string::npos ||
+            entity.find("horizon::platform_api::ColliderBoxPlatformComponent") == std::string::npos ||
+            entity.find("horizon::platform_api::PhysicsBodyPlatformComponent") == std::string::npos) continue;
+        floor = entity;
+        ++floors;
+    }
+    if (roots != 1 || floors != 1 || rootId.empty() || floor.empty()) return false;
+
+    // Use a wrapper-owned ID so repeated source IDs cannot collide with the
+    // official slot payload retained elsewhere in the combined manifest.
+    constexpr const char* kFloorId = "e7d04b11-145c-4c65-932c-63a8b6d2f409";
+    const std::string oldFloorId = jsonStringValue(floor, "id");
+    if (oldFloorId.empty() ||
+        !replaceFirstExact(floor, "\"" + oldFloorId + "\"", "\"" + std::string(kFloorId) + "\""))
+        return false;
+    const size_t half = floor.find("\"halfExtents\"");
+    const size_t pos = floor.find("\"localPosition\"");
+    const size_t scale = floor.find("\"localScale\"");
+    if (half == std::string::npos || pos == std::string::npos ||
+        !replaceJsonObjectAfter(floor, half, "halfExtents", "{\"x\":50.0,\"y\":0.5,\"z\":50.0}") ||
+        !replaceJsonObjectAfter(floor, pos, "localPosition", "{\"x\":0.0,\"y\":-0.5,\"z\":0.0}"))
+        return false;
+    if (scale != std::string::npos &&
+        !replaceJsonObjectAfter(floor, scale, "localScale", "{\"x\":1.0,\"y\":1.0,\"z\":1.0}"))
+        return false;
+
+    sourceEntities.push_back(floor);
+    sourceRels.push_back(
+        "{\"relationshipType\":\"RelationChildOf\",\"source\":\"" +
+        std::string(kFloorId) + "\",\"destination\":\"" + rootId + "\"}");
+    auto join = [](const std::vector<std::string>& values) {
+        std::string out;
+        for (const auto& value : values) {
+            if (!out.empty()) out += ",";
+            out += value;
+        }
+        return out;
+    };
+    const std::string output = "{\"version\":6,\"entities\":[" + join(sourceEntities) +
+                               "],\"relationships\":[" + join(sourceRels) + "]}";
+    patchedSource.assign(output.begin(), output.end());
+    return !patchedSource.empty();
+}
+
+// A native-space wrapped Home is selected through the official Vista package,
+// but its shellconfig loads the custom source Space directly. The official
+// FogTravel curve therefore has to live on that actually-loaded Scene root;
+// retaining it only on the dormant carrier Space produces intermittent abrupt
+// switches with no travel fog.
+inline bool injectVistaFogTravelIntoSourceSpace(const std::vector<uint8_t>& sourceSpace,
+                                                const std::vector<uint8_t>& officialSpace,
+                                                std::vector<uint8_t>& patchedSource) {
+    const std::string source(reinterpret_cast<const char*>(sourceSpace.data()), sourceSpace.size());
+    const std::string official(reinterpret_cast<const char*>(officialSpace.data()), officialSpace.size());
+    std::vector<std::string> sourceEntities, sourceRelationships, officialEntities;
+    if (!jsonObjectArray(source, "entities", sourceEntities) ||
+        !jsonObjectArray(source, "relationships", sourceRelationships) ||
+        !jsonObjectArray(official, "entities", officialEntities)) return false;
+
+    size_t sourceRoot = std::string::npos, sourceRoots = 0;
+    for (size_t i = 0; i < sourceEntities.size(); ++i) {
+        if (sourceEntities[i].find("horizon::platform_api::ScenePlatformComponent") ==
+            std::string::npos) continue;
+        sourceRoot = i;
+        ++sourceRoots;
+    }
+    if (sourceRoots != 1 || sourceRoot == std::string::npos) return false;
+    // Re-wrapping an already accepted profile must be byte-stable. FogTravel
+    // is already attached to the actually loaded source Space, so injecting a
+    // duplicate would be both unnecessary and invalid.
+    if (sourceEntities[sourceRoot].find("horizon::hpi::FogTravelComponent") !=
+        std::string::npos) {
+        patchedSource=sourceSpace;
+        return !patchedSource.empty();
+    }
+    std::string fogTravel;
+    size_t officialFogRoots = 0;
+    for (const auto& entity : officialEntities) {
+        if (entity.find("horizon::platform_api::ScenePlatformComponent") == std::string::npos ||
+            entity.find("horizon::hpi::FogTravelComponent") == std::string::npos) continue;
+        std::vector<std::string> components;
+        if (!jsonObjectArray(entity, "components", components)) return false;
+        for (const auto& component : components) {
+            if (component.find("horizon::hpi::FogTravelComponent") == std::string::npos) continue;
+            if (!fogTravel.empty()) return false;
+            fogTravel = component;
+        }
+        ++officialFogRoots;
+    }
+    if (officialFogRoots != 1 || fogTravel.empty())
+        return false;
+
+    std::vector<std::string> sourceComponents;
+    if (!jsonObjectArray(sourceEntities[sourceRoot], "components", sourceComponents) ||
+        sourceComponents.empty()) return false;
+    sourceComponents.insert(sourceComponents.begin(), fogTravel);
+    std::string componentArray = "[";
+    for (size_t i = 0; i < sourceComponents.size(); ++i) {
+        if (i) componentArray.push_back(',');
+        componentArray += sourceComponents[i];
+    }
+    componentArray.push_back(']');
+    if (!replaceJsonArrayAfter(sourceEntities[sourceRoot], 0, "components", componentArray))
+        return false;
+
+    auto join = [](const std::vector<std::string>& values) {
+        std::string out;
+        for (const auto& value : values) {
+            if (!out.empty()) out.push_back(',');
+            out += value;
+        }
+        return out;
+    };
+    const std::string output = "{\"version\":6,\"entities\":[" + join(sourceEntities) +
+                               "],\"relationships\":[" + join(sourceRelationships) + "]}";
+    patchedSource.assign(output.begin(), output.end());
+    return !patchedSource.empty();
+}
+
+// Build a custom Loft-menu Vista slot without re-cooking the Home.  The
+// official Vista APK remains the carrier (package identity, resources, dex and
+// all menu-facing metadata); only assets/scene.zip is taken from the cooked
+// Home.  The manifest version is bumped so Horizon cannot immediately replace
+// the sideloaded carrier with its same/older catalog build.
+inline std::vector<uint8_t> cloneVistaSlotWithScene(
+    const std::vector<uint8_t>& sourceHomeApk,
+    const std::vector<uint8_t>& officialVistaApk,
+    uint32_t officialVersionCode,
+    uint32_t replacementVersionCode,
+    const std::string& officialVersionName,
+    const std::string& replacementVersionName,
+    bool* ok = nullptr) {
+    if (ok) *ok = false;
+    if (sourceHomeApk.empty() || officialVistaApk.empty() ||
+        officialVersionCode == replacementVersionCode) return {};
+
+    std::vector<uint8_t> scene;
+    {
+        mz_zip_archive source{};
+        if (!mz_zip_reader_init_mem(&source, sourceHomeApk.data(), sourceHomeApk.size(), 0)) return {};
+        const int index = mz_zip_reader_locate_file(&source, "assets/scene.zip", nullptr, 0);
+        if (index < 0) { mz_zip_reader_end(&source); return {}; }
+        size_t bytes = 0;
+        void* raw = mz_zip_reader_extract_to_heap(&source, static_cast<mz_uint>(index), &bytes, 0);
+        if (raw && bytes != 0 && bytes <= zipsafety::kSceneReadLimits.maxTotalUncompressedBytes)
+            scene.assign(static_cast<const uint8_t*>(raw), static_cast<const uint8_t*>(raw) + bytes);
+        if (raw) mz_free(raw);
+        mz_zip_reader_end(&source);
+        if (scene.empty()) return {};
+    }
+
+    mz_zip_archive in{};
+    if (!mz_zip_reader_init_mem(&in, officialVistaApk.data(), officialVistaApk.size(), 0)) return {};
+    mz_zip_archive out{};
+    if (!mz_zip_writer_init_heap(&out, 0, 0)) { mz_zip_reader_end(&in); return {}; }
+
+    zipsafety::ArchiveReadBudget budget(zipsafety::kApkReadLimits);
+    zipsafety::EntryNameRegistry names;
+    bool copied = true, sawManifest = false, sawScene = false;
+    std::vector<uint8_t> manifest;
+    const mz_uint count = mz_zip_reader_get_num_files(&in);
+    for (mz_uint i = 0; copied && i < count; ++i) {
+        mz_zip_archive_file_stat stat{};
+        if (!mz_zip_reader_file_stat(&in, i, &stat)) { copied = false; break; }
+        const mz_uint nameBytes = mz_zip_reader_get_filename(&in, i, nullptr, 0);
+        if (nameBytes == 0 || nameBytes > zipsafety::kZip16Max + 1) { copied = false; break; }
+        std::vector<char> rawName(nameBytes);
+        if (!mz_zip_reader_get_filename(&in, i, rawName.data(), nameBytes)) { copied = false; break; }
+        const bool directory = mz_zip_reader_is_file_a_directory(&in, i) != 0;
+        std::string normalized;
+        const auto read = budget.add(std::string_view(rawName.data(), nameBytes - 1),
+                                     static_cast<uint64_t>(stat.m_uncomp_size), directory, &normalized);
+        if (read.status != zipsafety::ArchiveReadStatus::Ok) { copied = false; break; }
+        if (directory) continue;
+        if (normalized.rfind("META-INF/", 0) == 0) continue;
+        if (normalized == "assets/scene.zip") { sawScene = true; continue; }
+        // A previous wrapper may carry another Home's round-trip session.
+        // Replace it with the current source session, or omit it when the
+        // current source has none.
+        if (normalized == "assets/_editor_session.hsledit") continue;
+        if (normalized == "AndroidManifest.xml") {
+            sawManifest = true;
+            size_t bytes = 0;
+            void* raw = mz_zip_reader_extract_to_heap(&in, i, &bytes, 0);
+            if (!raw || bytes == 0) { if (raw) mz_free(raw); copied = false; break; }
+            manifest.assign(static_cast<const uint8_t*>(raw), static_cast<const uint8_t*>(raw) + bytes);
+            mz_free(raw);
+            continue;
+        }
+        if (names.add(normalized) != zipsafety::NameStatus::Ok ||
+            !mz_zip_writer_add_from_zip_reader(&out, &in, i)) copied = false;
+    }
+
+    if (copied && sawManifest && sawScene) {
+        manifest = patchAxml(manifest, officialVersionName, replacementVersionName, /*exact=*/true);
+        manifest = patchAxmlTypedInt(manifest, officialVersionCode, replacementVersionCode);
+        copied = !manifest.empty() &&
+            zipAddMemChecked(out, names, "AndroidManifest.xml", manifest.data(), manifest.size(), MZ_DEFAULT_COMPRESSION) &&
+            zipAddMemChecked(out, names, "assets/scene.zip", scene.data(), scene.size(), MZ_BEST_SPEED);
+    } else copied = false;
+
+    std::vector<uint8_t> apk;
+    const bool finalized = copied && zipFinalizeHeapChecked(out, apk);
+    mz_zip_writer_end(&out);
+    mz_zip_reader_end(&in);
+    if (!finalized) return {};
+    if (ok) *ok = true;
+    return apk;
+}
+
+inline std::vector<uint8_t> repackOfficialVistaWithScene(
+    const std::vector<uint8_t>& officialVistaApk,
+    const std::vector<uint8_t>& scene,
+    uint32_t officialVersionCode,
+    uint32_t replacementVersionCode,
+    const std::string& officialVersionName,
+    const std::string& replacementVersionName,
+    const std::vector<uint8_t>& editorSession = {},
+    const std::vector<uint8_t>& sourceNavmesh = {},
+    bool* ok = nullptr) {
+    if (ok) *ok = false;
+    if (officialVistaApk.empty() || scene.empty() ||
+        officialVersionCode == replacementVersionCode) return {};
+
+    mz_zip_archive in{};
+    if (!mz_zip_reader_init_mem(&in, officialVistaApk.data(), officialVistaApk.size(), 0)) return {};
+    mz_zip_archive out{};
+    if (!mz_zip_writer_init_heap(&out, 0, 0)) { mz_zip_reader_end(&in); return {}; }
+    zipsafety::ArchiveReadBudget budget(zipsafety::kApkReadLimits);
+    zipsafety::EntryNameRegistry names;
+    bool copied = true, sawManifest = false, sawScene = false;
+    std::vector<uint8_t> manifest;
+    const mz_uint count = mz_zip_reader_get_num_files(&in);
+    for (mz_uint i = 0; copied && i < count; ++i) {
+        mz_zip_archive_file_stat stat{};
+        if (!mz_zip_reader_file_stat(&in, i, &stat)) { copied = false; break; }
+        const mz_uint nameBytes = mz_zip_reader_get_filename(&in, i, nullptr, 0);
+        if (nameBytes == 0 || nameBytes > zipsafety::kZip16Max + 1) { copied = false; break; }
+        std::vector<char> rawName(nameBytes);
+        if (!mz_zip_reader_get_filename(&in, i, rawName.data(), nameBytes)) { copied = false; break; }
+        const bool directory = mz_zip_reader_is_file_a_directory(&in, i) != 0;
+        std::string normalized;
+        const auto read = budget.add(std::string_view(rawName.data(), nameBytes - 1),
+                                     static_cast<uint64_t>(stat.m_uncomp_size), directory, &normalized);
+        if (read.status != zipsafety::ArchiveReadStatus::Ok) { copied = false; break; }
+        if (directory) continue;
+        if (std::string(rawName.data(), nameBytes - 1) != normalized) { copied = false; break; }
+        if (normalized.rfind("META-INF/", 0) == 0) continue;
+        if (normalized == "assets/scene.zip") { sawScene = true; continue; }
+        if (normalized == "assets/_editor_session.hsledit") continue;
+        if (normalized == "assets/navmesh" && !sourceNavmesh.empty()) continue;
+        if (normalized == "AndroidManifest.xml") {
+            sawManifest = true;
+            size_t bytes = 0;
+            void* raw = mz_zip_reader_extract_to_heap(&in, i, &bytes, 0);
+            if (!raw || bytes == 0) { if (raw) mz_free(raw); copied = false; break; }
+            manifest.assign(static_cast<const uint8_t*>(raw), static_cast<const uint8_t*>(raw) + bytes);
+            mz_free(raw);
+            continue;
+        }
+        if (names.add(normalized) != zipsafety::NameStatus::Ok ||
+            !mz_zip_writer_add_from_zip_reader(&out, &in, i)) copied = false;
+    }
+
+    if (copied && sawManifest && sawScene) {
+        manifest = patchAxml(manifest, officialVersionName, replacementVersionName, /*exact=*/true);
+        manifest = patchAxmlTypedInt(manifest, officialVersionCode, replacementVersionCode);
+        // Official v206 Vistas store the nested scene archive verbatim.  Keeping
+        // that method avoids a second expensive Deflate pass and matches Meta's
+        // loader expectations exactly.
+        copied = !manifest.empty() &&
+            zipAddMemChecked(out, names, "AndroidManifest.xml", manifest.data(), manifest.size(), MZ_DEFAULT_COMPRESSION) &&
+            zipAddMemChecked(out, names, "assets/scene.zip", scene.data(), scene.size(), MZ_NO_COMPRESSION);
+        if (copied && !editorSession.empty())
+            copied = zipAddMemChecked(out, names, "assets/_editor_session.hsledit",
+                                      editorSession.data(), editorSession.size(), MZ_DEFAULT_COMPRESSION);
+        if (copied && !sourceNavmesh.empty())
+            copied = zipAddMemChecked(out, names, "assets/navmesh",
+                                      sourceNavmesh.data(), sourceNavmesh.size(), MZ_DEFAULT_COMPRESSION);
+    } else copied = false;
+
+    std::vector<uint8_t> apk;
+    const bool finalized = copied && zipFinalizeHeapChecked(out, apk);
+    mz_zip_writer_end(&out);
+    mz_zip_reader_end(&in);
+    if (!finalized) return {};
+    if (ok) *ok = true;
+    return apk;
+}
+
+// Build a no-root Haven replacement on top of the headset's exact current
+// Haven APK.  This deliberately preserves its v206 dex, resources and private
+// runtime assets; only the manifest identity and authored scene payload are
+// replaced.  Using the old embedded Nuxd application shell with a v206-looking
+// manifest produced APKs that installed successfully but rendered black.
+inline std::vector<uint8_t> buildCombinedHavenManifestFromCarrier(
+    const std::vector<uint8_t>& officialHavenApk) {
+    std::vector<uint8_t> manifest;
+    if (!extractZipEntryBytes(officialHavenApk, "AndroidManifest.xml",
+                              zipsafety::kApkReadLimits.maxTotalUncompressedBytes,
+                              manifest))
+        return {};
+    ApkManifestIdentity identity;
+    if (!readApkManifestIdentity(officialHavenApk, identity)) return {};
+
+    manifest = patchAxml(manifest, "footprint", "combined", /*exact=*/true);
+    const uint32_t replacementCode =
+        identity.versionCode == UINT32_MAX ? identity.versionCode
+                                           : identity.versionCode + 1;
+    std::string replacementName = identity.versionName;
+    const size_t dot = replacementName.rfind('.');
+    if (dot != std::string::npos) {
+        try {
+            const unsigned long part = std::stoul(replacementName.substr(dot + 1));
+            replacementName.resize(dot + 1);
+            replacementName += std::to_string(part + 1);
+        } catch (...) {
+            return {};
+        }
+    }
+    manifest = patchAxml(manifest, identity.versionName, replacementName,
+                         /*exact=*/true);
+    return patchAxmlTypedInt(manifest, identity.versionCode, replacementCode);
+}
+
+inline std::vector<uint8_t> repackOfficialHavenWithScene(
+    const std::vector<uint8_t>& officialHavenApk,
+    const std::vector<uint8_t>& scene,
+    const std::vector<uint8_t>& replacementManifest,
+    const std::vector<uint8_t>& editorSession = {},
+    const std::vector<uint8_t>& sourceNavmesh = {},
+    bool* ok = nullptr) {
+    if (ok) *ok = false;
+    if (officialHavenApk.empty() || scene.empty() || replacementManifest.empty())
+        return {};
+
+    mz_zip_archive in{};
+    if (!mz_zip_reader_init_mem(&in, officialHavenApk.data(), officialHavenApk.size(), 0))
+        return {};
+    mz_zip_archive out{};
+    if (!mz_zip_writer_init_heap(&out, 0, 0)) {
+        mz_zip_reader_end(&in);
+        return {};
+    }
+
+    zipsafety::ArchiveReadBudget budget(zipsafety::kApkReadLimits);
+    zipsafety::EntryNameRegistry names;
+    bool copied = true, sawManifest = false, sawScene = false;
+    const mz_uint count = mz_zip_reader_get_num_files(&in);
+    for (mz_uint i = 0; copied && i < count; ++i) {
+        mz_zip_archive_file_stat stat{};
+        if (!mz_zip_reader_file_stat(&in, i, &stat)) { copied = false; break; }
+        const mz_uint nameBytes = mz_zip_reader_get_filename(&in, i, nullptr, 0);
+        if (nameBytes == 0 || nameBytes > zipsafety::kZip16Max + 1) {
+            copied = false;
+            break;
+        }
+        std::vector<char> rawName(nameBytes);
+        if (!mz_zip_reader_get_filename(&in, i, rawName.data(), nameBytes)) {
+            copied = false;
+            break;
+        }
+        const bool directory = mz_zip_reader_is_file_a_directory(&in, i) != 0;
+        std::string normalized;
+        const auto read = budget.add(std::string_view(rawName.data(), nameBytes - 1),
+                                     static_cast<uint64_t>(stat.m_uncomp_size),
+                                     directory, &normalized);
+        if (read.status != zipsafety::ArchiveReadStatus::Ok) { copied = false; break; }
+        if (directory) continue;
+        if (std::string(rawName.data(), nameBytes - 1) != normalized) {
+            copied = false;
+            break;
+        }
+        if (normalized.rfind("META-INF/", 0) == 0) continue;
+        if (normalized == "AndroidManifest.xml") { sawManifest = true; continue; }
+        if (normalized == "assets/scene.zip") { sawScene = true; continue; }
+        if (normalized == "assets/_editor_session.hsledit") continue;
+        if (normalized == "assets/navmesh" && !sourceNavmesh.empty()) continue;
+        if (names.add(normalized) != zipsafety::NameStatus::Ok ||
+            !mz_zip_writer_add_from_zip_reader(&out, &in, i))
+            copied = false;
+    }
+
+    if (copied && sawManifest && sawScene) {
+        copied =
+            zipAddMemChecked(out, names, "AndroidManifest.xml",
+                             replacementManifest.data(), replacementManifest.size(),
+                             MZ_DEFAULT_COMPRESSION) &&
+            zipAddMemChecked(out, names, "assets/scene.zip",
+                             scene.data(), scene.size(), MZ_NO_COMPRESSION);
+        if (copied && !editorSession.empty())
+            copied = zipAddMemChecked(out, names, "assets/_editor_session.hsledit",
+                                      editorSession.data(), editorSession.size(),
+                                      MZ_DEFAULT_COMPRESSION);
+        if (copied && !sourceNavmesh.empty())
+            copied = zipAddMemChecked(out, names, "assets/navmesh",
+                                      sourceNavmesh.data(), sourceNavmesh.size(),
+                                      MZ_DEFAULT_COMPRESSION);
+    } else copied = false;
+
+    std::vector<uint8_t> apk;
+    const bool finalized = copied && zipFinalizeHeapChecked(out, apk);
+    mz_zip_writer_end(&out);
+    mz_zip_reader_end(&in);
+    if (!finalized) return {};
+    if (ok) *ok = true;
+    return apk;
+}
+
+inline bool isHomeVistaClosurePath(const std::string& path, const std::string& base) {
+    // A converted legacy Home keeps every scene-owned dependency below one
+    // generated root.  Import that complete root so animation clips,
+    // skeletons, audio, physics, navmesh and less obvious geometry are not
+    // silently lost.  v206 also needs the source space.hstf because
+    // shellconfig's firstWorldAssetId points at that Space asset, not directly
+    // at content.hstf.
+    if (!base.empty() && path.rfind(base, 0) == 0)
+        return true;
+    return path == "meta/renderer_module/shaders/unlit.surface/shader" ||
+           path == "meta/renderer_module/shaders/unlitblend.surface/shader" ||
+           path == "meta/horizon_shared_shaders/shaders/vat/vatunlitbasecolor.surface/shader";
+}
+
+// Construct a real v206 Vista scene: Meta's selected slot transition/root remains
+// the lifecycle owner, while the source Home keeps its unique render-closure key.
+// The source shellconfig remains authoritative because firstWorldAssetId selects
+// the source space and its authored placement. Shared home_c25 carrier-template
+// keys retain their official identities but may receive matching inert source
+// Root payloads. This prevents carrier placement templates from duplicating the
+// source transforms and moving otherwise-correct geometry.
+inline bool buildHomeVistaScene(const std::vector<uint8_t>& sourceHomeApk,
+                                const std::vector<uint8_t>& officialVistaApk,
+                                std::vector<uint8_t>& result,
+                                std::string* report = nullptr) {
+    result.clear();
+    auto fail = [&](const std::string& why) {
+        if (report) *report = why;
+        result.clear();
+        return false;
+    };
+    ApkManifestIdentity sourceIdentity;
+    if (!readApkManifestIdentity(sourceHomeApk, sourceIdentity))
+        return fail("source Home Android manifest identity missing or invalid");
+    std::vector<uint8_t> sourceScene, carrierScene;
+    if (!extractZipEntryBytes(sourceHomeApk, "assets/scene.zip",
+                              zipsafety::kSceneReadLimits.maxTotalUncompressedBytes, sourceScene))
+        return fail("source Home scene.zip missing or unsafe");
+    if (!extractZipEntryBytes(officialVistaApk, "assets/scene.zip",
+                              zipsafety::kSceneReadLimits.maxTotalUncompressedBytes, carrierScene))
+        return fail("official Vista scene.zip missing or unsafe");
+
+    std::vector<CookFile> sourceFiles, carrierFiles;
+    if (!readSceneArchiveFiles(sourceScene, sourceFiles)) return fail("source Home scene archive rejected");
+    if (!readSceneArchiveFiles(carrierScene, carrierFiles)) return fail("official Vista scene archive rejected");
+    std::unordered_map<std::string, size_t> sourceIndex, carrierIndex;
+    for (size_t i = 0; i < sourceFiles.size(); ++i)
+        if (!sourceIndex.emplace(sourceFiles[i].first, i).second) return fail("duplicate source Home ZIP path");
+    for (size_t i = 0; i < carrierFiles.size(); ++i)
+        if (!carrierIndex.emplace(carrierFiles[i].first, i).second) return fail("duplicate official ZIP path");
+
+    const auto sourceManifestAt = sourceIndex.find("content/assets.manifest");
+    const auto carrierManifestAt = carrierIndex.find("content/assets.manifest");
+    const auto staticArchAt = sourceIndex.find(
+        "content/meta/home_c25/templates/Quest3/home_static_arch.hstf/template");
+    std::string officialSpaceArchivePath;
+    size_t officialSpaceCount = 0;
+    for (const auto& file : carrierFiles) {
+        const std::string& path = file.first;
+        if (path.rfind("content/meta/", 0) == 0 &&
+            path.size() >= 28 &&
+            path.compare(path.size() - 25, 25, "/space.hstf/template_9k0v") == 0) {
+            officialSpaceArchivePath = path;
+            ++officialSpaceCount;
+        }
+    }
+    const auto carrierSpaceAt = carrierIndex.find(officialSpaceArchivePath);
+    if (sourceManifestAt == sourceIndex.end() || carrierManifestAt == carrierIndex.end() ||
+        officialSpaceCount != 1 || carrierSpaceAt == carrierIndex.end())
+        return fail("required manifest/template path missing");
+    const size_t sourceManifestIndex = sourceManifestAt->second;
+    size_t carrierManifestIndex = carrierManifestAt->second;
+    const size_t carrierSpaceIndex = carrierSpaceAt->second;
+
+    std::vector<AsmhRecord> sourceRecords, carrierRecords;
+    if (!parseAsmhRecords(sourceFiles[sourceManifestIndex].second, sourceRecords) ||
+        !parseAsmhRecords(carrierFiles[carrierManifestIndex].second, carrierRecords))
+        return fail("ASMH record import failed");
+    // Profile builds legitimately contain a different number of unrelated
+    // carrier/template records.  The scene-owned root below is the stable
+    // contract; keep the official Vista revision exact and put a sane bound on
+    // the source manifest.
+    constexpr size_t kMaxVistaWrapperCarrierRecords = 8192;
+    if (carrierRecords.empty() || carrierRecords.size() > kMaxVistaWrapperCarrierRecords)
+        return fail("unexpected official Vista manifest size");
+    // Official/library Homes vary widely in size. Keep a hard ceiling so a
+    // malformed source cannot balloon the wrapped Vista scene indefinitely,
+    // but do not reject valid large Homes.
+    constexpr size_t kMaxVistaWrapperSourceRecords = 4096;
+    if (sourceRecords.empty() || sourceRecords.size() > kMaxVistaWrapperSourceRecords)
+        return fail("unexpected source Home manifest size");
+
+    static const std::string kContentSuffix = "content.hstf/template";
+    const AsmhRecord* wrapperRecord = nullptr;
+    std::string wrapperContentPath, sourceBase;
+    size_t wrapperRecordCount = 0;
+    for (const auto& record : sourceRecords) {
+        if (record.path.size() <= kContentSuffix.size() ||
+            record.path.compare(record.path.size() - kContentSuffix.size(),
+                                kContentSuffix.size(), kContentSuffix) != 0 ||
+            record.tgt != 2719744159u ||
+            record.fourcc != 0x4E5A5248u ||
+            record.subtype != 0x4C504D54u ||
+            sourceIndex.find("content/" + record.path) == sourceIndex.end()) continue;
+        wrapperRecord = &record;
+        wrapperContentPath = record.path;
+        sourceBase = record.path.substr(0, record.path.size() - kContentSuffix.size());
+        ++wrapperRecordCount;
+    }
+    if (wrapperRecordCount != 1 || !wrapperRecord ||
+        wrapperRecord->tgt != 2719744159u ||
+        wrapperRecord->fourcc != 0x4E5A5248u ||
+        wrapperRecord->subtype != 0x4C504D54u)
+        return fail("source Home must contain exactly one materialized content.hstf/template root");
+    const auto wrapperFileAt = sourceIndex.find("content/" + wrapperContentPath);
+    if (wrapperFileAt == sourceIndex.end() || sourceFiles[wrapperFileAt->second].second.empty())
+        return fail("source Home content template payload missing");
+    for (const auto& record : carrierRecords) {
+        if (record.pkg == wrapperRecord->pkg && record.ing == wrapperRecord->ing &&
+            record.tgt == wrapperRecord->tgt)
+            return fail("source Home wrapper key collides with official Vista");
+    }
+    const std::string sceneSpacePath = sourceBase + "space.hstf/template";
+    const auto sourceSpaceAt = sourceIndex.find("content/" + sceneSpacePath);
+    const AsmhRecord* sourceSpaceRecord = nullptr;
+    size_t sourceSpaceRecordCount = 0;
+    for (const auto& record : sourceRecords) {
+        if (record.path != sceneSpacePath) continue;
+        sourceSpaceRecord = &record;
+        ++sourceSpaceRecordCount;
+    }
+    const bool sourceWrapperIsStub =
+        sourceFiles[wrapperFileAt->second].second.size() < 1024;
+    // Diagnostic/compatibility path for converted Homes whose own Space lacks
+    // a stable background or native collision layer.  The carrier-child
+    // layout is the proven legacy Vista layout: the official Vista owns
+    // sky/lighting/floor/transition while the converted Home is mounted as
+    // its visual content.  Keep this opt-in until automatic capability
+    // detection below can select it without regressing compact native Spaces.
+    const bool mountContentUnderCarrier =
+        sourceWrapperIsStub || sourceSpaceAt == sourceIndex.end() ||
+        std::getenv("HSR_VISTA_CARRIER_CHILD");
+    if (!mountContentUnderCarrier &&
+        (sourceFiles[sourceSpaceAt->second].second.empty() ||
+         sourceSpaceRecordCount != 1 || !sourceSpaceRecord))
+        return fail("source Home space identity/payload missing");
+
+    std::vector<uint8_t> patchedSpace;
+    if (!makeVistaCarrierSpace(carrierFiles[carrierSpaceIndex].second,
+                               mountContentUnderCarrier ? wrapperRecord : nullptr,
+                               patchedSpace))
+        return fail("official Vista wrapper patch failed");
+    carrierFiles[carrierSpaceIndex].second = patchedSpace;
+
+    // v206 reads the first world hint from shellconfig. Keeping the carrier's
+    // selected slot config can make the source render closure load at the wrong
+    // visual root even though navmesh/collision are correct.
+    const auto sourceShellConfigAt = sourceIndex.find("content/configs/shellconfig.jsonc");
+    const auto carrierShellConfigAt = carrierIndex.find("content/configs/shellconfig.jsonc");
+    if (carrierShellConfigAt == carrierIndex.end())
+        return fail("official Vista shellconfig missing");
+    size_t carrierShellConfigIndex = carrierShellConfigAt->second;
+    if (!mountContentUnderCarrier) {
+        if (sourceShellConfigAt == sourceIndex.end() ||
+            sourceFiles[sourceShellConfigAt->second].second.empty())
+            return fail("source Home shellconfig missing");
+        const auto& shellConfigBytes = sourceFiles[sourceShellConfigAt->second].second;
+        const std::string shellConfig(
+            reinterpret_cast<const char*>(shellConfigBytes.data()), shellConfigBytes.size());
+        uint64_t shellPackage = 0, shellIngestion = 0, shellTarget = 0;
+        if (!jsonUint64Value(shellConfig, "packageOrRemoteId", shellPackage) ||
+            !jsonUint64Value(shellConfig, "ingestionId", shellIngestion) ||
+            !jsonUint64Value(shellConfig, "targetId", shellTarget) ||
+            shellPackage != sourceSpaceRecord->pkg ||
+            shellIngestion != sourceSpaceRecord->ing ||
+            shellTarget != sourceSpaceRecord->tgt)
+            return fail("source Home shellconfig firstWorldAssetId mismatch");
+        carrierFiles[carrierShellConfigIndex].second =
+            shellConfigBytes;
+        std::vector<uint8_t> sourceWithFogTravel;
+        if (!injectVistaFogTravelIntoSourceSpace(
+                sourceFiles[sourceSpaceAt->second].second,
+                carrierFiles[carrierSpaceIndex].second,
+                sourceWithFogTravel))
+            return fail("source space Vista FogTravel injection failed");
+        sourceFiles[sourceSpaceAt->second].second = std::move(sourceWithFogTravel);
+        if (std::getenv("HSR_VISTA_BACKUP_FLOOR")) {
+            std::vector<uint8_t> sourceWithFloor;
+            if (!injectVistaFloorIntoSourceSpace(
+                    sourceFiles[sourceSpaceAt->second].second,
+                    carrierFiles[carrierSpaceIndex].second,
+                    sourceWithFloor))
+                return fail("source space Vista floor injection failed");
+            sourceFiles[sourceSpaceAt->second].second = std::move(sourceWithFloor);
+        }
+    }
+
+    const uint64_t collidingIngestions[] = {
+        11173504047846864142ull, 16632049155738013495ull,
+        17388586219142320831ull, 12722279997147320471ull,
+        11631735261009407721ull, 15392203948592102808ull,
+        262343565626933461ull, 2985500425370876421ull
+    };
+    auto isCollision = [&](const AsmhRecord& record) {
+        if (record.pkg != 12293612625969361106ull || record.tgt != 2719744159u) return false;
+        for (uint64_t ingestion : collidingIngestions) if (record.ing == ingestion) return true;
+        return false;
+    };
+
+    // Some legacy home_c25 scenes ship a small set of Root-only stubs. A v206
+    // slot may expose the same asset keys under different archive paths while
+    // leaving larger placement templates remote. Materialize matching inert
+    // source stubs at the official paths while keeping the carrier pkg/ing/tgt
+    // identity. This neutralizes only the duplicate carrier layer.
+    std::map<std::string, uint32_t> carrierTemplateOverrideSizes;
+    size_t carrierTemplateOverrides = 0;
+    if (!mountContentUnderCarrier) {
+        using CarrierTemplateKey = std::tuple<uint64_t, uint64_t, uint32_t>;
+        std::map<CarrierTemplateKey, const AsmhRecord*> sourceCarrierTemplates;
+        for (const auto& record : sourceRecords) {
+            if (!isCollision(record)) continue;
+            const CarrierTemplateKey key{record.pkg, record.ing, record.tgt};
+            if (!sourceCarrierTemplates.emplace(key, &record).second)
+                return fail("duplicate source Home carrier-template key");
+        }
+        constexpr size_t kExpectedCarrierTemplateOverrides =
+            sizeof(collidingIngestions) / sizeof(collidingIngestions[0]);
+        if (!sourceCarrierTemplates.empty() &&
+            sourceCarrierTemplates.size() != kExpectedCarrierTemplateOverrides)
+            return fail("source Home carrier-template set incomplete");
+
+        if (!sourceCarrierTemplates.empty()) {
+            for (const auto& record : carrierRecords) {
+                if (!isCollision(record)) continue;
+                const CarrierTemplateKey key{record.pkg, record.ing, record.tgt};
+                const auto sourceRecordAt = sourceCarrierTemplates.find(key);
+                if (sourceRecordAt == sourceCarrierTemplates.end())
+                    return fail("official carrier-template has no source Home counterpart");
+                const AsmhRecord& sourceRecord = *sourceRecordAt->second;
+                if (sourceRecord.fourcc != record.fourcc ||
+                    sourceRecord.subtype != record.subtype)
+                    return fail("carrier-template type mismatch");
+
+                const auto sourcePayloadAt = sourceIndex.find("content/" + sourceRecord.path);
+                if (sourcePayloadAt == sourceIndex.end())
+                    return fail("source Home carrier-template payload missing: " + sourceRecord.path);
+                const auto& sourcePayload = sourceFiles[sourcePayloadAt->second].second;
+                if (sourcePayload.size() != 271)
+                    return fail("source Home carrier-template payload size changed: " + sourceRecord.path);
+                const std::string sourceText(
+                    reinterpret_cast<const char*>(sourcePayload.data()), sourcePayload.size());
+                if (sourceText.find("\"name\":\"Root\"") == std::string::npos ||
+                    sourceText.find("\"relationships\":[]") == std::string::npos)
+                    return fail("source Home carrier-template is not an inert Root stub: " + sourceRecord.path);
+
+                const std::string carrierArchivePath = "content/" + record.path;
+                const auto carrierFileAt = carrierIndex.find(carrierArchivePath);
+                if (carrierFileAt == carrierIndex.end()) {
+                    carrierIndex.emplace(carrierArchivePath, carrierFiles.size());
+                    carrierFiles.push_back({carrierArchivePath, sourcePayload});
+                } else {
+                    carrierFiles[carrierFileAt->second].second = sourcePayload;
+                }
+                if (!carrierTemplateOverrideSizes.emplace(
+                        record.path, static_cast<uint32_t>(sourcePayload.size())).second)
+                    return fail("duplicate official carrier-template path");
+                ++carrierTemplateOverrides;
+            }
+            if (carrierTemplateOverrides != kExpectedCarrierTemplateOverrides ||
+                carrierTemplateOverrideSizes.size() != kExpectedCarrierTemplateOverrides)
+                return fail("official carrier-template set incomplete");
+        }
+    }
+
+    size_t closureExpected = 0, sceneSpaceRecords = 0;
+    size_t renderMeshes = 0, materials = 0;
+    for (const auto& record : sourceRecords) {
+        if (mountContentUnderCarrier && record.path == sceneSpacePath) continue;
+        if (record.path == sceneSpacePath) ++sceneSpaceRecords;
+        if (!isHomeVistaClosurePath(record.path, sourceBase)) continue;
+        ++closureExpected;
+        if (record.path.rfind(sourceBase, 0) != 0) continue;
+        if (record.path.size() >= 14 &&
+            record.path.compare(record.path.size() - 14, 14, ".rendmesh/mesh") == 0)
+            ++renderMeshes;
+        else if (record.path.size() >= 18 &&
+                 record.path.compare(record.path.size() - 18, 18, ".material/material") == 0)
+            ++materials;
+    }
+    // Do not tie compatibility to one historical mesh/asset count.  A direct
+    // legacy cook is smaller than an older re-cooked intermediary, but both are
+    // valid when they expose exactly one scene root plus real render payloads.
+    // File presence, key uniqueness, payload size and ASMH round-trip are
+    // validated independently below.
+    const size_t expectedSceneSpaceRecords = mountContentUnderCarrier ? 0u : 1u;
+    if (sceneSpaceRecords != expectedSceneSpaceRecords || closureExpected == 0 ||
+        closureExpected > kMaxVistaWrapperSourceRecords ||
+        renderMeshes == 0 || materials == 0)
+        return fail("source Home render closure structure mismatch");
+
+    std::vector<AsmhEntry> manifest;
+    manifest.reserve(carrierRecords.size() + closureExpected);
+    std::set<std::tuple<uint64_t, uint64_t, uint32_t>> keys;
+    std::map<std::tuple<uint64_t, uint64_t, uint32_t>, std::string> keyPaths;
+    const std::string officialSpacePath =
+        officialSpaceArchivePath.substr(std::string("content/").size());
+    for (const auto& record : carrierRecords) {
+        if (!keys.emplace(record.pkg, record.ing, record.tgt).second)
+            return fail("duplicate key in official Vista manifest");
+        keyPaths[{record.pkg, record.ing, record.tgt}] = record.path;
+        const auto carrierOverride = carrierTemplateOverrideSizes.find(record.path);
+        const uint32_t bytes = record.path == officialSpacePath
+                             ? static_cast<uint32_t>(patchedSpace.size())
+                             : carrierOverride != carrierTemplateOverrideSizes.end()
+                               ? carrierOverride->second : record.size;
+        manifest.push_back({ record.pkg, record.ing, record.tgt, record.path,
+                             record.fourcc, record.subtype, bytes });
+    }
+
+    size_t selected = 0;
+    size_t sharedDedup = 0;
+    size_t floorBoxesRemoved = 0;
+    const auto& sourceContent = sourceFiles[wrapperFileAt->second].second;
+    const bool contentIsStub = sourceContent.size() < 1024;
+    // A native source Space owns its complete render closure. Keeping the
+    // carrier's unrelated world assets only bloats installs and transition
+    // load time (Oceanarium added ~348 MiB to Star Trek). Prune by default;
+    // retain the old diagnostic escape hatch for byte-for-byte carrier audits.
+    const bool pruneUnusedCarrier =
+        !mountContentUnderCarrier && !std::getenv("HSR_VISTA_KEEP_UNUSED_CARRIER");
+    std::set<std::tuple<uint64_t, uint64_t, uint32_t>> sourceClosureKeys;
+    if (contentIsStub && staticArchAt == sourceIndex.end())
+        return fail("source Home content is a stub and static architecture is missing");
+    for (const auto& record : sourceRecords) {
+        if (mountContentUnderCarrier && record.path == sceneSpacePath) continue;
+        if (!isHomeVistaClosurePath(record.path, sourceBase)) continue;
+        sourceClosureKeys.emplace(record.pkg, record.ing, record.tgt);
+        if (isCollision(record)) return fail("source Home collision key entered Vista closure");
+        const std::string archivePath = "content/" + record.path;
+        std::vector<uint8_t> payload;
+        if (record.path == wrapperContentPath && contentIsStub)
+            payload = sourceFiles[staticArchAt->second].second;
+        else {
+            const auto file = sourceIndex.find(archivePath);
+            if (file == sourceIndex.end()) return fail("source Home closure file missing: " + record.path);
+            payload = sourceFiles[file->second].second;
+        }
+        if (mountContentUnderCarrier && record.path == wrapperContentPath) {
+            if (!stripNamedHstfEntities(payload, "FloorBox", floorBoxesRemoved))
+                return fail("source Home FloorBox cleanup failed");
+            // Modern automatic cooks may carry a dense height-field safety
+            // layer named AutoFloor.  In carrier-child mode the official
+            // Vista already supplies its proven flat landing floor; retaining
+            // the height cells as well turns tables/props sampled by the
+            // navmesh into invisible steps and blockers.  Keep the Smart
+            // Navmesh and authored/mesh PhysX, remove only this redundant
+            // primitive landing layer.
+            size_t autoFloorBoxesRemoved = 0;
+            if (!stripNamedHstfEntities(payload, "AutoFloor", autoFloorBoxesRemoved))
+                return fail("automatic landing-layer cleanup failed");
+            floorBoxesRemoved += autoFloorBoxesRemoved;
+        }
+        if (payload.empty() || payload.size() > zipsafety::kZip32Max)
+            return fail("source Home closure payload invalid: " + record.path);
+        if (record.path == wrapperContentPath) {
+            const char* sx = std::getenv("HSR_WRAPPER_SPAWN_X");
+            const char* sy = std::getenv("HSR_WRAPPER_SPAWN_Y");
+            const char* sz = std::getenv("HSR_WRAPPER_SPAWN_Z");
+            if (sx || sy || sz) {
+                if (!sx || !sy || !sz) return fail("wrapper spawn override incomplete");
+                std::string json(reinterpret_cast<const char*>(payload.data()), payload.size());
+                std::string marker = "\"name\":\"Spawn Point\"";
+                size_t spawn = json.find(marker);
+                if (spawn == std::string::npos) {
+                    marker = "\"name\":\"Spawn (automatic safe)\"";
+                    spawn = json.find(marker);
+                }
+                if (spawn == std::string::npos ||
+                    json.find(marker, spawn + marker.size()) != std::string::npos)
+                    return fail("wrapper Spawn Point identity mismatch");
+                const size_t transform =
+                    json.find("horizon::platform_api::TransformPlatformComponent", spawn);
+                const size_t nextEntity = json.find("},{\"id\":", spawn);
+                if (transform == std::string::npos ||
+                    (nextEntity != std::string::npos && transform > nextEntity))
+                    return fail("wrapper Spawn Point transform missing");
+                const std::string position =
+                    "{\"x\":" + std::string(sx) + ",\"y\":" + std::string(sy) +
+                    ",\"z\":" + std::string(sz) + "}";
+                if (!replaceJsonObjectAfter(json, transform, "localPosition", position))
+                    return fail("wrapper Spawn Point patch failed");
+                payload.assign(json.begin(), json.end());
+            }
+            if (std::getenv("HSR_WRAPPER_THIN_NAVBOX")) {
+                size_t thinned = 0;
+                if (!thinNavBoxSupports(payload, thinned) || thinned < 100)
+                    return fail("wrapper NavBox thinning failed");
+            }
+        }
+        if (!keys.emplace(record.pkg, record.ing, record.tgt).second) {
+            // Modern cooks and official Vista carriers can both reference a
+            // Horizon shared shader under its canonical hashed path. The v206
+            // carrier revision is authoritative for that explicitly shared
+            // namespace (and can legitimately differ from the old Home's
+            // bytes). Outside it, require byte identity; every other key
+            // collision remains a hard failure.
+            const auto existing = carrierIndex.find(archivePath);
+            const auto keyPath = keyPaths.find({record.pkg, record.ing, record.tgt});
+            const size_t sharedSurfaceEnd = record.path.find(".surface/");
+            const bool sameSharedSurface =
+                keyPath != keyPaths.end() &&
+                record.path.rfind("meta/horizon_shared_shaders/", 0) == 0 &&
+                sharedSurfaceEnd != std::string::npos &&
+                keyPath->second.compare(0, sharedSurfaceEnd + 9,
+                                        record.path, 0, sharedSurfaceEnd + 9) == 0;
+            if ((existing != carrierIndex.end() &&
+                 carrierFiles[existing->second].second == payload) ||
+                sameSharedSurface) {
+                ++selected;
+                ++sharedDedup;
+                continue;
+            }
+            return fail("source Home/official ASMH key collision: " + record.path +
+                        " officialPath=" +
+                        (keyPath == keyPaths.end() ? std::string("(missing)") : keyPath->second) +
+                        " key=" + std::to_string(record.pkg) + ":" +
+                        std::to_string(record.ing) + ":" +
+                        std::to_string(record.tgt));
+        }
+        if (carrierIndex.find(archivePath) != carrierIndex.end())
+            return fail("source Home/official ZIP path collision: " + record.path);
+        carrierIndex.emplace(archivePath, carrierFiles.size());
+        carrierFiles.push_back({ archivePath, std::move(payload) });
+        manifest.push_back({ record.pkg, record.ing, record.tgt, record.path,
+                             record.fourcc, record.subtype,
+                             static_cast<uint32_t>(carrierFiles.back().second.size()) });
+        ++selected;
+    }
+    // First conversion removes the legacy 28-box floor grid. Re-wrapping an
+    // already accepted profile sees the already-clean payload and removes 0.
+    if (mountContentUnderCarrier && floorBoxesRemoved != 0 &&
+        floorBoxesRemoved != 28 && floorBoxesRemoved != 97)
+        return fail("unexpected automatic floor-box count");
+    size_t prunedCarrierRecords = 0;
+    if (pruneUnusedCarrier) {
+        std::vector<AsmhEntry> retainedManifest;
+        retainedManifest.reserve(sourceClosureKeys.size() + 1);
+        std::set<std::string> retainedArchivePaths;
+        size_t retainedOfficialSpaces = 0;
+        for (const auto& entry : manifest) {
+            const auto key = std::make_tuple(entry.pkg, entry.ing, entry.tgt);
+            if (entry.path != officialSpacePath &&
+                sourceClosureKeys.find(key) == sourceClosureKeys.end()) continue;
+            if (entry.path == officialSpacePath) ++retainedOfficialSpaces;
+            retainedArchivePaths.insert("content/" + entry.path);
+            retainedManifest.push_back(entry);
+        }
+        if (retainedOfficialSpaces != 1 ||
+            retainedManifest.size() != sourceClosureKeys.size() + 1)
+            return fail("Vista carrier pruning identity mismatch");
+
+        std::vector<CookFile> retainedFiles;
+        retainedFiles.reserve(retainedManifest.size() + 2);
+        for (auto& file : carrierFiles) {
+            if (file.first == "content/assets.manifest" ||
+                file.first == "content/configs/shellconfig.jsonc" ||
+                retainedArchivePaths.find(file.first) != retainedArchivePaths.end())
+                retainedFiles.push_back(std::move(file));
+        }
+        if (retainedFiles.size() != retainedManifest.size() + 2)
+            return fail("Vista carrier pruning file mismatch");
+        prunedCarrierRecords = manifest.size() - retainedManifest.size();
+        manifest = std::move(retainedManifest);
+        carrierFiles = std::move(retainedFiles);
+        carrierIndex.clear();
+        for (size_t i = 0; i < carrierFiles.size(); ++i) {
+            if (!carrierIndex.emplace(carrierFiles[i].first, i).second)
+                return fail("Vista carrier pruning duplicate path");
+        }
+        const auto manifestAt = carrierIndex.find("content/assets.manifest");
+        const auto configAt = carrierIndex.find("content/configs/shellconfig.jsonc");
+        if (manifestAt == carrierIndex.end() || configAt == carrierIndex.end())
+            return fail("Vista carrier pruning metadata missing");
+        carrierManifestIndex = manifestAt->second;
+        keys.clear();
+        for (const auto& entry : manifest)
+            if (!keys.emplace(entry.pkg, entry.ing, entry.tgt).second)
+                return fail("Vista carrier pruning duplicate key");
+    }
+    const size_t mergedExpected = pruneUnusedCarrier
+                                ? sourceClosureKeys.size() + 1
+                                : carrierRecords.size() + closureExpected - sharedDedup;
+    if (selected != closureExpected || manifest.size() != mergedExpected ||
+        keys.size() != manifest.size())
+        return fail("Vista closure count mismatch");
+
+    const std::vector<uint8_t> mergedManifest = buildAsmh(manifest);
+    std::vector<AsmhRecord> roundTrip;
+    if (mergedManifest.empty() || !parseAsmhRecords(mergedManifest, roundTrip) ||
+        roundTrip.size() != manifest.size()) return fail("merged ASMH round-trip failed");
+    for (size_t i = 0; i < manifest.size(); ++i) {
+        const auto& expected = manifest[i];
+        const auto& actual = roundTrip[i];
+        if (expected.pkg != actual.pkg || expected.ing != actual.ing ||
+            expected.tgt != actual.tgt || expected.path != actual.path ||
+            expected.fourcc != actual.fourcc || expected.subtype != actual.subtype ||
+            expected.size != actual.size)
+            return fail("merged ASMH round-trip changed a record");
+    }
+    carrierFiles[carrierManifestIndex].second = mergedManifest;
+
+    result = buildStoredZip(carrierFiles);
+    if (result.empty()) return fail("Vista scene packaging failed");
+    std::vector<CookFile> packagedFiles;
+    if (!readSceneArchiveFiles(result, packagedFiles) ||
+        packagedFiles.size() != carrierFiles.size())
+        return fail("Vista packaged scene validation failed");
+    for (size_t i = 0; i < carrierFiles.size(); ++i) {
+        if (packagedFiles[i].first != carrierFiles[i].first ||
+            packagedFiles[i].second != carrierFiles[i].second)
+            return fail("Vista packaged scene changed an entry");
+    }
+    if (report) {
+        *report = "OK: official=" + std::to_string(carrierRecords.size()) +
+                  " homeSource=" + std::to_string(sourceRecords.size()) +
+                  " homeBase=" + sourceBase + " homeClosure=" +
+                  std::to_string(selected) + " contentBytes=" +
+                  std::to_string(sourceContent.size()) + " carrierTemplates=" +
+                  std::to_string(carrierTemplateOverrides) + " mount=" +
+                  (mountContentUnderCarrier ? "carrier-child" : "native-space") +
+                  " floorBoxesRemoved=" + std::to_string(floorBoxesRemoved) + " merged=" +
+                  std::to_string(manifest.size()) + " sharedDedup=" +
+                  std::to_string(sharedDedup) + " carrierPruned=" +
+                  std::to_string(prunedCarrierRecords) + " files=" +
+                  std::to_string(carrierFiles.size()) + " sceneBytes=" +
+                  std::to_string(result.size()) + " sourcePackage=" +
+                  sourceIdentity.packageName + " sourceRoot=" +
+                  wrapperContentPath;
+    }
+    return true;
+}
+
 struct CookAsset { std::string contentPath; uint32_t tgt; std::vector<uint8_t> data; AssetKey3 key; uint32_t cat = 0, sub = 0; };
 static const uint32_t TYPE_PHSX = 0x58534850u, TYPE_3MSH = 0x48534D33u;   // physics collision mesh (PHSX:3MSH)
 static const uint32_t TYPE_HZAN = 0x4E415A48u, TYPE_SKEL = 0x4C454B53u, TYPE_ANIM = 0x4D494E41u;   // HZAN:SKEL / HZAN:ANIM
@@ -1460,6 +3322,138 @@ inline std::vector<uint8_t> emptyVistaSceneZip() {
     assets.push_back({ pSpace,   TGT_TEMPLATE, jbytes(space),   spaceK });
     auto shellcfg = jbytes(shellConfigJson(spaceK, /*locomotion=*/false));
     return assembleSceneZip(assets, shellcfg);
+}
+
+// v206 still force-pairs the selected Vista when the Haven slot is replaced by a no-root spoof.  Replacing
+// the complete Vista scene with an empty scene is too aggressive: the shell keeps using the Vista as the
+// render/lighting companion and a scene without the stock ScenePlatform layer can leave the entire Home black.
+//
+// Keep the REAL Vista's space.hstf, shell config, manifest and assets intact, but replace every referenced
+// sub-template (lighting/skybox, mountains, midground, fog cards, birds, audio, pockets, ...) with a valid Root
+// template that renders nothing.  Padding the JSON to the original byte length deliberately keeps assets.manifest
+// valid without rewriting its binary size table.  The top-level space template therefore remains a fully valid
+// v206 Vista companion while contributing no visible Calming geometry.  [[project_hsr_v206_vista_companion]]
+inline std::vector<uint8_t> suppressVistaVisualsSceneZip(const std::vector<uint8_t>& realScene,
+                                                         size_t* suppressedTemplates = nullptr) {
+    if (suppressedTemplates) *suppressedTemplates = 0;
+    mz_zip_archive in; memset(&in, 0, sizeof in);
+    if (!mz_zip_reader_init_mem(&in, realScene.data(), realScene.size(), 0)) return {};
+
+    const mz_uint n = mz_zip_reader_get_num_files(&in);
+    zipsafety::ArchiveReadBudget readBudget(zipsafety::kSceneReadLimits);
+    std::vector<std::string> inputNames(n);
+    for (mz_uint i = 0; i < n; ++i) {
+        mz_zip_archive_file_stat st{};
+        if (!mz_zip_reader_file_stat(&in, i, &st)) { mz_zip_reader_end(&in); return {}; }
+        const mz_uint nameSize = mz_zip_reader_get_filename(&in, i, nullptr, 0);
+        if (nameSize == 0 || nameSize > zipsafety::kZip16Max + 1) { mz_zip_reader_end(&in); return {}; }
+        std::vector<char> rawName(nameSize);
+        if (mz_zip_reader_get_filename(&in, i, rawName.data(), nameSize) == 0) { mz_zip_reader_end(&in); return {}; }
+        const bool directory = mz_zip_reader_is_file_a_directory(&in, i) != 0;
+        const auto rr = readBudget.add(std::string_view(rawName.data(), nameSize - 1),
+                                       static_cast<uint64_t>(st.m_uncomp_size), directory, &inputNames[i]);
+        if (rr.status != zipsafety::ArchiveReadStatus::Ok) { mz_zip_reader_end(&in); return {}; }
+    }
+
+    CookRng rng(0x2067157AULL);
+    const std::string neutralTemplate = templateJson(rootEntityJson(makeUuid(rng)), "");
+    mz_zip_archive out; memset(&out, 0, sizeof out);
+    if (!mz_zip_writer_init_heap(&out, 0, 0)) { mz_zip_reader_end(&in); return {}; }
+    zipsafety::EntryNameRegistry names;
+    size_t changed = 0;
+    for (mz_uint i = 0; i < n; ++i) {
+        const std::string& name = inputNames[i];
+        if (mz_zip_reader_is_file_a_directory(&in, i)) continue;
+        size_t sz = 0;
+        void* raw = mz_zip_reader_extract_to_heap(&in, i, &sz, 0);
+        if (!raw) { mz_zip_reader_end(&in); mz_zip_writer_end(&out); return {}; }
+
+        static constexpr size_t kTemplateSuffixLen = sizeof(".hstf/template_9k0v") - 1;
+        const bool isTemplate = name.size() >= kTemplateSuffixLen &&
+            name.compare(name.size() - kTemplateSuffixLen, kTemplateSuffixLen, ".hstf/template_9k0v") == 0;
+        const bool isTopLevelSpace = name.find("/space.hstf/") != std::string::npos;
+        const void* data = raw;
+        std::vector<uint8_t> replacement;
+        if (isTemplate && !isTopLevelSpace && neutralTemplate.size() <= sz) {
+            replacement.assign(sz, static_cast<uint8_t>(' '));
+            memcpy(replacement.data(), neutralTemplate.data(), neutralTemplate.size());
+            data = replacement.data();
+            ++changed;
+        }
+        const bool added = zipAddMemChecked(out, names, name, data, sz, MZ_DEFAULT_COMPRESSION);
+        mz_free(raw);
+        if (!added) { mz_zip_reader_end(&in); mz_zip_writer_end(&out); return {}; }
+    }
+    mz_zip_reader_end(&in);
+    std::vector<uint8_t> scene;
+    const bool finalized = zipFinalizeHeapChecked(out, scene);
+    mz_zip_writer_end(&out);
+    if (!finalized || changed == 0) return {};
+    if (suppressedTemplates) *suppressedTemplates = changed;
+    return scene;
+}
+
+// Preserve the exact real Vista APK (manifest/resources/dex) and surgically neutralize only the visible
+// sub-templates inside assets/scene.zip.  This is intentionally separate from emptyOutVistaApk so the known
+// black-scene fallback remains available for diagnostics without being used as the v206 solution.
+inline std::vector<uint8_t> suppressVistaVisualsApk(const std::vector<uint8_t>& realApk, bool* ok = nullptr,
+                                                    size_t* suppressedTemplates = nullptr) {
+    if (ok) *ok = false;
+    if (suppressedTemplates) *suppressedTemplates = 0;
+    mz_zip_archive in; memset(&in, 0, sizeof in);
+    if (!mz_zip_reader_init_mem(&in, realApk.data(), realApk.size(), 0)) return {};
+    const mz_uint n = mz_zip_reader_get_num_files(&in);
+    zipsafety::ArchiveReadBudget readBudget(zipsafety::kApkReadLimits);
+    std::vector<std::string> inputNames(n);
+    for (mz_uint i = 0; i < n; ++i) {
+        mz_zip_archive_file_stat st{};
+        if (!mz_zip_reader_file_stat(&in, i, &st)) { mz_zip_reader_end(&in); return {}; }
+        const mz_uint nameSize = mz_zip_reader_get_filename(&in, i, nullptr, 0);
+        if (nameSize == 0 || nameSize > zipsafety::kZip16Max + 1) { mz_zip_reader_end(&in); return {}; }
+        std::vector<char> rawName(nameSize);
+        if (mz_zip_reader_get_filename(&in, i, rawName.data(), nameSize) == 0) { mz_zip_reader_end(&in); return {}; }
+        const bool directory = mz_zip_reader_is_file_a_directory(&in, i) != 0;
+        const auto rr = readBudget.add(std::string_view(rawName.data(), nameSize - 1),
+                                       static_cast<uint64_t>(st.m_uncomp_size), directory, &inputNames[i]);
+        if (rr.status != zipsafety::ArchiveReadStatus::Ok) { mz_zip_reader_end(&in); return {}; }
+    }
+
+    mz_zip_archive out; memset(&out, 0, sizeof out);
+    if (!mz_zip_writer_init_heap(&out, 0, 0)) { mz_zip_reader_end(&in); return {}; }
+    zipsafety::EntryNameRegistry names;
+    bool sawScene = false;
+    size_t changed = 0;
+    for (mz_uint i = 0; i < n; ++i) {
+        const std::string& name = inputNames[i];
+        if (mz_zip_reader_is_file_a_directory(&in, i)) continue;
+        if (name.rfind("META-INF/", 0) == 0) continue; // old signature; caller signs the rebuilt APK
+        size_t sz = 0;
+        void* raw = mz_zip_reader_extract_to_heap(&in, i, &sz, 0);
+        if (!raw) { mz_zip_reader_end(&in); mz_zip_writer_end(&out); return {}; }
+        const void* data = raw;
+        size_t outSize = sz;
+        std::vector<uint8_t> scene;
+        if (name == "assets/scene.zip") {
+            sawScene = true;
+            std::vector<uint8_t> original(static_cast<uint8_t*>(raw), static_cast<uint8_t*>(raw) + sz);
+            scene = suppressVistaVisualsSceneZip(original, &changed);
+            if (scene.empty()) { mz_free(raw); mz_zip_reader_end(&in); mz_zip_writer_end(&out); return {}; }
+            data = scene.data(); outSize = scene.size();
+        }
+        const mz_uint flags = name == "resources.arsc" ? MZ_NO_COMPRESSION : MZ_DEFAULT_COMPRESSION;
+        const bool added = zipAddMemChecked(out, names, name, data, outSize, flags);
+        mz_free(raw);
+        if (!added) { mz_zip_reader_end(&in); mz_zip_writer_end(&out); return {}; }
+    }
+    mz_zip_reader_end(&in);
+    if (!sawScene) { mz_zip_writer_end(&out); return {}; }
+    std::vector<uint8_t> apk;
+    const bool finalized = zipFinalizeHeapChecked(out, apk);
+    mz_zip_writer_end(&out);
+    if (!finalized || changed == 0) return {};
+    if (suppressedTemplates) *suppressedTemplates = changed;
+    if (ok) *ok = true;
+    return apk;
 }
 // PRIMARY invisible-vista path: take the REAL installed vista APK (pulled from the device via pm path) and
 // keep EVERYTHING — its AndroidManifest (correct vista package + type), resources, dex — replacing ONLY
@@ -1543,7 +3537,8 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos_, 
                                                 const std::vector<uint8_t>& boneIdx_ = {}, const std::vector<uint8_t>& boneWgt_ = {},
                                                 const std::vector<uint32_t>& jointIds = {},   // jointIds = murmur3(joint name) per skeleton joint
                                                 bool spinBoundsY = false,    // Y-ROTATION mesh: bake the AABB as the swept cylinder so the device doesn't FRUSTUM-CULL the getTime()-rotated geometry (it can't see the shader's vertex spin)
-                                                const std::vector<uint8_t>& vertCol = {}) {   // per-ORIGINAL-vertex sem4 COLOR_0 RGBA (baked lightmap → shader does base×COLOR0); empty → white (neutral)
+                                                const std::vector<uint8_t>& vertCol = {},
+                                                const std::vector<uint8_t>& depthClass = {}) { // optional per-original-vertex stable far-depth ramp, encoded in COLOR_0.a for DEPTHCONDITIONAL
     struct Part { std::vector<uint8_t> vb, ib; uint32_t nv = 0; };
     std::vector<Part> parts;
     // BOUNDS VERTEX (skinned-mesh CULL fix, V205): the device culls SKINNED meshes by their runtime SKINNED-VERTEX extent,
@@ -1567,17 +3562,6 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos_, 
         posA = pos_; uvA = uv_; idxA = idx_; biA = boneIdx_; bwA = boneWgt_;
         if (uvA.size() < (posA.size()/3)*2) uvA.resize((posA.size()/3)*2, 0.f);   // UV parity before the append
         uint32_t base = (uint32_t)(posA.size()/3);
-        // ANCHOR JOINT (IDA-PROVEN root cause, SkeletonSystem_vf7__1480F70): the device computes a SKINNED mesh's CULL
-        // bounds from the SKELETON's per-joint boxes (each joint's bind-pose influenced-vert AABB) transformed by the posed
-        // joint matrices — and its accumulation loop SKIPS JOINT 0 (iterates joints 1..n-1 starting at jointArray+120; the
-        // init fn__AF08EC only zeroes the accumulator, it does NOT add joint 0). So the old bounds vert weighted 100% to
-        // joint 0 was SILENTLY IGNORED (omnidroid still culled). FIX = weight it to the HIGHEST joint this mesh actually
-        // uses (>=1, already in the dense palette, and iterated by the loop) so THAT joint's box spans the scene -> the
-        // skeleton bounds span the scene -> the frustum/occlusion cull can never drop the skinned mesh.
-        uint8_t anchorJoint = 0;
-        for (size_t i = 0; i < boneIdx_.size() && i < boneWgt_.size(); i++)
-            if (boneWgt_[i] > 0 && boneIdx_[i] > anchorJoint) anchorJoint = boneIdx_[i];
-        if (anchorJoint == 0) anchorJoint = 1;   // mesh uses only joint 0 (which the loop skips): reference joint 1 (the bounds vert's weight=255 makes it a legit palette entry)
         // TWO tiny NON-DEGENERATE far triangles at OPPOSITE corners (±1e5) — the SKINNED-BOUNDS FIX. Root cause chain:
         //  (1) the device recomputes a skinned mesh's CULL bounds from its geometry (ignores the cooked AABB);
         //  (2) it SKIPS degenerate/zero-area triangles, so our old single far vert in a (base,base,base) tri was NEVER
@@ -1682,6 +3666,10 @@ inline std::vector<uint8_t> encodeRendMeshParts(const std::vector<float>& pos_, 
                     } else {
                         uint8_t nb[4] = { 0xFF,0xFF,0xFF,0xFF };   // sem4 COLOR_0 (white=neutral, OR baked lightmap → base×COLOR0)
                         if (vertCol.size() >= (size_t)(g+1)*4) { nb[0]=vertCol[(size_t)g*4]; nb[1]=vertCol[(size_t)g*4+1]; nb[2]=vertCol[(size_t)g*4+2]; nb[3]=vertCol[(size_t)g*4+3]; }
+                        // Preserve the full 8-bit scene-wide distance ramp. Collapsing every
+                        // non-zero class to 255 turns all far components into the same depth
+                        // plane, causing view-dependent ties in VrShell's final resolve.
+                        if (depthClass.size() > g) nb[3] = depthClass[g];
                         pr.vb.insert(pr.vb.end(),nb,nb+4);
                     }
                     pr.nv++;
@@ -1847,8 +3835,8 @@ struct ExportMesh {
                                     // the paired blend copy draws the smooth color on top. Gives smooth edges AND correct depth.
     std::vector<uint8_t> iblVertCol; // FAITHFUL SpecIbl diffuse-irradiance per-vertex RGBA = diffuseCube(worldN)·ambientIBLTint, baked in buildExportMeshes (the renderer's exact uploadMesh bake). Device base·vertexColor0 = env-lit lake water, NOT the dark basecolor (the "black lake" bug). Empty for non-specibl meshes.
     bool blend = false;             // alpha-blended (transparent) -> route to unlitblend.surface
-    bool alphaTest = false;         // MASK/cutout (foliage, *_masked scenery): DEPTH-WRITE cutout shader (alpha-test discard) so it OCCLUDES + discards transparent texels — was routed to the no-depth-write blend pass = the lakeside 2D-scenery overlay/flash. Meta cuts depth-write too (unlitfoliage f2,f3 PRESENT).
-    bool additive = false;          // EMISSIVE GLOW (warp streaks, nebula fog, force-field) -> route to the OPAQUE-pass shader (unlit/unlitdoublesidedskinned, f2,f3 PRESENT) kept in the TRANSPARENT MATL = ADDITIVE blend (src+dst). Alpha-blended these vanish on a dark backdrop (the Star Trek warp/fog "IS NOT VISIBLE" bug). 3x device-proven: opaque vs alpha shaders differ ONLY in pass f2,f3; the shipped unlitspritesheetflipbookadditive keeps f2,f3 PRESENT.
+    bool alphaTest = false;         // MASK/cutout (foliage, *_masked scenery): DEPTH-WRITE cutout shader (alpha-test discard) so it OCCLUDES + discards transparent texels. Meta cutouts depth-write too (unlitfoliage f2,f3 PRESENT).
+    bool additive = false;          // EMISSIVE GLOW (streaks, fog, force-fields) -> route to the OPAQUE-pass shader (unlit/unlitdoublesidedskinned, f2,f3 PRESENT) kept in the TRANSPARENT MATL = ADDITIVE blend (src+dst). Alpha-blended glows vanish on dark backdrops. Device-proven: opaque vs alpha shaders differ in pass f2,f3; the shipped unlitspritesheetflipbookadditive keeps f2,f3 PRESENT.
     bool doubleSided = false;       // glTF doubleSided material -> cook appends REVERSED tris so the single-sided unlit shader still draws back faces (else flat/open meshes back-face-cull on device = see-through HOLES; renderer honors doubleSided so its preview looked fine)
     bool flipbook = false;          // animated flat material -> route to unlitspritesheetflipbookadditive.surface (GPU getTime() spritesheet cycle, NO skeleton)
     int flipCols = 0, flipRows = 0; // spritesheet grid (cols x rows)
@@ -1861,6 +3849,8 @@ struct ExportMesh {
     std::vector<float> vatOffsets;  // VAT vertex offsets, frames*vertexCount*3 (WORLD space) -> animated via VAT (non-skeletal)
     int vatFrames = 0;
     bool pulse = false;             // node-animated billboard (flame wisp) -> CUSTOM wisp_pulse.surface (unlitblend + getTime() brightness pulse)
+    int depthRemapMode = -1;        // -1=auto by bounds, 0=force normal-depth near part, 1=force far-depth remap part
+    bool preserveOneWayPeriod = false; // append a last-frame hold so an open HZANIM loop reaches its masking endpoint at N/fps
     // Visual-only distant scenery that must keep its relative layout. Every mesh in the
     // same non-negative group is uniformly fitted about the spawn with ONE shared factor
     // before large meshes are split. This avoids the torn/flattened skyline produced by
@@ -2279,6 +4269,84 @@ inline bool extractZipTo(const std::string& zipPath, const std::string& destDir)
     mz_zip_reader_end(&z); return ok;
 }
 
+// HSR_DEPTHCLAMP must not classify a mixed scenery mesh by ONE farthest vertex. Some source meshes contain both
+// two train-connector towers/track near the player and a few skyline triangles beyond the shell clip. Routing that
+// whole mesh through the far-depth shader puts the static connectors in a different depth space from the animated
+// train, so its otherwise-correct endpoints appear displaced at both buildings. Split only truly mixed STATIC meshes
+// by triangle: a triangle is FAR only when all three vertices are outside the threshold; every crossing triangle stays
+// NEAR so local buildings never get torn. Geometry and UVs are copied byte-for-byte; only shader routing changes.
+inline std::vector<ExportMesh> splitMixedDepthMeshes(std::vector<ExportMesh> in, const float origin[3], float radius) {
+    std::vector<ExportMesh> out;
+    out.reserve(in.size() + 4);
+    const float r2 = radius * radius;
+    for (auto& m : in) {
+        const size_t nv = m.positions.size() / 3;
+        const bool animated = m.hzJointCount > 0 || m.vatFrames > 0 || m.transAnim || m.rotAnim || m.scaleAnim || m.poseAnim;
+        if (animated || m.skybox || m.backdropFitGroup >= 0 || nv < 3 || m.indices.size() < 6) {
+            out.push_back(std::move(m)); continue;
+        }
+        // Classify whole topological components, never individual triangles. A building can cross the radius;
+        // triangle classification tears its facade between two depth spaces. Union triangles through shared
+        // vertices, mark a component NEAR when any of its authored vertices is near, and route only completely
+        // detached all-far components through the remap shader.
+        std::vector<uint32_t> parent(nv), rank(nv,0);
+        for (uint32_t v=0;v<(uint32_t)nv;v++) parent[v]=v;
+        auto find=[&](uint32_t x){uint32_t r=x;while(parent[r]!=r)r=parent[r];
+            while(parent[x]!=x){uint32_t n=parent[x];parent[x]=r;x=n;}return r;};
+        auto join=[&](uint32_t a,uint32_t b){a=find(a);b=find(b);if(a==b)return;
+            if(rank[a]<rank[b])std::swap(a,b);parent[b]=a;if(rank[a]==rank[b])rank[a]++;};
+        for(size_t t=0;t+2<m.indices.size();t+=3){uint32_t a=m.indices[t],b=m.indices[t+1],c=m.indices[t+2];
+            if(a<nv&&b<nv&&c<nv){join(a,b);join(a,c);}}
+        std::unordered_map<uint32_t,bool> componentNear;
+        for(uint32_t v=0;v<(uint32_t)nv;v++){
+            float dx=m.positions[(size_t)v*3]-origin[0],dy=m.positions[(size_t)v*3+1]-origin[1],dz=m.positions[(size_t)v*3+2]-origin[2];
+            if(dx*dx+dy*dy+dz*dz<=r2)componentNear[find(v)]=true;
+        }
+        std::vector<uint8_t> farTri(m.indices.size()/3,0);
+        size_t nearCount=0,farCount=0;
+        for(size_t t=0;t<farTri.size();t++){uint32_t v=m.indices[t*3];
+            bool isFarComponent=v<nv&&!componentNear[find(v)];
+            farTri[t]=isFarComponent?1:0;if(isFarComponent)++farCount;else ++nearCount;
+        }
+        // Split only a NEAR-DOMINANT mesh with a meaningful far tail. A far-dominant skyline
+        // mat6/mat7 can contain a handful of vertices just inside the radius; peeling those triangles away opens
+        // visible seams in the right skyline. Tiny far tails on sign atlases likewise stay intact. mat5 is the
+        // intended class (26060 near / 257 far): local city geometry with a real but small distant tail.
+        if (!nearCount || farCount < 32 || nearCount <= farCount * 4) {
+            out.push_back(std::move(m)); continue;
+        }
+        if (!m.sharedRgba && !m.rgba.empty()) m.sharedRgba = std::make_shared<const std::vector<uint8_t>>(std::move(m.rgba));
+        if (!m.sharedSrcAstc && !m.srcAstc.empty()) m.sharedSrcAstc = std::make_shared<const std::vector<uint8_t>>(std::move(m.srcAstc));
+        const bool haveUv=m.uvs.size()>=nv*2, haveUv2=m.uvs2.size()>=nv*2, haveCol=m.iblVertCol.size()>=nv*4;
+        auto makePart = [&](bool wantFar) {
+            ExportMesh c = m;
+            c.name += wantFar ? "_far" : "_near";
+            c.positions.clear(); c.uvs.clear(); c.uvs2.clear(); c.indices.clear(); c.iblVertCol.clear();
+            c.depthRemapMode = wantFar ? 1 : 0;
+            std::unordered_map<uint32_t,uint32_t> remap;
+            for (size_t t=0; t<farTri.size(); ++t) if ((farTri[t]!=0)==wantFar) {
+                for (int k=0;k<3;++k) {
+                    uint32_t g=m.indices[t*3+k]; auto it=remap.find(g); uint32_t l;
+                    if (it==remap.end()) {
+                        l=(uint32_t)remap.size(); remap.emplace(g,l);
+                        c.positions.insert(c.positions.end(), {m.positions[g*3],m.positions[g*3+1],m.positions[g*3+2]});
+                        if(haveUv) c.uvs.insert(c.uvs.end(), {m.uvs[g*2],m.uvs[g*2+1]});
+                        if(haveUv2) c.uvs2.insert(c.uvs2.end(), {m.uvs2[g*2],m.uvs2[g*2+1]});
+                        if(haveCol) c.iblVertCol.insert(c.iblVertCol.end(), m.iblVertCol.begin()+g*4, m.iblVertCol.begin()+g*4+4);
+                    } else l=it->second;
+                    c.indices.push_back(l);
+                }
+            }
+            return c;
+        };
+        fprintf(stderr,"[COOK] MIXED-DEPTH-COMPONENTS '%s': %zu near + %zu detached far triangles at %.0fm\n",
+                m.name.c_str(),nearCount,farCount,radius);
+        out.push_back(makePart(false));
+        out.push_back(makePart(true));
+    }
+    return out;
+}
+
 // find the dir directly containing `tool`(.bat/.exe) anywhere under `root`.
 inline std::string findToolDirUnder(const std::string& root, const char* tool) {
     namespace fs = std::filesystem; std::error_code ec;
@@ -2437,29 +4505,98 @@ inline void reportToolchain(FILE* out = stderr) {
     fprintf(out, "        Device install uses adb (auto-detected: SideQuest / SDK / PATH, or auto-downloaded on demand).\n");
 }
 
-// AUTO-SIGN a cooked APK: zipalign + apksigner with a debug keystore -> an INSTALLABLE signed APK. PORTABLE (no
-// hardcoded SDK path): build-tools are AUTO-DETECTED (AppConfig::detectBuildTools scans ANDROID_HOME / ANDROID_SDK_ROOT
-// / LOCALAPPDATA / ~/Android/Sdk / common dirs), and the keystore is AUTO-GENERATED with keytool if missing (so a fresh
-// clone on any machine signs with zero setup — keytool ships with the JDK that apksigner needs anyway). Cross-platform
-// (Windows .bat/.exe + backslashes; POSIX apksigner/zipalign). Override via HSR_BUILDTOOLS / HSR_KEYSTORE.
 // SELF-CONTAINED sign: built-in zipalign (4-byte) + APK Signature Scheme v2 with a baked-in debug key.
 // NO Java, NO apksigner, NO keytool, NO zipalign binary, NO downloads. Quest (API 29+) accepts v2-only.
+inline bool signApkData(const std::vector<uint8_t>& in, const std::string& signedApk,
+                        const std::function<void(float,const char*)>& progress = {}) {
+    auto prog = [&](float f, const char* s){ if (progress) progress(f, s); };
+    if (in.empty()) { prog(1.0f, "sign: empty APK"); return false; }
+    // Signing temporarily needs a second full APK beside the unsigned input.
+    // Fail before zipalign/signing when the destination cannot hold it; otherwise
+    // a large Vista wrapper can spend seconds signing and then die at fwrite.
+    // Write to a sibling temporary file so an existing known-good output is never
+    // truncated by an interrupted or out-of-space replacement.
+    namespace fs = std::filesystem;
+    fs::path destination(signedApk);
+    fs::path parent = destination.parent_path();
+    if (parent.empty()) parent = fs::current_path();
+    std::error_code spaceError;
+    const auto capacity = fs::space(parent, spaceError);
+    constexpr uintmax_t kSigningHeadroom = 8u * 1024u * 1024u;
+    if (!spaceError &&
+        capacity.available < static_cast<uintmax_t>(in.size()) + kSigningHeadroom) {
+        prog(1.0f, "sign: insufficient destination disk space for atomic APK output");
+        return false;
+    }
+    prog(0.92f, "zipalign (built-in)");
+    std::vector<uint8_t> aligned;
+    if (!sign::zipalign4(in, aligned)) aligned = in;              // unparseable zip -> sign as-is (still a valid v2 sig)
+    prog(0.96f, "signing v2 (built-in, no Java)");
+    std::vector<uint8_t> out;
+    if (!sign::signApkV2(aligned, out)) { prog(1.0f, "sign: v2 signing failed (bad APK?)"); return false; }
+    fs::path temporary = destination;
+    temporary += ".signing." +
+        std::to_string((unsigned long long)std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    std::error_code cleanupError;
+    fs::remove(temporary, cleanupError);
+    {
+        FILE* f = fopen(temporary.string().c_str(), "wb");
+        if (!f) { prog(1.0f, "sign: can't write the signed APK"); return false; }
+        const size_t written = fwrite(out.data(), 1, out.size(), f);
+        const int closeResult = fclose(f);
+        if (written != out.size() || closeResult != 0) {
+            cleanupError.clear(); fs::remove(temporary, cleanupError);
+            prog(1.0f, "sign: failed to write the complete signed APK (disk full or write error)");
+            return false;
+        }
+    }
+    std::error_code sizeError;
+    if (fs::file_size(temporary, sizeError) != out.size() || sizeError) {
+        cleanupError.clear(); fs::remove(temporary, cleanupError);
+        prog(1.0f, "sign: temporary signed APK size verification failed");
+        return false;
+    }
+    // Portable replace-with-rollback: std::filesystem::rename does not replace an
+    // existing file on Windows. Move the old artifact aside first, then restore it
+    // if publishing the completed temporary file fails.
+    fs::path previous = destination;
+    previous += ".previous-signing";
+    std::error_code replaceError, previousError;
+    fs::remove(previous, previousError);
+    const bool hadPrevious = fs::exists(destination, previousError) && !previousError;
+    if (hadPrevious) {
+        fs::rename(destination, previous, replaceError);
+        if (replaceError) {
+            cleanupError.clear(); fs::remove(temporary, cleanupError);
+            prog(1.0f, "sign: cannot preserve the previous signed APK");
+            return false;
+        }
+    }
+    replaceError.clear();
+    fs::rename(temporary, destination, replaceError);
+    if (replaceError) {
+        cleanupError.clear(); fs::remove(temporary, cleanupError);
+        if (hadPrevious) {
+            std::error_code restoreError;
+            fs::rename(previous, destination, restoreError);
+        }
+        prog(1.0f, "sign: cannot atomically publish the signed APK");
+        return false;
+    }
+    if (hadPrevious) {
+        cleanupError.clear(); fs::remove(previous, cleanupError);
+    }
+    prog(1.0f, "Signed OK (v2, built-in)");
+    return true;
+}
+
 inline bool signApk(const std::string& unsignedApk, const std::string& signedApk,
                     const std::function<void(float,const char*)>& progress = {}) {
     auto prog = [&](float f, const char* s){ if (progress) progress(f, s); };
     std::vector<uint8_t> in;
     { FILE* f = fopen(unsignedApk.c_str(), "rb"); if (!f) { prog(1.0f, "sign: can't open the unsigned APK"); return false; }
       fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ in.resize((size_t)n); if(fread(in.data(),1,(size_t)n,f)!=(size_t)n){ fclose(f); prog(1.0f,"sign: read failed"); return false; } } fclose(f); }
-    prog(0.92f, "zipalign (built-in)");
-    std::vector<uint8_t> aligned;
-    if (!sign::zipalign4(in, aligned)) aligned.swap(in);          // unparseable zip -> sign as-is (still a valid v2 sig)
-    prog(0.96f, "signing v2 (built-in, no Java)");
-    std::vector<uint8_t> out;
-    if (!sign::signApkV2(aligned, out)) { prog(1.0f, "sign: v2 signing failed (bad APK?)"); return false; }
-    { FILE* f = fopen(signedApk.c_str(), "wb"); if (!f) { prog(1.0f, "sign: can't write the signed APK"); return false; }
-      fwrite(out.data(),1,out.size(),f); fclose(f); }
-    prog(1.0f, "Signed OK (v2, built-in)");
-    return true;
+    return signApkData(in, signedApk, progress);
 }
 
 // Port ANY decoded scene (e.g. a V79 .ovrscene loaded by the renderer) to a bootable V203 APK: per-mesh RENDMESH
@@ -2470,9 +4607,11 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
                                            bool locomotion = true, bool* ok = nullptr, const float* legacyCamPos = nullptr,
                                            std::vector<uint8_t>* outSceneZip = nullptr,
                                            const std::vector<uint8_t>& bgOgg = {},
-                                           const std::function<void(float,const char*)>& progress = {},
-                                           std::vector<sitem::Item> sceneItems = {},
-                                           const std::string& editorSession = {}) {   // .hsledit text -> embedded in the APK so an ORPHAN cook re-opens with its scene items
+                                            const std::function<void(float,const char*)>& progress = {},
+                                            std::vector<sitem::Item> sceneItems = {},
+                                            const std::string& editorSession = {},
+                                            CookQualityOptions quality = cookQualityOptions(defaultCookQualityProfile()),
+                                            bool packageApk = true) {   // .hsledit text -> embedded in the APK so an ORPHAN cook re-opens with its scene items
     auto prog = [&](float f, const char* s){ if (progress) progress(f, s); };
     prog(0.02f, "Preparing scene");
     // [COOKTRACE] wall-clock stage timing to pinpoint hangs (HSR_COOKTRACE=1). The LAST line printed before a
@@ -2482,7 +4621,25 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     auto ctrace = [&](const char* s){ if (ctOn) { double dt = std::chrono::duration<double>(std::chrono::steady_clock::now()-ctT0).count();
         fprintf(stderr, "[COOKTRACE] %8.2fs  %s\n", dt, s); fflush(stderr); } };
     if (ok) *ok = false;
+    fprintf(stderr, "[COOK] quality profile: %.*s\n", (int)cookQualityName(quality.profile).size(), cookQualityName(quality.profile).data());
     (void)vspv; (void)fspv; (void)legacyCamPos;   // retained only for source compatibility; cooks resolve the real spawn from scene data
+    // Some official Meta scenes contain malformed animated particle/helper
+    // quads whose evaluated transform produces NaN positions (Japan ships four
+    // 4-vertex pPlane helpers like this). They are not structural geometry and
+    // cannot be encoded. Quarantine only tiny invalid helpers; malformed real
+    // scene meshes continue into the strict preflight and fail safely.
+    meshes.erase(std::remove_if(meshes.begin(), meshes.end(), [](const ExportMesh& mesh) {
+        const size_t vertexCount=mesh.positions.size()/3;
+        const size_t triangleCount=mesh.indices.size()/3;
+        if(vertexCount>16 || triangleCount>32) return false;
+        const bool invalid=std::any_of(mesh.positions.begin(),mesh.positions.end(),
+            [](float value){ return !std::isfinite(value); });
+        if(invalid)
+            fprintf(stderr,
+                    "[COOK-PREFLIGHT] quarantined malformed micro-helper '%s' (%zu vertices, %zu triangles); structural meshes remain strict\n",
+                    mesh.name.c_str(),vertexCount,triangleCount);
+        return invalid;
+    }),meshes.end());
     // Fail malformed source geometry before loading shader templates or encoding
     // textures. This is intentionally read-only: valid scene data flows into the
     // existing cook unchanged. In particular there is no legacy 1000-mesh cap.
@@ -2588,8 +4745,12 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     // only in the far distance (invisible). The actual spawn is resolved below. [[project_hsr_eye_subcamera_farclip]]
     auto shad      = readFileBytes("cooker/nuxd_unlit_shader.bin");        // NORMAL (near) — byte-exact
     auto shadBlend = readFileBytes("cooker/nuxd_unlitblend_shader.bin");
-    auto shadDC      = dclamp ? readFileBytes("cooker/nuxd_unlit_depthclamp.bin")      : std::vector<uint8_t>{};   // REMAP (far only)
-    auto shadBlendDC = dclamp ? readFileBytes("cooker/nuxd_unlitblend_depthclamp.bin") : std::vector<uint8_t>{};
+    auto shadDC      = dclamp ? shadergen::generate(shad, shadergen::DEPTHREMAP, 0.f)      : std::vector<uint8_t>{};
+    auto shadBlendDC = dclamp ? shadergen::generate(shadBlend, shadergen::DEPTHREMAP, 0.f) : std::vector<uint8_t>{};
+    auto shadCD      = dclamp ? shadergen::generate(shad, shadergen::DEPTHCONDITIONAL, 0.f)      : std::vector<uint8_t>{};
+    auto shadBlendCD = dclamp ? shadergen::generate(shadBlend, shadergen::DEPTHCONDITIONAL, 0.f) : std::vector<uint8_t>{};
+    if(dclamp && shadDC.empty())shadDC=readFileBytes("cooker/nuxd_unlit_depthclamp.bin");
+    if(dclamp && shadBlendDC.empty())shadBlendDC=readFileBytes("cooker/nuxd_unlitblend_depthclamp.bin");
     float farMargin = 4500.f; if (const char* fm = std::getenv("HSR_FARCLIP_R")) { float v=(float)atof(fm); if (v>1.f) farMargin=v; }
     if (dclamp) fprintf(stderr, "[COOK] FAR-ONLY DEPTH-REMAP ON: meshes beyond %.0f from spawn use the remap shader; near byte-exact\n", farMargin);
     auto matTpl    = readFileBytes("cooker/realfloor_mat.bin");   // unlit.surface MATL template
@@ -2600,7 +4761,6 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     // in transparent MATL" trick only yields ALPHA-blend on device -> the lake foam's black-bg texture showed as a dark
     // card (user: "full dark foam thingy"). A true additive MATL makes black add 0 = transparent overlay, white = foam.
     auto matAdd    = readFileBytes("cooker/realadditive_mat.bin");
-    bool haveAdd   = matAdd.size() >= 176;
     auto shadVat   = readFileBytes("cooker/vat_shader.bin");      // vatunlitbasecolor (vertex-animation) shader — OPAQUE (fish/foliage)
     auto shadVatBlend = readFileBytes("cooker/vatunlitblend.surface.bin"); // vatunlitbasecolor made TRANSPARENT alpha-blend (cooker/make_vat_blend_shader.py): the faithful V79 wisp port (alphaMode=BLEND sparkle). Identical VAT vertex morph + descriptor layout as vatunlitbasecolor; only pass render-state fields f2,f3 are dropped to match the SHIPPED vatlitbubble's proven transparent state. ⛔ ALSO dropping f4 (doubleSided) = a combo NO shipped shader has → broke the pipeline → INVISIBLE sparkles on device (device-proven). Kept single-sided; the wisp billboards face the player.
     auto matVat    = readFileBytes("cooker/vat_mat.bin");         // VAT MATL template (416B, shader@48/56/64 + base@152/160 + VAT@192/200)
@@ -2631,7 +4791,7 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     // CUTOUT (alpha-test discard) shader — generated from unlit via cooker/make_cutout_shader.py: injects an OpKill on
     // texel alpha<0.5 into the unlit FORWARD-frag SPIR-V (spirv-dis -> add discard -> spirv-as spv1.0 -> spirv-val).
     // DEPTH-WRITES (inherits unlit's f2,f3 render-state) so cutouts OCCLUDE correctly + discard transparent texels —
-    // instead of the no-depth-write blend pass that made the lakeside MASK scenery (campsite *_dblsided_masked) overlay
+    // instead of the no-depth-write blend pass that made MASK scenery overlay
     // everything + flash. Reuses the unlit MATL (matTpl); shipped env-local. [[project_hsr_cook_2d_anim_depth_flash]]
     // SHADERGEN the cutout from the stock unlit base (in-binary alpha-test discard via shadergen::CUTOUT — no NDK
     // spirv tools, no pre-baked .bin, no haveCutout/CWD fragility). Faithful to Meta's unlitfoliage (decompiled): the
@@ -2657,7 +4817,7 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     }
     // FAR-ONLY remap shader variants — shipped under the env's OWN namespace; far meshes (below) repoint their material's
     // field7 shader ref to these so ONLY they get the infinite-projection remap (near meshes keep unlit/unlitblend = exact).
-    AssetKey3 shaderDCK{}, shaderBlendDCK{};
+    AssetKey3 shaderDCK{}, shaderBlendDCK{}, shaderCDK{}, shaderBlendCDK{};
     if (dclamp && !shadDC.empty()) {
         std::string pDC = MH + "/shaders/unlit_dc.surface/shader"; shaderDCK = keyForPath(pDC);
         assets.push_back({ pDC, shaderDCK.tgt, shadDC, shaderDCK });
@@ -2716,7 +4876,14 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     struct AssetPoolEntry { std::vector<uint8_t> bytes; AssetKey3 key; std::vector<uint8_t> pairAnim; };  // pairAnim (skelPool only): the clip this shared skeleton is bound to — a skeleton is reused ONLY for the SAME clip
     std::vector<AssetPoolEntry> skelPool, animPool;
     std::string rootId = makeUuid(rng);
-    std::string entities = rootEntityJson(rootId), rels;
+    float rootXOffset = 0.f, rootYOffset = 0.f, rootZOffset = 0.f;
+    if (const char* e = std::getenv("HSR_ROOT_X_OFFSET")) rootXOffset = (float)atof(e);
+    if (const char* e = std::getenv("HSR_ROOT_Y_OFFSET")) rootYOffset = (float)atof(e);
+    if (const char* e = std::getenv("HSR_ROOT_Z_OFFSET")) rootZOffset = (float)atof(e);
+    std::string entities = rootEntityJson(rootId, rootXOffset, rootYOffset, rootZOffset), rels;
+    if (std::fabs(rootXOffset) > 1e-6f || std::fabs(rootYOffset) > 1e-6f || std::fabs(rootZOffset) > 1e-6f)
+        fprintf(stderr, "[COOK] root offset (%.3f, %.3f, %.3f)m (entire render/collision hierarchy)\n",
+                rootXOffset, rootYOffset, rootZOffset);
     // Far-clip-plane extension (ScenePlatformComponent v3) is emitted into space.hstf below — NOT here in content.hstf.
     // (Vista-proven: the shell only applies it from space.hstf. See spaceJson + the HSR_FARCLIP read at the spaceJson call.)
     float pos0[3]={0,0,0}, rot0[3]={0,0,0}, scl1[3]={1,1,1};
@@ -2735,6 +4902,15 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     // carry m.rgba (the planet split into 11 parts; only the rgba-bearing one reclassified = 10 still ghosted).
     // HSR_NOOPAQUEBLEND reverts.
     std::vector<ExportMesh> meshesPre = std::move(meshes);
+
+    if(dclamp&&!shadCD.empty()){
+        std::string pCD=MH+"/shaders/unlit_cd.surface/shader";shaderCDK=keyForPath(pCD);
+        assets.push_back({pCD,shaderCDK.tgt,shadCD,shaderCDK});
+        if(haveBlend&&!shadBlendCD.empty()){
+            std::string pBCD=MH+"/shaders/unlitblend_cd.surface/shader";shaderBlendCDK=keyForPath(pBCD);
+            assets.push_back({pBCD,shaderBlendCDK.tgt,shadBlendCD,shaderBlendCDK});
+        }
+    }
     if (!std::getenv("HSR_NOOPAQUEBLEND"))
         for (size_t mi = 0; mi < meshesPre.size(); ++mi) {
             ExportMesh& m = meshesPre[mi];
@@ -2757,7 +4933,8 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     }
     if (fitOriginSource==0) {
         double ax=0.0, az=0.0; size_t an=0; float nmin=1e30f, nmax=-1e30f;
-        for (const auto& si : sceneItems) if (si.type==sitem::NAVMESH)
+        for (const auto& si : sceneItems)
+            if (si.type==sitem::NAVMESH && si.name.rfind("Collider",0)!=0)
             for (size_t v=0; v+2<si.navVerts.size(); v+=3) {
                 float x=si.navVerts[v], y=si.navVerts[v+1], z=si.navVerts[v+2];
                 if(!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)) continue;
@@ -2765,7 +4942,8 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
             }
         if (an) {
             float cx=(float)(ax/an), cz=(float)(az/an), band=nmin+(nmax-nmin)*0.4f, best=1e30f; bool got=false;
-            for (const auto& si : sceneItems) if (si.type==sitem::NAVMESH)
+            for (const auto& si : sceneItems)
+                if (si.type==sitem::NAVMESH && si.name.rfind("Collider",0)!=0)
                 for (size_t v=0; v+2<si.navVerts.size(); v+=3) {
                     float x=si.navVerts[v], y=si.navVerts[v+1], z=si.navVerts[v+2];
                     if(!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||y>band) continue;
@@ -2788,8 +4966,70 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
         }
         if(got){fitOrigin[0]=(mn[0]+mx[0])*0.5f;fitOrigin[1]=mn[1]+1.6f;fitOrigin[2]=(mn[2]+mx[2])*0.5f;}
     }
+    // Deterministic legacy-port override. Dense multi-level V79 scenes can bias
+    // the navmesh centroid onto an upper platform even when markup proves the
+    // authored ground is elsewhere. Values are floor coordinates; the emitted
+    // SpawnPoint remains at eye height.
+    bool spawnOverride = false;
+    if (const char* e=std::getenv("HSR_SPAWN_X")) {
+        float v=(float)atof(e); if(std::isfinite(v)){fitOrigin[0]=v;spawnOverride=true;}
+    }
+    if (const char* e=std::getenv("HSR_SPAWN_FLOOR_Y")) {
+        float v=(float)atof(e); if(std::isfinite(v)){fitOrigin[1]=v+1.6f;spawnOverride=true;}
+    }
+    if (const char* e=std::getenv("HSR_SPAWN_Z")) {
+        float v=(float)atof(e); if(std::isfinite(v)){fitOrigin[2]=v;spawnOverride=true;}
+    }
+    if (spawnOverride) fitOriginSource = 3;
     fprintf(stderr,"[COOK] BACKDROP_FIT origin = actual %s eye (%.2f, %.2f, %.2f)\n",
-            fitOriginSource==2?"user-spawn":(fitOriginSource==1?"navmesh-spawn":"automatic-spawn"), fitOrigin[0],fitOrigin[1],fitOrigin[2]);
+            fitOriginSource==3?"override-spawn":(fitOriginSource==2?"user-spawn":(fitOriginSource==1?"navmesh-spawn":"automatic-spawn")), fitOrigin[0],fitOrigin[1],fitOrigin[2]);
+    // Normal-user far-clip repair. VrShell v206 can ignore even a valid
+    // ScenePlatformComponent far plane on some Vista/Haven paths. Detect only
+    // static visual scenery that actually crosses the fixed 5000m camera
+    // boundary and fit all detected pieces as ONE coherent group. Scaling about
+    // the real player eye preserves angular placement and apparent size; near
+    // and collision-authored geometry remains byte-for-byte untouched.
+    if (std::getenv("HSR_AUTO_FARCLIP")) {
+        float automaticFarPlane=150000.f;
+        if(const char* fc=std::getenv("HSR_FARCLIP")){
+            const float value=(float)atof(fc);
+            if(std::isfinite(value)&&value>1.f)automaticFarPlane=value;
+        }
+        const float transformThreshold=std::max(20000.f,automaticFarPlane*0.80f);
+        std::unordered_set<int> collisionSources;
+        for(const auto& si:sceneItems)
+            if(si.type==sitem::NAVMESH)
+                collisionSources.insert(si.srcMeshes.begin(),si.srcMeshes.end());
+        constexpr int autoGroup=900206;
+        size_t marked=0;
+        for(size_t mi=0;mi<meshesPre.size();++mi) {
+            ExportMesh& m=meshesPre[mi];
+            if(m.backdropFitGroup>=0 || !backdropFitIsStatic(m) || m.positions.size()<9
+               || collisionSources.count((int)mi)) continue;
+            double sx=0.0,sy=0.0,sz=0.0; float minD2=std::numeric_limits<float>::max(),maxD2=0.f; size_t count=0;
+            for(size_t v=0;v+2<m.positions.size();v+=3) {
+                const float x=m.positions[v],y=m.positions[v+1],z=m.positions[v+2];
+                if(!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)) continue;
+                const float dx=x-fitOrigin[0],dy=y-fitOrigin[1],dz=z-fitOrigin[2],d2=dx*dx+dy*dy+dz*dz;
+                minD2=std::min(minD2,d2); maxD2=std::max(maxD2,d2); sx+=x;sy+=y;sz+=z;++count;
+            }
+            if(!count || maxD2<=transformThreshold*transformThreshold) continue;
+            const float cx=(float)(sx/count)-fitOrigin[0],cy=(float)(sy/count)-fitOrigin[1],cz=(float)(sz/count)-fitOrigin[2];
+            const float centerD2=cx*cx+cy*cy+cz*cz;
+            std::string lower=m.name; for(char& c:lower)c=(char)std::tolower((unsigned char)c);
+            const bool namedBackdrop=lower.find("sky")!=std::string::npos
+                                  || lower.find("vista")!=std::string::npos
+                                  || lower.find("backdrop")!=std::string::npos
+                                  || lower.find("dome")!=std::string::npos
+                                  || lower.find("horizon")!=std::string::npos;
+            if(minD2<=1000.f*1000.f && centerD2<=1500.f*1500.f && !namedBackdrop) continue;
+            m.backdropFitGroup=autoGroup; ++marked;
+            fprintf(stderr,"[COOK] AUTO_FARCLIP normalize mesh %zu '%s' maxDistance=%.1fm threshold=%.1fm\n",
+                    mi,m.name.c_str(),std::sqrt(maxD2),transformThreshold);
+        }
+        fprintf(stderr,"[COOK] AUTO_FARCLIP: %zu pathological mesh(es) cross %.0fm -> coherent group %d; authored 5-15km backdrops stay unchanged\n",
+                marked,transformThreshold,autoGroup);
+    }
     float backdropFitRadius = 3000.f;
     if (const char* fr = std::getenv("HSR_BACKDROP_FIT_R")) {
         backdropFitRadius = (float)atof(fr);
@@ -2832,8 +5072,36 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     }
     ctrace("before splitLargeStaticMeshes");
     std::vector<ExportMesh> meshesV = splitLargeStaticMeshes(std::move(meshesPre));
+    // Classify a connected animated object before any vertex-limit split. Per-piece automatic far routing can
+    // otherwise put different pieces of one moving object into different depth spaces. If its authored/rest
+    // geometry crosses the near/far boundary, keep the entire animation at normal depth; the nearby portion then
+    // retains correct occlusion and the split pieces inherit one consistent decision.
+    if (dclamp) {
+        const float r2 = farMargin * farMargin;
+        for (auto& m : meshesV) {
+            const bool animated = m.hzJointCount > 0 || m.vatFrames > 0 || m.transAnim ||
+                                  m.rotAnim || m.scaleAnim || m.poseAnim;
+            if (!animated || m.depthRemapMode >= 0) continue;
+            const std::vector<float>& gp =
+                (!m.hzRestPos.empty() && m.hzRestPos.size() == m.positions.size()) ? m.hzRestPos : m.positions;
+            bool hasNear = false, hasFar = false;
+            for (size_t v=0; v+2<gp.size(); v+=3) {
+                float dx=gp[v]-fitOrigin[0], dy=gp[v+1]-fitOrigin[1], dz=gp[v+2]-fitOrigin[2];
+                if (dx*dx + dy*dy + dz*dz <= r2) hasNear = true; else hasFar = true;
+                if (hasNear && hasFar) break;
+            }
+            if (hasNear && hasFar) {
+                m.depthRemapMode = 0;
+                if (std::getenv("HSR_VERBOSE"))
+                    fprintf(stderr,"[COOK] MIXED-DEPTH-ANIM '%s': keep connected animation normal-depth before splitting\n",
+                            m.name.c_str());
+            }
+        }
+    }
     // Split >60000-vert SKINNED meshes the SAME way (multi-part skinned CRASHES the device — snakeway 5_Car dragon).
     meshesV = splitLargeSkinnedMeshes(std::move(meshesV));
+    // Do not partition mixed connected geometry. The conditional far shader preserves near depth inside the
+    // original mesh and remaps only vertices that are genuinely beyond the clip plane.
     ctrace("after split; entering per-mesh cook loop");
     // ── HSR_FITCLIP: scale EVERY mesh under the shell's fixed far-clip plane (default R=4500, margin under 5000) ──
     // Per-mesh UNIFORM scale ABOUT THE SPAWN: each vertex keeps its DIRECTION (angular position) and the mesh keeps its
@@ -2863,12 +5131,22 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
         }
         fprintf(stderr, "[COOK] FITCLIP: scaled %d mesh(es) under R=%.0f about spawn (%.1f,%.1f,%.1f) — nothing exceeds the far clip\n", nfit, MAXR, o[0],o[1],o[2]);
     }
-    std::unordered_map<uint64_t, std::pair<AssetKey3, std::string>> texCache;  // rgba hash -> shared texture (split chunks share one)
+    std::unordered_map<uint64_t, std::pair<AssetKey3, std::string>> texCache;  // encoded-policy hash -> shared texture (split chunks share one)
+    std::unordered_map<const void*, uint64_t> sharedRgbaHashes;  // immutable shared payload -> hash once, even after mesh splitting
     std::unordered_map<std::string, AssetKey3> rotShaders;  // rot shader filename -> shipped key (one per distinct period/dir Y-spin)
     // [Z-AUDIT] which meshes ship a DEPTH-WRITING material (opaque/cutout MATL; 0 = transparent no-depth-write
     // blend). Filled as each mesh's final MATL is chosen; the coplanar-overlap z-fight audit below the loop only
     // needs to check depth-writing surfaces (blend never writes depth, so it can't z-fight — it can only sort wrong).
     std::vector<uint8_t> zDepthWrite(meshesV.size(), 0);
+    // One scene-wide normalization range for every static far-depth ramp. Per-mesh normalization
+    // maps unrelated skyline layers onto the same 0..1 interval and recreates depth ties.
+    float sceneDepthMax = farMargin + 1.f;
+    for (const auto& dm : meshesV) for (size_t v=0; v+2<dm.positions.size(); v+=3) {
+        float dx=dm.positions[v]-fitOrigin[0],dy=dm.positions[v+1]-fitOrigin[1],dz=dm.positions[v+2]-fitOrigin[2];
+        sceneDepthMax=std::max(sceneDepthMax,sqrtf(dx*dx+dy*dy+dz*dz));
+    }
+    if(dclamp && std::getenv("HSR_VERBOSE"))
+        fprintf(stderr,"[COOK] scene-wide stable far-depth range: %.0f..%.0f\n",farMargin,sceneDepthMax);
     // ── SMART FLOOR = AUTO MESH-COLLIDER ──────────────────────────────────────────────────────────────────────
     // When auto-floor collision is ON and the env has NO user-placed Navmesh item, give EVERY STATIC mesh a real
     // SEBD trimesh collider (exactly the per-mesh "add collider" that works by hand, applied to all static geometry)
@@ -2882,7 +5160,9 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     size_t autoMeshColliderCooked = 0;
     std::vector<uint8_t> autoMeshColliderMask(meshesV.size(), 0);
     { bool userNavPre = false;
-      for (const auto& si : sceneItems) if (si.type == sitem::NAVMESH && si.navVerts.size() >= 9) { userNavPre = true; break; }
+      for (const auto& si : sceneItems)
+          if (si.type == sitem::NAVMESH && si.name.rfind("Collider",0)!=0 &&
+              si.navVerts.size() >= 9) { userNavPre = true; break; }
       autoMeshCollide = !std::getenv("HSR_NOAUTOFLOOR") && !userNavPre && !std::getenv("HSR_NOSMARTMESHCOL");
       if (autoMeshCollide) { size_t nCol=0;
           for (size_t mi = 0; mi < meshesV.size(); ++mi) {
@@ -2906,27 +5186,79 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
         if (m.positions.size() < 9 || m.indices.size() < 3) continue;   // skip empty
         const auto& rgba = meshRgba(m);
         const auto& srcAstc = meshSrcAstc(m);
-        // GENERIC depth-write discriminator (V79 MeshShellEnvMaskDepthWrite + HAS_ALPHACUTOFF): a HARD-EDGED / BIMODAL
-        // transparent card — pixels are ~all opaque or fully transparent (midF~0) with real opaque content — must OCCLUDE.
-        // Cook it with alpha-cutoff DISCARD + DEPTH-WRITE on WHICHEVER path the mesh takes (static OR skinned/rigid-hzanim:
-        // the moving train card). Soft-gradient transparents (fog/smoke/glow/aurora/ice: midF high) stay alpha BLEND.
-        // Texture-driven, no material names. Computed once so every path (below) agrees.
-        bool bimodalOccluder = false;
-        if (m.blend && !m.additive && rgba.size() >= 4) {
-            size_t nt=rgba.size()/4, opq=0, mid=0;
-            for (size_t k=3;k<rgba.size();k+=4){ uint8_t a=rgba[k]; if(a>=230)opq++; if(a>=40&&a<=215)mid++; }
-            float opF = nt?(float)opq/(float)nt:0.f, midF = nt?(float)mid/(float)nt:1.f;
-            bimodalOccluder = (midF < 0.05f) && (opF > 0.004f);
-        }
         // FAR-ONLY remap routing (HSR_DEPTHCLAMP): does this mesh poke past the 5000 clip from the spawn? If so it gets the
         // remap shader (renders past the clip); near meshes stay byte-exact. Use the same resolved player spawn as fitting.
-        bool meshFar = false;
+        bool meshFar = m.depthRemapMode > 0, meshConditional = false;
+        std::vector<uint8_t> componentDepthClass;
         if (dclamp) {
-            const float* o = fitOrigin;
-            float md2 = 0.f;
-            for (size_t v=0; v+2<m.positions.size(); v+=3){ float dx=m.positions[v]-o[0],dy=m.positions[v+1]-o[1],dz=m.positions[v+2]-o[2]; float d=dx*dx+dy*dy+dz*dz; if(d>md2)md2=d; }
-            meshFar = sqrtf(md2) > farMargin;
-            if (meshFar && std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FAR (>%.0f) -> remap shader\n", i, m.name.c_str(), farMargin);
+            if (m.depthRemapMode < 0) {
+                const float* o = fitOrigin;
+                float md2 = 0.f; size_t nearVerts=0,farVerts=0; const float fr2=farMargin*farMargin;
+                for (size_t v=0; v+2<m.positions.size(); v+=3){ float dx=m.positions[v]-o[0],dy=m.positions[v+1]-o[1],dz=m.positions[v+2]-o[2]; float d=dx*dx+dy*dy+dz*dz; if(d>md2)md2=d; if(d<=fr2)++nearVerts;else ++farVerts; }
+                meshFar = sqrtf(md2) > farMargin;
+                meshConditional = meshFar && farVerts>=32 && nearVerts>farVerts*4;
+            }
+            const bool staticDepthRamp = meshFar &&
+                !(m.hzFrames>1 || m.transAnim || m.rotAnim || m.rotReplay || m.scaleAnim || m.pulse);
+            if (staticDepthRamp) {
+                const size_t nv = m.positions.size()/3;
+                std::vector<uint32_t> parent(nv), rank(nv, 0);
+                for (uint32_t v=0; v<(uint32_t)nv; ++v) parent[v]=v;
+                auto findRoot = [&](uint32_t x) {
+                    uint32_t r=x; while(parent[r]!=r) r=parent[r];
+                    while(parent[x]!=x){ uint32_t n=parent[x]; parent[x]=r; x=n; }
+                    return r;
+                };
+                auto join = [&](uint32_t a,uint32_t b) {
+                    a=findRoot(a); b=findRoot(b); if(a==b)return;
+                    if(rank[a]<rank[b])std::swap(a,b); parent[b]=a; if(rank[a]==rank[b])++rank[a];
+                };
+                for(size_t t=0;t+2<m.indices.size();t+=3){
+                    uint32_t a=m.indices[t],b=m.indices[t+1],c=m.indices[t+2];
+                    if(a<nv&&b<nv&&c<nv){join(a,b);join(b,c);}
+                }
+                const float* o=fitOrigin; const float fr2=farMargin*farMargin;
+                // Keep each connected object in one depth space and classify it by vertex
+                // majority. This is equally important for 3/4-vertex facade cards: one remote
+                // corner must not flatten an otherwise-near tower.
+                std::vector<uint32_t> rootCount(nv,0),rootFarCount(nv,0);
+                for(uint32_t v=0;v<(uint32_t)nv;++v){
+                    float dx=m.positions[(size_t)v*3]-o[0],dy=m.positions[(size_t)v*3+1]-o[1],dz=m.positions[(size_t)v*3+2]-o[2];
+                    uint32_t r=findRoot(v); ++rootCount[r];
+                    if(dx*dx+dy*dy+dz*dz>fr2) ++rootFarCount[r];
+                }
+                std::vector<uint8_t> rootFar(nv,0);
+                for(uint32_t r=0;r<(uint32_t)nv;++r) if(parent[r]==r && rootFarCount[r]){
+                    rootFar[r]=(rootFarCount[r]*2>=rootCount[r])?1:0;
+                    if(std::getenv("HSR_VERBOSE") && rootFarCount[r]<rootCount[r])
+                        fprintf(stderr,"[COOK] m%03zu crossing component root=%u verts=%u far=%u -> %s\n",
+                            i,r,rootCount[r],rootFarCount[r],rootFar[r]?"far":"near");
+                }
+                componentDepthClass.resize(nv);
+                float rampMax=sceneDepthMax;
+                if(meshConditional){
+                    float localMaxSq=0.f;
+                    for(uint32_t v=0;v<(uint32_t)nv;++v){
+                        float dx=m.positions[(size_t)v*3]-o[0],dy=m.positions[(size_t)v*3+1]-o[1],dz=m.positions[(size_t)v*3+2]-o[2];
+                        localMaxSq=std::max(localMaxSq,dx*dx+dy*dy+dz*dz);
+                    }
+                    rampMax=std::max(farMargin+1.f,sqrtf(localMaxSq));
+                }
+                size_t flagged=0;
+                for(uint32_t v=0;v<(uint32_t)nv;++v){
+                    if(rootFar[findRoot(v)]){
+                        float dx=m.positions[(size_t)v*3]-o[0],dy=m.positions[(size_t)v*3+1]-o[1],dz=m.positions[(size_t)v*3+2]-o[2];
+                        float dist=sqrtf(dx*dx+dy*dy+dz*dz);
+                        float inv=1.f-(dist-farMargin)/(rampMax-farMargin);
+                        inv=std::max(0.f,std::min(1.f,inv));
+                        componentDepthClass[v]=(uint8_t)std::max(1,std::min(255,(int)lroundf(inv*254.f)+1));
+                        ++flagged;
+                    }
+                }
+                if(std::getenv("HSR_VERBOSE"))fprintf(stderr,"[COOK] m%03zu %s depth ramp: %zu/%zu vertices, %s %.0f..%.0f range\n",i,meshConditional?"component-stable":"full-mesh",flagged,nv,meshConditional?"local":"shared",farMargin,rampMax);
+                meshConditional = true; // all static ramps consume the COLOR_0.a driven shader
+            }
+            if (meshFar && std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' FAR (>%.0f) -> %s remap shader\n", i, m.name.c_str(), farMargin,meshConditional?"conditional-mixed":"stable-full");
         }
         { // skip DEGENERATE meshes: all verts at one point (0-area). For a SKINNED mesh (e.g. the omnidroid's Shield) the
           // bind/rest pose is real geometry and only the ANIMATED rest collapses (Shield joint scale 0->1 pop); the cooked
@@ -2989,7 +5321,7 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
             texSrc = rgba.data();
         }
         else if (m.additive && rgba.size() >= (size_t)m.w * m.h * 4) {
-            // ADDITIVE glow → ALPHA conversion (the storybook godRays "still black" fix). GROUND TRUTH from the
+            // ADDITIVE glow → ALPHA conversion. Ground truth from the
             // official V205 files: the additive flipbook .surface forward pass is BYTE-IDENTICAL in state to the
             // OPAQUE one, and the official flame(additive)/mist(alpha) MATLs both carry field2=2 — so there is NO
             // independent additive pipeline the cook can target, and the old "opaque-pass shader in transparent
@@ -3051,9 +5383,21 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
                                                     i, m.name.c_str(), capCols, capRows, padU, padV, umin, umax, vmin, vmax);
         }
         if (rgba.size() >= (size_t)m.w * m.h * 4 && m.w && m.h && !droidWhite) {
-            uint64_t rh = murmur64A(texSrc, (size_t)m.w * m.h * 4);   // dedup identical textures (esp. the chunks a big mesh was split into)
+            int texW=(int)m.w, texH=(int)m.h;
+            const bool alphaWeightedResize=m.blend||m.alphaTest;
+            std::vector<uint8_t> reducedTex=downscaleRgbaForCook(texSrc,texW,texH,quality.maxTextureEdge,alphaWeightedResize,texW,texH);
+            if(!reducedTex.empty()) texSrc=reducedTex.data();
+            uint64_t rh=0;
+            if(texSrc==rgba.data() && m.sharedRgba){
+                const void* identity=m.sharedRgba.get();
+                auto hit=sharedRgbaHashes.find(identity);
+                if(hit!=sharedRgbaHashes.end()) rh=hit->second;
+                else { rh=murmur64A(texSrc,(size_t)m.w*m.h*4); sharedRgbaHashes.emplace(identity,rh); }
+            } else rh=murmur64A(texSrc,(size_t)texW*texH*4);
             rh ^= (uint64_t)(uint32_t)(capCols*73856093 ^ capRows*19349663);   // spritesheet cap is part of the encoded chain -> distinct entry
             if (m.alphaTest && !m.blend) rh ^= 0xC07C07u ^ (uint64_t)(uint32_t)(m.alphaCutoff*1000.f);   // coverage-preserved chain at THIS cutoff = distinct entry
+            rh ^= cookQualityCachePolicyKey(quality);
+            rh ^= ((uint64_t)(uint32_t)texW<<32)|(uint32_t)texH;
             auto cit = texCache.find(rh);
             if (cit != texCache.end()) { texK = cit->second.first; pTex = cit->second.second; }  // reuse the shared texture; leave `tex` empty so it isn't re-encoded/re-pushed
             else { texK = keyForPath(pTex);
@@ -3063,14 +5407,14 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
                   // VERBATIM instead of decode→re-encode (double ASTC at MEDIUM softens every texture). Byte-exact
                   // source quality + faster (no encode) + the ORIGINAL Meta mips (authoritative). Skip for
                   // spritesheets (need the per-cell mip cap). HSR_NOTEXPASS forces re-encode.
-                  bool unmodified = (texSrc == rgba.data());
+                   bool unmodified = (texSrc == rgba.data());
                   // MASKED foliage -> coverage-preserving re-encode (alpha-weighted RGB + CLAMPED per-mip alpha
                   // rescale at the AUTHORED cutoff). With the discard finally RUNNING on the drawn pass (the
                   // forwardSkinned fix), the source KTX's plain box-filtered mips collapse the canopy's alpha
                   // below the cutoff at range = "now is all sticks". The earlier BLACK-blotch regression was the
                   // UNBOUNDED rescale (now clamped to 2x). HSR_FOLIAGE_SRCMIPS restores the verbatim pass-through.
-                  bool canPass = unmodified && !srcAstc.empty() && capCols==1 && capRows==1
-                               && !(m.alphaTest && !m.blend && !std::getenv("HSR_FOLIAGE_SRCMIPS"))
+                   bool canPass = quality.preserveSourceAstc && unmodified && !srcAstc.empty() && capCols==1 && capRows==1
+                                && !(m.alphaTest && !m.blend && !quality.preserveMaskedSourceAstc && !std::getenv("HSR_FOLIAGE_SRCMIPS"))
                                && !std::getenv("HSR_NOTEXPASS")
                                && ((m.srcAstcBw==8&&m.srcAstcBh==8)||(m.srcAstcBw==6&&m.srcAstcBh==6)||(m.srcAstcBw==12&&m.srcAstcBh==12));
                   int passMips = (int)m.srcAstcMips;
@@ -3087,7 +5431,7 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
                       // byte-exact, shipped alpha intact, shader discard present — the mips were the last delta.)
                       int extMips = 0;
                       std::vector<uint8_t> ext;
-                      if (!(m.alphaTest && !m.blend))
+                       if (quality.extendMissingMips && !(m.alphaTest && !m.blend))
                           ext = extendAstcMipChain(srcAstc, rgba.data(), (int)m.w, (int)m.h,
                                                    (int)m.srcAstcBw, (int)m.srcAstcBh, (int)m.srcAstcMips, extMips);
                       if (!ext.empty()) { tex = encodeRendTxtrFromAstc(ext, (int)m.w, (int)m.h, (int)m.srcAstcBw, (int)m.srcAstcBh, extMips); passMips = extMips; }
@@ -3102,9 +5446,10 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
                       // (2 bpp) even when the source authored 6x6 (3.56 bpp) — a straight quality downgrade
                       // for every re-encoded 6x6 texture. Keep the authored block size when the device
                       // supports it (6x6/8x8/12x12 enums).
-                      int ebw = 8, ebh = 8;
-                      if ((m.srcAstcBw==6&&m.srcAstcBh==6)||(m.srcAstcBw==8&&m.srcAstcBh==8)||(m.srcAstcBw==12&&m.srcAstcBh==12)) { ebw=(int)m.srcAstcBw; ebh=(int)m.srcAstcBh; }
-                      tex = encodeRendTxtr(texSrc, (int)m.w, (int)m.h, ebw, ebh, 11, aw, capCols, capRows, cov, covCut);
+                       int ebw=cov?quality.maskedBlockWidth:quality.opaqueBlockWidth;
+                       int ebh=cov?quality.maskedBlockHeight:quality.opaqueBlockHeight;
+                       CookEncoderPreset preset=cov?quality.maskedPreset:quality.opaquePreset;
+                       tex = encodeRendTxtr(texSrc, texW, texH, ebw, ebh, 11, aw, capCols, capRows, cov, covCut, preset, cookQualityCachePolicyKey(quality));
                   } else if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' TEX PASS-THROUGH (source ASTC %dx%d %ux->%dx mips, lossless base)\n", i, m.name.c_str(), (int)m.srcAstcBw, (int)m.srcAstcBh, m.srcAstcMips, passMips);
                   texCache[rh] = { texK, pTex };
                   if ((capCols>1||capRows>1) && std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SPRITESHEET %dx%d -> mip-capped\n", i, m.name.c_str(), capCols, capRows); }
@@ -3119,11 +5464,11 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
         // (IDA @0xeba93c). Fixed in encodeRendMeshParts -> no size cap needed. HSR_HZMAXVERTS still overrides if set.
         int hzMaxVerts = std::getenv("HSR_HZMAXVERTS") ? atoi(std::getenv("HSR_HZMAXVERTS")) : 0x7FFFFFFF;
         // Clip byte budget: NONE by default — FULL PORT, every source frame ships untouched (user directive).
-        // ⚠ The old 20000-byte default was FEAR FROM A MISDIAGNOSIS: the lakesidepeak `std::length_error` was NEVER
+        // The old 20000-byte default came from a misdiagnosis: the observed `std::length_error` was not caused by
         // clip size — it was the missing 5-byte trailing channel-name table (IDA-proven @0x1617f4c, fixed in
         // hzAclEncode; "never a malformed clip, data-dependent"). The old "signed-16 size field" theory is disproven
         // by GROUND TRUTH: the official oceanarium whale ships 240,520-byte HzAnim clips. The 20 KB ceiling was
-        // silently DESTROYING big-rig anims: cyberhome's screens (153 joints x 578 frames) got subsampled
+        // silently DESTROYING big-rig animations when dense joint/frame data was subsampled
         // 578 -> 17 frames = 0.83 fps = the "2D anims not ported" slideshow. HSR_HZMAXBYTES opts back into a budget
         // (the subsample loop below then reduces the frame count, DURATION preserved, until it fits).
         size_t hzMaxBytes = SIZE_MAX;
@@ -3133,7 +5478,7 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
             && m.hzTrsLocal.size() >= (size_t)m.hzFrames*m.hzJointCount*10) {
             // SKELETON BOUNDS ANCHOR (skinned-mesh CULL fix, V205): V205 culls SKINNED meshes by their SKELETON's animated
             // joint extent, NOT the cooked mesh AABB — device-proven (the scene-spanning HSR_NOCULL AABB does NOTHING for
-            // skinned meshes: the omnidroid/cyberhome cars still vanish on a small rotate once their animated parts exceed the
+            // skinned meshes: fast movers can vanish on a small rotation once their animated parts exceed the
             // tight skeleton bound). FIX = append a FAR "anchor" joint (child of root, +1e5 on X) to the skeleton + clip so the
             // skeleton bounds span the scene → the frustum/occlusion cull can never drop it (the skin-path analogue of the
             // HSR_NOCULL mesh bounds). The anchor weights NO vertex (it's absent from the palette/f2/markers), so the skinning
@@ -3176,7 +5521,13 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
             // (appliances/doors ~0.18 vs cars/train ~336). HSR_FORCELOOPWRAP overrides (always seam).
             const bool  oneWay  = endDrift > 5.0f && !std::getenv("HSR_FORCELOOPWRAP");
             const bool  loopWrap = !std::getenv("HSR_NOLOOPWRAP") && nfSrc > 1 && !oneWay;
-            const int   nf0  = nfSrc + (loopWrap ? 1 : 0);  // +1 = appended copy of frame 0 (the REPEAT seam step)
+            // ACL duration is (numSamples-1)/sampleRate. A plain N-sample one-way clip therefore
+            // teleported at (N-1)/fps, one full source frame early, so one-way movers reset before
+            // entered the two masking towers. Append one HOLD copy of the last sample for one-way
+            // clips: all N authored samples still play at the exact source fps, duration becomes
+            // N/fps, then the device teleports from the fully reached endpoint. This changes no XYZ.
+            const bool  teleportHold = oneWay && nfSrc > 1 && m.preserveOneWayPeriod;
+            const int   nf0  = nfSrc + ((loopWrap || teleportHold) ? 1 : 0);
             const float fps0 = m.hzFps;
             // clip duration (seconds) — preserved across every subsample so playback speed never changes.
             const float dur  = (fps0 > 1e-6f && nf0 > 1) ? (float)(nf0 - 1) / fps0 : 0.f;
@@ -3184,7 +5535,9 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
             for (int k = 0; k < nAnch; ++k) parentsA.push_back(0);   // each anchor parented to root joint 0
             std::vector<float> trs0((size_t)nf0 * nj0 * 10);   // FULL-res source clip (+REPEAT seam frame), augmented with the 6 static FAR anchor tracks
             for (int f = 0; f < nf0; ++f) {
-                int src = (loopWrap && f == nf0 - 1) ? 0 : f;   // appended final frame == frame 0 -> the device interpolates the REPEAT wrap smoothly
+                int src = (loopWrap && f == nf0 - 1) ? 0
+                        : (teleportHold && f == nf0 - 1) ? nfSrc - 1
+                        : f;   // cyclic: append frame0; one-way: hold the reached endpoint for one source step
                 std::memcpy(&trs0[(size_t)f*nj0*10], &m.hzTrsLocal[(size_t)src*njReal*10], (size_t)njReal*10*sizeof(float));
                 for (int k = 0; k < nAnch; ++k) { float* a = &trs0[((size_t)f*nj0 + njReal + k)*10];   // cook layout per joint = {qx,qy,qz,qw, t3, s3}
                     a[0]=0;a[1]=0;a[2]=0;a[3]=1;                       // identity quat (xyzw)
@@ -3198,7 +5551,7 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
                 const float* fL = &m.hzTrsLocal[(size_t)(nfSrc-1)*njReal*10];
                 fprintf(stderr,"[LOOPDBG] '%s' nfSrc=%d root0=(%.2f,%.2f,%.2f) rootLast=(%.2f,%.2f,%.2f) endDrift=%.3f oneWay=%d loop=%s\n",
                         m.name.c_str(), nfSrc, f0[4],f0[5],f0[6], fL[4],fL[5],fL[6], endDrift, (int)oneWay,
-                        oneWay ? "TELEPORT" : (loopWrap ? "SEAM" : "none"));
+                        oneWay ? (teleportHold ? "TELEPORT+ENDHOLD" : "TELEPORT") : (loopWrap ? "SEAM" : "none"));
             }
             // ── ACL SHELL DISTANCE = the farthest vertex from its DOMINANT joint in JOINT-LOCAL units (the cyan
             //    "animations very shaky" fix). ACL evaluates its rotation-error budget AT shell_distance; the old
@@ -3393,6 +5746,36 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
                 // together with the luminance-alpha texture the additive branch already bakes (alpha = max(rgb)·a) →
                 // the bright beam feathers in over the sky and the dark atlas background drops out = a real glow.
                 AssetKey3 sk = ((m.blend || foliageBlend || m.additive) && !solidSilhouette && (shaderSkinBK.pkg || shaderSkinBK.ing)) ? shaderSkinBK : shaderSkinK;
+                // FAR HZANIM: static far meshes already use the proven depth-remap
+                // shader, but the skinned branch previously ignored meshFar and silently kept its normal-depth
+                // shader. Generate the exact same clip-Z=0.066 edit on the selected skinned base, after skinning,
+                // so moving and static authored geometry share one depth space. Geometry/animation stays untouched.
+                if (meshFar) {
+                    const bool farBlend = (m.blend || foliageBlend || m.additive) && !solidSilhouette && !shadSkinB.empty();
+                    const std::vector<uint8_t>& farBase = farBlend ? shadSkinB : shadSkin;
+                    const char* farName = farBlend ? "skinblend_dc" : "skinopq_dc";
+                    std::string farCache = std::string("cooker/") + farName + ".surface.bin";
+                    AssetKey3 farK{};
+                    auto itFar = rotShaders.find(farCache);
+                    if (itFar != rotShaders.end()) farK = itFar->second;
+                    else {
+                        auto farBytes = readFileBytes(farCache);
+                        if (farBytes.empty() && !farBase.empty()) {
+                            farBytes = shadergen::generate(farBase, shadergen::DEPTHREMAP, 0.f);
+                            if (!farBytes.empty()) writeFileBytes(farCache.c_str(), farBytes);
+                        }
+                        if (!farBytes.empty()) {
+                            std::string farPath = MH + "/shaders/" + farName + ".surface/shader";
+                            farK = keyForPath(farPath);
+                            assets.push_back({farPath, farK.tgt, farBytes, farK});
+                            rotShaders[farCache] = farK;
+                        }
+                    }
+                    if (farK.pkg || farK.ing) {
+                        sk = farK;
+                        if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' SKINNED-FAR depth remap\n", i, m.name.c_str());
+                    }
+                }
                 // SKINNED (blend OR opaque) + MaterialTint RGBA cycle (stinson zen tree: the SOURCE SHADER
                 // cycles the tint green→cyan→pink): chain TINTREPLAY onto the matching skinned frag. This
                 // covers the OPAQUE skinned meshes too (materialsplit_fill — the tree's opaque inner-canopy
@@ -3877,73 +6260,30 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
             // (foliage ~22% opaque, fog/smoke/waterfall ~0%) stays BLEND. Routing the mostly-opaque cards to BLEND (no
             // depth-write) was the regression: they didn't occlude (DEPTH ISSUES) + blended over black where the SkyDome
             // wasn't already in the framebuffer (BLACK background). Clean split at opaque>~35% (terrain >=47% vs foliage <=22%).
-            bool cutoutOK = (m.alphaTest && !m.additive && haveCutout && !meshFar);   // authored MASK
-            bool isTreeCutout = false;   // sparse tree-line card -> use the LOW-threshold cutout (keeps foliage, still depth-writes)
-            if (!cutoutOK && m.blend && !m.additive && haveCutout && !meshFar && rgba.size() >= 4) {
+            sceneryalpha::Route alphaRoute =
+                sceneryalpha::classify({m.name, m.alphaTest, m.blend, m.additive,
+                                        haveCutout, meshFar});
+            bool cutoutOK = sceneryalpha::writesDepth(alphaRoute);
+            bool isTreeCutout = sceneryalpha::usesLowCutoff(alphaRoute);
+            if (!cutoutOK && m.blend && !m.additive && haveCutout && !meshFar &&
+                rgba.size() >= 4) {
                 size_t nt = rgba.size()/4, opq=0, mid=0;
                 for (size_t k=3; k<rgba.size(); k+=4){ uint8_t a=rgba[k]; if (a>=230) opq++; if (a>=40 && a<=215) mid++; }
                 float opF = nt ? (float)opq/(float)nt : 0.f, midF = nt ? (float)mid/(float)nt : 1.f;
-                // (a) mostly-opaque silhouette cards (mountains/cliffs/lakeshore: opaque>35%); (b) distant TREE-LINE cards
-                // (LakeTrees etc.: sparser ~22% opaque + soft edges, so the opaque-fraction test misses them) — the user
-                // wants these SOLID, not see-through blend cards with a black border. This branch is STATIC-only (skinned
-                // foreground foliage takes the skinned path), so close soft foliage is unaffected by the tree-name rule.
-                // GENERIC (no material names): the DEVICE picks cutout-vs-blend by the texture's ALPHA SHAPE
-                // (ShellEnv HAS_ALPHACUTOFF variant = discard alpha<cutoff + depth-write, vs plain alpha BLEND).
-                // A HARD-EDGED / BIMODAL card — pixels are ~all opaque or fully transparent, negligible soft
-                // gradient (midF ~ 0) — is a mask / foliage / vista card that must OCCLUDE: cook it as a
-                // depth-write cutout (discard the transparent gaps). SOFT-alpha transparents (fog / smoke / glow /
-                // aurora / ice: a real mid-alpha gradient, midF high) stay BLEND. This REPLACES the old
-                // name-based "Tree" rule + opaque-fraction threshold, which missed sparse foliage
-                // (winterwonderland gazeboTrees/lodgeTrees opF=0.01-0.05 -> blend -> saw-through). Verified split:
-                // trees midF=0.00, vistaCards midF=0.01 (CUTOUT) vs moonGlow 0.13 / lambert34 0.14 / ice 0.58 (BLEND).
-                bool bimodal   = (midF < 0.05f);   // hard-edged cutout mask (no soft gradient)
-                bool hasOpaque = (opF  > 0.004f);  // has real opaque content (skip near-empty cards)
-                // SOLID-BODIED soft-edged cards (vista's layered diorama: midBG opF=0.35, LtFg 0.49, RtFg 0.26
-                // with midF 0.07-0.14 = a solid silhouette wearing an anti-aliased EDGE) — V79 renders these via
-                // the dedicated MeshShellEnvMaskDepthWrite pass (depth-write the body, blend the edge). Cooking
-                // them plain BLEND (no depth-write) broke layer occlusion = vista "depth issues everywhere".
-                // Port = the LOW-threshold cutout: depth-writes the body, discards the transparent sky, keeps
-                // most of the soft edge (0.12 cut). Pure-soft FX (fog/glow/glass: opF~0 or midF high) stay BLEND.
-                // midF cap 0.18 (was 0.30): the measured split is vista solid cards midF 0.07-0.14 vs VOLUMETRIC FOG
-                // midF 0.28 (stinson fogB opF=0.30 midF=0.28). The lax 0.30 cap routed the fog to CUTOUT(solid-body):
-                // an alpha-test on a card whose alpha is ~all soft 0.3s discards nearly EVERY pixel = "i dont see the
-                // fog". Fog/haze keeps a real mid-alpha gradient everywhere -> stays BLEND.
-                // ANIMATED-FX gate (stinson fogC opF=0.31 midF=0.08 slipped the midF cap): a card with ANY authored
-                // material animation (UV scroll/flipbook/tint/fade) is soft FX by construction — V79 authored it
-                // Transparent and ANIMATES it; hard-cutting it kills both the softness and the visible motion
-                // ("fogC not ported properly"). Solid-body reclassification is for STATIC diorama scenery only.
                 bool animatedFx = m.tintAnim || m.fadeAnim || m.flipbook || m.uvScroll || m.transAnim || m.scaleAnim || m.rotAnim;
-                bool solidBody = (opF > 0.25f && midF < 0.18f && !animatedFx);
-                // FLAT HORIZONTAL DECAL guard (property, not name): a pond shadow / water-colour overlay lies IN the
-                // floor plane (Y is its SMALLEST extent) and paints translucently ONTO the coplanar floor — it must
-                // NOT depth-write or it z-fights the floor ("texture fighting" on pond_color_sh over platformCenter).
-                // A vista scenery card is VERTICAL (large Y extent) and must occlude, so it still depth-writes. Only
-                // the solidBody branch is gated (a genuinely bimodal mask decal keeps its cutout).
                 float pmn[3]={1e30f,1e30f,1e30f}, pmx[3]={-1e30f,-1e30f,-1e30f};
                 for (size_t q=0; q+2<m.positions.size(); q+=3) for(int a=0;a<3;a++){ float p=m.positions[q+a]; if(p<pmn[a])pmn[a]=p; if(p>pmx[a])pmx[a]=p; }
                 float exX=pmx[0]-pmn[0], exY=pmx[1]-pmn[1], exZ=pmx[2]-pmn[2];
-                // 0.20 (was 0.15): pond_white's rim lifts its Y ratio to 0.155 and fogC's haze sheet to 0.145 —
-                // both are HORIZONTAL soft layers (pond sparkle overlay / under-city fog sheet) that the solid-body
-                // rule hard-cut WITH depth-write = pond z-fight + clumpy fog. Vista diorama cards are VERTICAL
-                // (Y-dominant) and stay unaffected by the flat guard.
-                bool flatHorizontalDecal = (exY < 0.20f*exX && exY < 0.20f*exZ);   // near-planar in Y = ground/pond/fog layer
-                // GIANT SOFT SHEET (fogC: a 1020m sloped haze sheet, midF=0.08): scenery hundreds of meters across
-                // with a REAL soft-alpha gradient is atmosphere, not a diorama card — hard-cutting it makes clumpy
-                // fog with depth-writes. Hard-silhouette giants (bgMountains: midF≈0.01 bimodal) keep their cutout.
-                if ((exX > 300.f || exZ > 300.f) && midF > 0.05f) flatHorizontalDecal = true;
-                // AUTHORED MASK by NAME: a material named "...AlphaMask..." IS an authored alpha-mask (foliage/decal
-                // that MUST occlude), even though the V79 "_alpha" suffix routed it to blend. asgardswrath's
-                // FoliageDistance_AlphaMask cards are soft distance-blurred (midF~0.20 > the 0.18 solid-body cap) so
-                // the alpha-shape tests miss them -> they cooked as no-depth-write blend = "another depth issue"
-                // (they don't occlude + overlapping cards sort wrong). Trust the AUTHORED name and depth-write via the
-                // LOW-threshold cutout (0.12) so the soft foliage edge survives. Gated: has real opaque leaf content +
-                // not an animated soft-FX card + not a flat ground decal (so it can't catch a named soft fog sheet).
-                bool namedMask = (m.name.find("AlphaMask")!=std::string::npos) && hasOpaque && !animatedFx;
-                if (!flatHorizontalDecal && ((bimodal && hasOpaque) || solidBody || namedMask)) {   // flat floor decals stay BLEND (no depth-write = no z-fight with the coplanar floor)
-                    cutoutOK = true;
-                    isTreeCutout = true;   // LOW 0.12 discard: depth-writes + keeps any faint soft edge; for midF~0 it equals a 0.5 cut
-                }
-                if (std::getenv("HSR_VERBOSE")) fprintf(stderr, "[COOK] m%03zu '%s' blendcard opF=%.2f midF=%.2f -> %s\n", i, m.name.c_str(), opF, midF, cutoutOK?(bimodal?"CUTOUT(bimodal)":namedMask?"CUTOUT(named-mask)":"CUTOUT(solid-body)"):"blend");
+                alphaRoute = sceneryalpha::classify(
+                    {m.name, m.alphaTest, m.blend, m.additive, haveCutout,
+                     meshFar, animatedFx, opF, midF, exX, exY, exZ});
+                cutoutOK = sceneryalpha::writesDepth(alphaRoute);
+                isTreeCutout = sceneryalpha::usesLowCutoff(alphaRoute);
+                if (std::getenv("HSR_VERBOSE"))
+                    fprintf(stderr,
+                            "[COOK] m%03zu '%s' blendcard opF=%.2f midF=%.2f -> %s\n",
+                            i, m.name.c_str(), opF, midF,
+                            sceneryalpha::label(alphaRoute));
             }
             matl = (m.blend && haveBlend && !cutoutOK) ? matBlend : matTpl; zBlend = (m.blend && haveBlend && !cutoutOK);
             if (cutoutOK) {   // CUTOUT = opaque MATL + alpha-test DISCARD shader -> DEPTH-WRITE: authored MASK scenery OCCLUDES (fixes back-overlays-front); discard cuts the hard mask. Double-sided handled by the cook's reversed-tri append.
@@ -3974,12 +6314,12 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
                 }
                 memcpy(matl.data()+48,&ck.pkg,8); memcpy(matl.data()+56,&ck.ing,8);
                 if (std::getenv("HSR_VERBOSE")) fprintf(stderr,"[COOK] m%03zu '%s' CUTOUT depth-write (blend=%d mask=%d tree=%d cutoff=%.2f)\n", i, m.name.c_str(), (int)m.blend, (int)m.alphaTest, (int)isTreeCutout, m.alphaTest?m.alphaCutoff:(isTreeCutout?0.12f:0.5f));
-            } else if (meshFar) { AssetKey3 dck = (m.blend && haveBlend) ? shaderBlendDCK : shaderDCK;   // FAR -> remap shader (renders past the 5000 clip); near keeps unlit/unlitblend = byte-exact
+            } else if (meshFar) { AssetKey3 dck = meshConditional ? ((m.blend&&haveBlend)?shaderBlendCDK:shaderCDK) : ((m.blend && haveBlend) ? shaderBlendDCK : shaderDCK);
                            if (dck.ing) { memcpy(matl.data()+48,&dck.pkg,8); memcpy(matl.data()+56,&dck.ing,8); } }
             else if (m.additive && haveBlend) {
                 // EMISSIVE GLOW (godRays/warp/nebula): unlitblend (the alpha-pass shader) + matBlend + the
                 // luminance-alpha texture (converted above). The OLD "opaque-pass unlit shader in the transparent
-                // MATL = additive" trick is DISPROVEN on device (storybook godRays / lake foam rendered their
+                // MATL = additive" trick is disproven on device (glow and foam effects rendered their
                 // black background as a DARK SHEET over bright scenes — it draws UNBLENDED; the official additive
                 // .surface pass state is byte-identical to opaque, so f2,f3-presence never encoded a blend mode).
                 // HSR_ADDGLOW_OLD restores the trick for A/B.
@@ -4233,7 +6573,7 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
         // BG_RearAnim_Knife + BG_fireworkBLights "u fucked 2 things") — removed, base UVs ship VERBATIM.
         const std::vector<float>* uvPtr = &m.uvs;
         auto mesh = useHz ? encodeRendMeshParts(hzMeshPos, *uvPtr, hzIdx, matl, 0, m.hzBoneIdx, m.hzBoneWgt, jointIds, false, vertCol)
-                          : encodeRendMeshParts(*posPtr, *uvPtr, *sIdx, matl, useVat ? vc : 0, {}, {}, {}, useRot, vertCol);
+                          : encodeRendMeshParts(*posPtr, *uvPtr, *sIdx, matl, useVat ? vc : 0, {}, {}, {}, useRot, vertCol, componentDepthClass);
         // COOK-TIME VERIFY: check the just-cooked skinned RENDMESH against the Meta-shipped reference schema (the
         // device runs the stock flatbuffers verifier; this catches structural divergence — e.g. a field emitted as
         // an offset where the schema wants an inline scalar — BEFORE the asset ever ships to the headset).
@@ -4361,8 +6701,8 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
         }
         // GENERIC sky-DOME fix: the SkyboxPlatformComponent binds the dome's 2D texture as a CUBEMAP (colorTexture +
         // reflectionMap) — the shell's skybox shader samples it as a cube and renders a 2D equirect/dome texture BLACK
-        // (cyberhome mat7 = the sunset dome). A 2D-textured backdrop renders correctly as a NORMAL far mesh: the cook's
-        // 150000 farClippingPlane already covers it (PROVEN — the cyberhome city buildings at 7–9.5km render fine as
+        // A 2D-textured backdrop renders correctly as a NORMAL far mesh: the cook's
+        // 150000 farClippingPlane already covers authored buildings at multi-kilometre distances as
         // normal meshes). So render skybox-marked meshes as normal far meshes by default; HSR_SKYBOX_COMPONENT forces the
         // cubemap component back (only correct for an actual cubemap skybox). This fixes ANY 2D sky dome, preview + device.
         if (skybox && std::getenv("HSR_SKYBOX_COMPONENT")) {
@@ -4521,10 +6861,12 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
       // triangles (their height pulls it up off the floor), so: centroid XZ, then the nearest navmesh vert in the LOWEST
       // 40% Y band (= floor, not walls/upper levels). This is a guaranteed walkable floor point — no camera involved.
       double ax=0,az=0; size_t an=0; float nmin=1e30f, nmax=-1e30f;
-      for (const auto& si : sceneItems) if (si.type==sitem::NAVMESH)
+      for (const auto& si : sceneItems)
+          if (si.type==sitem::NAVMESH && si.name.rfind("Collider",0)!=0)
           for (size_t v=0; v+2<si.navVerts.size(); v+=3){ ax+=si.navVerts[v]; az+=si.navVerts[v+2]; ++an; float y=si.navVerts[v+1]; if(y<nmin)nmin=y; if(y>nmax)nmax=y; }
       if (an){ float cx=(float)(ax/an), cz=(float)(az/an), band=nmin+(nmax-nmin)*0.4f, best=1e30f; bool got=false;
-        for (const auto& si : sceneItems) if (si.type==sitem::NAVMESH)
+        for (const auto& si : sceneItems)
+            if (si.type==sitem::NAVMESH && si.name.rfind("Collider",0)!=0)
             for (size_t v=0; v+2<si.navVerts.size(); v+=3){ float y=si.navVerts[v+1]; if (y>band) continue;   // floor band only (skip walls/upper)
                 float dx=si.navVerts[v]-cx, dz=si.navVerts[v+2]-cz, d=dx*dx+dz*dz; if (d<best){ best=d; gx=si.navVerts[v]; gy=y; gz=si.navVerts[v+2]; got=true; } }
         if (!got){ gx=cx; gz=cz; gy=nmin; } } }
@@ -4536,7 +6878,9 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     float spawnSurfY = gy;   // road/floor surface Y under the spawn (set from the heightfield) -> spawn ON it, not above
     bool userNav = false;    // if the user placed a navmesh, THAT is the ground — skip the redundant auto smart-floor
     if (!std::getenv("HSR_NONAV"))   // diag: HSR_NONAV ignores user navmeshes -> tests Meta's realfloor collider in isolation
-        for (const auto& si : sceneItems) if (si.type == sitem::NAVMESH && si.navVerts.size() >= 9) { userNav = true; break; }
+        for (const auto& si : sceneItems)
+            if (si.type == sitem::NAVMESH && si.name.rfind("Collider",0)!=0 &&
+                si.navVerts.size() >= 9) { userNav = true; break; }
     auto phys = readFileBytes("cooker/realfloor_phys.bin");
     if (!phys.empty() && smx[0] >= smn[0]) {
         std::string pPhys = MH + "/ground.phys/phys"; AssetKey3 colliderK = keyForPath(pPhys);
@@ -4758,8 +7102,16 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     // AUTOMATIC spawn (only when the user placed NO Spawn Point): at the navmesh/scene ANCHOR (gx,gz), NOT the camera.
     // Y = floor + EYE HEIGHT: the shell positions the player AT the spawn transform (head/eye ref), NOT the feet
     // (device-proven: a floor-Y spawn → player UNDER the map), so +1.6 puts the FEET on the floor. (Matches the editor
-    // preview's eye = pos + 1.6.)
-    float spawnPos[3] = { gx, spawnSurfY + 1.6f, gz };
+    // preview's eye = pos + 1.6.) Automatic detection can land on the lower
+    // face of a thick floor or a coarse PhysX triangle by a few centimetres.
+    // Give only AUTO spawns a small clearance; gravity settles the capsule
+    // onto the verified collider, while starting embedded makes the user's
+    // eye height permanently too low. User-authored Spawn items remain exact.
+    constexpr float kAutoSpawnClearance = 0.12f;
+    float spawnPos[3] = { gx, spawnSurfY + 1.6f + kAutoSpawnClearance, gz };
+    if (std::getenv("HSR_VERBOSE"))
+        fprintf(stderr,"[COOK] automatic spawn floorY=%.3f eyeY=%.3f clearance=%.2f\n",
+                spawnSurfY,spawnPos[1],kAutoSpawnClearance);
     if (userLocalSpawn == 0) {
         std::string spawnId = makeUuid(rng);
         entities += "," + spawnPointEntityJson(spawnId, spawnPos);
@@ -4917,7 +7269,7 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
     }
     // Far clip plane (ScenePlatformComponent v3) goes in space.hstf — vista-proven the shell only applies it there.
     // V79 envs ship NO ScenePlatformComponent, so on V205 they fall back to the shell's SMALL default far and
-    // distant geometry clips (the cyberhome "far plane showing up"). We AUTO-SIZE the far to the scene's own
+    // distant geometry clips. We AUTO-SIZE the far to the scene's own
     // extent (bounding-sphere radius from origin × 2.5 + 2000, floored at 40000) so no ported home can out-run
     // its own far plane regardless of size (official focused=150000). HSR_FARCLIP overrides explicitly.
     // FAR CLIP = MAX on EVERY bake (user demand: distant geometry must NEVER clip on device — V79 envs ship no
@@ -4960,6 +7312,36 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
             assets.push_back({ std::string("meta/home_c25/") + v.rel + "/template", TGT_TEMPLATE,
                                jbytes(tpl), AssetKey3{ STOCK_HOME_PKG, v.ing, TGT_TEMPLATE } });
         }
+
+        // VrShell 206 keeps the Calming Vista active while it instantiates a no-root Haven
+        // replacement through home_static_arch.  Calming's skybox/light probes and audio are
+        // separate from its visible scenery.  Shadow every Calming geometry/FX child referenced
+        // by meta/calming/space.hstf with a valid Root-only template, but deliberately retain
+        // calming_lighting and calming_audio.  This removes the foreign mountains, foreground
+        // pocket, midground, waterfalls, mist meshes, birds and butterflies without disabling
+        // the Vista (an entirely empty Vista makes the v206 scene black).
+        if (std::getenv("HSR_V206_HAVEN_COMPAT")) {
+            constexpr uint64_t CALMING_PKG = 7929622942407832842ull;
+            static const struct { const char* path; uint64_t ing; } CALMING_GEOMETRY[] = {
+                { "meta/calming/templates/calming_waterfalls.hstf/template",                     47715554925080682ull },
+                { "meta/calming/templates/calming_midground.hstf/template",                     338336347684630979ull },
+                { "meta/calming/templates/calming_hero_waterfall.hstf/template",                711289040945467745ull },
+                { "meta/calming/templates/calming_butterflies.hstf/template",                 13674246187553701183ull },
+                { "meta/calming/templates/calming_pocket_butterflies.hstf/template",           4750286886138598994ull },
+                { "meta/calming/templates/calming_birds.hstf/template",                        7205223574412204865ull },
+                { "meta/calming/templates/calming_mist.hstf/template",                        15988153191285333577ull },
+                { "meta/calming/templates/pocket_content/calming_fgpocket.hstf/template",     16058436263782370897ull },
+                { "meta/calming/templates/calming_mountains.hstf/template",                   18359863212740980040ull },
+            };
+            for (const auto& v : CALMING_GEOMETRY) {
+                std::string tpl = templateJson(rootEntityJson(makeUuid(rng)), "");
+                assets.push_back({ v.path, TGT_TEMPLATE, jbytes(tpl),
+                                   AssetKey3{ CALMING_PKG, v.ing, TGT_TEMPLATE } });
+            }
+            if (std::getenv("HSR_VERBOSE"))
+                fprintf(stderr, "[COOK] v206 Calming geometry shadows enabled (%zu Root-only templates; lighting/sky/audio retained)\n",
+                        std::size(CALMING_GEOMETRY));
+        }
     }
     ctrace("floor/navmesh done; packaging scene.zip");
     prog(0.80f, "Packaging scene.zip");
@@ -4999,6 +7381,11 @@ inline std::vector<uint8_t> exportSceneAPK(std::vector<ExportMesh> meshes, const
         *outSceneZip = assembleSceneZip(spoofAssets, shellcfg);
     }
     ctrace("scene.zip packaged; splicing APK");
+    if (!packageApk) {
+        const bool ready = outSceneZip ? !outSceneZip->empty() : !sceneZip.empty();
+        if (ok) *ok = ready;
+        return {};
+    }
     prog(0.90f, "Building APK");
     // Package spoof: rename the shell's package to a chosen one so the port can MASQUERADE as an official env
     // (e.g. set HSR_COOK_SHELL=haven2025.apk + HSR_COOK_FROMPKG/HSR_COOK_PKG=<haven2025 pkg> to replace it). The
