@@ -284,9 +284,8 @@ public:
     // UV-scroll loop-time cap ("Water flow" slider): boosts a slow track's rate so its loop completes in this many
     // seconds. ⛔ DEFAULT OFF (0 = faithful authored rate): the renderer's animate() CLIP path already plays every
     // UV track at its OWN authored duration (frames/fps — the "moves too fast / doesn't follow" fix), but the COOK's
-    // uvScrollRate still applied this boost → preview right, device wrong: treehouse's ocean_waves track is 5001
-    // frames = a 166.7s/tile swell, boosted 8.3x to 20s = "wave animations too fast" on device. The lakeside lake
-    // (336s/tile, near-frozen) is what V79 authors — opt IN via the editor slider if you want it livelier.
+    // uvScrollRate still applied this boost, making preview and device speeds disagree for long water tracks.
+    // Preserve the authored near-static rate by default; opt in through the editor slider if a livelier result is wanted.
     float uvMaxLoopSec = 0.0f;
     // UV-scroll VISIBLE SPEED CAP (UV/sec). The mat.sanim has NO FrameRate field so a UV track inherits the NODE
     // sanim's 30fps (bird/butterfly) — wrong: that makes the fog scroll 3.0 tiles/s & the waterfall 3.75 (user:
@@ -555,7 +554,7 @@ public:
         // PER-NODE loop period — THE faithful fix (matches the renderer; user-confirmed correct). The renderer loops
         // each node track at its OWN nFrames (sampleTrack fmod), so a node's motion repeats every max(effFrames) over
         // its own track + animating ancestors. The GLOBAL animMaxFrames (longest track in the scene = 577 here) is
-        // WRONG for a shorter-period node: e.g. cyberhome car_strip_02 has a 436-frame period but was sampled over
+        // WRONG for a shorter-period node: a 436-frame track sampled over
         // the 577-frame global duration => 1.32 periods => the world position WRAPS mid-clip (sawtooth) => the device
         // loop reset jumps MID-TILE = "speed backward". Sampling over the node's OWN period => exactly one loop =>
         // frame[last]≈frame[0] => seamless. (HSR_NOPERNODELOOP restores the old global behavior.)
@@ -862,6 +861,14 @@ public:
     // direct PARENT node of the train STEAM's node) and route it to the same getTime() clock so the two stay attached.
     int animNodeOf(int meshIdx) const { for (auto& a:animRecs) if ((int)a.meshIdx==meshIdx) return (int)a.nodeIdx; return -1; }
     int animNodeParentOf(int node) const { return (node>=0 && node<(int)animNodes.size()) ? animNodes[node].parent : -1; }
+    const char* animNodeNameOf(int meshIdx) const {
+        int node = animNodeOf(meshIdx);
+        return (node >= 0 && node < (int)animNodes.size()) ? animNodes[node].name.c_str() : "";
+    }
+    bool animNodeNamed(int meshIdx, const char* name) const {
+        int node = animNodeOf(meshIdx);
+        return name && node >= 0 && node < (int)animNodes.size() && animNodes[node].name == name;
+    }
 
     // ── COOK: node TRANSLATION (train STEAM / drifting FOG) → N WORLD-space OFFSET frames (delta from the frame-0 world
     //    position, frame0=(0,0,0)) sampled over the node's OWN period, for a shadergen::TRANSLATE getTime() shader. The
@@ -1193,7 +1200,7 @@ public:
             }
         }
     }
-    // FLIPBOOK ATLAS tracks (lakeside waterfall/stream/fog): a mat.sanim UVTransform whose 2x2 is identity but whose
+    // FLIPBOOK ATLAS tracks: a mat.sanim UVTransform whose 2x2 is identity but whose
     // per-frame OFFSET steps by ~1/cols (a whole cell) instead of a tiny scroll. uvScrollRate() rejects these (returns
     // false) so they are NOT cooked as a continuous scroll. Here we detect them + derive the grid so the cook routes
     // them to the OFFSET flipbook shader (shadergen::FLIPBOOK, az=1) = frame-SNAP, matching the live preview.
@@ -1293,7 +1300,7 @@ public:
 
     // Evaluate ONLY the animated node hierarchy at time t -> nodeWorldAnim (NO mesh deform, NO skinning/UV/tint).
     // The cook rotation sampler calls this per frame instead of the full animate() (which skins/UV-transforms EVERY
-    // mesh -> far too slow over 33 frames on a big env like lakesidepeak).
+    // mesh -> far too slow over 33 frames on a large environment).
     void evalAnimNodes(float t) {
         nodeWorldAnim.resize(animNodes.size());
         for (size_t i = 0; i < animNodes.size(); ++i) {
@@ -1477,8 +1484,7 @@ public:
                 continue;
             }
             if (isScroll) {
-                // CONTINUOUS linear UV scroll (deconstructed from lakesidepeak.apk mat.sanim: fog/fogB/smoke/
-                // waterfall_fog/waterfall/stream/lake all have an IDENTITY 2x2 + a constant-velocity offset, e.g.
+                // CONTINUOUS linear UV scroll: effect tracks use an IDENTITY 2x2 plus a constant-velocity offset, e.g.
                 // fog dc=0.1/fr & smoke dc=0.125/fr — NOT atlas flipbooks). The faithful play is uv = baseUV + rate*t
                 // (UNBOUNDED; the texture REPEAT wrap makes it seamless), which is EXACTLY the device cook's getTime()
                 // `uv += rate*time` shader (the SAME uvScrollRate), so the preview matches the headset. Frame-sampling
@@ -1497,7 +1503,7 @@ public:
                 if (matdbg && nuv>0) fprintf(stderr, "[MATDBG] t=%.2f mesh#%zu '%s' SCROLL rate=(%.4f,%.4f) uv0=(%.4f,%.4f)\n",
                     t, ur.meshIdx, ur.node.c_str(), ru, rv, md.uvs[0], md.uvs[1]);
             } else {
-                // FLIPBOOK ATLAS (storybook lilypad scale-flipbook, AND the lakeside waterfall/stream/fog which step
+                // FLIPBOOK ATLAS (both scale-flipbooks and effect tracks which step
                 // an identity-matrix UV by ~1/cols per frame): the texture is a sprite GRID, the track flips cells.
                 // SNAP to the integer frame (interpolating would slide across a cell boundary = blend two sprites =
                 // the smeared "all messed" waterfall). flipSlow stretches the loop so the flipbook reads as flowing
@@ -1720,7 +1726,7 @@ public:
         // A scene can ship MULTIPLE *.mat.sanim.opa: one scene-wide (papercraft.fbx.mat.sanim.opa,
         // holds e.g. the waterCard UVTransform) PLUS per-mesh ones (hummingbird_winguv...). libshell
         // loads each cooked mesh's own material-anim, so we parse them ALL and merge by geo name —
-        // grabbing only the first (the old bug) missed storybook's animated water -> it rendered the
+        // grabbing only the first (the old bug) missed animated water -> it rendered the
         // whole 2x2 atlas static (green + black blotches) = the "dark / messed up moving lilypad".
         std::vector<std::vector<uint8_t>> files;
         { mz_zip_archive z; memset(&z, 0, sizeof(z));
@@ -1875,11 +1881,16 @@ public:
             // Dump the node chain for any 'train' node: local TRS + parent so we can see if it floats.
             for (size_t i = 0; i < nodes.size(); ++i) {
                 std::string ln; for (char ch : nodes[i].name) ln += (char)tolower((unsigned char)ch);
-                if (ln.find("train")!=std::string::npos || ln.find("track")!=std::string::npos) {
+                if (ln.find("train")!=std::string::npos || ln.find("track")!=std::string::npos ||
+                    ln.find("car_strip_01")!=std::string::npos || ln=="anim_cars") {
                     int par = nodes[i].parent;
-                    log("[ANIMDBG] node[%zu] '%s' parent=%d('%s') localT=(%.2f,%.2f,%.2f) S=(%.3f,%.3f,%.3f) keyed=%d",
+                    const auto at=nodeAnim.find(nodes[i].name);
+                    const bool keyed=at!=nodeAnim.end();
+                    const float* t0=(keyed && at->second.t.v.size()>=3)?at->second.t.v.data():nullptr;
+                    log("[ANIMDBG] node[%zu] '%s' parent=%d('%s') localT=(%.2f,%.2f,%.2f) S=(%.3f,%.3f,%.3f) keyed=%d trackT0=(%.2f,%.2f,%.2f)",
                         i, nodes[i].name.c_str(), par, (par>=0&&par<(int)nodes.size())?nodes[par].name.c_str():"-",
-                        nodes[i].t[0],nodes[i].t[1],nodes[i].t[2], nodes[i].s[0],nodes[i].s[1],nodes[i].s[2], (int)nodeAnim.count(nodes[i].name));
+                        nodes[i].t[0],nodes[i].t[1],nodes[i].t[2], nodes[i].s[0],nodes[i].s[1],nodes[i].s[2],
+                        (int)keyed, t0?t0[0]:0.f,t0?t0[1]:0.f,t0?t0[2]:0.f);
                 }
             }
         }
@@ -2423,7 +2434,7 @@ private:
             // Submesh extras by version — IDENTICAL to parseModel (the working 0x409 rigid path):
             // 0x407/0x408 add 2 u32, 0x409 adds 2 MORE (4 total). The old per-submesh skip(24)+u8 here
             // was wrong (parseModel has no per-submesh AABB) and made every 0x409 skin fail to parse
-            // -> "loaded 0 skinned meshes" (lakeside tent/trees never reached the GPU).
+            // -> "loaded 0 skinned meshes" (affected skinned scenery never reached the GPU).
             if (ver >= 0x407) { c.u32(); c.u32(); }
             if (ver >= 0x409) { c.u32(); c.u32(); }
             c.skip(24); c.u8();   // per-submesh AABB (24) + flag (1) — the SKIN has this, the rigid model doesn't

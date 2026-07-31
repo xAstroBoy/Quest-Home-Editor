@@ -17,6 +17,8 @@ namespace ui {
 struct Font {
     int   atlasW = 0, atlasH = 0;
     std::vector<uint8_t> pixels;          // R8 coverage atlas (atlasW*atlasH)
+    float logoU0=0.f, logoV0=0.f, logoU1=0.f, logoV1=0.f;
+    bool hasOculusLogo=false;
     stbtt_packedchar glyphs[224];         // codepoints 32..255 (ASCII + Latin-1 supplement) — fast path
     std::unordered_map<unsigned, stbtt_packedchar> ext;   // extra codepoints (CJK etc.) baked from a fallback font
     float pixelHeight = 0.f;

@@ -88,6 +88,11 @@ struct DrawList {
         Vtx v[3]={{ax,ay,wu,wv,col},{bx,by,wu,wv,col},{cx,cy,wu,wv,col}};
         static const uint16_t id[3]={0,1,2}; prim(v,3,id,3);
     }
+    void image(float x,float y,float w,float h,float u0,float v0,float u1,float v1,uint32_t col){
+        if(w<=0||h<=0)return;
+        Vtx v[4]={{x,y,u0,v0,col},{x+w,y,u1,v0,col},{x+w,y+h,u1,v1,col},{x,y+h,u0,v1,col}};
+        static const uint16_t id[6]={0,1,2,0,2,3}; prim(v,4,id,6);
+    }
     // Draw text; returns the end-x. Baseline placed at y+ascent so y is the top of the line box.
     float text(float x, float y, const char* s, uint32_t col) {
         if (!font || !s) return x;

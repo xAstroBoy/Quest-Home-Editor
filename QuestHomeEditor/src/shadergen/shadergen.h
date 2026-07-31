@@ -27,11 +27,11 @@ namespace shadergen {
 
 //   FLIPBOOK : uv' = inUv*(1/cols,1/rows) + (col/cols,row/rows), frame=mod(floor(time*fps),frames) (skinned/grid sprite TV)
 //   TRANSLATE: pos' = inPos + replay(N sampled translation OFFSETS, looped) — FAITHFULLY ports ANY node TRANSLATION track
-//              (e.g. Star Trek sliding screens) by piecewise-linear interpolation of the sampled frames; not pattern-matched.
+//              (e.g. sliding screens) by piecewise-linear interpolation of the sampled frames; not pattern-matched.
 //   SCALE    : pos' = pivot + (inPos - pivot)*replay(N sampled per-axis SCALE FACTORS, looped) — FAITHFULLY ports ANY node
 //              SCALE "breathe" track (e.g. Erebor's 12 wisps, NON-UNIFORM per-axis amplitudes) by piecewise-linear
 //              interpolation of the sampled per-axis factor frames (frame0 = (1,1,1)); not a (1-cos) shape guess.
-enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3, TRANSLATE = 4, SCALE = 5, CUTOUT = 6, ROTREPLAY = 7, TINTREPLAY = 8, FOLIAGE = 9, TINTREPLAY_VERT = 10 };
+enum Mode { ROTATE = 0, OSCILLATE = 1, UVSCROLL = 2, FLIPBOOK = 3, TRANSLATE = 4, SCALE = 5, CUTOUT = 6, ROTREPLAY = 7, TINTREPLAY = 8, FOLIAGE = 9, TINTREPLAY_VERT = 10, DEPTHREMAP = 11, DEPTHCONDITIONAL = 12 };
 // TINTREPLAY: per-frame RGBA MaterialTint replay in the forward FRAGMENT (color *= tint[frame]) — ports V79's
 //   mat.sanim MaterialTint COLOR cycling (stinson fireworks flashes / city window lights) that the cook previously
 //   dropped entirely (only the alpha FADE subset was ported, and only on the flipbook path). tframes = N*4 RGBA,
@@ -431,7 +431,7 @@ inline std::vector<uint8_t> editVertModule(const uint8_t* sd, uint32_t spvLen, M
     } else if (mode==FLIPBOOK){
         // p0=cols p1=rows ax=frames ay=fps. Two layouts (az = offset-only flag):
         //   az<=0.5 (SCALE flipbook, spritesheet TV): base UV is the FULL quad -> uv' = inUv*(1/cols,1/rows)+(col/cols,row/rows).
-        //   az >0.5 (OFFSET flipbook, the lakeside waterfall/stream/fog mat.sanim): the mesh UV ALREADY maps to ONE
+        //   az >0.5 (OFFSET flipbook used by stepped effects): the mesh UV ALREADY maps to ONE
         //           cell -> uv' = inUv + (col/cols,row/rows). This matches libshell's BaseTextureMtx play (uv+=offset)
         //           SNAPPED to the integer cell (STEP) = the frame-snap the preview does. cell scale is skipped.
         const uint32_t GLSL_FLOOR=8;
@@ -1199,6 +1199,101 @@ inline std::vector<uint8_t> editVertTintReplay(const uint8_t* sd, uint32_t spvLe
     return mod;
 }
 
+// FAR-DEPTH remap for an arbitrary vertex shader, including the skinned/HZANIM shaders. This is the
+// immediately before storing gl_PerVertex.gl_Position, preserve every in-frustum vertex's authored Z and
+// replace Z with 0.066 only when it is actually behind the reversed-Z far plane (Z < 0). This lets one
+// connected mesh contain near occluders and detached far scenery without splitting or flattening its
+// local depth ordering.
+inline std::vector<uint8_t> editVertDepthRemap(const uint8_t* sd, uint32_t spvLen, bool conditional=false){
+    using namespace detail;
+    size_t nw=spvLen/4; auto W=[&](size_t k){ return u32(sd,spvLen,(int64_t)k*4); };
+    uint32_t version=W(1), generator=W(2), bound=W(3);
+    std::vector<Inst> insts;
+    for(size_t i=5;i<nw;){ uint32_t ins=W(i),wc=ins>>16,op=ins&0xffff; if(!wc)break;
+        Inst t; t.op=(int)op; for(uint32_t k=0;k<wc;++k)t.w.push_back(W(i+k));
+        insts.push_back(std::move(t)); i+=wc; }
+
+    uint32_t tBool=0,tFloat=0,tV4=0,perVertexStruct=0,colorInput=0;
+    std::map<uint32_t,uint32_t> ptrPointee;
+    std::map<uint32_t,uint32_t> locations;
+    std::set<uint32_t> outVars;
+    for(auto& t:insts){ auto&w=t.w;
+        if(t.op==20 && w.size()>=2) tBool=w[1];                                      // OpTypeBool
+        else if(t.op==22 && w.size()>=3 && w[2]==32) tFloat=w[1];                    // OpTypeFloat
+        else if(t.op==72 && w.size()>=5 && w[2]==0 && w[3]==11 && w[4]==0)          // OpMemberDecorate struct 0 BuiltIn Position
+            perVertexStruct=w[1];
+        else if(t.op==32 && w.size()>=4 && (w[2]==1||w[2]==3)) ptrPointee[w[1]]=w[3];// Input/Output pointer
+        else if(t.op==71 && w.size()>=4 && w[2]==30) locations[w[1]]=w[3];           // OpDecorate Location
+    }
+    for(auto& t:insts){ auto&w=t.w;
+        if(t.op==23 && w.size()>=4 && w[2]==tFloat && w[3]==4) tV4=w[1];
+        else if(t.op==59 && w.size()>=4 && w[3]==3) {
+            auto it=ptrPointee.find(w[1]); if(it!=ptrPointee.end() && it->second==perVertexStruct) outVars.insert(w[2]);
+        } else if(t.op==59 && w.size()>=4 && w[3]==1) {
+            auto it=ptrPointee.find(w[1]), il=locations.find(w[2]);
+            if(it!=ptrPointee.end()&&it->second==tV4&&il!=locations.end()&&il->second==2) colorInput=w[2];
+        }
+    }
+    if(!tFloat||!tV4||!perVertexStruct||outVars.empty()||(conditional&&!colorInput)) return {};
+
+    std::map<uint32_t,Inst*> byId;
+    for(auto& t:insts) if(t.op==65 && t.w.size()>=5) byId[t.w[2]]=&t;                // OpAccessChain
+    int storeIdx=-1; uint32_t storeVal=0;
+    for(size_t k=0;k<insts.size();++k){ Inst& t=insts[k];
+        if(t.op!=62||t.w.size()<3) continue;
+        auto it=byId.find(t.w[1]); if(it==byId.end()) continue;
+        Inst& ac=*it->second;
+        if(ac.w.size()>=5 && outVars.count(ac.w[3])) { storeIdx=(int)k; storeVal=t.w[2]; break; }
+    }
+    if(storeIdx<0) return {};
+
+    auto nid=[&](){return bound++;}; auto fbits=[](float f){uint32_t u;memcpy(&u,&f,4);return u;};
+    if(conditional&&!tBool)tBool=nid();
+    uint32_t cDepth=nid(),cFlagMin=conditional?nid():0,cDepthBase=conditional?nid():0,cDepthScale=conditional?nid():0;
+    std::vector<Inst> out; bool globals=false;
+    for(size_t k=0;k<insts.size();++k){
+        if(!globals && insts[k].op==54){
+            if(conditional&&!std::any_of(insts.begin(),insts.end(),[&](const Inst&i){return i.op==20&&i.w.size()>=2&&i.w[1]==tBool;}))
+                out.push_back({20,{0,tBool}});
+            out.push_back({43,{0,tFloat,cDepth,fbits(0.066f)}});
+            if(conditional){
+                out.push_back({43,{0,tFloat,cFlagMin,fbits(0.001f)}});
+                // Keep remapped scenery in a narrow band immediately above the reversed-Z
+                // far plane. The old 0.005..0.065 band was close enough to draw distant
+                // facade cards in front of authored near buildings ("ghost towers").
+                // Perspective-stable NDC band equivalent to v43's proven clip-Z
+                // compression across authored multi-kilometre scenery distances.
+                // The narrow D24-safe v47 band preserves internal ordering while
+                // remaining well behind authored normal-depth scenery.
+                out.push_back({43,{0,tFloat,cDepthBase,fbits(0.00000006f)}});
+                out.push_back({43,{0,tFloat,cDepthScale,fbits(0.00000074f)}});
+            }
+            globals=true;
+        }
+        if((int)k==storeIdx){
+            uint32_t remapped=nid();
+            if(conditional){
+                uint32_t clipZ=nid(),clipW=nid(),color=nid(),flag=nid(),isFar=nid(),scaled=nid(),farNdcZ=nid(),farClipZ=nid(),newZ=nid();
+                out.push_back({81,{0,tFloat,clipZ,storeVal,2}});
+                out.push_back({81,{0,tFloat,clipW,storeVal,3}});
+                out.push_back({61,{0,tV4,color,colorInput}});
+                out.push_back({81,{0,tFloat,flag,color,3}});
+                out.push_back({184,{0,tBool,isFar,cFlagMin,flag}});
+                out.push_back({133,{0,tFloat,scaled,flag,cDepthScale}});
+                out.push_back({129,{0,tFloat,farNdcZ,cDepthBase,scaled}});
+                out.push_back({133,{0,tFloat,farClipZ,farNdcZ,clipW}});
+                out.push_back({169,{0,tFloat,newZ,isFar,farClipZ,clipZ}});
+                out.push_back({82,{0,tV4,remapped,newZ,storeVal,2}});
+            }else out.push_back({82,{0,tV4,remapped,cDepth,storeVal,2}});
+            Inst st=insts[k]; st.w[2]=remapped; out.push_back(st);
+        } else out.push_back(insts[k]);
+    }
+    if(!globals) return {};
+    std::vector<uint32_t> words={0x07230203u,version,generator,bound,0u};
+    for(auto&t:out){words.push_back(((uint32_t)t.w.size()<<16)|(uint32_t)t.op);for(size_t j=1;j<t.w.size();++j)words.push_back(t.w[j]);}
+    std::vector<uint8_t> mod(words.size()*4); memcpy(mod.data(),words.data(),mod.size()); return mod;
+}
+
 // ── GENERAL round-trip: compile arbitrary GLSL → SPIR-V (bundled tools/glslangValidator.exe) and swap it into a
 //    RENDSHAD .surface's forward-FRAGMENT stage. This is the "transform ANY shader" path — instead of hand-patching
 //    a fixed base with a getTime enum, the cook can emit a WHOLE target program (any fade/scroll/noise/cell/timing,
@@ -1283,6 +1378,21 @@ inline std::vector<uint8_t> generate(const std::vector<uint8_t>& src, Mode mode,
     }
     if (mode==TINTREPLAY){   // per-frame RGBA MaterialTint replay in EVERY color fragment stage (all passes/LODs)
         return editAllFragStages(src, [&](const uint8_t* sd, uint32_t L){ return editFragTintReplay(sd, L, tframes, tN, p0); });   // p0 = loopSec, tframes = tN*4 RGBA
+    }
+    if (mode==DEPTHREMAP || mode==DEPTHCONDITIONAL){
+        std::vector<VStage> stages; collectVertStages(d,N,stages);
+        if(stages.empty()) return {};
+        std::vector<uint8_t> o=src; int edited=0; std::vector<int64_t> done;
+        for(const auto& st:stages){
+            bool dup=false; for(int64_t v:done) if(v==st.spvOff){dup=true;break;}
+            if(dup) continue; done.push_back(st.spvOff);
+            auto mod=editVertDepthRemap(o.data()+st.spvOff,st.spvLen,mode==DEPTHCONDITIONAL); if(mod.empty()) continue;
+            while(o.size()%4)o.push_back(0);
+            uint32_t nv=(uint32_t)o.size(),modLen=(uint32_t)mod.size();
+            o.insert(o.end(),(uint8_t*)&modLen,(uint8_t*)&modLen+4); o.insert(o.end(),mod.begin(),mod.end());
+            detail::repointAll(o,(size_t)nv,st.spvOff-4,nv); ++edited;
+        }
+        return edited?o:std::vector<uint8_t>();
     }
     if ((mode==FLIPBOOK || mode==UVSCROLL) && !std::getenv("HSR_VERTFLIP")){   // DEFAULT: FRAGMENT-stage UV anim (animates on device; vertex-UV did not)
         // EVERY color fragment stage (all passes/LOD techniques): the single-stage edit left lower-technique

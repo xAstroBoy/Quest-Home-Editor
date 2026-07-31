@@ -1,0 +1,19 @@
+---
+Checks: >
+  -*,
+  clang-analyzer-core.*,
+  clang-analyzer-cplusplus.*,
+  clang-analyzer-deadcode.*,
+  clang-analyzer-security.*,
+  bugprone-use-after-move,
+  bugprone-dangling-handle,
+  bugprone-unused-return-value,
+  performance-move-const-arg,
+  performance-unnecessary-copy-initialization
+WarningsAsErrors: >
+  clang-analyzer-core.*,
+  clang-analyzer-cplusplus.*,
+  clang-analyzer-security.*
+HeaderFilterRegex: 'QuestHomeEditor/src/(core|cook|io|loaders|render|ui)/.*'
+FormatStyle: none
+...

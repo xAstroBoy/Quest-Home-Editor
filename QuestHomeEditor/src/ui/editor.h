@@ -11,6 +11,13 @@
 #include "core/camera.h"
 #include "core/scene_items.h"
 #include "cook/hsl_cooker.h"
+#include "cook/navigation_floor_policy.h"
+#include "cook/standalone_haven_policy.h"
+#include "device/quest_display_policy.h"
+#include "device/install_safety_policy.h"
+#include "device/runtime_health_policy.h"
+#include "library/home_library_policy.h"
+#include "ui/cook_ui_policy.h"
 #include "io/gltf_export.h"          // Blender round-trip: env -> glTF 2.0 project
 #include "ui/ui_core.h"
 #include "stb_image.h"               // decode PNG/JPG for "set mesh/skybox texture from image"
@@ -2963,6 +2970,8 @@ struct Editor {
     char search[96] = "";
     bool prevKeyA=false, prevKeyC=false;   // Ctrl+A (select-all-filtered) / Ctrl+C (copy names) edge-detect
     float outlinerScroll = 0.f, propScroll = 0.f;
+    float standardPropContentHeight = 0.f; // measured previous-frame height; prevents scrolling into empty space
+    float propContentHeightByTab[7] = {};  // exact previous-frame content extent for every Expert tab
     bool  scrollToSel = false;
     bool  didAutoSel = false;      // auto-select a centered object once (frame 1)
     // right-click context menu
@@ -3115,7 +3124,17 @@ struct Editor {
             sitem::Item it; it.name = name.empty()?type:name; it.pos[0]=pos[0]; it.pos[1]=pos[1]; it.pos[2]=pos[2];
             std::string ln=name; for(auto& c:ln) c=(char)tolower(c);
             bool seat = ln.find("seat")!=std::string::npos||ln.find("couch")!=std::string::npos||ln.find("chair")!=std::string::npos||ln.find("sofa")!=std::string::npos||ln.find("stool")!=std::string::npos;
-            if (type=="portal") { it.type=sitem::SPAWN; it.allowStart=true; it.isLocal=true; for(int k=0;k<3;k++) it.rot[k]=ar[k]; }
+            if (type=="portal") {
+                it.type=sitem::SPAWN;
+                // Horizon World portals are retired metadata in both legacy
+                // Homes and newer Vistas. Keep the locator editable, but do not
+                // let it override automatic safe-spawn placement. An expert
+                // compatibility escape hatch can explicitly restore that old
+                // behavior.
+                it.allowStart=std::getenv("HSR_USE_PORTAL_SPAWN")!=nullptr;
+                it.isLocal=true;
+                for(int k=0;k<3;k++) it.rot[k]=ar[k];
+            }
             else if (seat)      { it.type=sitem::CHAIR; for(int k=0;k<3;k++){ it.rot[k]=rot[k]; it.exitPos[k]=ap[k]; } }
             else                { it.type=sitem::HOTSPOT; for(int k=0;k<3;k++) it.rot[k]=rot[k]; }
             items.push_back(it); ++added;
@@ -3128,6 +3147,13 @@ struct Editor {
     // was launched (the old CWD-relative "saved/" broke when launched from the taskbar). So we look in a "saved/" subfolder
     // at EVERY ancestor of the env (nearest first) — finds the repo-level saved/ that already holds your sessions.
     std::string sessionPath;   // the .hsledit path load/save actually used this session (so save round-trips to it)
+    static constexpr int kSessionFormatVersion = 3;
+    static constexpr int kNavigationGeneratorVersion = 4;
+    int loadedSessionVersion = 0;
+    int loadedNavigationGeneratorVersion = 0;
+    bool sessionRestored = false;
+    bool automaticNavigationGenerated = false;
+    bool collisionReviewSuggested = false;
     // A cooked APK is "<stem>_Rooted-System.apk" / "<stem>_NoRoot-Spoof.apk" / "<stem>_cooked.apk". Strip the cook
     // suffix so the session round-trips to the SOURCE env's "<stem>.apk.hsledit" — loading the COOKED APK then shows
     // the same scene ITEMS (spawn/navmesh/colliders) the cook baked in. (The cook re-orders meshes, so the cooked APK
@@ -3160,6 +3186,8 @@ struct Editor {
                 fs::path up = d.parent_path(); if (up == d || up.empty()) break; d = up; }
             c.push_back(projectPath + ".hsledit");          // legacy: next to the env file
         }
+        if (!AppConfig::s_homeLibrary.empty())
+            c.push_back(AppConfig::homeRel("saved/" + base));
         c.push_back("saved/" + base);                       // legacy: CWD-relative saved/
         return c;
     }
@@ -3168,7 +3196,15 @@ struct Editor {
     std::string saveTargetFile() {
         if (!sessionPath.empty()) return sessionPath;
         namespace fs = std::filesystem; std::error_code ec; auto cands = projectCandidates();
-        for (auto& c : cands) { if (fs::is_directory(fs::path(c).parent_path(), ec)) return c; }
+        for (auto& c : cands) {
+            if (!projectPath.empty() && c == projectPath + ".hsledit") continue; // load-only legacy location
+            if (fs::is_directory(fs::path(c).parent_path(), ec)) return c;
+        }
+        if (!AppConfig::s_homeLibrary.empty()) {
+            const std::string central=AppConfig::homeRel("saved/" + projectBase() + ".hsledit");
+            fs::create_directories(fs::path(central).parent_path(),ec);
+            return central;
+        }
         if (!cands.empty()) { fs::create_directories(fs::path(cands[0]).parent_path(), ec); return cands[0]; }
         std::filesystem::create_directories("saved", ec); return "saved/" + projectBase() + ".hsledit";
     }
@@ -3188,12 +3224,20 @@ struct Editor {
     // round-trips its scene items when reloaded (loadProject extracts + parses it cooked-mode). [[the cook embeds this]]
     std::string serializeSession(){
         std::string s; char b[640];
-        s += "HSLEDIT 2\n";
+        s += "HSLEDIT " + std::to_string(kSessionFormatVersion) + "\n";
         snprintf(b,sizeof b,"CAM %.4f %.4f %.4f %.5f %.5f\n", r->cam.pos[0],r->cam.pos[1],r->cam.pos[2], r->cam.yaw, r->cam.pitch); s+=b;
-        snprintf(b,sizeof b,"CFG %d %.3f %.3f %.3f %.1f %.4f %.0f %d %.0f %d %d %d %d %d %d %d %.4f %.4f %.4f %d %d\n",
+        // Fog densities used for long-distance transition masking are commonly
+        // around 1e-5. Four decimals serialized them as zero and made delegated
+        // cooks lose the fog effect; retain enough precision for those values.
+        snprintf(b,sizeof b,"CFG %d %.3f %.3f %.3f %.1f %.8f %.0f %d %.0f %d %d %d %d %d %d %d %.4f %.4f %.4f %d %d\n",
             cfgFog?1:0, cfgFogColor[0],cfgFogColor[1],cfgFogColor[2], cfgFogStart, cfgFogDensity, cfgFar,
             skybox?1:0, skyboxDist, noCull?1:0, solidCollision?1:0, animSkinned?1:0, cookAudio?1:0, previewAudio?1:0, voxelSolid?1:0,
-            bgColorSet?1:0, bgColor[0], bgColor[1], bgColor[2], antiCull?1:0, v206HavenCompat?1:0); s+=b;
+            bgColorSet?1:0, bgColor[0], bgColor[1], bgColor[2], antiCull?1:0, 0); s+=b;
+        snprintf(b,sizeof b,"BUILD 2 %d\n",hslcook::cookQualityIndex(cookQuality)); s+=b;
+        snprintf(b,sizeof b,"AUTOFIX 2 %d %d %d\n",autoFarClipFix?1:0,autoV206Compat?1:0,autoNavigation?1:0); s+=b;
+        if(automaticNavigationGenerated)
+            s += "NAVGEN 1 " + std::to_string(kNavigationGeneratorVersion) + "\n";
+        snprintf(b,sizeof b,"LOFTTARGET 1 %d\n",loftTarget); s+=b;
         for(int i=0;i<(int)r->gpuMeshes.size();++i){ auto& gm=r->gpuMeshes[i];
             snprintf(b,sizeof b,"MESH %d %s %.5f %.5f %.5f %.6f %.6f %.6f %.6f %.5f %.5f %.5f %d\n", i, qstr(gm.name).c_str(),
                 gm.editT[0],gm.editT[1],gm.editT[2], gm.editR[0],gm.editR[1],gm.editR[2],gm.editR[3],
@@ -3262,13 +3306,15 @@ struct Editor {
         FILE* f=nullptr; std::string used;
         for (auto& c : projectCandidates()) { f=fopen(c.c_str(),"rb"); if(f){ used=c; break; } }
         std::string all;
-        if(f){ sessionPath=used; fprintf(stderr,"[EDIT] loaded session: %s\n", used.c_str());
+        sessionRestored=false; loadedSessionVersion=0; loadedNavigationGeneratorVersion=0;
+        automaticNavigationGenerated=false; collisionReviewSuggested=false;
+        if(f){ sessionPath=used; sessionRestored=true; fprintf(stderr,"[EDIT] loaded session: %s\n", used.c_str());
                fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET); if(n>0){ all.resize(n); fread(&all[0],1,n,f);} fclose(f); }
         else { all = extractEmbeddedSession();   // ORPHAN cooked APK: no saved/<env>.hsledit on disk -> read the session the cook EMBEDDED inside the APK ("extract em")
                if(all.empty()){ fprintf(stderr,"[EDIT] no saved session (disk) and no _editor_session.hsledit embedded in the APK\n");
                                 loadGeomSidecar(saveTargetFile());   // a .geom can exist without a .hsledit (autosave-only runs) — created meshes still restore
                                 checkAutosaveRecovery(); return; }   // a crash before the FIRST save still leaves an .autosave -> offer it
-               sessionPath.clear(); fprintf(stderr,"[EDIT] loaded EMBEDDED session from cooked APK (%zu bytes)\n", all.size()); }
+               sessionPath.clear(); sessionRestored=true; fprintf(stderr,"[EDIT] loaded EMBEDDED session from cooked APK (%zu bytes)\n", all.size()); }
         // Restore editor-CREATED meshes (fuse/cut/seal/split/slice/duplicate results) BEFORE the session
         // lines apply — their MESH/DELETED/MATF indices assume those meshes exist.
         if (!sessionPath.empty()) loadGeomSidecar(sessionPath);
@@ -3283,9 +3329,13 @@ struct Editor {
     // Parse + apply a .hsledit session text (shared by loadProject and the auto-save recovery banner).
     void applySessionText(const std::string& all, int& meshN, int& itemN){
         items.clear(); selItem=-1; deselectAll(); animColliders.clear();
-        // The VrShell-206 workaround is deliberately opt-in. An older session
-        // without the new CFG token must never inherit it from the prior project.
-        v206HavenCompat = false;
+        // Project-local automatic compatibility settings must never leak from a
+        // previously loaded Home. Legacy sessions receive the safe defaults.
+        autoFarClipFix = true;
+        autoV206Compat = true;
+        autoNavigation = true;
+        loftTarget = 0;
+        cookQuality = hslcook::defaultCookQualityProfile();
         { // GEOM3 owns compacted editor-created mesh fit groups; keep them while session lines restore base meshes.
           std::map<int,int> keep; if(geomAuth) for(const auto& kv:backdropFitGroups) if(kv.first>=baseMeshCount) keep.emplace(kv);
           backdropFitGroups=std::move(keep); nextBackdropFitGroup=0;
@@ -3300,8 +3350,16 @@ struct Editor {
         while(p<all.size()){
             size_t e=all.find('\n',p); std::string line=all.substr(p, e==std::string::npos?std::string::npos:e-p); p=(e==std::string::npos)?all.size():e+1;
             auto t=tokenize(line); if(t.empty()) continue;
-            if(t[0]=="CAM" && t.size()>=6){ r->cam.pos[0]=(float)atof(t[1].c_str()); r->cam.pos[1]=(float)atof(t[2].c_str()); r->cam.pos[2]=(float)atof(t[3].c_str()); r->cam.yaw=(float)atof(t[4].c_str()); r->cam.pitch=(float)atof(t[5].c_str()); }
-            else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; /* t[15]=voxelSolid: NOT loaded — stays at the reverted default (false); old sessions saved 1 and would re-wall rooms */ if(t.size()>=20){ bgColorSet=atoi(t[16].c_str())!=0; bgColor[0]=(float)atof(t[17].c_str()); bgColor[1]=(float)atof(t[18].c_str()); bgColor[2]=(float)atof(t[19].c_str()); if(bgColorSet&&r){ r->clearRGB[0]=bgColor[0]; r->clearRGB[1]=bgColor[1]; r->clearRGB[2]=bgColor[2]; } } if(t.size()>=21) antiCull=atoi(t[20].c_str())!=0; if(t.size()>=22) v206HavenCompat=atoi(t[21].c_str())!=0; g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
+            if(t[0]=="HSLEDIT" && t.size()>=2){ loadedSessionVersion=std::max(0,atoi(t[1].c_str())); }
+            else if(t[0]=="CAM" && t.size()>=6){ r->cam.pos[0]=(float)atof(t[1].c_str()); r->cam.pos[1]=(float)atof(t[2].c_str()); r->cam.pos[2]=(float)atof(t[3].c_str()); r->cam.yaw=(float)atof(t[4].c_str()); r->cam.pitch=(float)atof(t[5].c_str()); }
+            else if(t[0]=="CFG" && t.size()>=15){ cfgFog=atoi(t[1].c_str())!=0; cfgFogColor[0]=(float)atof(t[2].c_str()); cfgFogColor[1]=(float)atof(t[3].c_str()); cfgFogColor[2]=(float)atof(t[4].c_str()); cfgFogStart=(float)atof(t[5].c_str()); cfgFogDensity=(float)atof(t[6].c_str()); cfgFar=(float)atof(t[7].c_str()); skybox=atoi(t[8].c_str())!=0; skyboxDist=(float)atof(t[9].c_str()); noCull=atoi(t[10].c_str())!=0; solidCollision=atoi(t[11].c_str())!=0; prevSolidCol=solidCollision; animSkinned=atoi(t[12].c_str())!=0; cookAudio=atoi(t[13].c_str())!=0; previewAudio=atoi(t[14].c_str())!=0; /* t[15]=voxelSolid: NOT loaded — stays at the reverted default (false); old sessions saved 1 and would re-wall rooms */ if(t.size()>=20){ bgColorSet=atoi(t[16].c_str())!=0; bgColor[0]=(float)atof(t[17].c_str()); bgColor[1]=(float)atof(t[18].c_str()); bgColor[2]=(float)atof(t[19].c_str()); if(bgColorSet&&r){ r->clearRGB[0]=bgColor[0]; r->clearRGB[1]=bgColor[1]; r->clearRGB[2]=bgColor[2]; } } if(t.size()>=21) antiCull=atoi(t[20].c_str())!=0; /* t[21] was the disproven Haven-static v206 carrier; ignored for backward-compatible session loading. */ g_audioMuted.store(!previewAudio, std::memory_order_relaxed); }
+            // Quality cards are intentionally disabled until the policies have
+            // device-proven visual/performance differences. Normalize legacy
+            // sessions to the one supported automatic policy.
+            else if(t[0]=="BUILD" && t.size()>=3){ cookQuality=hslcook::defaultCookQualityProfile(); }
+            else if(t[0]=="AUTOFIX" && t.size()>=4){ autoFarClipFix=atoi(t[2].c_str())!=0; autoV206Compat=atoi(t[3].c_str())!=0; if(t.size()>=5)autoNavigation=atoi(t[4].c_str())!=0; }
+            else if(t[0]=="NAVGEN" && t.size()>=3){ loadedNavigationGeneratorVersion=std::max(0,atoi(t[2].c_str())); automaticNavigationGenerated=true; }
+            else if(t[0]=="LOFTTARGET" && t.size()>=3){ loftTarget=std::clamp(atoi(t[2].c_str()),0,4); }
             else if(t[0]=="MESH" && t.size()>=14 && !cooked){ int idx=atoi(t[1].c_str()); if(geomAuth && idx>=baseMeshCount) continue;   /* GEOM2/3 owns created meshes; compacted sidecar re-orders them = stale indices */ if(idx>=0&&idx<(int)r->gpuMeshes.size()){ auto& gm=r->gpuMeshes[idx];
                 gm.name=t[2]; gm.editT[0]=(float)atof(t[3].c_str()); gm.editT[1]=(float)atof(t[4].c_str()); gm.editT[2]=(float)atof(t[5].c_str());
                 gm.editR[0]=(float)atof(t[6].c_str()); gm.editR[1]=(float)atof(t[7].c_str()); gm.editR[2]=(float)atof(t[8].c_str()); gm.editR[3]=(float)atof(t[9].c_str());
@@ -3345,6 +3403,18 @@ struct Editor {
         // the complete file is parsed so visual-only marks cannot leak into the
         // restored collision preview or player simulator.
         for(auto& it:items) if(it.type==sitem::NAVMESH) bakeNavGeometry(it);
+        const bool hasNavigation=std::any_of(items.begin(),items.end(),[](const sitem::Item& item){
+            return item.type==sitem::NAVMESH;
+        });
+        // Never replace restored collision implicitly. Older sessions did not
+        // record whether navigation was generated or authored, so offer review
+        // instead. Known generated navigation can likewise be flagged when its
+        // generator revision falls behind.
+        collisionReviewSuggested=hasNavigation&&sessionRestored&&(
+            (loadedSessionVersion>0&&loadedSessionVersion<kSessionFormatVersion&&loadedNavigationGeneratorVersion==0)||
+            (loadedNavigationGeneratorVersion>0&&loadedNavigationGeneratorVersion<kNavigationGeneratorVersion));
+        if(collisionReviewSuggested)
+            fprintf(stderr,"[AUTONAV] existing collision preserved; session uses an older/unknown navigation revision and can be reviewed manually\n");
     }
     // ── AUTO-SAVE (Phase-1 crash resistance): every autoSaveIntervalS seconds, if the session text changed since the
     //    last save/auto-save, write it to "<session>.hsledit.autosave". saveProject deletes the .autosave (state is now
@@ -3396,13 +3466,14 @@ struct Editor {
         setStatus("Recovered auto-save ("+std::to_string(meshN)+" mesh edits + "+std::to_string(itemN)+" items) - Save to keep it");
     }
     void dismissAutosave(){ std::error_code ec; std::filesystem::remove(recoverPath, ec); recoverOffer=false; }
-    // V79 stores NO navmesh file — the LocomotionSystem generates it from the walkable ground geometry at runtime.
-    // So auto-add a NAVMESH item sourced from the env's ground/floor/terrain meshes (the faithful re-creation; the
-    // cook PhysX-cooks them into a V203 ColliderMesh). Returns the mesh count (0 = none found -> user picks manually).
+    // Some V79 APKs carry an authoritative outer assets/navmesh while others
+    // rely on runtime generation. Scene collision still needs visible source
+    // geometry, so auto-add a NAVMESH item from plausible walkable meshes. The
+    // packager independently preserves assets/navmesh when present.
     // Pick the env's walkable ground/floor meshes by NAME (index-independent), so it works on the SOURCE env or a
     // cook OUTPUT (whose meshes are re-ordered) alike — used by autoNavmeshFromGround + the cooked-APK navmesh re-derive.
     void fillGroundMeshes(std::vector<int>& out) const {
-        static const char* kw[] = { "ground","floor","terrain","mainground","lakeshore","walk","path","road","plane","sidewalk","tile" };
+        static const char* kw[] = { "ground","floor","terrain","mainground","lakeshore","walk","path","road","plane","sidewalk","tile","platform","deck" };
         for (int i=0;i<(int)r->gpuMeshes.size();++i){
             if (r->isHidden(i) || isBackdrop(r->gpuMeshes[i].name)) continue;
             std::string n=r->gpuMeshes[i].name; for (auto& c:n) c=(char)tolower(c);
@@ -3465,15 +3536,22 @@ struct Editor {
     // ── properties tabs ──
     enum { TAB_OBJECT, TAB_SCENE, TAB_MATERIAL, TAB_ANIM, TAB_PHYSICS, TAB_COOK, TAB_LOGCAT };
     int tab = TAB_OBJECT;
+    // Two deliberately different workspaces: Standard is the guided, safe path for raw Homes;
+    // Expert keeps the complete editor available without making normal users understand it.
+    bool expertMode = false;
+    bool standardOculusLogo = true; // Nostalgic Standard-workspace branding; one click hides it persistently.
 
     // ── cook (threaded) ──
     std::thread cookThread; std::atomic<bool> cooking{false}; std::atomic<float> cookProg{0.f};
     std::mutex statusMx; std::string cookStage = "idle", cookStatus;
     std::string cookPkg = "com.environment.outerwilds";
     bool autoSign = true, spoofHaven = true;
+    hslcook::CookQualityProfile cookQuality = hslcook::defaultCookQualityProfile();
+    bool cookAdvancedOpen = false, cookDeviceOpen = false, cookMaintenanceOpen = false;
+    bool cookWarnForceRebuild = false;
     bool cookAudio = true;             // DEFAULT ON: bake the env's background audio loop into the cooked APK. Toggle off = silent home.
     bool cookAutoFloor = true;         // DEFAULT ON: when NO Navmesh item exists, the cook generates a walkable floor (ColliderBox grid / disk). OFF = ship ZERO generated collision (the "invisible wall I never placed").
-    bool spoofFootprint = false;       // DEFAULT OFF = COMBINED spoof (nuxd manifest, hsr_package_type="combined") →
+    bool spoofFootprint = false;       // DEFAULT OFF = proven combined Environment runtime with Haven build identity →
                                        // envIsFootprint=0 → the resolver drops the vista entirely (vista='') → NO vista
                                        // loads → NO vista interference (no black, no empty-vista fragility). The simplest,
                                        // most robust default. ON = FOOTPRINT spoof (pairs a companion vista you can fill
@@ -3482,6 +3560,30 @@ struct Editor {
     // Vista neutralize is MANUAL ONLY (the "Neutralize vistas now" button) — never automatic on cook or connect,
     // because it destructively replaces the real Meta vistas with empty ones. [[project_hsr_unrooted_footprint_vista_fix]]
     bool cookWarnOpen = false;         // pre-cook "no collision" confirmation modal is showing (blocks the frame's other input while up)
+    bool clearVrShellConfirmOpen = false; // explicit guard for the destructive VrShell app-data reset
+    struct HomeLibraryEntry {
+        std::string path;
+        std::string rootedPath;
+        std::string havenPath;
+        std::string labelSidecar;
+        std::string name;
+        std::string displayName;
+        homelibrary::Classification classification;
+        uintmax_t bytes = 0;
+        bool hasRecipe = false;
+        bool currentRecipe = false;
+        bool hasRooted = false;
+        bool hasHaven = false;
+        bool hasRaw = false;
+        std::string sourcePath;
+    };
+    bool homeLibraryOpen = false;
+    std::vector<HomeLibraryEntry> homeLibraryEntries;
+    std::vector<std::string> homeLibraryUserFolders;
+    int homeLibraryRenameIndex = -1;
+    std::string homeLibraryRenameText;
+    int homeLibraryFilter = 0; // 0=normal/Haven Homes, 1=Vista Homes
+    float homeLibraryScroll = 0.f;
     // A cook has collision the player can stand on IF: the auto-floor is on, OR the user placed a Navmesh (walkable
     // mesh) or a Box collider. WITHOUT any of these the port ships zero collision — the player falls through forever
     // and respawns at the void floor. This gates the pre-cook warning + is the truth the wiki/README point at.
@@ -3505,6 +3607,11 @@ struct Editor {
     int shellRestart = 0;              // after-install vrshell restart (was FORCED, now an option): 0=Auto — restart only
                                        // when UNROOTED (rooted headsets hot-swap via the environment_selected IPC, no kill
                                        // needed); 1=Always; 2=Never. Cook-panel cycle button.
+    bool autoDisplayQuality = true;     // Detect the Quest model and apply a device-appropriate Home HD+ target after install.
+    bool manualDisplayQuality = false;  // Expert-only override; Standard can only select safe automatic detection.
+    int manualDisplayWidth = 1832, manualDisplayHeight = 1920;
+    bool displayInfoScanned=false;
+    std::string displayInfoDevice, displayInfoCurrent, displayInfoTarget;
     std::string adbSerial, wifiIp;     // device serial ("" = default); wifiIp -> "adb connect" for wireless adb
     bool loadDiag = true;              // after an unrooted install+reload, capture the no-root env-load logcat and show WHY it was accepted/rejected
     // ── Logcat page state (live, NO-ROOT vrshell log viewer) ────────────────────────────────────────────────────
@@ -3537,12 +3644,15 @@ struct Editor {
         });
     }
     std::thread restoreThread; std::atomic<bool> restoring{false};   // "Restore original Haven 2025" button (runs off the UI thread)
-    std::thread javaThread; std::atomic<int> javaState{0};           // proactive Java auto-install: 0=installing, 1=ready, 2=failed
     bool animSkinned = true;   // HZANIM skinned + 1-joint rigid clips (door/discs/screens/cars/train/sphere). DEFAULT ON:
                                // the incredibles fixed-type-targetId fix ([[project_hsr_skinned_rendmesh_skinblock]]) made
                                // the clip cook stable on device (loads, no std::length_error). Opt-out: toggle / HSR_NOHZ.
     bool noCull = true;        // DEFAULT ON: preserve established V79-style draw-everything behavior. -> HSR_NOCULL
-    bool v206HavenCompat = false; // DEFAULT OFF: optional no-root fallback for affected VrShell-206/Haven installs only.
+    bool autoFarClipFix = true; // Analyze geometry and coherently fit only scenery that crosses VrShell's fixed camera limit.
+    bool autoV206Compat = true; // Detect the connected headset's Haven/VrShell generation and select the v206 no-root scene automatically.
+    bool autoNavigation = true; // Raw Homes receive Smart Navmesh + structural PhysX once; authored navigation remains authoritative.
+    int loftTarget = 0; // 0=standard Haven/root selection, 1=Calming, 2=Focused, 3=Oceanarium, 4=Horror.
+    int lastVistaTarget = 3; // remembered only for the clearer Standard two-stage destination picker
     bool skybox = false;       // DEFAULT OFF (camera-locked, fragile): route the FAR backdrop (centroid > skyboxDist) to the SkyboxPlatformComponent
                                // pass — depth-clamped, EXEMPT from the shell's hard PortalStereoCamera far=5000 clip (device-
                                // proven: official homes/vistas escape the 5000 clip ONLY this way, NOT via a bigger far). The
@@ -3558,16 +3668,87 @@ struct Editor {
 
     // ── i18n (GitHub #10): UI language + CJK-aware font atlas ────────────────────────────────────────────────
     std::vector<unsigned> langCps;   // non-ASCII codepoints the active language needs (empty for English)
+    void appendOculusLogoToFontAtlas() {
+        font.hasOculusLogo=false;
+#ifdef _WIN32
+        HRSRC res=FindResourceA(nullptr,"OCULUSLOGO",(LPCSTR)RT_RCDATA);
+        if(!res)return;
+        HGLOBAL data=LoadResource(nullptr,res); if(!data)return;
+        const void* bytes=LockResource(data); const DWORD byteCount=SizeofResource(nullptr,res);
+        int srcW=0,srcH=0,channels=0;
+        unsigned char* rgba=stbi_load_from_memory((const stbi_uc*)bytes,(int)byteCount,&srcW,&srcH,&channels,4);
+        if(!rgba||srcW<=0||srcH<=0){if(rgba)stbi_image_free(rgba);return;}
+        const int pad=8;
+        const int oldH=font.atlasH,newH=oldH+srcH+2*pad;
+        std::vector<uint8_t> expanded((size_t)font.atlasW*newH,0);
+        for(int y=0;y<oldH;y++)
+            memcpy(&expanded[(size_t)y*font.atlasW],&font.pixels[(size_t)y*font.atlasW],font.atlasW);
+        const int x=pad,y=oldH+pad;
+        const int copyW=std::min(srcW,font.atlasW-2*pad);
+        for(int py=0;py<srcH;py++)for(int px=0;px<copyW;px++)
+            expanded[(size_t)(y+py)*font.atlasW+x+px]=rgba[((size_t)py*srcW+px)*4+3];
+        stbi_image_free(rgba);
+        font.pixels.swap(expanded); font.atlasH=newH;
+        font.logoU0=(float)x/font.atlasW; font.logoV0=(float)y/newH;
+        font.logoU1=(float)(x+copyW)/font.atlasW; font.logoV1=(float)(y+srcH)/newH;
+        font.hasOculusLogo=true;
+#endif
+    }
     // Bake the UI font at `px`, including exactly the CJK glyphs the active language uses (English = ASCII-only).
     void reloadUIFont(float px) {
         langCps.clear();
         if (i18n::g_lang != i18n::EN) i18n::collectExtraCodepoints(langCps);
         loadUIFont(font, px, false, langCps.empty() ? nullptr : &langCps);
+        appendOculusLogoToFontAtlas();
         mono = font;   // one shared atlas — a stale mono copy would index the re-baked atlas with old UVs
     }
     static std::string langCfgPath() { return AppConfig::exeRel("hsr_ui_lang.txt"); }
     void loadLangPref() { FILE* f=fopen(langCfgPath().c_str(),"r"); if(!f) return; int l=0; if(fscanf(f,"%d",&l)==1 && l>=0 && l<i18n::LANG_COUNT) i18n::g_lang=l; fclose(f); }
     void saveLangPref() { FILE* f=fopen(langCfgPath().c_str(),"w"); if(!f) return; fprintf(f,"%d\n", i18n::g_lang); fclose(f); }
+    static std::string displayQualityCfgPath() { return AppConfig::exeRel("auto_display_quality.txt"); }
+    void loadDisplayQualityPref() {
+        FILE* f=fopen(displayQualityCfgPath().c_str(),"r"); if(!f) return;
+        int enabled=1,manual=0,width=1832,height=1920;
+        int fields=fscanf(f,"%d %d %d %d",&enabled,&manual,&width,&height);
+        if(fields>=1) autoDisplayQuality=enabled!=0;
+        if(fields>=2) manualDisplayQuality=manual!=0;
+        if(fields>=4 && width>=1024 && height>=1024) { manualDisplayWidth=width; manualDisplayHeight=height; }
+        if(manualDisplayQuality) autoDisplayQuality=false;
+        fclose(f);
+    }
+    void saveDisplayQualityPref() {
+        FILE* f=fopen(displayQualityCfgPath().c_str(),"w"); if(!f) return;
+        fprintf(f,"%d %d %d %d\n",autoDisplayQuality?1:0,manualDisplayQuality?1:0,
+                manualDisplayWidth,manualDisplayHeight); fclose(f);
+    }
+    static std::string uiModeCfgPath() { return AppConfig::exeRel("ui_mode.txt"); }
+    void loadUiModePref() {
+        FILE* f=fopen(uiModeCfgPath().c_str(),"r"); if(!f) return;
+        int expert=0; if(fscanf(f,"%d",&expert)==1) expertMode=expert!=0; fclose(f);
+    }
+    void saveUiModePref() {
+        FILE* f=fopen(uiModeCfgPath().c_str(),"w"); if(!f) return;
+        fprintf(f,"%d\n",expertMode?1:0); fclose(f);
+    }
+    static std::string oculusLogoCfgPath() { return AppConfig::exeRel("standard_oculus_logo.txt"); }
+    void loadOculusLogoPref() {
+        FILE* f=fopen(oculusLogoCfgPath().c_str(),"r"); if(!f) return;
+        int enabled=1; if(fscanf(f,"%d",&enabled)==1) standardOculusLogo=enabled!=0; fclose(f);
+    }
+    void saveOculusLogoPref() {
+        FILE* f=fopen(oculusLogoCfgPath().c_str(),"w"); if(!f) return;
+        fprintf(f,"%d\n",standardOculusLogo?1:0); fclose(f);
+    }
+    void setExpertMode(bool expert) {
+        if (expertMode==expert) return;
+        expertMode=expert;
+        // Never strand Standard users on a technical-only page.
+        if (!expertMode && tab!=TAB_SCENE && tab!=TAB_COOK && tab!=TAB_LOGCAT) tab=TAB_SCENE;
+        cookAdvancedOpen = expertMode && cookAdvancedOpen;
+        propScroll=0.f;
+        saveUiModePref();
+        setStatus(expertMode ? "Expert workspace enabled" : "Standard workspace enabled");
+    }
     void setLanguage(int l) {
         if (l<0 || l>=i18n::LANG_COUNT || l==i18n::g_lang) return;
         i18n::g_lang = l; saveLangPref();
@@ -3606,6 +3787,15 @@ struct Editor {
         float xs = 1.f, ys = 1.f; glfwGetWindowContentScale(window, &xs, &ys);
         dpiScale = (xs > 0.5f) ? xs : 1.f; uiScale = dpiScale;
         loadLangPref();                                  // restore the saved UI language BEFORE the first font bake (CJK atlas)
+        loadDisplayQualityPref();
+        loadUiModePref();
+        loadOculusLogoPref();
+        if(const char* forcedMode=std::getenv("HSR_UI_EXPERT")) expertMode=atoi(forcedMode)!=0; // deterministic responsive-UI captures
+        if(!expertMode) tab=TAB_SCENE;                    // Standard always opens on the first guided step.
+        if(const char* forcedTab=std::getenv("HSR_UI_TAB")) {
+            std::string ft=forcedTab;
+            if(ft=="prepare")tab=TAB_SCENE; else if(ft=="cook")tab=TAB_COOK; else if(ft=="quest")tab=TAB_LOGCAT;
+        }
         reloadUIFont(baseFontPx * uiScale);
         mono = font;   // the UI pipeline binds ONE atlas (the main font); "mono" MUST share it or its glyph UVs index garbage
         // NO-GPU COOK MODE: no device -> no UI atlas/pipeline (uiDraw's first call writes a GPU
@@ -3623,29 +3813,24 @@ struct Editor {
         r->overlayDraw  = [this](VkCommandBuffer cmd) { uiDraw.record(cmd, dl); };
         baseMeshCount = sceneMeshes ? (int)sceneMeshes->size() : 0;   // anything appended past this = editor-created (persisted via the .geom sidecar)
         // (auto-select of a centered, in-front object happens on frame 1 in buildFrame, when the camera matrices are valid)
-        // Proactively AUTO-INSTALL Java if not present (Temurin JRE beside the exe), in the background, so the first
-        // cook isn't blocked on a ~40MB download. apksigner/keytool need it; a no-op if java is already on PATH.
-        javaThread = std::thread([this]{
-            std::string jh = hslcook::ensureJava([](float,const char*){});
-#ifdef _WIN32
-            bool onPath = (system("java -version >NUL 2>&1")==0);
-#else
-            bool onPath = (system("java -version >/dev/null 2>&1")==0);
-#endif
-            javaState.store((!jh.empty() || onPath) ? 1 : 2);
-        });
+        // APK signing is self-contained.  Do not download Java or Android
+        // build-tools during first launch; build-only users need neither.
         ready = true;
+        if(const char* forcedLibrary=std::getenv("HSR_UI_LIBRARY"))
+            if(atoi(forcedLibrary)!=0) {
+                homeLibraryFilter=atoi(forcedLibrary)>1?1:0;
+                openHomeLibrary();
+            }
     }
     void shutdown() {
         stopPlayerChannel();   // stop the persistent Quest player-control worker
         if (cookThread.joinable()) cookThread.join();
         if (restoreThread.joinable()) restoreThread.join();
-        if (javaThread.joinable()) javaThread.join();
         if (geomThread.joinable()) geomThread.join();
         if (adbDlThread.joinable()) adbDlThread.join();
         if (ready) { vkDeviceWaitIdle(r->device); uiDraw.destroy(); ready = false; }
     }
-    ~Editor() { stopLogStream(); if (cookThread.joinable()) cookThread.join(); if (restoreThread.joinable()) restoreThread.join(); if (javaThread.joinable()) javaThread.join(); if (geomThread.joinable()) geomThread.join(); if (adbDlThread.joinable()) adbDlThread.join(); }
+    ~Editor() { stopLogStream(); if (cookThread.joinable()) cookThread.join(); if (restoreThread.joinable()) restoreThread.join(); if (geomThread.joinable()) geomThread.join(); if (adbDlThread.joinable()) adbDlThread.join(); }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  INPUT  (GLFW callbacks in main route here; we accumulate into cx.in, cleared at end of buildFrame)
@@ -3915,11 +4100,12 @@ struct Editor {
         // MODAL INPUT LOCK: while the pre-cook warning is up, park the mouse off-screen so NOTHING under the scrim
         // hovers/clicks (immediate-mode widgets gate all interaction on hover). Restored just before the modal draws.
         float savedMx=cx.in.mx, savedMy=cx.in.my;
-        if (cookWarnOpen) { cx.in.mx = cx.in.my = -1e5f; }
+        const bool modalOpen = cookWarnOpen || clearVrShellConfirmOpen || homeLibraryOpen;
+        if (modalOpen) { cx.in.mx = cx.in.my = -1e5f; }
         // NOTE: do NOT fill the whole window — the 3D scene shows through rcViewport; each panel paints its
         // own opaque background and the layout tiles the rest, so the viewport pane stays the live 3D view.
         drawViewportOverlay();
-        drawItems();                                            // spawn/chair/collider/wall/hotspot/navmesh markers
+        if(expertMode) drawItems();                              // Standard never leaks technical navmesh/collider markers
         if (xrayMesh) drawSelectedMeshWire();                   // X-ray: selected mesh wireframe over the boxes (alignment)
         if (hasRespawn) {                                       // visualize the respawn kill-floor: a red grid at respawnY around you
             VkRect2D vp=rcViewport; dl.pushClip((float)vp.offset.x,(float)vp.offset.y,(float)vp.extent.width,(float)vp.extent.height);
@@ -3946,9 +4132,10 @@ struct Editor {
         drawHeader();
         drawRecoverBanner();                                    // crash-recovery offer strip (under the header)
         autoSaveTick(now);                                      // periodic dirty-checked session autosave
-        drawOutliner();
+        if(expertMode) drawOutliner();
         drawProperties();
-        if (homeLoaded()) drawTimeline();          // no timeline strip on the empty (Logcat-only) session
+        drawStandardOculusWatermark();                          // real logo occupies the unused lower Standard tool column
+        if (expertMode && homeLoaded()) drawTimeline();          // guided Standard has no mesh outliner/timeline chrome
         wantCursor = 0;
         drawSplitters();
         // apply the resize cursor when hovering/dragging a splitter (create the standard cursors lazily)
@@ -3992,7 +4179,10 @@ struct Editor {
         drawSliceOverlay();                                     // slice gizmo: plane quad + LIVE glowing cut line
         drawKnifeOverlay();                                     // knife: the 2D stroke line while dragging
         drawKeybindsPanel();                                    // F1 overlay: every shortcut in one place
-        if (cookWarnOpen) { cx.in.mx=savedMx; cx.in.my=savedMy; drawCookWarn(); }   // restore mouse for the modal only
+        if (modalOpen) { cx.in.mx=savedMx; cx.in.my=savedMy; }
+        if (cookWarnOpen) drawCookWarn();
+        else if (clearVrShellConfirmOpen) drawClearVrShellConfirm();
+        else if (homeLibraryOpen) drawHomeLibrary();
         drawLangMenu();                                         // language dropdown (on top of the UI, under tooltips)
         cx.drawTooltip();                                       // deferred hover tooltips — drawn ABOVE everything
         cx.in.newFrame();                                       // consume per-frame input edges/deltas
@@ -4001,10 +4191,14 @@ struct Editor {
     // ── tiled Blender layout: header strip on top, timeline strip on bottom, a right column (outliner over
     //    properties), and the 3D viewport filling the remaining left/center. Borders are draggable. ──
     void layout() {
-        float W=(float)fbW, H=(float)fbH, hH=cx.th.headerH, tH=homeLoaded()?timelineH:0.f;   // no timeline until a home loads
-        float rightW = std::clamp(W*rightRatio, 220.f*uiScale, W*0.75f);   // up to 75% wide (log viewer / wide panels)
+        float W=(float)fbW, H=(float)fbH, hH=cx.th.headerH;
+        float tH=(expertMode&&homeLoaded())?timelineH:0.f;   // Standard keeps the guided workspace visually quiet
+        const float minRight=(expertMode?270.f:320.f)*dpiScale;
+        const float effectiveRightRatio=expertMode?rightRatio:
+            std::max(rightRatio,0.275f);
+        float rightW = std::clamp(W*effectiveRightRatio,minRight,W*0.75f);
         float midY = hH, midH = H - hH - tH;
-        float oH = std::clamp(midH*outlinerRatio, 80.f*uiScale, midH-80.f*uiScale);
+        float oH = expertMode?std::clamp(midH*outlinerRatio,80.f*uiScale,midH-80.f*uiScale):0.f;
         rcHeader   = {{0,0},{(uint32_t)W,(uint32_t)hH}};
         float panelX = panelLeft ? 0.f : (W-rightW);         // tool column on the LEFT or RIGHT
         float viewX  = panelLeft ? rightW : 0.f;
@@ -4018,15 +4212,29 @@ struct Editor {
         float bx = panelLeft ? (float)(rcOutliner.offset.x + rcOutliner.extent.width) : (float)rcOutliner.offset.x;
         float by=(float)rcHeader.extent.height, bh=(float)(rcViewport.extent.height);
         handleSplit(1, bx-3, by, 6, bh, true);
-        // horizontal: outliner|properties
+        // horizontal: outliner|properties (Expert only)
         float hy = (float)rcProps.offset.y;
-        handleSplit(2, (float)rcOutliner.offset.x, hy-3, (float)rcOutliner.extent.width, 6, false);
+        if(expertMode) handleSplit(2, (float)rcOutliner.offset.x, hy-3, (float)rcOutliner.extent.width, 6, false);
         // horizontal: middle|timeline (only when the timeline is shown)
-        if (homeLoaded()) handleSplit(3, 0, (float)rcTimeline.offset.y-3, (float)fbW, 6, false);
+        if (expertMode&&homeLoaded()) handleSplit(3, 0, (float)rcTimeline.offset.y-3, (float)fbW, 6, false);
         // thin separator lines
         dl.rect(bx-1, by, 1, bh, cx.th.splitLine);
-        dl.rect((float)rcProps.offset.x, hy-1, (float)rcProps.extent.width, 1, cx.th.splitLine);
-        if (homeLoaded()) dl.rect(0, (float)rcTimeline.offset.y-1, (float)fbW, 1, cx.th.splitLine);
+        if(expertMode) dl.rect((float)rcProps.offset.x, hy-1, (float)rcProps.extent.width, 1, cx.th.splitLine);
+        if (expertMode&&homeLoaded()) dl.rect(0, (float)rcTimeline.offset.y-1, (float)fbW, 1, cx.th.splitLine);
+    }
+    void drawStandardOculusWatermark() {
+        if(expertMode||tab==TAB_LOGCAT||!font.hasOculusLogo)return;
+        const float px=(float)rcProps.offset.x,py=(float)rcProps.offset.y;
+        const float pw=(float)rcProps.extent.width,ph=(float)rcProps.extent.height;
+        if(pw<220*uiScale||ph<260*uiScale)return;
+        const float logoW=std::min(pw-42*uiScale,410*uiScale);
+        const float logoH=logoW*(212.38f/986.2f);
+        const float logoX=px+(pw-logoW)*0.5f;
+        const float logoY=py+ph-logoH-34*uiScale;
+        if(logoY<py+210*uiScale)return; // Never cover actual cook controls/status on a short window.
+        if(standardOculusLogo)
+            dl.image(logoX,logoY,logoW,logoH,font.logoU0,font.logoV0,font.logoU1,font.logoV1,
+                     ui::rgba(255,255,255,245));
     }
     void handleSplit(int id, float x, float y, float w, float h, bool vertical) {
         bool hv = cx.hover(x,y,w,h);
@@ -4371,31 +4579,675 @@ struct Editor {
         };
         for (const char* ln : lines) { cx.textAligned(bx+pad, y, bw-2*pad, rh, ln, th.textDim, 0); y += rh*0.92f; }
         float bwid = (bw-2*pad-10*uiScale)/2, bhh = rh+8*uiScale, byb = by+bh-pad-bhh;
-        if (cx.button(ui::hashId("cwcancel"), bx+pad, byb, bwid, bhh, "Cancel") || cx.in.keyRepeat[ui::KEY_ESCAPE])
-            cookWarnOpen=false;
+        if (cx.button(ui::hashId("cwcancel"), bx+pad, byb, bwid, bhh, "Cancel") || cx.in.keyRepeat[ui::KEY_ESCAPE]) {
+            cookWarnOpen=false; cookWarnForceRebuild=false;
+        }
         if (cx.button(ui::hashId("cwgo"), bx+pad+bwid+10*uiScale, byb, bwid, bhh, "Cook anyway", true)) {
-            cookWarnOpen=false; startCookNow();
+            const bool force=cookWarnForceRebuild;
+            cookWarnOpen=false; cookWarnForceRebuild=false; startCookNow(force);
         }
     }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  SPACES
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
+    // Explicit confirmation for `pm clear com.oculus.vrshell`. This resets VrShell preferences/caches and the
+    // selected Home, so it must never run from a casual single click in the maintenance panel.
+    void drawClearVrShellConfirm() {
+        auto& th = cx.th; const float W=(float)fbW, H=(float)fbH;
+        dl.rect(0,0,W,H,ui::rgba(0,0,0,165));
+        const float bw=std::min(520.f*uiScale,W-40*uiScale), bh=246.f*uiScale;
+        const float bx=(W-bw)*0.5f, by=(H-bh)*0.5f, pad=18.f*uiScale, rh=th.rowH;
+        dl.rect(bx,by,bw,bh,th.panelBg); dl.border(bx,by,bw,bh,th.border);
+        dl.rect(bx,by,bw,4*uiScale,ui::rgba(235,95,85));
+        float y=by+pad+4*uiScale;
+        cx.textAligned(bx+pad,y,bw-2*pad,rh+2*uiScale,"Reset VrShell app data?",ui::rgba(255,145,130),0);
+        y+=rh+12*uiScale;
+        const char* lines[]={
+            "This clears VrShell's saved Home selection, preferences, and caches,",
+            "then relaunches Quest Home with factory-fresh state.",
+            "",
+            "Installed Home APKs are NOT removed.",
+            "Use this only when Home switching is stuck or corrupted.",
+            "Rooted headsets may need to select their Home again afterwards.",
+        };
+        for(const char* ln:lines){ cx.textAligned(bx+pad,y,bw-2*pad,rh,ln,th.textDim,0); y+=rh*0.95f; }
+        const float gap=10*uiScale, buttonW=(bw-2*pad-gap)/2, buttonH=rh+9*uiScale;
+        const float buttonY=by+bh-pad-buttonH;
+        if(cx.button(ui::hashId("clearvrshellcancel"),bx+pad,buttonY,buttonW,buttonH,"Cancel") ||
+           cx.in.keyRepeat[ui::KEY_ESCAPE]) clearVrShellConfirmOpen=false;
+        if(cx.button(ui::hashId("clearvrshellconfirm"),bx+pad+buttonW+gap,buttonY,buttonW,buttonH,
+                     "CLEAR + RELAUNCH",true)) {
+            clearVrShellConfirmOpen=false;
+            if(restoreThread.joinable()) restoreThread.join();
+            restoring.store(true);
+            restoreThread=std::thread([this]{ clearVrShellData(); restoring.store(false); });
+        }
+    }
+
+    static std::string friendlyLibrarySourceName(std::string logicalName) {
+        namespace fs=std::filesystem;
+        auto timestampLike=[](const std::string& value) {
+            return value.size()>20 && std::isdigit((unsigned char)value[0]) &&
+                   value[4]=='-' && value[7]=='-' && value.find('T')!=std::string::npos;
+        };
+        if(!timestampLike(logicalName)) return logicalName;
+        std::error_code ec;
+        const fs::path root=AppConfig::s_homeLibrary;
+        if(root.empty()||!fs::is_directory(root,ec))return logicalName;
+        const std::string wanted=logicalName+".apk";
+        for(fs::recursive_directory_iterator it(
+                root,fs::directory_options::skip_permission_denied,ec),end;
+            it!=end&&!ec;it.increment(ec)) {
+            if(it->is_directory(ec)) {
+                const std::string folder=homelibrary::lowerAscii(
+                    it->path().filename().string());
+                if(folder=="cooked"||folder=="saved"||folder=="backups"||
+                   folder=="carriers"||folder=="profiles")
+                    it.disable_recursion_pending();
+                continue;
+            }
+            if(!it->is_regular_file(ec)||it->path().filename().string()!=wanted)
+                continue;
+            fs::path folder=it->path().parent_path();
+            if(homelibrary::lowerAscii(folder.filename().string())=="apks")
+                folder=folder.parent_path();
+            std::string name=folder.filename().string();
+            const size_t open=name.rfind('('),close=name.rfind(')');
+            if(open!=std::string::npos&&close==name.size()-1&&close>open+1)
+                name=name.substr(open+1,close-open-1);
+            else if(name.rfind("com.",0)==0&&name.find('.')!=std::string::npos)
+                name=name.substr(name.find_last_of('.')+1);
+            for(char& c:name)if(c=='_'||c=='-')c=' ';
+            if(!name.empty())name[0]=(char)std::toupper((unsigned char)name[0]);
+            return name.empty()?logicalName:name;
+        }
+        return logicalName;
+    }
+
+    static bool libraryApkHasScene(
+        const std::filesystem::path& apkPath) {
+        mz_zip_archive zip{};
+        if (!mz_zip_reader_init_file(&zip, apkPath.string().c_str(), 0))
+            return false;
+        const bool valid =
+            mz_zip_reader_locate_file(&zip, "assets/scene.zip", nullptr, 0) >= 0;
+        mz_zip_reader_end(&zip);
+        return valid;
+    }
+
+    void loadHomeLibraryUserFolders() {
+        std::vector<std::string> lines;
+        if (FILE* file =
+                fopen(AppConfig::exeRel("home_library_folders.txt").c_str(), "rb")) {
+            char line[4096];
+            while (fgets(line, sizeof line, file))
+                lines.emplace_back(line);
+            fclose(file);
+        }
+        homeLibraryUserFolders = homelibrary::uniqueFolderLines(lines);
+    }
+
+    void saveHomeLibraryUserFolders() const {
+        if (FILE* file =
+                fopen(AppConfig::exeRel("home_library_folders.txt").c_str(), "wb")) {
+            for (const std::string& folder : homeLibraryUserFolders) {
+                fwrite(folder.data(), 1, folder.size(), file);
+                fputc('\n', file);
+            }
+            fclose(file);
+        }
+    }
+
+    void addHomeLibraryUserFolder() {
+        const std::string selected =
+            pickFolderWin32(L"Add a folder to the Home Library");
+        if (selected.empty())
+            return;
+        std::error_code ec;
+        const std::filesystem::path absolute =
+            std::filesystem::weakly_canonical(
+                std::filesystem::absolute(
+                    std::filesystem::path(selected), ec), ec);
+        if (ec || !std::filesystem::is_directory(absolute, ec)) {
+            setStatus("Library folder was not added because it is not accessible.");
+            return;
+        }
+        auto folders = homeLibraryUserFolders;
+        folders.push_back(absolute.string());
+        homeLibraryUserFolders = homelibrary::uniqueFolderLines(folders);
+        saveHomeLibraryUserFolders();
+        refreshHomeLibrary();
+        setStatus("Library folder added. Only APKs containing assets/scene.zip are indexed.");
+    }
+
+    void refreshHomeLibrary() {
+        namespace fs=std::filesystem;
+        homeLibraryEntries.clear();
+        std::vector<fs::path> roots;
+        std::vector<fs::path> canonicalApkRoots;
+        if(!AppConfig::s_homeLibrary.empty()) roots.emplace_back(AppConfig::homeRel("cooked"));
+        roots.emplace_back("cooked");
+        // Canonical Quest Homes stores each imported Home under
+        // <friendly/package folder>/apks. Include those finished artifacts too
+        // (Polar Village is a real example) without recursively ingesting
+        // backups, raw-auto experiments or arbitrary APK dumps.
+        if(!AppConfig::s_homeLibrary.empty()) {
+            std::error_code rootEc;
+            for(const auto& homeDir:fs::directory_iterator(
+                    AppConfig::s_homeLibrary,rootEc)) {
+                if(rootEc||!homeDir.is_directory(rootEc))continue;
+                const std::string folder=homelibrary::lowerAscii(
+                    homeDir.path().filename().string());
+                if(folder=="cooked"||folder=="saved"||folder=="backups"||
+                   folder=="carriers"||folder=="profiles"||folder=="tools"||
+                   folder=="raw auto tests")
+                    continue;
+                const fs::path apks=homeDir.path()/"apks";
+                if(fs::is_directory(apks,rootEc)) {
+                    roots.push_back(apks);
+                    canonicalApkRoots.push_back(apks);
+                }
+            }
+        }
+        // User-approved roots are the only external discovery surface. Scan
+        // recursively inside them, validate every APK as a Home first, then
+        // reuse the normal raw/finished classification on its parent folder.
+        std::set<std::string> externalParents;
+        for (const std::string& configured : homeLibraryUserFolders) {
+            std::error_code scanEc;
+            const fs::path userRoot(configured);
+            if (!fs::is_directory(userRoot, scanEc))
+                continue;
+            fs::recursive_directory_iterator it(
+                userRoot, fs::directory_options::skip_permission_denied, scanEc);
+            const fs::recursive_directory_iterator end;
+            for (; !scanEc && it != end; it.increment(scanEc)) {
+                if (it->is_symlink(scanEc) && it->is_directory(scanEc)) {
+                    it.disable_recursion_pending();
+                    continue;
+                }
+                if (!it->is_regular_file(scanEc) ||
+                    homelibrary::lowerAscii(it->path().extension().string()) !=
+                        ".apk" ||
+                    !libraryApkHasScene(it->path()))
+                    continue;
+                const fs::path parent = it->path().parent_path();
+                const std::string key =
+                    fs::absolute(parent, scanEc).lexically_normal().string();
+                if (externalParents.insert(homelibrary::lowerAscii(key)).second) {
+                    roots.push_back(parent);
+                    canonicalApkRoots.push_back(parent);
+                }
+            }
+        }
+        struct RawSource {
+            fs::path path;
+            std::string displayName;
+            fs::file_time_type modified{};
+        };
+        std::map<std::string,RawSource> rawSources;
+        for(const fs::path& apks:canonicalApkRoots) {
+            RawSource newest;
+            std::string newestStem;
+            std::error_code rawEc;
+            const std::string rootKey=homelibrary::lowerAscii(
+                fs::absolute(apks,rawEc).lexically_normal().string());
+            const bool externalRoot=externalParents.count(rootKey)!=0;
+            for(const auto& file:fs::directory_iterator(apks,rawEc)) {
+                if(rawEc||!file.is_regular_file(rawEc)||
+                   homelibrary::classifyFileName(file.path().filename().string()).kind!=
+                       homelibrary::Kind::Unknown||
+                   homelibrary::lowerAscii(file.path().extension().string())!=".apk"||
+                   (externalRoot&&!libraryApkHasScene(file.path())))
+                    continue;
+                const std::string low=homelibrary::lowerAscii(
+                    file.path().filename().string());
+                // Old AstroBoy delivery names predate the current classifier.
+                // They are cooked derivatives, never authoritative raw inputs.
+                if(low.find("_cooked_")!=std::string::npos||
+                   low.find("_cooked.")!=std::string::npos||
+                   low.find("_edited_")!=std::string::npos)
+                    continue;
+                const auto modified=file.last_write_time(rawEc);
+                if(newest.path.empty()||modified>newest.modified) {
+                    newest.path=file.path();
+                    newest.modified=modified;
+                    newestStem=file.path().stem().string();
+                }
+            }
+            if(newest.path.empty())continue;
+            std::string folderName=apks.parent_path().filename().string();
+            const size_t open=folderName.rfind('('),close=folderName.rfind(')');
+            if(open!=std::string::npos&&close==folderName.size()-1&&close>open+1)
+                folderName=folderName.substr(open+1,close-open-1);
+            else if(folderName.rfind("com.",0)==0&&
+                    folderName.find_last_of('.')!=std::string::npos)
+                folderName=folderName.substr(folderName.find_last_of('.')+1);
+            for(char& c:folderName)if(c=='_'||c=='-')c=' ';
+            if(!folderName.empty())
+                folderName[0]=(char)std::toupper((unsigned char)folderName[0]);
+            newest.displayName=folderName.empty()?newestStem:folderName;
+            auto existing=rawSources.find(newestStem);
+            if(existing==rawSources.end()||newest.modified>existing->second.modified)
+                rawSources[newestStem]=std::move(newest);
+        }
+        std::set<std::string> seen;
+        std::map<std::string,size_t> groupedHomes;
+        std::error_code ec;
+        for(const fs::path& root:roots) {
+            ec.clear();
+            if(!fs::is_directory(root,ec)) continue;
+            const std::string rootKey=homelibrary::lowerAscii(
+                fs::absolute(root,ec).lexically_normal().string());
+            const bool externalRoot=externalParents.count(rootKey)!=0;
+            for(const auto& item:fs::directory_iterator(root,ec)) {
+                if(ec || !item.is_regular_file(ec)) continue;
+                const auto classification=homelibrary::classifyFileName(item.path().filename().string());
+                if(classification.kind==homelibrary::Kind::Unknown||
+                   (externalRoot&&!libraryApkHasScene(item.path()))) continue;
+                const std::string absolute=fs::absolute(item.path(),ec).lexically_normal().string();
+                if(!seen.insert(absolute).second) continue;
+                std::string logicalName=item.path().stem().string();
+                if(classification.kind==homelibrary::Kind::Vista) {
+                    const std::string suffix="-"+std::string(classification.destination)+"-Vista";
+                    if(logicalName.size()>=suffix.size() &&
+                       logicalName.compare(logicalName.size()-suffix.size(),suffix.size(),suffix)==0)
+                        logicalName.resize(logicalName.size()-suffix.size());
+                }
+                if(classification.kind!=homelibrary::Kind::Vista) {
+                    for(const std::string& suffix:{"_Rooted-System","_NoRoot-Spoof"})
+                        if(logicalName.size()>=suffix.size() &&
+                           logicalName.compare(logicalName.size()-suffix.size(),suffix.size(),suffix)==0)
+                            logicalName.resize(logicalName.size()-suffix.size());
+                    const std::string key=(fs::absolute(item.path().parent_path(),ec)/
+                                           logicalName).lexically_normal().string();
+                    auto existing=groupedHomes.find(key);
+                    if(existing!=groupedHomes.end()) {
+                        HomeLibraryEntry& entry=homeLibraryEntries[existing->second];
+                        entry.bytes+=item.file_size(ec);
+                        entry.hasRooted|=classification.kind==homelibrary::Kind::StandardRooted;
+                        entry.hasHaven|=classification.kind==homelibrary::Kind::HavenSpoof;
+                        if(classification.kind==homelibrary::Kind::StandardRooted) {
+                            entry.path=absolute;
+                            entry.rootedPath=absolute;
+                            entry.classification={homelibrary::Kind::StandardRooted,0,"Standard + Haven"};
+                        } else entry.havenPath=absolute;
+                        continue;
+                    }
+                    groupedHomes[key]=homeLibraryEntries.size();
+                }
+                HomeLibraryEntry entry;
+                entry.path=absolute;
+                entry.name=logicalName;
+                entry.displayName=friendlyLibrarySourceName(entry.name);
+                entry.labelSidecar=(item.path().parent_path()/
+                                    (logicalName+".library-name.txt")).string();
+                const fs::path displayNamePath=entry.labelSidecar;
+                if(FILE* f=fopen(displayNamePath.string().c_str(),"rb")) {
+                    char label[256]={0};
+                    if(fgets(label,sizeof label,f)) {
+                        entry.displayName=trimAdbValue(label);
+                        if(entry.displayName.empty()) entry.displayName=entry.name;
+                    }
+                    fclose(f);
+                }
+                entry.classification=classification;
+                entry.bytes=item.file_size(ec);
+                entry.hasRooted=classification.kind==homelibrary::Kind::StandardRooted;
+                entry.hasHaven=classification.kind==homelibrary::Kind::HavenSpoof;
+                if(entry.hasRooted) entry.rootedPath=absolute;
+                if(entry.hasHaven) entry.havenPath=absolute;
+                // logicalName already has the Vista destination suffix removed.
+                // Strip its delivery variant too so every Rooted/Haven/Vista
+                // artifact resolves to the same source cook signature.
+                std::string recipeStem=logicalName;
+                for(const std::string& suffix:{"_Rooted-System","_NoRoot-Spoof"})
+                    if(recipeStem.size()>=suffix.size() &&
+                       recipeStem.compare(recipeStem.size()-suffix.size(),suffix.size(),suffix)==0)
+                        recipeStem.resize(recipeStem.size()-suffix.size());
+                const fs::path recipe=item.path().parent_path()/(recipeStem+".cooksig");
+                entry.hasRecipe=fs::is_regular_file(recipe,ec) ||
+                                fs::is_regular_file(item.path().string()+".wrapper.txt",ec);
+                if(fs::is_regular_file(recipe,ec)) {
+                    if(FILE* f=fopen(recipe.string().c_str(),"rb")) {
+                        char signature[96]={0};
+                        if(fgets(signature,sizeof signature,f)) {
+                            const std::string value=trimAdbValue(signature);
+                            entry.currentRecipe=
+                                homelibrary::isCurrentArtifactSignature(value);
+                        }
+                        fclose(f);
+                    }
+                }
+                if(const auto source=rawSources.find(recipeStem);
+                   source!=rawSources.end()) {
+                    entry.sourcePath=source->second.path.string();
+                    entry.hasRaw=true;
+                    entry.displayName=source->second.displayName;
+                }
+                homeLibraryEntries.push_back(std::move(entry));
+            }
+        }
+        // Add canonical raw Homes that have never been cooked. If a finished
+        // Rooted/Haven/Vista variant already resolved to this source, it stays
+        // on the same card instead of becoming a duplicate row.
+        for(const auto& [stem,source]:rawSources) {
+            auto existing=std::find_if(homeLibraryEntries.begin(),
+                homeLibraryEntries.end(),[&](const HomeLibraryEntry& entry) {
+                    std::error_code cmpEc;
+                    return !entry.sourcePath.empty()&&
+                           fs::equivalent(entry.sourcePath,source.path,cmpEc);
+                });
+            if(existing!=homeLibraryEntries.end()) {
+                existing->hasRaw=true;
+                continue;
+            }
+            HomeLibraryEntry entry;
+            entry.path=source.path.string();
+            entry.sourcePath=entry.path;
+            entry.name=stem;
+            entry.displayName=source.displayName;
+            entry.labelSidecar=(source.path.parent_path()/
+                                (stem+".library-name.txt")).string();
+            entry.classification={homelibrary::Kind::Unknown,0,"Raw Home"};
+            entry.bytes=fs::file_size(source.path,ec);
+            entry.hasRaw=true;
+            homeLibraryEntries.push_back(std::move(entry));
+        }
+        std::sort(homeLibraryEntries.begin(),homeLibraryEntries.end(),
+                  [](const HomeLibraryEntry& a,const HomeLibraryEntry& b) {
+            if(a.classification.kind!=b.classification.kind)
+                return static_cast<int>(a.classification.kind) <
+                       static_cast<int>(b.classification.kind);
+            if(a.classification.vistaSlot!=b.classification.vistaSlot)
+                return a.classification.vistaSlot<b.classification.vistaSlot;
+            return a.name<b.name;
+        });
+    }
+
+    void openHomeLibrary() {
+        loadHomeLibraryUserFolders();
+        refreshHomeLibrary();
+        homeLibraryRenameIndex=-1;
+        homeLibraryScroll=0.f;
+        homeLibraryOpen=true;
+    }
+
+    void installHomeLibraryEntry(size_t index) {
+        if(index>=homeLibraryEntries.size() || cooking.load()) return;
+        const HomeLibraryEntry entry=homeLibraryEntries[index];
+        if(!entry.currentRecipe) {
+            if(entry.sourcePath.empty()) {
+                setStatus("Library update required, but the raw source APK was not found. Add the raw Home and cook it again.");
+                return;
+            }
+            setStatus("Older Library cook detected. Raw source opened safely; Cook and Install will create a current artifact.");
+            tab=TAB_COOK;
+            propScroll=0.f;
+            homeLibraryOpen=false;
+            swapTo=entry.sourcePath;
+            return;
+        }
+        if(!deviceConnected()) {
+            setStatus("Library install: no Quest connected. Connect and unlock the headset, then retry.");
+            homeLibraryOpen=false;
+            tab=TAB_LOGCAT;
+            return;
+        }
+        if(cookThread.joinable()) cookThread.join();
+        cooking.store(true);
+        setStage(0.02f,"Library compatibility check");
+        cookThread=std::thread([this,entry] {
+            auto progress=[this](float f,const char* stage){setStage(f,stage);};
+            bool ok=false;
+            std::string summary;
+            if(entry.classification.kind==homelibrary::Kind::Vista) {
+                std::string systemApk=entry.path;
+                const std::string suffix="-"+std::string(entry.classification.destination)+"-Vista.apk";
+                if(systemApk.size()>=suffix.size() &&
+                   systemApk.compare(systemApk.size()-suffix.size(),suffix.size(),suffix)==0) {
+                    systemApk.resize(systemApk.size()-suffix.size());
+                    systemApk+=".apk";
+                }
+                if(!fileEx(systemApk)) {
+                    summary="Vista update requires its paired Rooted-System APK. Open the source Home and cook this Vista slot again.";
+                } else {
+                    ok=wrapAndInstallLoftTargetFor(entry.classification.vistaSlot,
+                                                   systemApk,progress,summary);
+                    ok=ok && summary.rfind("installed wrapped Home",0)==0;
+                }
+            } else {
+                const bool rooted=deviceIsRooted();
+                std::string artifact=rooted?entry.rootedPath:entry.havenPath;
+                if(artifact.empty()) {
+                    summary=rooted
+                        ?"This library Home has no Rooted-System artifact. Open and cook it again."
+                        :"This library Home has no Haven spoof. Open and cook it for a non-rooted Quest.";
+                } else {
+                    hslcook::ApkManifestIdentity identity;
+                    if(!hslcook::readApkManifestIdentity(hslcook::readFileBytes(artifact),identity)) {
+                        summary="The selected library APK has no readable Android identity; nothing was installed.";
+                    } else if(rooted) {
+                        ok=installToDevice(artifact,identity.packageName,progress,false,true);
+                        summary=ok?"Installed and verified as a normal rooted Home.":statusSnapshot();
+                    } else {
+                        std::string backup;
+                        const HavenBkp haven=backupOriginalHaven(backup);
+                        if(haven==HB_FAILED) {
+                            summary="Install aborted: original Haven 2025 could not be backed up.";
+                        } else {
+                            ok=installToDevice(artifact,HAVEN_PKG(),progress,true,false);
+                            summary=ok?"Installed and verified in Haven 2025; original backup preserved.":statusSnapshot();
+                        }
+                    }
+                }
+            }
+            setStatus(summary);
+            setStage(1.f,ok?"Complete":"Stopped safely");
+            cooking.store(false);
+        });
+    }
+
+    void drawHomeLibrary() {
+        auto& th=cx.th;
+        dl.rect(0,0,(float)fbW,(float)fbH,ui::rgba(5,7,12,205));
+        const float margin=std::max(20.f*uiScale,(float)fbW*0.08f);
+        const float bx=margin,by=margin,bw=(float)fbW-2*margin,bh=(float)fbH-2*margin;
+        dl.rect(bx,by,bw,bh,th.panelBg); dl.border(bx,by,bw,bh,th.accent);
+        const float pad=16*uiScale,rh=th.rowH;
+        cx.label(bx+pad,by+pad,bw-2*pad,rh+5*uiScale,"Home Library",th.text);
+        cx.label(bx+pad,by+pad+rh+4*uiScale,bw-2*pad,rh,
+                 cooking.load()
+                    ?"Installation is still running - wait for READY before starting another Home."
+                    :"Finished Homes are grouped by destination. Compatibility is rechecked before installation.",
+                 cooking.load()?ui::rgba(245,190,70):th.textDim);
+        if(cx.button(ui::hashId("libraryaddfolder"),bx+bw-pad-274*uiScale,by+pad,
+                     118*uiScale,rh+3*uiScale,"Add folder"))
+            addHomeLibraryUserFolder();
+        if(cx.button(ui::hashId("libraryrefresh"),bx+bw-pad-150*uiScale,by+pad,
+                     92*uiScale,rh+3*uiScale,"Refresh")) refreshHomeLibrary();
+        if(cx.button(ui::hashId("libraryclose"),bx+bw-pad-52*uiScale,by+pad,
+                     52*uiScale,rh+3*uiScale,"Close") ||
+           cx.in.keyRepeat[ui::KEY_ESCAPE]) homeLibraryOpen=false;
+        int standardCount=0,vistaCount=0;
+        for(const auto& entry:homeLibraryEntries)
+            entry.classification.kind==homelibrary::Kind::Vista?vistaCount++:standardCount++;
+        float y=by+pad+2*rh+14*uiScale;
+        const float tabGap=6*uiScale,tabW=(bw-2*pad-tabGap)/2;
+        const std::string standardTab="Standard Homes  "+std::to_string(standardCount);
+        const std::string vistaTab="Vista Homes  "+std::to_string(vistaCount);
+        if(cx.tab(ui::hashId("librarystandard"),bx+pad,y,tabW,rh+5*uiScale,
+                  standardTab.c_str(),homeLibraryFilter==0)) {
+            homeLibraryFilter=0; homeLibraryScroll=0.f; homeLibraryRenameIndex=-1;
+        }
+        if(cx.tab(ui::hashId("libraryvista"),bx+pad+tabW+tabGap,y,tabW,rh+5*uiScale,
+                  vistaTab.c_str(),homeLibraryFilter==1)) {
+            homeLibraryFilter=1; homeLibraryScroll=0.f; homeLibraryRenameIndex=-1;
+        }
+        y+=rh+12*uiScale;
+        if (homeLibraryUserFolders.empty()) {
+            cx.label(bx+pad,y,bw-2*pad,rh,
+                     "Managed Quest Homes library only. Add a folder to index external Homes.",
+                     th.textDim);
+            y+=rh+5*uiScale;
+        } else {
+            for (size_t folderIndex=0;
+                 folderIndex<homeLibraryUserFolders.size(); ++folderIndex) {
+                const float removeW=78*uiScale;
+                cx.label(bx+pad,y,bw-2*pad-removeW-6*uiScale,rh,
+                         homeLibraryUserFolders[folderIndex].c_str(),th.textDim);
+                if (cx.button(ui::hashId("libraryremovefolder",
+                                         static_cast<uint32_t>(folderIndex)),
+                              bx+bw-pad-removeW,y,removeW,rh+1*uiScale,
+                              "Remove")) {
+                    homeLibraryUserFolders.erase(
+                        homeLibraryUserFolders.begin()+folderIndex);
+                    saveHomeLibraryUserFolders();
+                    refreshHomeLibrary();
+                    homeLibraryScroll=0.f;
+                    break;
+                }
+                y+=rh+4*uiScale;
+            }
+        }
+        if(cooking.load()) {
+            cx.progressBar(bx+pad,y,bw-2*pad,rh+4*uiScale,
+                           cookProg.load(),stageStr().c_str());
+            y+=rh+12*uiScale;
+        }
+        if(homeLibraryRenameIndex>=0 &&
+           homeLibraryRenameIndex<(int)homeLibraryEntries.size()) {
+            cx.label(bx+pad,y,110*uiScale,rh,"Library name",th.textDim);
+            const float fieldX=bx+pad+112*uiScale;
+            const float buttons=150*uiScale;
+            cx.textField(ui::hashId("libraryrenametext"),fieldX,y,
+                         bw-2*pad-112*uiScale-buttons,rh+2*uiScale,
+                         homeLibraryRenameText);
+            const float saveX=bx+bw-pad-buttons+4*uiScale;
+            if(cx.button(ui::hashId("libraryrenamesave"),saveX,y,70*uiScale,
+                         rh+2*uiScale,"Save")) {
+                homeLibraryRenameText=trimAdbValue(homeLibraryRenameText);
+                if(homeLibraryRenameText.empty())
+                    homeLibraryRenameText=homeLibraryEntries[homeLibraryRenameIndex].name;
+                const std::string sidecar=
+                    homeLibraryEntries[homeLibraryRenameIndex].labelSidecar;
+                if(FILE* f=fopen(sidecar.c_str(),"wb")) {
+                    fputs(homeLibraryRenameText.c_str(),f); fputc('\n',f); fclose(f);
+                    homeLibraryEntries[homeLibraryRenameIndex].displayName=homeLibraryRenameText;
+                }
+                homeLibraryRenameIndex=-1;
+            }
+            if(cx.button(ui::hashId("libraryrenamecancel"),saveX+74*uiScale,y,
+                         70*uiScale,rh+2*uiScale,"Cancel"))
+                homeLibraryRenameIndex=-1;
+            y+=rh+10*uiScale;
+        }
+        const float rowH=rh*2.25f,rowGap=5*uiScale;
+        std::vector<size_t> visibleEntries;
+        for(size_t i=0;i<homeLibraryEntries.size();i++) {
+            const bool vista=homeLibraryEntries[i].classification.kind==homelibrary::Kind::Vista;
+            if(vista==(homeLibraryFilter==1)) visibleEntries.push_back(i);
+        }
+        if(visibleEntries.empty()) {
+            cx.textAligned(bx+pad,y,bw-2*pad,rh*2,
+                           homeLibraryFilter==1
+                               ?"No finished Vista Homes found yet."
+                               :"No finished normal or Haven Homes found yet.",
+                           th.textDim,1);
+            return;
+        }
+        const float bottom=by+bh-pad;
+        const float viewportH=std::max(0.f,bottom-y);
+        const float contentH=visibleEntries.size()*(rowH+rowGap)-rowGap;
+        const float maxScroll=std::max(0.f,contentH-viewportH);
+        if(cx.hover(bx+pad,y,bw-2*pad,viewportH) && cx.in.wheel!=0.f)
+            homeLibraryScroll=std::clamp(homeLibraryScroll-cx.in.wheel*rowH,0.f,maxScroll);
+        homeLibraryScroll=std::clamp(homeLibraryScroll,0.f,maxScroll);
+        dl.pushClip(bx+pad,y,bw-2*pad,viewportH);
+        float rowY=y-homeLibraryScroll;
+        for(size_t order=0;order<visibleEntries.size();order++) {
+            const size_t i=visibleEntries[order];
+            const HomeLibraryEntry& entry=homeLibraryEntries[i];
+            if(rowY+rowH<y) { rowY+=rowH+rowGap; continue; }
+            if(rowY>bottom) break;
+            dl.rect(bx+pad,rowY,bw-2*pad,rowH,th.subPanel);
+            const uint32_t accent=entry.classification.kind==homelibrary::Kind::Vista
+                ?ui::rgba(150,112,235):th.accent;
+            dl.rect(bx+pad,rowY,4*uiScale,rowH,accent);
+            cx.label(bx+pad+12*uiScale,rowY+4*uiScale,bw-230*uiScale,rh,
+                     entry.displayName.c_str(),th.text);
+            char detail[180];
+            if(entry.classification.kind==homelibrary::Kind::Vista) {
+                snprintf(detail,sizeof detail,"Vista Home  ->  %s  |  %.1f MiB",
+                         entry.classification.destination,
+                         (double)entry.bytes/(1024.0*1024.0));
+            } else {
+                std::string available;
+                if(entry.hasRooted&&entry.hasHaven)available="Rooted + Haven";
+                else if(entry.hasRooted)available="Rooted";
+                else if(entry.hasHaven)available="Haven";
+                else available="Raw source";
+                if(entry.hasRaw&&(entry.hasRooted||entry.hasHaven))
+                    available+=" + source";
+                snprintf(detail,sizeof detail,"%s available  |  %.1f MiB",
+                         available.c_str(),(double)entry.bytes/(1024.0*1024.0));
+            }
+            cx.label(bx+pad+12*uiScale,rowY+rh+3*uiScale,bw-360*uiScale,rh,
+                     detail,th.textDim);
+            const char* state=entry.currentRecipe?"READY":entry.hasRecipe?"UPDATE":"RAW";
+            const uint32_t stateColor=entry.currentRecipe
+                ?ui::rgba(76,190,120):ui::rgba(245,190,70);
+            const float actionX=bx+bw-pad-300*uiScale;
+            cx.textAligned(actionX-98*uiScale,rowY+rh+3*uiScale,90*uiScale,rh,
+                           state,stateColor,1);
+            if(cx.button(ui::hashId("libraryrename",(uint32_t)i),actionX,
+                         rowY+6*uiScale,70*uiScale,rowH-12*uiScale,"Rename")) {
+                homeLibraryRenameIndex=(int)i;
+                homeLibraryRenameText=entry.displayName;
+            }
+            if(cx.button(ui::hashId("libraryopen",(uint32_t)i),actionX+76*uiScale,
+                         rowY+6*uiScale,104*uiScale,rowH-12*uiScale,
+                         "Review")) {
+                swapTo=entry.path;
+                homeLibraryOpen=false;
+            }
+            if(cx.button(ui::hashId("libraryinstall",(uint32_t)i),actionX+186*uiScale,
+                         rowY+6*uiScale,114*uiScale,rowH-12*uiScale,
+                         cooking.load()?"Working..."
+                             :entry.currentRecipe?"Install now"
+                             :entry.hasRecipe?"Update":"Cook",
+                         !cooking.load()))
+                installHomeLibraryEntry(i);
+            rowY+=rowH+rowGap;
+        }
+        dl.popClip();
+    }
+
     void drawHeader() {
         auto& th = cx.th; float h = (float)rcHeader.extent.height, W=(float)fbW, pad=8*uiScale;
         dl.rect(0,0,W,h, th.headerBg);
         dl.rect(0,h-1,W,1, th.splitLine);
-        cx.textAligned(pad, 0, 200*uiScale, h, "V79  Quest Home  Editor", th.text, 0);
-        // menu strip (visual; functional menus land in cleanup phase)
-        const char* menus[] = {"File","Edit","Object","View"};
-        const char* menuTips[] = {
-            "File actions - Save / Load a session, Export or Import a glTF, Cook to APK.\n(Use the Save / Load / Cook buttons on the right for now.)",
-            "Edit actions - Undo / Redo, and the per-object edits in the Object tab.",
-            "Object actions - add / duplicate / delete, and transform the selected mesh\n(see the Object and Geometry tabs).",
-            "View options - camera + viewport display (grid, gizmos, far-clip overlay)."};
-        float mx = 220*uiScale;
-        for (int mi2=0; mi2<4; ++mi2) { const char* m=menus[mi2]; float w = dl.textW(i18n::tr(m))+18*uiScale;
-            cx.button(ui::hashId(m), mx, 3*uiScale, w, h-6*uiScale, m); cx.tip(mx, 3*uiScale, w, h-6*uiScale, menuTips[mi2]); mx += w+2*uiScale; }
+        const char* brand="Quest Home Studio";
+        float brandW=dl.textW(brand);
+        cx.textAligned(pad,0,brandW,h,brand,th.text,0);
+        float mx=pad+brandW+16*uiScale;
+        const float modeY=3*uiScale,modeH=h-6*uiScale;
+        const float modeLabelW=dl.textW("MODE")+12*uiScale;
+        cx.textAligned(mx,modeY,modeLabelW,modeH,"MODE",th.textDim,1);
+        mx+=modeLabelW;
+        float standardW=dl.textW("Standard")+26*uiScale,expertW=dl.textW("Expert")+26*uiScale;
+        dl.rect(mx-3*uiScale,modeY-uiScale,
+                standardW+expertW+8*uiScale,modeH+2*uiScale,th.subPanel);
+        dl.border(mx-3*uiScale,modeY-uiScale,
+                  standardW+expertW+8*uiScale,modeH+2*uiScale,
+                  expertMode?ui::rgba(178,120,245):th.accent);
+        if (cx.tab(ui::hashId("modestandard"),mx,modeY,standardW,modeH,"Standard",!expertMode)) setExpertMode(false);
+        cx.tip(mx,modeY,standardW,modeH,"Guided workflow with safe automatic defaults.");
+        mx+=standardW+2*uiScale;
+        if (cx.tab(ui::hashId("modeexpert"),mx,modeY,expertW,modeH,"Expert",expertMode)) setExpertMode(true);
+        cx.tip(mx,modeY,expertW,modeH,"Full scene, material, animation, physics and cook controls.");
+        mx+=expertW+8*uiScale;
         // language selector (GitHub #10): click for a dropdown of all languages; persisted + re-bakes the atlas
         { const char* ll = i18n::langName(i18n::g_lang); float w = dl.textW(ll)+26*uiScale; if (w < 64*uiScale) w = 64*uiScale;
           float lx = mx + 10*uiScale; langBtnX=lx; langBtnY=3*uiScale; langBtnW=w; langBtnH=h-6*uiScale;
@@ -4405,8 +5257,8 @@ struct Editor {
         float bw = 96*uiScale, bh = h-8*uiScale, bx = W - bw - pad;
         if (cooking) { cx.progressBar(bx-150*uiScale, 4*uiScale, 150*uiScale+bw, bh, cookProg.load(), stageStr().c_str()); }
         else {
-            if (cx.button(ui::hashId("hdrcook"), bx, 4*uiScale, bw, bh, "Cook APK", true)) { tab=TAB_COOK; startCook(); }
-            cx.tip(bx, 4*uiScale, bw, bh, "Cook the loaded home into an installable Quest APK (and install it\nif Install is on). Opens the Cook tab. Same as the Cook button there.");
+            if (cx.button(ui::hashId("hdrcook"), bx, 4*uiScale, bw, bh, "Cook", true)) { tab=TAB_COOK; }
+            cx.tip(bx, 4*uiScale, bw, bh, "Cook the loaded home into signed Quest APKs and optionally install.\nOpens the Cook workspace.");
             float sw=56*uiScale;
             if (cx.button(ui::hashId("hdrload"), bx-sw-4*uiScale, 4*uiScale, sw, bh, "Load")) loadProject();
             cx.tip(bx-sw-4*uiScale, 4*uiScale, sw, bh, "Load a saved session (.hsledit) or a cooked APK back into the editor.\nRestores your edits, selection and cook settings.");
@@ -4414,14 +5266,20 @@ struct Editor {
             cx.tip(bx-2*sw-8*uiScale, 4*uiScale, sw, bh, "Save this session to a .hsledit file (Ctrl+S) so your edits persist\nand you can reopen exactly where you left off.");
             // Blender / glTF round-trip: export the home to a glTF project, edit it in Blender (or any 3D tool),
             // then import the edited glTF/glb back in. Labels say plainly which way each button goes.
-            float blw = 104*uiScale;
+            // Keep the core Save/Load/Cook path usable on compact windows. Expert round-trip tools
+            // progressively move out of the header instead of overlapping the mode/language controls.
+            const bool showGltf = expertMode && W >= 1280*uiScale;
+            const bool showAutosave = W >= 900*uiScale;
+            float blw = showGltf ? 104*uiScale : 0.f;
             float bex = bx-2*sw-12*uiScale-blw;
-            if (cx.button(ui::hashId("hdrblend"),  bex, 4*uiScale, blw, bh, "Export glTF")) exportBlender();
-            cx.tip(bex, 4*uiScale, blw, bh, "Export this home to a glTF 2.0 project (meshes + materials + textures\n+ transforms) that opens in Blender or any 3D tool for editing.\nEdit it, then use \"Import glTF\" to bring it back and cook it.");
-            if (cx.button(ui::hashId("hdrimport"), bex-blw-4*uiScale, 4*uiScale, blw, bh, "Import glTF")) importBlender();
-            cx.tip(bex-blw-4*uiScale, 4*uiScale, blw, bh, "Import a glTF/glb you edited (e.g. in Blender) as a fresh session,\nso you can preview and cook the edited home. Pairs with \"Export glTF\".");
-            { const char* s = autoSaveOn ? "Auto-save: On" : "Auto-save: Off"; float aw = dl.textW(s)+14*uiScale;   // crash-resistance: periodic .autosave + recovery on reopen
-              float ax = bex-2*blw-8*uiScale-aw; float ay0=4*uiScale;
+            if (showGltf) {
+                if (cx.button(ui::hashId("hdrblend"),  bex, 4*uiScale, blw, bh, "Export glTF")) exportBlender();
+                cx.tip(bex, 4*uiScale, blw, bh, "Export this home to a glTF 2.0 project (meshes + materials + textures\n+ transforms) that opens in Blender or any 3D tool for editing.\nEdit it, then use \"Import glTF\" to bring it back and cook it.");
+                if (cx.button(ui::hashId("hdrimport"), bex-blw-4*uiScale, 4*uiScale, blw, bh, "Import glTF")) importBlender();
+                cx.tip(bex-blw-4*uiScale, 4*uiScale, blw, bh, "Import a glTF/glb you edited (e.g. in Blender) as a fresh session,\nso you can preview and cook the edited home. Pairs with \"Export glTF\".");
+            }
+            if (showAutosave) { const char* s = autoSaveOn ? "Auto-save: On" : "Auto-save: Off"; float aw = dl.textW(s)+14*uiScale;   // crash-resistance: periodic .autosave + recovery on reopen
+              float ax = expertMode ? bex-2*blw-8*uiScale-aw : bex-8*uiScale-aw; float ay0=4*uiScale;
               if (cx.tab(ui::hashId("hdrautosave"), ax, ay0, aw, bh, s, autoSaveOn)) autoSaveOn = !autoSaveOn;
               cx.tip(ax, ay0, aw, bh, "Auto-save the session to <env>.hsledit.autosave every 30s\n(only when something changed). If the editor crashes or closes\nwith unsaved edits, reopening offers to restore them.\nSave (Ctrl+S) still writes the real .hsledit."); }
         }
@@ -4449,6 +5307,7 @@ struct Editor {
         dl.rect((float)v.offset.x,(float)v.offset.y,(float)v.extent.width,bh, ui::withA(th.headerBg,210));
         cx.textAligned(v.offset.x+8*uiScale, v.offset.y, 200*uiScale, bh, "Viewport", th.textDim, 0);
         // transform-mode pills (G/R/S) + axis space
+        if(expertMode) {
         const char* ops[]={"Move","Rotate","Scale"};
         const char* opTips[]={"Move (G) - drag the gizmo arrows to translate the selected mesh.",
                               "Rotate (R) - drag the gizmo rings to rotate the selected mesh.",
@@ -4474,6 +5333,15 @@ struct Editor {
         // X-RAY: selected mesh wireframe over the boxes (align colliders to meshes without camera-angle ambiguity)
         { const char* s = "X-ray"; float w=dl.textW(s)+16*uiScale;
           if (cx.tab(ui::hashId("hdrxray"), px+8*uiScale, v.offset.y, w, bh, s, xrayMesh)) xrayMesh=!xrayMesh; cx.tip(px+8*uiScale, (float)v.offset.y, w, bh, "X-ray: draw the selected mesh as a wireframe over everything, so you\ncan line up box colliders with the mesh regardless of camera angle."); px+=w+8*uiScale; }
+        } else {
+            float px=v.offset.x+82*uiScale;
+            { const char* s=playSim?"Exit walk":"Walk preview"; float w=dl.textW(s)+16*uiScale;
+              if(cx.tab(ui::hashId("stdwalksim"),px,v.offset.y,w,bh,s,playSim)){if(playSim)stopSim();else startSim();}
+              cx.tip(px,(float)v.offset.y,w,bh,"Walk through the Home using its generated navigation."); px+=w+6*uiScale; }
+            { const char* s=previewAudio?"Audio: On":"Audio: Off"; float w=dl.textW(s)+16*uiScale;
+              if(cx.tab(ui::hashId("stdaudio"),px,v.offset.y,w,bh,s,previewAudio)){previewAudio=!previewAudio;g_audioMuted.store(!previewAudio,std::memory_order_relaxed);}
+              cx.tip(px,(float)v.offset.y,w,bh,"Play or mute the Home's background audio preview."); }
+        }
         if (playSim) cx.textAligned(v.offset.x+8*uiScale, v.offset.y+v.extent.height-40*uiScale, v.extent.width-16, 18*uiScale, "WALK MODE - WASD+mouse to walk the navmesh, P to exit", ui::rgba(120,230,140), 0);
         // (overlay/gizmo toggles moved to their single home: the Scene tab "Gizmos / overlays" section —
         //  they used to duplicate here in the viewport header, which read as a confusing second selector)
@@ -4634,20 +5502,46 @@ struct Editor {
         if (!cx.in.down[0]) outlinerDragRow=-1;   // end the drag-paint when the button is released
         dl.popClip();
     }
-    // Floating "Add Component" menu — each entry shows the FRIENDLY name + the REAL Meta component class; click = spawn it.
+    // Floating scene-item palette. Keep the technical Meta class in the tooltip rather than squeezing two
+    // full labels into a single short row (the old layout overlapped badly at the default 1024px window size).
     void drawAddMenu() {
         if (!addMenuOpen) return;
-        auto& th=cx.th; int types[]={sitem::SPAWN,sitem::CHAIR,sitem::BOXCOL,sitem::NAVMESH,sitem::WALLPLACE,sitem::HOTSPOT,sitem::BOUNDARY}; int n=7;
-        float rh=(th.rowH+8*uiScale), w=300*uiScale, hh=n*rh+8*uiScale;
+        auto& th=cx.th;
+        struct AddChoice { int type; const char* detail; };
+        const AddChoice choices[] = {
+            {sitem::SPAWN,     "Choose where the player appears"},
+            {sitem::CHAIR,     "Add a comfortable seated position"},
+            {sitem::BOXCOL,    "Place simple solid collision"},
+            {sitem::NAVMESH,   "Create a walkable scene surface"},
+            {sitem::WALLPLACE, "Mark a surface for wall placement"},
+            {sitem::HOTSPOT,   "Add a locomotion destination"},
+            {sitem::BOUNDARY,  "Protect edges and falling areas"},
+        };
+        constexpr int n=(int)(sizeof(choices)/sizeof(choices[0]));
+        const float headerH=48*uiScale;
+        const float rh=std::max(42.f*uiScale, th.rowH*2.f+8*uiScale);
+        const float w=std::min(420.f*uiScale, (float)fbW-12*uiScale);
+        const float hh=headerH+n*rh+8*uiScale;
         float x=addMenuX, y=addMenuY; if (x+w>fbW) x=fbW-w-2; if (y+hh>fbH) y=fbH-hh-2;
         ctxRX=x; ctxRY=y; ctxRW=w; ctxRH=hh;   // route clicks (reuse the ctx-menu capture path)
         dl.rect(x,y,w,hh,th.panelBg); dl.border(x,y,w,hh,th.border);
-        dl.pushClip(x,y,w,hh); float ry=y+4*uiScale;
+        dl.rect(x,y,3*uiScale,headerH,th.accent);
+        cx.textAligned(x+14*uiScale,y+4*uiScale,w-28*uiScale,th.rowH,"ADD SCENE ITEM",th.text,0);
+        cx.textAligned(x+14*uiScale,y+th.rowH+3*uiScale,w-28*uiScale,th.rowH,
+                       "Choose what to place in this Home",th.textDim,0);
+        dl.rect(x+8*uiScale,y+headerH-1,w-16*uiScale,1,th.splitLine);
+        dl.pushClip(x,y,w,hh); float ry=y+headerH+3*uiScale;
         for (int i=0;i<n;++i, ry+=rh) {
-            bool hv=cx.hover(x,ry,w,rh); if (hv) dl.rect(x+1,ry,w-2,rh,th.accent);
-            cx.textAligned(x+12*uiScale,ry+2*uiScale,w-16*uiScale,th.rowH, sitem::typeName(types[i]), hv?th.textSel:th.text, 0);
-            cx.textAligned(x+12*uiScale,ry+th.rowH-1*uiScale,w-16*uiScale,th.rowH-2*uiScale, sitem::metaName(types[i]), hv?ui::withA(th.textSel,180):th.textDim, 0, mono.ok?&mono:&font);
-            if (hv && cx.in.pressed[0]) { addItem(types[i]); addMenuOpen=false; }
+            const int type=choices[i].type;
+            const bool hv=cx.hover(x+4*uiScale,ry,w-8*uiScale,rh-2*uiScale);
+            if (hv) dl.rect(x+4*uiScale,ry,w-8*uiScale,rh-2*uiScale,th.rowHover);
+            dl.rect(x+10*uiScale,ry+8*uiScale,4*uiScale,rh-16*uiScale,typeColor(type,hv));
+            cx.textAligned(x+22*uiScale,ry+2*uiScale,w-34*uiScale,th.rowH,
+                           sitem::typeName(type),hv?th.textSel:th.text,0);
+            cx.textAligned(x+22*uiScale,ry+th.rowH,w-34*uiScale,th.rowH,
+                           choices[i].detail,hv?ui::withA(th.textSel,190):th.textDim,0);
+            cx.tip(x+4*uiScale,ry,w-8*uiScale,rh-2*uiScale,sitem::metaName(type));
+            if (hv && cx.in.pressed[0]) { addItem(type); addMenuOpen=false; }
         }
         dl.popClip();
     }
@@ -4984,6 +5878,139 @@ struct Editor {
     float bgColor[3] = {0.f,0.f,0.f};
     bool  bgColorSet = false;
 
+    void drawStandardPreparePanel(float x, float y, float w) {
+        auto& th=cx.th;
+        const float contentTop=y;
+        const float rh=th.rowH, gap=7*uiScale, pad=10*uiScale;
+        std::string home=projectPath;
+        size_t slash=home.find_last_of("/\\"); if(slash!=std::string::npos) home=home.substr(slash+1);
+        if(home.empty()) home="No Home loaded";
+
+        cx.label(x,y,w,rh,"PREPARE HOME",th.accent); y+=rh;
+        cx.label(x,y,w,rh,home.c_str(),th.text); y+=rh+gap;
+        if(cx.button(ui::hashId("stdhomelibrary"),x,y,w,rh+4*uiScale,
+                     "Open Home Library")) openHomeLibrary();
+        cx.tip(x,y,w,rh+4*uiScale,
+               "Browse finished normal and Vista Homes, grouped by destination.\nCompatibility is checked again before a later installation.");
+        y+=rh+gap+4*uiScale;
+
+        int navCount=0, colliderCount=0;
+        for(const auto& it:items) {
+            if(it.type==sitem::NAVMESH) ++navCount;
+            else if(it.type==sitem::BOXCOL) ++colliderCount;
+        }
+        const bool loaded=homeLoaded();
+        const bool hasAuthoredNav=navCount>0 || colliderCount>0;
+        auto statusRow=[&](const char* title,const std::string& detail,bool ready){
+            dl.rect(x,y,w,rh*1.75f,th.subPanel);
+            dl.rect(x,y,4*uiScale,rh*1.75f,ready?ui::rgba(76,190,120):ui::rgba(245,190,70));
+            cx.textAligned(x+pad,y,w-2*pad,rh,title,th.text,0);
+            cx.textAligned(x+pad,y+rh*0.72f,w-2*pad,rh,detail.c_str(),th.textDim,0);
+            y+=rh*1.75f+gap;
+        };
+        statusRow("Source Home",loaded?std::to_string(r->gpuMeshes.size())+" meshes loaded":"Open a raw APK or saved session",loaded);
+        statusRow("Navigation",
+                  hasAuthoredNav?std::to_string(navCount)+" navmesh, "+std::to_string(colliderCount)+" collider items":
+                  (autoNavigation?"Will be generated automatically during Cook":"Automatic navigation is disabled"),
+                  hasAuthoredNav||autoNavigation);
+        statusRow("Quest compatibility",autoV206Compat?"VrShell version will be detected automatically":"Automatic compatibility is disabled",autoV206Compat);
+        statusRow("Distant scenery",autoFarClipFix?"Far-clip problems will be analyzed automatically":"Automatic far-clip repair is disabled",autoFarClipFix);
+
+        y+=2*uiScale;
+        cx.checkbox(ui::hashId("stdautonav"),x,y,"Automatic navigation and collision",autoNavigation); y+=rh+2*uiScale;
+        cx.checkbox(ui::hashId("stdautov206"),x,y,"Automatic Quest compatibility",autoV206Compat); y+=rh+2*uiScale;
+        cx.checkbox(ui::hashId("stdautofar"),x,y,"Automatic far-clip repair",autoFarClipFix); y+=rh+gap;
+
+        if(!loaded) {
+            cx.label(x,y,w,rh,"Open a Home APK to begin.",th.textDim); y+=rh+gap;
+        }
+        if(cx.button(ui::hashId("stdnextcook"),x,y,w,rh+5*uiScale,loaded?"Continue to Cook":"Cook unavailable",loaded)) {
+            if(loaded){tab=TAB_COOK;propScroll=0.f;}
+        }
+        y+=rh+gap;
+        if(cx.button(ui::hashId("stdopenexpert"),x,y,w,rh,"Open detailed scene tools")) {
+            setExpertMode(true); tab=TAB_SCENE; propScroll=0.f;
+        }
+        cx.tip(x,y,w,rh,"Switch to Expert for manual spawn, fog, components, navigation and scene editing.");
+        y+=rh+gap;
+        if(cx.button(ui::hashId("standardoculuslogo"),x,y,w,rh,
+                     standardOculusLogo?"Oculus logo: On":"Oculus logo: Off")) {
+            standardOculusLogo=!standardOculusLogo;
+            saveOculusLogoPref();
+            setStatus(standardOculusLogo?"Oculus logo enabled":"Oculus logo hidden");
+        }
+        cx.tip(x,y,w,rh,standardOculusLogo?"Hide the nostalgic Oculus branding."
+                                          :"Show the nostalgic Oculus branding.");
+        standardPropContentHeight=std::max(0.f,y+rh-contentTop);
+    }
+
+    void drawStandardQuestPanel(float x, float y, float w, float h) {
+        auto& th=cx.th; const float rh=th.rowH, gap=7*uiScale, pad=10*uiScale;
+        dl.pushClip(x,y,w,h);
+        float cy=y+7*uiScale;
+        cx.label(x+8*uiScale,cy,w-16*uiScale,rh,"QUEST",th.accent); cy+=rh;
+        cx.label(x+8*uiScale,cy,w-16*uiScale,rh,"Connect, install and reload without technical setup.",th.textDim); cy+=rh+gap;
+
+        ensureAdbAsync();
+        if(adbDlDone.exchange(false)){adbWorks(true);adbDevScanned=false;}
+        if(!adbDevScanned && adbWorks()) refreshAdbDevices();
+        const bool adbReady=adbWorks();
+        const bool deviceReady=adbReady && !adbDeviceList.empty();
+        if(deviceReady && !displayInfoScanned) refreshDisplayQualityInfo();
+        dl.rect(x+8*uiScale,cy,w-16*uiScale,rh*1.9f,th.subPanel);
+        dl.rect(x+8*uiScale,cy,4*uiScale,rh*1.9f,deviceReady?ui::rgba(76,190,120):ui::rgba(245,190,70));
+        cx.textAligned(x+8*uiScale+pad,cy,w-32*uiScale,rh,deviceReady?"Quest connected":"Waiting for Quest",th.text,0);
+        std::string detail;
+        if(adbDling.load()) { std::lock_guard<std::mutex> lk(adbDlMx); detail=adbDlStatus; }
+        else if(!adbReady) detail="Preparing the included Android connection tools";
+        else if(!deviceReady) detail="Connect USB and accept the headset prompt";
+        else detail=adbDeviceLabel();
+        cx.textAligned(x+8*uiScale+pad,cy+rh*0.78f,w-32*uiScale,rh,detail.c_str(),th.textDim,0);
+        cy+=rh*1.9f+gap;
+
+        if(deviceReady && displayInfoScanned) {
+            std::string dq=displayInfoTarget.empty()?"HD+ unavailable":
+                           ("Home HD+  "+displayInfoTarget+"  |  current "+displayInfoCurrent);
+            dl.rect(x+8*uiScale,cy,w-16*uiScale,rh*1.75f,th.subPanel);
+            cx.textAligned(x+8*uiScale+pad,cy,w-32*uiScale,rh,displayInfoDevice.c_str(),th.text,0);
+            cx.textAligned(x+8*uiScale+pad,cy+rh*0.72f,w-32*uiScale,rh,dq.c_str(),th.textDim,0);
+            cy+=rh*1.75f+gap;
+        }
+
+        if(deviceReady) {
+            float refreshW=68*uiScale;
+            if(cx.button(ui::hashId("stdquestdevice"),x+8*uiScale,cy,w-24*uiScale-refreshW,rh,adbDeviceLabel().c_str())) cycleAdbDevice();
+            if(cx.button(ui::hashId("stdquestrefresh"),x+w-8*uiScale-refreshW,cy,refreshW,rh,"Refresh")) {
+                displayInfoScanned=false; refreshAdbDevices();
+            }
+        } else if(cx.button(ui::hashId("stdquestrefresh"),x+8*uiScale,cy,w-16*uiScale,rh,"Check connection again")) {
+            adbWorks(true); adbDevScanned=false; displayInfoScanned=false; refreshAdbDevices();
+        }
+        cy+=rh+gap;
+
+        cx.checkbox(ui::hashId("stdinstallafter"),x+8*uiScale,cy,"Install automatically after Cook",installAfterCook); cy+=rh+2*uiScale;
+        bool stdDisplayQuality=autoDisplayQuality && !manualDisplayQuality;
+        if(cx.checkbox(ui::hashId("stddisplayquality"),x+8*uiScale,cy,"Home HD+ quality (recommended)",stdDisplayQuality)) {
+            autoDisplayQuality=stdDisplayQuality; manualDisplayQuality=false;
+            saveDisplayQualityPref();
+        }
+        cy+=rh+gap;
+        static const char* restartModes[]={"Home reload: Automatic","Home reload: Always","Home reload: Never"};
+        if(cx.button(ui::hashId("stdshellrestart"),x+8*uiScale,cy,w-16*uiScale,rh,restartModes[shellRestart]))
+            shellRestart=(shellRestart+1)%3;
+        cy+=rh+gap;
+
+        if(cx.button(ui::hashId("stdbackcook"),x+8*uiScale,cy,w-16*uiScale,rh+5*uiScale,"Back to Cook",true)){
+            tab=TAB_COOK;propScroll=0.f;
+        }
+        cy+=rh+gap;
+        if(cx.button(ui::hashId("stdopendiag"),x+8*uiScale,cy,w-16*uiScale,rh,"Open detailed diagnostics")){
+            setExpertMode(true);tab=TAB_LOGCAT;propScroll=0.f;
+        }
+        cx.tip(x+8*uiScale,cy,w-16*uiScale,rh,"Switch to Expert and open the complete live VrShell log.");
+        dl.popClip();
+    }
+
     void drawProperties() {
         auto& th = cx.th; VkRect2D a = rcProps;
         float x=(float)a.offset.x, y=(float)a.offset.y, w=(float)a.extent.width, h=(float)a.extent.height;
@@ -4996,12 +6023,12 @@ struct Editor {
             "Material - the selected mesh's material: base color, texture, blend mode,\ntransparency, emissive, double-sided.",
             "Anim - playback + per-clip settings for animated meshes (loop, speed);\nscrub with the timeline at the bottom.",
             "Physics - collision for the home: auto floor, real trimesh collider,\nnavmeshes and box colliders (so you don't fall through).",
-            "Cook - turn this home into an installable Quest APK: signing, spoof,\ncollision, fog, far-clip, and Install-over-adb settings.",
+            "Cook - create signed Root and No-root APKs with a stable automatic policy,\nsmart incremental reuse, collision, rendering, and install settings.",
             "Logcat - read WHY a cooked home loaded or fell back on the headset,\nover adb with NO root. Works even with no home loaded."};
         // Photoshop-style dock grip: DRAG it to re-dock the tool panel LEFT/RIGHT (only once a home is loaded;
         // on the empty Logcat-only session there's no grip - it was easy to misclick and pointless there).
-        float dbw = homeLoaded() ? 30*uiScale : 0.f;
-        if (homeLoaded()) {
+        float dbw = (expertMode&&homeLoaded()) ? 30*uiScale : 0.f;
+        if (expertMode&&homeLoaded()) {
             bool hv = cx.hover(x, y, dbw, th_h);
             dl.rect(x, y, dbw, th_h, (hv||dockDragging)?th.widgetHot:th.headerBg);
             uint32_t gc = th.textDim;                                   // 2x3 grip dots
@@ -5010,24 +6037,62 @@ struct Editor {
             if (hv && cx.in.pressed[0]) dockDragging=true;
             cx.tip(x, y, dbw, th_h, "Grip - DRAG to dock the tool panel on the LEFT or RIGHT side\n(like Photoshop). Drag the divider between the panel and the\nviewport to resize it (up to 75% wide).");
         }
-        float tx=x+dbw, tw=(w-dbw)/7.f;
-        for (int i=0;i<7;i++){ if (cx.tab(ui::hashId(4000+i,13), tx, y, tw, th_h, tabs[i], tab==i)) { tab=i; propScroll=0.f; } cx.tip(tx, y, tw, th_h, tabTips[i]); tx+=tw; }
+        float tx=x+dbw;
+        if (expertMode) {
+            const char* expertTabsWide[]={"Object","Scene","Material","Anim","Physics","Cook","Logs"};
+            const char* expertTabsCompact[]={"Obj","Scn","Mat","Anim","Phys","Cook","Logs"};
+            const char** expertTabs=w<400*dpiScale?expertTabsCompact:expertTabsWide;
+            float tw=(w-dbw)/7.f;
+            for (int i=0;i<7;i++){ if (cx.tab(ui::hashId(4000+i,13), tx, y, tw, th_h, expertTabs[i], tab==i)) { tab=i; propScroll=0.f; } cx.tip(tx, y, tw, th_h, tabTips[i]); tx+=tw; }
+        } else {
+            const int standardTabs[]={TAB_SCENE,TAB_COOK,TAB_LOGCAT};
+            const char* standardLabels[]={"1  Prepare","2  Cook","3  Quest"};
+            const char* standardTips[]={
+                "Prepare - inspect the Home and let automatic navigation, compatibility and render fixes do the technical work.",
+                "Cook - choose the target and create an installable Home with safe automatic defaults.",
+                "Quest - follow device connection, install and Home loading diagnostics."};
+            float tw=(w-dbw)/3.f;
+            for(int i=0;i<3;i++){ int target=standardTabs[i]; if(cx.tab(ui::hashId(4400+i,13),tx,y,tw,th_h,standardLabels[i],tab==target)){tab=target;propScroll=0.f;} cx.tip(tx,y,tw,th_h,standardTips[i]); tx+=tw; }
+        }
         dl.rect(x,y+th_h,w,1,th.splitLine);
         // Logcat page owns its whole area (its own scroll + live stream); handle it BEFORE the shared propScroll logic.
-        if (tab==TAB_LOGCAT) { drawLogcatPanel(x, y+th_h+1, w, h-th_h-1); return; }
+        if (tab==TAB_LOGCAT) {
+            if(expertMode) drawLogcatPanel(x, y+th_h+1, w, h-th_h-1);
+            else drawStandardQuestPanel(x, y+th_h+1, w, h-th_h-1);
+            return;
+        }
         // SCROLLABLE content: the tool panels outgrew the window - mouse wheel over the panel scrolls,
         // the offset applies to every tab's content, clamped generously (tabs report no exact height).
         if (cx.hover(x, y+th_h, w, h-th_h) && cx.in.wheel!=0) propScroll -= cx.in.wheel * th.rowH * 3.f;
-        propScroll = std::clamp(propScroll, 0.f, 1800.f*uiScale);
+        const float visible=std::max(1.f,h-th_h-12*uiScale);
+        const float measuredHeight=expertMode?propContentHeightByTab[std::clamp(tab,0,6)]
+                                             :standardPropContentHeight;
+        const float maxPropScroll=std::max(0.f,measuredHeight-visible);
+        propScroll = std::clamp(propScroll, 0.f, maxPropScroll);
         float cy = y+th_h+6*uiScale - propScroll, cx0 = x+8*uiScale, cw = w-16*uiScale;
         dl.pushClip(x, y+th_h, w, h-th_h);
+        const size_t contentVtxStart=dl.vtx.size();
+        const float contentOrigin=y+th_h+6*uiScale;
+        auto finishMeasuredContent=[&] {
+            float bottom=contentOrigin-propScroll;
+            for(size_t i=contentVtxStart;i<dl.vtx.size();++i) bottom=std::max(bottom,dl.vtx[i].y);
+            const float measured=std::max(0.f,bottom+propScroll-contentOrigin+6*uiScale);
+            propContentHeightByTab[std::clamp(tab,0,6)]=measured;
+            if(!expertMode) standardPropContentHeight=measured;
+        };
         if (propScroll > 0.5f)   // scroll indicator
             cx.textAligned(x+w-40*uiScale, y+th_h+2*uiScale, 36*uiScale, 14*uiScale, "^^^", th.textDim, 2);
-        if (tab==TAB_SCENE) { drawScenePanel(cx0, cy, cw); dl.popClip(); return; }   // the Meta-component manager (toggles + Add)
-        if (selItem>=0 && selItem<(int)items.size() && tab!=TAB_COOK) { drawItemProps(cx0, cy, cw); dl.popClip(); return; }
+        if (tab==TAB_SCENE) {
+            if(expertMode) drawScenePanel(cx0, cy, cw);
+            else drawStandardPreparePanel(cx0, cy, cw);
+            finishMeasuredContent();
+            dl.popClip(); return;
+        }   // the Meta-component manager (toggles + Add)
+        if (selItem>=0 && selItem<(int)items.size() && tab!=TAB_COOK) { drawItemProps(cx0, cy, cw); finishMeasuredContent(); dl.popClip(); return; }
         if (selected<0 || selected>=(int)r->gpuMeshes.size()) {
             if (tab==TAB_COOK) drawCookPanel(cx0, cy, cw);
             else cx.label(cx0, cy, cw, th.rowH, "(no selection)", th.textDim);
+            finishMeasuredContent();
             dl.popClip(); return;
         }
         VkGpuMesh& gm = r->gpuMeshes[selected];
@@ -5036,6 +6101,7 @@ struct Editor {
         else if (tab==TAB_ANIM)     drawAnimTab(cx0, cy, cw);
         else if (tab==TAB_PHYSICS)  drawPhysicsTab(cx0, cy, cw);
         else if (tab==TAB_COOK)     drawCookPanel(cx0, cy, cw);
+        finishMeasuredContent();
         dl.popClip();
     }
 
@@ -5629,21 +6695,112 @@ struct Editor {
     // ── Cook / Export panel: package name, auto-sign + spoof toggles, Cook button, live progress, status ──
     void drawCookPanel(float x, float y, float w) {
         auto& th=cx.th;
+        const float contentTop=y;
         if (adbDlDone.exchange(false)) { adbWorks(true); adbDevScanned=false; }
-        ensureAdbAsync();                    // installing needs adb — auto-grab it (once, background) if missing
+        if (installAfterCook || cookDeviceOpen) ensureAdbAsync(); // build-only users need no adb download
         float y0;
-        cx.label(x,y,w,th.rowH,"Cook to bootable Quest APK",th.text); y+=th.rowH+6*uiScale;
+        cookQuality=hslcook::defaultCookQualityProfile();
+        cx.label(x,y,w,th.rowH,"COOK HOME",th.accent); y+=th.rowH;
+        if(expertMode) {
+            cx.label(x,y,w,th.rowH,"Stable automatic cook policy",th.text); y+=th.rowH;
+            cx.label(x,y,w,th.rowH,"Quality profiles are disabled until their differences are device-proven.",th.textDim); y+=th.rowH+7*uiScale;
+            { std::string outputs=std::string("Outputs: Rooted System")+(spoofHaven?" + No-root Spoof":""); cx.label(x,y,w,th.rowH,outputs.c_str(),th.textDim); y+=th.rowH; }
+            const char* qualityPolicy="Incremental reuse on  |  source ASTC kept  |  edits ASTC 6x6";
+            cx.label(x,y,w,th.rowH,qualityPolicy,th.textDim); y+=th.rowH+7*uiScale;
+        } else {
+            cx.label(x,y,w,th.rowH,"Automatic preparation, compatibility and installation",th.text); y+=th.rowH;
+            cx.label(x,y,w,th.rowH,"Your original Home and saved edits are preserved.",th.textDim); y+=th.rowH+7*uiScale;
+        }
+        y0=y; cx.checkbox(ui::hashId("autofarclipfix"),x,y,"Automatic far-clip fix",autoFarClipFix);
+        cx.tip(x,y0,w,th.rowH,"Recommended for normal users. Analyzes the actual player spawn and\nonly adjusts static distant scenery that crosses VrShell's camera\nlimit. Near/playable meshes remain unchanged. Advanced exposes the\nexact fog, far-plane, backdrop radius, and skybox controls."); y+=th.rowH+2*uiScale;
+        y0=y; cx.checkbox(ui::hashId("autov206compat"),x,y,"Automatic Meta compatibility routing",autoV206Compat);
+        cx.tip(x,y0,w,th.rowH,"Detects the connected Quest generation before any mutation.\nFor a Normal Home on VrShell 206, first switch the headset to the\nCalming slot; the installer preserves every Vista and replaces only\nHaven. Vista Home delivery remains available for all four slots."); y+=th.rowH+6*uiScale;
+        y0=y; cx.checkbox(ui::hashId("autonavigation"),x,y,"Automatic PhysX navigation",autoNavigation);
+        cx.tip(x,y0,w,th.rowH,"For a raw Home with no authored navigation, creates one Smart\nNavmesh plus detected structural colliders and uses the official\nPhysX cooker. Existing manual Navmesh/Collider items are preserved\nand never replaced."); y+=th.rowH+6*uiScale;
+        if(collisionReviewSuggested){
+            cx.label(x,y,w,th.rowH,"Collision update available - existing collision remains active.",ui::rgba(245,190,70)); y+=th.rowH;
+            const bool knownAutomatic=automaticNavigationGenerated&&loadedNavigationGeneratorVersion>0;
+            if(knownAutomatic) {
+                const float gap=4*uiScale,bw=(w-gap)/2.f;
+                if(cx.button(ui::hashId("updateautocollision"),x,y,bw,th.rowH,
+                             "Update automatic collision"))
+                    rebuildGeneratedWalkSurface();
+                if(cx.button(ui::hashId("keepoldcollision"),x+bw+gap,y,bw,th.rowH,
+                             "Keep current"))
+                    collisionReviewSuggested=false;
+                cx.tip(x,y,w,th.rowH,"Updates only the known generated Smart walk surface and AutoFloor\n"
+                       "cells. Manually added colliders remain untouched.");
+            } else {
+                if(cx.button(ui::hashId("keepoldcollision"),x,y,w,th.rowH,
+                             "Keep existing manual collision"))
+                    collisionReviewSuggested=false;
+                cx.tip(x,y,w,th.rowH,"This profile predates automatic-generation tracking, so the tool\n"
+                       "will not guess. Existing manual collision remains untouched.");
+            }
+            y+=th.rowH+6*uiScale;
+        }
+        {
+          static const char* targetNames[5]={
+            "Standard Home","Calming","Focused","Oceanarium","Horror"};
+          if(expertMode) {
+              std::string label="Cook target: ";
+              label+=(loftTarget==0?"Standard / Haven":std::string("Vista - ")+targetNames[loftTarget]);
+              y0=y;
+              if(cx.button(ui::hashId("lofttarget"),x,y,w,th.rowH,label.c_str()))
+                  loftTarget=(loftTarget+1)%5;
+              cx.tip(x,y0,w,th.rowH,"Choose the normal Home package or one of the four Vista carriers.\nClick to cycle; the selected Vista is backed up before replacement.");
+              y+=th.rowH+6*uiScale;
+          } else {
+              cx.label(x,y,w,th.rowH,"Installation type",th.text); y+=th.rowH+2*uiScale;
+              const float gap=5*uiScale, half=(w-gap)/2;
+              if(cx.tab(ui::hashId("stdtypenormal"),x,y,half,th.rowH+5*uiScale,
+                        "Normal Home",loftTarget==0)) loftTarget=0;
+              if(cx.tab(ui::hashId("stdtypevista"),x+half+gap,y,half,th.rowH+5*uiScale,
+                        "Vista Home",loftTarget>0)) {
+                  if(loftTarget==0) loftTarget=lastVistaTarget;
+              }
+              y+=th.rowH+9*uiScale;
+              if(loftTarget==0) {
+                  const float noticeH=th.rowH*2.25f;
+                  dl.rect(x,y,w,noticeH,ui::rgba(58,45,20,235));
+                  dl.border(x,y,w,noticeH,ui::rgba(245,190,70),1.5f*uiScale);
+                  dl.rect(x,y,5*uiScale,noticeH,ui::rgba(245,190,70));
+                  cx.textAligned(x+12*uiScale,y+2*uiScale,w-20*uiScale,th.rowH,
+                                 "BEFORE INSTALL: SWITCH QUEST TO CALMING",
+                                 ui::rgba(255,214,105),0);
+                  cx.textAligned(x+12*uiScale,y+th.rowH*0.95f,w-20*uiScale,th.rowH,
+                                 "Calming is preserved; only the Haven Home is replaced.",
+                                 th.text,0);
+                  y+=noticeH+8*uiScale;
+              } else {
+                  cx.label(x,y,w,th.rowH,"Choose exactly one Vista slot",th.textDim); y+=th.rowH+2*uiScale;
+                  for(int row=0;row<2;row++) {
+                      for(int col=0;col<2;col++) {
+                          const int target=1+row*2+col;
+                          const float bx=x+col*(half+gap);
+                          if(cx.tab(ui::hashId("stdtarget",target),bx,y,half,th.rowH+3*uiScale,
+                                    targetNames[target],loftTarget==target)) {
+                              loftTarget=target; lastVistaTarget=target;
+                          }
+                      }
+                      y+=th.rowH+5*uiScale;
+                  }
+                  cx.label(x,y,w,th.rowH,"Only this slot is backed up, updated and replaced.",th.textDim);
+                  y+=th.rowH+6*uiScale;
+              }
+          }
+        }
+        if (expertMode) {
+            cx.collapse(ui::hashId("buildadvanced"),x,y,w,"Advanced scene options",cookAdvancedOpen); y+=th.rowH+4*uiScale;
+        }
+        if(expertMode && cookAdvancedOpen){
         y0=y; cx.label(x,y,90*uiScale,th.rowH,"Package",th.textDim);
         cx.textField(ui::hashId("cookpkg"), x+92*uiScale, y, w-92*uiScale, th.rowH, cookPkg);
         cx.tip(x,y0,w,th.rowH,"Android package id for the UNSPOOFED (rooted) APK,\ne.g. com.environment.outerwilds.\nThe haven2025 spoof always uses Meta's haven2025\npackage and ignores this field."); y+=th.rowH+4*uiScale;
-        y0=y; cx.checkbox(ui::hashId("autosign"), x, y, "Auto-sign (zipalign + apksigner)", autoSign);
-        cx.tip(x,y0,w,th.rowH,"Sign the APKs so the Quest will install them (unsigned ->\nINSTALL_PARSE_FAILED_NO_CERTIFICATES). Build-tools are\nauto-detected, or auto-downloaded beside the exe on first\nuse (pre-fetch with --fetch-tools). Keep this ON."); y+=th.rowH;
-        { int js=javaState.load(); const char* jt = js==1 ? "Java: ready (auto-installed if it was missing)" : js==2 ? "Java: auto-install failed - retries on cook, or install a JDK" : "Java: installing runtime in background...";
-          cx.label(x+14*uiScale, y, w, th.rowH, jt, js==2?ui::rgba(230,160,80):th.textDim); y+=th.rowH; }
-        y0=y; cx.checkbox(ui::hashId("spoof"), x, y, "Emit haven2025 spoof (no-root install)", spoofHaven);
-        cx.tip(x,y0,w,th.rowH,"Also build <env>_NoRoot-Spoof.apk, which masquerades as\nMeta's haven2025 home. This is the ONLY way to install on a\nNON-rooted Quest: it replaces haven2025, then you pick\n\"Haven 2025\" in the home menu. Keep this ON."); y+=th.rowH;
-        y0=y; cx.checkbox(ui::hashId("v206havencompat"), x, y, "VrShell 206 fallback (only if Home opens NUXD)", v206HavenCompat);
-        cx.tip(x,y0,w,th.rowH,"OPTIONAL and OFF by default. Enable only when a recent Quest update\nmakes a no-root haven2025 spoof open NUXD / the default Home. It\nmirrors content through the canonical Haven static-architecture\ntemplate and uses compatible tight bounds. Leave OFF when your\nexisting cooks already work."); y+=th.rowH;
+        y0=y; cx.checkbox(ui::hashId("autosign"), x, y, "Sign APKs (built-in Android v2)", autoSign);
+        cx.tip(x,y0,w,th.rowH,"Produces installable APKs with the built-in zipalign and Android v2\nsigner. No Java or Android Studio step is needed. Keep this enabled\nfor normal cooks."); y+=th.rowH;
+        y0=y; cx.checkbox(ui::hashId("spoof"), x, y, "Emit legacy haven2025 spoof", spoofHaven);
+        cx.tip(x,y0,w,th.rowH,"Builds the no-root Haven replacement used by Normal Home.\nOn VrShell 206, switch to Calming before installation. The validated\ncombined carrier then loads without modifying the selected Vista."); y+=th.rowH;
         y0=y; cx.checkbox(ui::hashId("hzanim"), x, y, "Animate skinned meshes (HZANIM - EXPERIMENTAL)", animSkinned);
         cx.tip(x,y0,w,th.rowH,"Emit skeletal animation for skinned meshes (clouds/koi/\ndroids). EXPERIMENTAL: the clip cook can still crash the\nenvironment on the device. Leave OFF unless testing."); y+=th.rowH+6*uiScale;
         y0=y; cx.checkbox(ui::hashId("nocull"), x, y, "Draw everything - disable culling (fixes clipping, V79-style)", noCull);
@@ -5652,7 +6809,7 @@ struct Editor {
         y+=cx.th.rowH+2*uiScale; cx.checkbox(ui::hashId("cookautofloor"), x, y, "Auto floor collision (no Navmesh item)", cookAutoFloor);
         cx.tip(x,y0,w,th.rowH,"Bake the environment's background audio loop into the cooked APK\n(FMOD asset placed at the spawn). Turn OFF for a silent home."); y+=th.rowH+2*uiScale;
         y0=y; cx.checkbox(ui::hashId("spooffp"), x, y, "Spoof as footprint (pairs an invisible vista)", spoofFootprint);
-        cx.tip(x,y0,w,th.rowH,"Ship the spoof as a FOOTPRINT home (hsr_package_type=footprint), the\nnative home type - so the shell pairs a companion vista, which the\n'Neutralize vistas' option then fills with an INVISIBLE (empty) vista.\nOFF = the old 'combined' spoof (no vista paired) - use that only if\nvista-neutralize can't run on your device. Keep both ON."); y+=th.rowH+2*uiScale;
+        cx.tip(x,y0,w,th.rowH,"Advanced compatibility mode: ship as a FOOTPRINT and pair a\ncompanion Vista. OFF uses the proven standalone combined-Haven\ncarrier and is the safe default. Enable only for a diagnosed legacy\nworkflow that explicitly requires Vista pairing."); y+=th.rowH+2*uiScale;
         // ── the AUDIO COOKER UI: shows what will ship + Replace/Add/Export/Revert (backend above: setAudioFromFile etc.) ──
         { if(audioInfo.empty() && !bgOgg.empty()) refreshAudioInfo();
           std::string al = bgOgg.empty() ? "  audio: none - Add one below"
@@ -5682,7 +6839,7 @@ struct Editor {
             char sdb[32]; snprintf(sdb,sizeof sdb,"%.0f",skyboxDist); std::string sds=sdb;
             cx.textField(ui::hashId("skyboxdist"), x+152*uiScale, y, w-152*uiScale, th.rowH, sds);
             skyboxDist=(float)atof(sds.c_str()); if(skyboxDist<1.f)skyboxDist=1500.f;
-            cx.tip(x,y0,w,th.rowH,"Meshes whose centroid is farther than this from the origin are\ndrawn as skybox (camera-locked, far-clip-exempt). Lower = more\ngeometry skyboxed. cyberhome's city skyline sits ~3-7 km out."); y+=th.rowH+6*uiScale; }
+            cx.tip(x,y0,w,th.rowH,"Meshes whose centroid is farther than this from the origin are\ndrawn as skybox (camera-locked, far-clip-exempt). Lower values classify\nmore distant geometry as backdrop."); y+=th.rowH+6*uiScale; }
         else y+=4*uiScale;
         // ── HSL render config (distance fog + far clip): WYSIWYG — the preview applies the SAME values the cook ships ──
         y0=y; cx.checkbox(ui::hashId("cfgfog"), x, y, "Distance fog (preview + cook)", cfgFog);
@@ -5706,8 +6863,41 @@ struct Editor {
           cx.tip(x,y0,w,th.rowH,"ScenePlatformComponent farClippingPlane. The device default is 5000m;\nthe cook extends it to this. Use the viewport 'Far-clip' overlay to\nsee the 5000m default boundary."); y+=th.rowH+6*uiScale; }
         // (fog + far-clip WYSIWYG binding moved to buildFrame — applies EVERY frame, not just while this tab is open)
         // ── Install to headset (USB or Wi-Fi adb); the installer auto-detects root and picks spoofed vs unspoofed ──
-        y0=y; cx.checkbox(ui::hashId("install"), x, y, "Install to headset after cook (auto)", installAfterCook);
+        }
+        y0=y; cx.checkbox(ui::hashId("install"), x, y, "Install to headset after cook", installAfterCook);
         cx.tip(x,y0,w,th.rowH,"After cooking, install over adb. The installer detects root:\n  ROOT  -> install the UNSPOOFED APK + auto-select it.\n  NO root-> back up the real haven2025, install the SPOOF,\n           and relaunch the shell. The spoof REPLACES Haven 2025\n           in place (unrooted Quests can't switch envs).\nNeeds adb bundled beside the exe or on PATH."); y+=th.rowH+2*uiScale;
+        if(expertMode) {
+            cx.collapse(ui::hashId("builddevice"),x,y,w,"Headset install options",cookDeviceOpen); y+=th.rowH+4*uiScale;
+        }
+        if(expertMode && cookDeviceOpen){
+        y0=y;
+        const char* displayMode=manualDisplayQuality?"Display quality: MANUAL":
+                                autoDisplayQuality?"Display quality: HOME HD+ AUTO":"Display quality: OFF";
+        if(cx.button(ui::hashId("displayqualitymode"),x,y,w,th.rowH,displayMode)) {
+            if(!autoDisplayQuality && !manualDisplayQuality) autoDisplayQuality=true;
+            else if(autoDisplayQuality) {autoDisplayQuality=false;manualDisplayQuality=true;}
+            else manualDisplayQuality=false;
+            saveDisplayQualityPref();
+        }
+        cx.tip(x,y0,w,th.rowH,"Home HD+ detects Quest 1, Quest 2, Quest Pro, Quest 3, or Quest 3S\nand applies a model-appropriate high-resolution Home target.\nManual is an Expert override. Unknown devices are never modified."); y+=th.rowH+2*uiScale;
+        if(adbWorks() && !displayInfoScanned) refreshDisplayQualityInfo();
+        if(displayInfoScanned) {
+            std::string info=displayInfoDevice+"  |  current "+displayInfoCurrent+
+                             (displayInfoTarget.empty()?"":("  |  HD+ "+displayInfoTarget));
+            cx.label(x,y,w,th.rowH,info.c_str(),th.textDim); y+=th.rowH+2*uiScale;
+        }
+        if(manualDisplayQuality) {
+            char wb[24],hb[24]; snprintf(wb,sizeof wb,"%d",manualDisplayWidth); snprintf(hb,sizeof hb,"%d",manualDisplayHeight);
+            std::string ws=wb,hs=hb; float half=(w-6*uiScale)/2;
+            cx.textField(ui::hashId("manualdisplayw"),x,y,half,th.rowH,ws);
+            cx.textField(ui::hashId("manualdisplayh"),x+half+6*uiScale,y,half,th.rowH,hs);
+            int nw=atoi(ws.c_str()),nh=atoi(hs.c_str());
+            if(nw>=1024 && nh>=1024 && (nw!=manualDisplayWidth||nh!=manualDisplayHeight)) {
+                manualDisplayWidth=nw;manualDisplayHeight=nh;saveDisplayQualityPref();
+            }
+            cx.tip(x,y,w,th.rowH,"Expert per-eye texture width and height. Applied and verified after install.");
+            y+=th.rowH+2*uiScale;
+        }
         { y0=y; const char* srN[3] = { "Shell restart after install: AUTO (only if no root)", "Shell restart after install: ALWAYS", "Shell restart after install: NEVER" };
           if (cx.button(ui::hashId("shellrestart"), x, y, w, th.rowH, srN[shellRestart%3])) shellRestart = (shellRestart+1)%3;
           cx.tip(x,y0,w,th.rowH,"Whether to kill/relaunch vrshell after installing, so it picks up\nthe new env. ROOTED headsets hot-swap via the environment_selected\nIPC (no restart needed); UNROOTED ones need the restart (nothing\nelse reloads the replaced Haven 2025). Click to cycle."); y+=th.rowH+2*uiScale; }
@@ -5723,31 +6913,63 @@ struct Editor {
         if (cx.button(ui::hashId("devref"), x+w-rbw, y, rbw, th.rowH, "Refresh")) { refreshAdbDevices(); setStatus("adb: "+std::to_string(adbDeviceList.size())+" device(s) attached."); }
         cx.tip(x,y0,w,th.rowH,"Pick which attached Quest to target when several are connected.\nClick the name to CYCLE devices; Refresh re-scans `adb devices`.\n\"(default / only device)\" = unset (uses the single attached one)."); y+=th.rowH;
         cx.label(x,y,w,th.rowH*0.85f,"USB: leave blank. Wi-Fi: type IP, Connect.",th.textDim); y+=th.rowH*0.95f+6*uiScale;
+        }
         bool busy = cooking.load();
         if (busy) { cx.progressBar(x, y, w, th.rowH+2*uiScale, cookProg.load(), stageStr().c_str()); }
-        else { y0=y; if (cx.button(ui::hashId("cookgo"), x, y, w, th.rowH+4*uiScale, installAfterCook?"COOK + SIGN + INSTALL":"COOK  +  SIGN", true)) startCook();
-               cx.tip(x,y0,w,th.rowH+4*uiScale,"Cook the edited scene to APK(s), sign them, and (if Install\nis on) push to the headset. Outputs land next to the loaded\nenv:  <env>_Rooted-System.apk  +  <env>_NoRoot-Spoof.apk"); }
+        else { y0=y; const char* cookAction=!installAfterCook?"COOK + SIGN":(loftTarget>0?"COOK TO VISTA SLOT":"COOK + SIGN + INSTALL");
+               if (cx.button(ui::hashId("cookgo"), x, y, w, th.rowH+4*uiScale, cookAction, true)) startCook();
+               cx.tip(x,y0,w,th.rowH+4*uiScale,"Incremental cook: unchanged outputs are reused immediately.\nChanged scenes are cooked, signed, and optionally installed.\nVista targets consume the Rooted-System scene and wrap it in the\nselected official Vista carrier; v206 Haven installs are blocked."); }
         y += th.rowH+8*uiScale;
         // ── INSTALL ONLY — skip the cook if the scene is UNCHANGED since the last cook (installs the existing
         //    APK). Shows whether the cooked APK is up to date / stale / missing so you know if a re-cook is needed.
         if (!busy) {
             bool hSys=false,hSpoof=false; int st=cookState(hSys,hSpoof);
-            const char* stTxt = st==0? "cooked APK is UP TO DATE (unchanged)" : st==1? "scene CHANGED since last cook (stale) - re-cook" : "no cooked APK yet - cook first";
+            const char* stTxt = st==0? "Cook status: current - unchanged output will be reused" : st==1? "Cook status: scene changed - recook required" : "Cook status: no output yet";
             uint32_t stCol = st==0? ui::rgba(120,220,140) : st==1? ui::rgba(240,200,110) : th.textDim;
             cx.label(x,y,w,th.rowH*0.9f, stTxt, stCol); y+=th.rowH*0.9f+2*uiScale;
-            y0=y; bool canInstall = st==0;
-            if (cx.button(ui::hashId("installonly"), x, y, w, th.rowH+2*uiScale, "INSTALL ONLY  (no re-cook if unchanged)", canInstall)) installOnly();
-            cx.tip(x,y0,w,th.rowH+2*uiScale,"Install the already-cooked APK WITHOUT re-cooking - but only if\nnothing changed since it was cooked (a .cooksig hash of the scene +\ncook settings + source env is compared). If the scene changed, it\ntells you to re-cook instead of pushing a stale env.");
-            y += th.rowH+10*uiScale;
+            if(cookDeviceOpen){
+                y0=y; bool canInstall = st==0;
+                if (cx.button(ui::hashId("installonly"), x, y, w, th.rowH+2*uiScale, "INSTALL CURRENT COOK", canInstall)) installOnly();
+                cx.tip(x,y0,w,th.rowH+2*uiScale,"Install the already-built APK without cooking again. Enabled only\nwhen the scene, profile, settings, and source Home are unchanged.");
+                y += th.rowH+8*uiScale;
+            } else y+=5*uiScale;
         }
         // Undo a spoof: put the REAL Haven 2025 back from the auto-backup (off the UI thread).
-        if (!busy && !restoring.load()) {
+        if(expertMode) {
+            cx.collapse(ui::hashId("buildmaintenance"),x,y,w,"Maintenance and recovery",cookMaintenanceOpen); y+=th.rowH+4*uiScale;
+        }
+        if(expertMode && cookMaintenanceOpen && !busy && !restoring.load()) {
+            y0=y; if (cx.button(ui::hashId("forcerebuild"), x, y, w, th.rowH, "Force full recook (ignore current output)")) startCook(true);
+            cx.tip(x,y0,w,th.rowH,"Recook both APKs even when the scene and cook profile are unchanged.\nNormal COOK is incremental and returns immediately for a current output."); y += th.rowH+3*uiScale;
             y0=y; if (cx.button(ui::hashId("restorehaven"), x, y, w, th.rowH, "Restore original Haven 2025")) {
                 if (restoreThread.joinable()) restoreThread.join();
                 restoring.store(true);
                 restoreThread = std::thread([this]{ restoreHaven(); restoring.store(false); });
             }
             cx.tip(x,y0,w,th.rowH,"Reinstall the ORIGINAL Haven 2025 from the auto-backup\n(folder \"Haven2025_Backup\" beside the exe) + relaunch the shell.\nUse this to undo a spoof install."); y += th.rowH+3*uiScale;
+            cx.label(x,y,w,th.rowH*0.85f,"Restore an original Meta Vista slot",th.textDim);
+            y+=th.rowH*0.9f;
+            const float vistaGap=3*uiScale;
+            const float vistaButtonW=(w-vistaGap)/2.f;
+            for(int target=1;target<=4;++target) {
+                const int column=(target-1)%2;
+                const char* label=target==1?"Calming":target==2?"Focused":
+                                  target==3?"Oceanarium":"Horror";
+                if(cx.button(ui::hashId((std::string("restorevista")+std::to_string(target)).c_str()),
+                             x+column*(vistaButtonW+vistaGap),y,vistaButtonW,th.rowH,label)) {
+                    if(restoreThread.joinable()) restoreThread.join();
+                    restoring.store(true);
+                    restoreThread=std::thread([this,target]{
+                        restoreVistaSlot(target);
+                        restoring.store(false);
+                    });
+                }
+                if(column==1)y+=th.rowH+vistaGap;
+            }
+            cx.tip(x,y-(2*th.rowH+vistaGap),w,2*th.rowH+vistaGap,
+                   "Restore only the selected Vista package from its preserved original\n"
+                   "Meta carrier baseline. Other Vista slots and every backup remain untouched.");
+            y+=3*uiScale;
             // Manual uninstall: rip out whatever Haven 2025 is on the headset (your spoof, or a different Meta version).
             y0=y; if (cx.button(ui::hashId("uninsthaven"), x, y, w, th.rowH, "Uninstall Haven 2025 (remove the spoof)")) {
                 if (restoreThread.joinable()) restoreThread.join();
@@ -5755,17 +6977,14 @@ struct Editor {
                 restoreThread = std::thread([this]{ uninstallHaven(); restoring.store(false); });
             }
             cx.tip(x,y0,w,th.rowH,"Uninstall whatever Haven 2025 is installed on the headset (your spoof,\nor a different Meta version) - no root needed, if it's a store app.\nDetects the installed version first. Then \"Restore original Haven 2025\"\nputs Meta's back, or just re-cook + install."); y += th.rowH+3*uiScale;
-            // One-click vrshell state reset: pm clear + relaunch (off the UI thread like the other maintenance buttons).
-            y0=y; if (cx.button(ui::hashId("clearvrshell"), x, y, w, th.rowH, "Clear VrShell app data (reset home state)")) {
-                if (restoreThread.joinable()) restoreThread.join();
-                restoring.store(true);
-                restoreThread = std::thread([this]{ clearVrShellData(); restoring.store(false); });
-            }
-            cx.tip(x,y0,w,th.rowH,"pm clear com.oculus.vrshell: wipe the home's saved data (env\nselection, caches) and relaunch it factory-fresh. Use when the home\nis stuck or corrupted after experiments. Tries no-root first, falls\nback to su on rooted headsets. Installed env APKs are NOT touched;\na rooted headset must re-select the env afterwards (re-cook or\nInstall only does it)."); y += th.rowH+3*uiScale;
+            y0=y; if (cx.button(ui::hashId("clearvrshell"),x,y,w,th.rowH,"Reset VrShell app data..."))
+                clearVrShellConfirmOpen=true;
+            cx.tip(x,y0,w,th.rowH,"Recovery action for a stuck or corrupted Home state.\nClears VrShell preferences/caches and relaunches Quest Home.\nInstalled Home APKs are not removed. A confirmation is required.");
+            y += th.rowH+3*uiScale;
             // Standalone vista-neutralize (no re-cook): install an invisible vista over every installed vista package.
             y0=y; if (cx.button(ui::hashId("killvistabtn"), x, y, w, th.rowH, "Neutralize vistas now (invisible vista over each)")) neutralizeVistasButton();
             cx.tip(x,y0,w,th.rowH,"Right now (no re-cook): replace every installed com.meta.shell.env.vista.*\npackage with an INVISIBLE 0-mesh environment, so a force-paired vista\nrenders nothing. Use this if a vista shows behind your ported home.\nUpdatable vistas are replaced without root; system-app vistas are\nreported (need root). Restore a vista by reinstalling it from the store."); y += th.rowH+8*uiScale;
-        } else if (restoring.load()) {
+        } else if(expertMode && cookMaintenanceOpen && restoring.load()) {
             // live progress bar (vista-neutralize drives setStage per vista; restore/uninstall just show "working")
             if (vistaBusy.load()) cx.progressBar(x, y, w, th.rowH+2*uiScale, cookProg.load(), stageStr().c_str());
             else cx.label(x,y,w,th.rowH,"Working on Haven 2025...",th.textDim);
@@ -5799,11 +7018,52 @@ struct Editor {
         }
         std::string st; { std::lock_guard<std::mutex> l(statusMx); st = cookStatus; }
         if (!st.empty()) {
-            // word-ish wrap into the panel width
-            float ly=y; size_t i=0; while (i<st.size()) { size_t take=std::min<size_t>(st.size()-i, (size_t)(w/ (7*uiScale)) ); cx.label(x, ly, w, th.rowH, st.substr(i,take).c_str(), th.textDim); i+=take; ly+=th.rowH*0.9f; }
+            const cookui::Guidance guidance=cookui::guideStatus(st);
+            const cookui::Severity severity=guidance.severity;
+            const bool error=severity==cookui::Severity::Error;
+            const bool warning=severity==cookui::Severity::Warning;
+            uint32_t statusColor=error?ui::rgba(230,86,90):warning?ui::rgba(245,190,70):ui::rgba(76,190,120);
+            if(!expertMode) {
+                size_t chars=std::max<size_t>(24,(size_t)(w/(7*uiScale)));
+                size_t lines=(st.size()+chars-1)/chars;
+                const bool hasGuidance=guidance.solution[0]!='\0';
+                float cardH=(lines*th.rowH*0.9f)+12*uiScale+
+                            (hasGuidance?th.rowH*1.9f+8*uiScale:0.f);
+                dl.rect(x,y,w,cardH,th.subPanel); dl.rect(x,y,4*uiScale,cardH,statusColor);
+                float ly=y+5*uiScale; size_t i=0;
+                while(i<st.size()){size_t take=std::min(chars,st.size()-i);cx.label(x+10*uiScale,ly,w-18*uiScale,th.rowH,st.substr(i,take).c_str(),error?ui::rgba(255,190,190):th.text);i+=take;ly+=th.rowH*0.9f;}
+                if(hasGuidance) {
+                    ly+=3*uiScale;
+                    cx.label(x+10*uiScale,ly,w-18*uiScale,th.rowH,guidance.solution,th.textDim);
+                    ly+=th.rowH+3*uiScale;
+                    if(guidance.action==cookui::RecoveryAction::RetryCook) {
+                        if(cx.button(ui::hashId("standardretrycook"),x+10*uiScale,ly,w-20*uiScale,th.rowH,
+                                     "Retry Cook",!cooking.load())) startCook();
+                    } else if(guidance.action==cookui::RecoveryAction::RefreshQuest) {
+                        if(cx.button(ui::hashId("standardrefreshquest"),x+10*uiScale,ly,w-20*uiScale,th.rowH,
+                                     "Refresh Quest",!cooking.load())) {
+                            refreshAdbDevices();
+                            displayInfoScanned=false;
+                            refreshDisplayQualityInfo();
+                        }
+                    }
+                }
+                y+=cardH;
+            } else {
+                float ly=y; size_t i=0;
+                while(i<st.size()){size_t take=std::min<size_t>(st.size()-i,(size_t)(w/(7*uiScale)));cx.label(x,ly,w,th.rowH,st.substr(i,take).c_str(),statusColor);i+=take;ly+=th.rowH*0.9f;}
+            }
         }
+        if(!expertMode) standardPropContentHeight=std::max(0.f,y-contentTop);
     }
-    std::string stageStr() { std::lock_guard<std::mutex> l(statusMx); char b[80]; snprintf(b,sizeof b,"%s  %d%%", cookStage.c_str(), (int)(cookProg.load()*100)); return b; }
+    std::string stageStr() {
+        const auto progress=cookui::describeProgress(cookProg.load());
+        std::lock_guard<std::mutex> l(statusMx);
+        char b[160];
+        snprintf(b,sizeof b,"Step %d/%d - %s - %d%%  |  %s",
+                 progress.step,progress.stepCount,progress.label,progress.percent,cookStage.c_str());
+        return b;
+    }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════════════
     //  CUSTOM GIZMO  (move/rotate/scale; projected handles drawn via ui_draw, ray-screen drag)
@@ -6312,7 +7572,7 @@ struct Editor {
             // normals (same as the renderer's local `nrm`). View-dependent specular is intentionally omitted (can't bake).
             // Two cases, exactly matching the renderer's uploadMesh bake (vk_renderer.h:647 / :679):
             //   (1) the env HAS an IBL diffuse cubemap -> diffuseCube(worldN)·ambientIBLTint;
-            //   (2) NO IBL (lakeside) -> the renderer's HEMISPHERIC AMBIENT fallback (0.55..1.0 by world-up, gently warm)
+            //   (2) NO IBL -> the renderer's HEMISPHERIC AMBIENT fallback (0.55..1.0 by world-up, gently warm)
             //       — the "honest ambient" that lights an opaque, non-lightmapped, non-blend mesh (the SpecIbl lake water).
             // Without this the cook ships white vertexColor0 -> device base·white = the DARK water basecolor = the black lake.
             bool doIbl  = md.iblLit && r->iblDiffuse.ok();
@@ -6393,7 +7653,8 @@ struct Editor {
             // crisp correctly-colored image at any distance. Static-UV meshes only (UV-animated cards sample
             // outside their base span); tiling (UVs beyond [0,1]) exempt.
             if (!em.rgba.empty() && em.w >= 256 && em.uvs.size() >= 4
-                && !em.flipbook && !em.uvScroll && em.flipUVMats.empty() && !em.skybox) {
+                && !em.flipbook && !em.uvScroll && em.flipUVMats.empty() && !em.skybox
+                && sceneryalpha::allowsAtlasCrop(md.name)) {
                 float umin=1e9f,umax=-1e9f,vmin=1e9f,vmax=-1e9f;
                 for (size_t k=0;k+1<em.uvs.size();k+=2){ float u=em.uvs[k],v=em.uvs[k+1];
                     if(u<umin)umin=u; if(u>umax)umax=u; if(v<vmin)vmin=v; if(v>vmax)vmax=v; }
@@ -6547,8 +7808,9 @@ struct Editor {
         if (!projectPath.empty()) { size_t sl=projectPath.find_last_of("/\\");
             base = (sl==std::string::npos)? projectPath : projectPath.substr(sl+1);
             size_t dot=base.rfind('.'); if(dot!=std::string::npos) base=base.substr(0,dot); }
-        std::error_code ec; std::filesystem::create_directories("cooked", ec);   // make the output dir (no-op if it exists)
-        return "cooked/" + base + "_cooked.apk";
+        const std::string cookedDir=AppConfig::s_homeLibrary.empty() ? "cooked" : AppConfig::homeRel("cooked");
+        std::error_code ec; std::filesystem::create_directories(cookedDir, ec);
+        return cookedDir + "/" + base + "_cooked.apk";
     }
     // ── COOK-UP-TO-DATE detection ("Install only if nothing changed") ────────────────────────────────────
     // The cooked APKs share a stem: cooked/<env>_Rooted-System.apk / _NoRoot-Spoof.apk. Alongside them we drop
@@ -6565,10 +7827,13 @@ struct Editor {
     static uint64_t fnv1a(const void* p, size_t n, uint64_t h=1469598103934665603ull){
         const uint8_t* b=(const uint8_t*)p; for(size_t i=0;i<n;i++){ h^=b[i]; h*=1099511628211ull; } return h; }
     uint64_t cookInputHash() {
-        // serialized session MINUS the CAM line (a camera orbit isn't a content change)
+        // Serialized session minus UI-only camera and delivery target. Neither
+        // changes the cooked Rooted-System scene; a finished cook can therefore
+        // be wrapped into another Vista slot without rebuilding its assets.
         std::string ses=serializeSession(), noCam;
         { size_t i=0; while(i<ses.size()){ size_t e=ses.find('\n',i); std::string ln=ses.substr(i,e==std::string::npos?std::string::npos:e-i+1);
-            if (ln.rfind("CAM ",0)!=0) noCam+=ln; i=(e==std::string::npos)?ses.size():e+1; } }
+            if (ln.rfind("CAM ",0)!=0 && ln.rfind("LOFTTARGET ",0)!=0) noCam+=ln;
+            i=(e==std::string::npos)?ses.size():e+1; } }
         uint64_t h=fnv1a(noCam.data(), noCam.size());
         // created-mesh geometry (the .geom sidecar written next to the session on save/cook)
         std::string gp = saveTargetFile()+".geom";
@@ -6580,16 +7845,29 @@ struct Editor {
         h=fnv1a(&sz,sizeof sz,h);
         return h;
     }
-    std::string cookSignatureHex() { char b[20]; snprintf(b,sizeof b,"%016llx",(unsigned long long)cookInputHash()); return b; }
+    std::string cookSignatureHex() {
+        char b[20];
+        snprintf(b,sizeof b,"%016llx",(unsigned long long)cookInputHash());
+        return homelibrary::artifactSignature(b);
+    }
     void writeCookSig() { std::string sig=cookSignatureHex(); if (FILE* f=fopen(cookSigPath().c_str(),"w")){ fputs(sig.c_str(),f); fclose(f); } }
     std::string readCookSig() { std::string rec; if (FILE* f=fopen(cookSigPath().c_str(),"r")){ char b[64]={0}; if(fgets(b,sizeof b,f)) rec=b; fclose(f);
         while(!rec.empty()&&(rec.back()=='\n'||rec.back()=='\r'||rec.back()==' ')) rec.pop_back(); } return rec; }
     // 0 = up to date (unchanged since last cook), 1 = changed/stale, 2 = never cooked (no APK). Fills apkStem sizes.
     int cookState(bool& haveSys, bool& haveSpoof) {
         std::string stem=cookStem(); haveSys=fileEx(stem+"_Rooted-System.apk"); haveSpoof=fileEx(stem+"_NoRoot-Spoof.apk");
-        if (!haveSys && !haveSpoof) return 2;
+        if(haveSys && !hslcook::sign::hasApkV2Signature(hslcook::readFileBytes(stem+"_Rooted-System.apk")))
+            haveSys=false;
+        if(haveSpoof && !hslcook::sign::hasApkV2Signature(hslcook::readFileBytes(stem+"_NoRoot-Spoof.apk")))
+            haveSpoof=false;
+        const bool requiredOutputsPresent=cookui::requiredCookOutputsPresent(
+            haveSys,haveSpoof,spoofHaven,loftTarget);
+        if (!requiredOutputsPresent) return 2;
         std::string rec=readCookSig(); if (rec.empty()) return 1;   // APK exists but no sig (older cook) -> treat as stale
         return (rec==cookSignatureHex()) ? 0 : 1;
+    }
+    bool blockUnsupportedNormalHomeInstall() {
+        return false;
     }
     // Install the ALREADY-COOKED APK for this env WITHOUT re-cooking, but only if the scene is unchanged.
     void installOnly() {
@@ -6599,20 +7877,34 @@ struct Editor {
         if (st==2) { setStatus("No cooked APK for this env yet — run COOK first."); return; }
         if (st==1) { setStatus("Scene CHANGED since the last cook (or the cook predates change-tracking) — the cooked APK is STALE. Run COOK to rebuild; Install-only skipped so you don't push an outdated env."); return; }
         if (!deviceConnected()) { setStatus("Scene is up to date, but NO device is connected — connect the Quest (USB / adb connect) and press Install only again."); return; }
+        if (blockUnsupportedNormalHomeInstall()) return;
         std::string stem=cookStem(), sysApk=stem+"_Rooted-System.apk", spoofApk=stem+"_NoRoot-Spoof.apk";
         cooking.store(true); cookProg.store(0.f);
         if (cookThread.joinable()) cookThread.join();
-        cookThread = std::thread([this,sysApk,spoofApk,haveSys,haveSpoof]{
+        const int requestedTarget=loftTarget;
+        cookThread = std::thread([this,sysApk,spoofApk,haveSys,haveSpoof,requestedTarget]{
             auto progress=[this](float f,const char* s){ setStage(f,s); };
             std::string msg="Install-only (scene unchanged — no re-cook): ";
+            if(cookui::usesVistaWrapper(requestedTarget)) {
+                if(!haveSys) {
+                    msg+="no Rooted-System scene APK is available for the selected Vista wrapper.";
+                } else {
+                    std::string summary;
+                    wrapAndInstallLoftTargetFor(
+                        requestedTarget,sysApk,progress,summary);
+                    msg+=summary.empty() ? statusSnapshot() : summary;
+                }
+                setStatus(msg); setStage(1.f,"Done"); cooking.store(false);
+                return;
+            }
             bool rooted=deviceIsRooted();
             if (rooted && haveSys) { bool ok=installToDevice(sysApk, cookPkg, progress, /*uninstallFirst=*/false, rooted);
-                msg += ok? "installed "+sysApk+" ("+cookPkg+") + selected (shell restart: "+shellRestartName()+")" : "install FAILED (adb/device?)"; }
+                msg += ok? "installed "+sysApk+" ("+cookPkg+") + selected (shell restart: "+shellRestartName()+")" : statusSnapshot(); }
             else if (haveSpoof) {
                 std::string bkp; HavenBkp hb=backupOriginalHaven(bkp);
                 if (hb==HB_FAILED) msg += "ABORTED: could NOT back up the original Haven 2025 (left untouched).";
                 else { bool ok=installToDevice(spoofApk, HAVEN_PKG(), progress, /*uninstallFirst=*/true, rooted);
-                    msg += ok? "installed the SPOOF ("+spoofApk+") (shell restart: "+std::string(shellRestartName())+")" : "spoof install FAILED (try the Rooted-System APK)."; }
+                    msg += ok? "installed the SPOOF ("+spoofApk+") (shell restart: "+std::string(shellRestartName())+")" : statusSnapshot(); }
             } else msg += rooted? "no Rooted-System APK found (cook with a rooted device, or use the spoof)." : "no spoof APK found (enable the spoof toggle + cook once).";
             setStatus(msg); setStage(1.f,"Done"); cooking.store(false);
         });
@@ -6620,13 +7912,344 @@ struct Editor {
 
     void setStage(float f, const char* s){ cookProg.store(f); std::lock_guard<std::mutex> l(statusMx); cookStage=s; }
     void setStatus(const std::string& s){ std::lock_guard<std::mutex> l(statusMx); cookStatus=s; fprintf(stderr,"[COOK] %s\n", s.c_str()); }
+    std::string statusSnapshot() {
+        std::lock_guard<std::mutex> l(statusMx);
+        return cookStatus;
+    }
+
+    bool deriveAutomaticFogColor(float out[3]) const {
+        if (!sceneMeshes) return false;
+        const MeshData* sky = nullptr;
+        size_t bestPixels = 0;
+        for (const auto& mesh : *sceneMeshes) {
+            std::string name = mesh.name;
+            std::transform(name.begin(), name.end(), name.begin(),
+                           [](unsigned char c){ return (char)std::tolower(c); });
+            const bool skySemantic =
+                mesh.isSkybox || name.find("skysphere") != std::string::npos ||
+                name.find("sky_sphere") != std::string::npos ||
+                name.find("skydome") != std::string::npos ||
+                name.find("sky_dome") != std::string::npos ||
+                name.find("projection_sky") != std::string::npos;
+            const size_t pixels = mesh.texRGBA.size() / 4;
+            if (skySemantic && pixels > bestPixels) {
+                sky = &mesh;
+                bestPixels = pixels;
+            }
+        }
+        if (!sky || bestPixels < 16) return false;
+
+        // The bright half of an authored sky panorama is the scene's own
+        // atmospheric/horizon colour. Sampling it avoids inventing a generic
+        // dark-blue fog while rejecting black padding and night-card borders.
+        std::array<size_t, 64> histogram{};
+        size_t valid = 0;
+        for (size_t p=0; p<bestPixels; ++p) {
+            const uint8_t* px = &sky->texRGBA[p*4];
+            if (px[3] < 128) continue;
+            const float l = (0.2126f*px[0] + 0.7152f*px[1] + 0.0722f*px[2]) / 255.f;
+            if (l < 0.025f || l > 0.985f) continue;
+            histogram[std::min<size_t>(63, (size_t)(l*64.f))]++;
+            valid++;
+        }
+        if (valid < 16) return false;
+        const size_t target = (valid * 42) / 100; // upper 58%, robust against dark ground
+        size_t accumulated = 0, thresholdBin = 0;
+        for (size_t b=64; b-- > 0;) {
+            accumulated += histogram[b];
+            if (accumulated >= target) { thresholdBin = b; break; }
+        }
+        const float threshold = (float)thresholdBin / 64.f;
+        double sum[3]{0,0,0};
+        size_t count = 0;
+        for (size_t p=0; p<bestPixels; ++p) {
+            const uint8_t* px = &sky->texRGBA[p*4];
+            if (px[3] < 128) continue;
+            const float l = (0.2126f*px[0] + 0.7152f*px[1] + 0.0722f*px[2]) / 255.f;
+            if (l < std::max(0.025f, threshold) || l > 0.985f) continue;
+            for (int c=0;c<3;c++) sum[c] += px[c] / 255.0;
+            count++;
+        }
+        if (count < 8) return false;
+        for (int c=0;c<3;c++) out[c] = (float)(sum[c] / count);
+        return true;
+    }
+
+#if defined(_WIN32) && !defined(HSR_HAVE_PHYSX)
+    // The fast LLVM build cannot link AstroBoy's MSVC PhysX static libraries
+    // directly. Keep it as the responsive front-end and transparently hand an
+    // isolated APK + exact .hsledit session to the official PhysX-enabled
+    // cooker only when real SEBD structure colliders are requested.
+    std::string findOfficialPhysxCooker() const {
+        namespace fs=std::filesystem;
+        std::vector<fs::path> candidates;
+        if(const char* configured=std::getenv("HSR_PHYSX_COOKER")) candidates.emplace_back(configured);
+        candidates.emplace_back(AppConfig::exeRel("Quest-Home-Editor-PhysX.exe"));
+        candidates.emplace_back(AppConfig::exeRel("Quest-Home-Editor-windows-x64.exe"));
+        if(const char* user=std::getenv("USERPROFILE"))
+            candidates.emplace_back(fs::path(user)/"Downloads"/"Quest-Home-Editor-windows-x64.exe");
+        std::error_code ec;
+        const fs::path self=fs::weakly_canonical(fs::path(AppConfig::exePath()),ec);
+        for(const fs::path& candidate:candidates){
+            ec.clear();
+            if(!fs::is_regular_file(candidate,ec)) continue;
+            const fs::path canonical=fs::weakly_canonical(candidate,ec);
+            if(!ec && canonical!=self) return canonical.string();
+        }
+        return {};
+    }
+    bool delegateOfficialPhysxCook(const std::string& pkg, const std::string& out,
+                                   bool spoof, std::string& systemOut,
+                                   std::string& spoofOut, std::string& detail) {
+        namespace fs=std::filesystem;
+        const std::string backend=findOfficialPhysxCooker();
+        if(backend.empty()){
+            detail="official PhysX cooker not found (set HSR_PHYSX_COOKER or place Quest-Home-Editor-PhysX.exe beside this app)";
+            return false;
+        }
+        const std::string source=!sourceEnvPath.empty()?sourceEnvPath:projectPath;
+        std::error_code ec;
+        if(source.empty() || !fs::is_regular_file(source,ec)){
+            detail="source Home APK is unavailable for the PhysX backend";
+            return false;
+        }
+        // Stage beside the source when possible. On the same volume a hard
+        // link avoids copying a potentially multi-hundred-MiB raw APK; the
+        // isolated filename still gives the backend its own sibling session.
+        // Read-only/unusual filesystems fall back to a normal copy.
+        const fs::path stageRoot=fs::path(source).parent_path()/".qhe-physx-stage";
+        const fs::path stage=stageRoot/
+            (std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64()));
+        if(!fs::create_directories(stage,ec)){
+            detail="cannot create isolated PhysX staging directory";
+            return false;
+        }
+        const fs::path stagedApk=stage/"source.apk";
+        fs::create_hard_link(source,stagedApk,ec);
+        if(ec){
+            ec.clear();
+            if(!fs::copy_file(source,stagedApk,fs::copy_options::overwrite_existing,ec)){
+                detail="cannot stage source APK for PhysX";
+                return false; // preserve the diagnostic stage on failure
+            }
+        }
+        // Older/current official backends rebuild their environment variables
+        // from CFG after startup. Merely inheriting HSR_FOG* is therefore not
+        // enough: a CFG with fog disabled resets density to zero inside the
+        // backend. Persist the automatic transition fog in the isolated
+        // delegated session so every official backend cooks the same result.
+        const bool originalCfgFog=cfgFog;
+        float originalFogColor[3]={cfgFogColor[0],cfgFogColor[1],cfgFogColor[2]};
+        const float originalFogStart=cfgFogStart;
+        const float originalFogDensity=cfgFogDensity;
+        if(autoFarClipFix&&!cfgFog){
+            float automaticFog[3]={0.05f,0.06f,0.09f};
+            deriveAutomaticFogColor(automaticFog);
+            cfgFog=true;
+            cfgFogColor[0]=automaticFog[0];cfgFogColor[1]=automaticFog[1];cfgFogColor[2]=automaticFog[2];
+            cfgFogStart=90000.f;cfgFogDensity=0.00001f;
+        }
+        const std::string session=serializeSession();
+        cfgFog=originalCfgFog;
+        cfgFogColor[0]=originalFogColor[0];cfgFogColor[1]=originalFogColor[1];cfgFogColor[2]=originalFogColor[2];
+        cfgFogStart=originalFogStart;cfgFogDensity=originalFogDensity;
+        const fs::path stagedSession=fs::path(stagedApk.string()+".hsledit");
+        {
+            FILE* f=fopen(stagedSession.string().c_str(),"wb");
+            if(!f){ detail="cannot stage the PhysX .hsledit session"; return false; }
+            const bool wrote=fwrite(session.data(),1,session.size(),f)==session.size();
+            fclose(f);
+            if(!wrote){ detail="cannot finish the PhysX .hsledit session"; return false; }
+        }
+        HsrScopedEnvironment restore({
+            "HSR_EXPORT","HSR_EXPORT_QUIT","HSR_NOUI","HSR_NOGPU","HSR_NOINSTALL",
+            "HSR_COOK_OUT","HSR_COOK_PKG","HSR_PHYSX_DELEGATED","HSR_NOSPOOF","HSR_FARCLIP",
+            "HSR_FOGCOLOR","HSR_FOGSTART","HSR_FOGDENSITY","HSR_BACKDROP_FIT_R","HSR_DEPTHCLAMP"
+        });
+        setenv_("HSR_EXPORT","1");
+        setenv_("HSR_EXPORT_QUIT","1");
+        setenv_("HSR_NOUI","1");
+        setenv_("HSR_NOGPU","1");
+        setenv_("HSR_NOINSTALL","1");
+        setenv_("HSR_COOK_OUT",out.c_str());
+        setenv_("HSR_COOK_PKG",pkg.c_str());
+        setenv_("HSR_PHYSX_DELEGATED","1");
+        // Preserve the Home's authored sky/backdrop exactly. Only meshes that
+        // actually cross VrShell's 4.5km camera boundary receive the cooker's
+        // far-depth shader; near geometry stays byte-exact.
+        setenv_("HSR_DEPTHCLAMP",autoFarClipFix?"1":"");
+        setenv_("HSR_NOSPOOF",spoof?"":"1");
+        { char value[32];snprintf(value,sizeof value,"%.0f",cfgFar);setenv_("HSR_FARCLIP",value); }
+        { char value[32];snprintf(value,sizeof value,"%.0f",backdropFitRadius);setenv_("HSR_BACKDROP_FIT_R",value); }
+        if(cfgFog) {
+            char color[64],start[32],density[32];
+            snprintf(color,sizeof color,"%.4f,%.4f,%.4f",cfgFogColor[0],cfgFogColor[1],cfgFogColor[2]);
+            snprintf(start,sizeof start,"%.3f",cfgFogStart);snprintf(density,sizeof density,"%.6f",cfgFogDensity);
+            setenv_("HSR_FOGCOLOR",color);setenv_("HSR_FOGSTART",start);setenv_("HSR_FOGDENSITY",density);
+        } else if(autoFarClipFix) {
+            float automaticFog[3]={0.05f,0.06f,0.09f};
+            deriveAutomaticFogColor(automaticFog);
+            char color[64];
+            snprintf(color,sizeof color,"%.4f,%.4f,%.4f",
+                     automaticFog[0],automaticFog[1],automaticFog[2]);
+            setenv_("HSR_FOGCOLOR",color);setenv_("HSR_FOGSTART","90000");setenv_("HSR_FOGDENSITY","0.00001");
+        } else {
+            setenv_("HSR_FOGCOLOR","");setenv_("HSR_FOGSTART","");setenv_("HSR_FOGDENSITY","0");
+        }
+        auto wide=[](const std::string& utf8){
+            int n=MultiByteToWideChar(CP_UTF8,0,utf8.c_str(),-1,nullptr,0);
+            std::wstring value(n>1?(size_t)n-1:0,L'\0');
+            if(n>1) MultiByteToWideChar(CP_UTF8,0,utf8.c_str(),-1,value.data(),n);
+            return value;
+        };
+        const std::wstring backendW=wide(backend), stagedW=wide(stagedApk.string());
+        std::wstring command=L"\""+backendW+L"\" \""+stagedW+L"\"";
+        std::vector<wchar_t> commandBuffer(command.begin(),command.end()); commandBuffer.push_back(0);
+        setStage(0.08f,"Official PhysX collision cook");
+        const ULONGLONG backendStarted=GetTickCount64();
+        fprintf(stderr,"[PHYSX] backend=%s source=%s output-mode=%s\n",
+                backend.c_str(),stagedApk.string().c_str(),spoof?"root+no-root":"root-only");
+        const fs::path backendLog=stage/"official-physx.log";
+        DWORD wait=WAIT_FAILED,exitCode=1;
+        for(int attempt=1;attempt<=2;++attempt) {
+            SECURITY_ATTRIBUTES sa{sizeof sa,nullptr,TRUE};
+            HANDLE log=CreateFileW(wide(backendLog.string()).c_str(),FILE_APPEND_DATA,
+                                   FILE_SHARE_READ|FILE_SHARE_WRITE,&sa,OPEN_ALWAYS,
+                                   FILE_ATTRIBUTE_NORMAL,nullptr);
+            STARTUPINFOW si={sizeof si}; PROCESS_INFORMATION pi={};
+            if(log!=INVALID_HANDLE_VALUE) {
+                si.dwFlags|=STARTF_USESTDHANDLES;
+                si.hStdOutput=log; si.hStdError=log; si.hStdInput=GetStdHandle(STD_INPUT_HANDLE);
+            }
+            commandBuffer.assign(command.begin(),command.end()); commandBuffer.push_back(0);
+            const BOOL launched=CreateProcessW(backendW.c_str(),commandBuffer.data(),nullptr,nullptr,
+                                               log!=INVALID_HANDLE_VALUE,CREATE_NO_WINDOW,
+                                               nullptr,nullptr,&si,&pi);
+            if(log!=INVALID_HANDLE_VALUE) CloseHandle(log);
+            if(!launched) {
+                wait=WAIT_FAILED; exitCode=GetLastError();
+            } else {
+                CloseHandle(pi.hThread);
+                wait=WaitForSingleObject(pi.hProcess,30u*60u*1000u);
+                exitCode=1; if(wait==WAIT_OBJECT_0)GetExitCodeProcess(pi.hProcess,&exitCode);
+                CloseHandle(pi.hProcess);
+            }
+            if(wait==WAIT_OBJECT_0&&exitCode==0) break;
+            if(attempt==1) {
+                setStage(0.08f,"Official PhysX retry");
+                fprintf(stderr,"[PHYSX] backend attempt 1 failed (exit %lu); retrying once, log=%s\n",
+                        (unsigned long)exitCode,backendLog.string().c_str());
+            }
+        }
+        if(wait!=WAIT_OBJECT_0 || exitCode!=0){
+            detail=wait==WAIT_TIMEOUT
+                ?"official PhysX cooker timed out twice; staging/log preserved at "+stage.string()
+                :"official PhysX cooker failed twice with exit code "+std::to_string(exitCode)+"; staging/log preserved at "+stage.string();
+            return false;
+        }
+        std::string stem=out;
+        if(size_t dot=stem.rfind(".apk");dot!=std::string::npos) stem.resize(dot);
+        if(stem.size()>=7 && stem.compare(stem.size()-7,7,"_cooked")==0) stem.resize(stem.size()-7);
+        systemOut=stem+"_Rooted-System.apk";
+        spoofOut=spoof?stem+"_NoRoot-Spoof.apk":std::string();
+        if(!fileEx(systemOut) || (spoof && !fileEx(spoofOut))){
+            detail="official PhysX cooker returned success but expected signed output is missing";
+            return false;
+        }
+        // Keep the backend transcript beside the requested output. A successful
+        // overall cook can still contain a rejected individual PhysX mesh; the
+        // durable log makes that reproducible instead of deleting the evidence.
+        const fs::path durableBackendLog=fs::path(out+".physx.log");
+        ec.clear();fs::copy_file(backendLog,durableBackendLog,fs::copy_options::overwrite_existing,ec);
+        if(ec)fprintf(stderr,"[PHYSX] warning: could not preserve backend log at %s\n",
+                      durableBackendLog.string().c_str());
+        fs::remove_all(stage,ec); // exact app-created staging directory; failed stages are intentionally retained
+        ec.clear(); fs::remove(stageRoot,ec); // removes only when empty; never touches another diagnostic run
+        const double backendSeconds=(double)(GetTickCount64()-backendStarted)/1000.0;
+        fprintf(stderr,"[PHYSX] backend completed in %.2fs\n",backendSeconds);
+        char elapsed[48];snprintf(elapsed,sizeof elapsed,"%.2fs",backendSeconds);
+        detail=std::string("official PhysX SEBD backend (")+elapsed+")";
+        return true;
+    }
+    bool needsOfficialPhysxDelegate() const {
+        if(!solidCollision || std::getenv("HSR_FORCE_NAVBOX") ||
+           std::getenv("HSR_PHYSX_DELEGATED")) return false;
+        return std::any_of(items.begin(),items.end(),
+            [this](const sitem::Item& item){return isMeshColliderItem(item);});
+    }
+    void runOfficialPhysxDelegatedCook(const std::string& pkg, bool spoof,
+                                       bool terminalBar) {
+        lastCookOk.store(false);
+        const std::string out=cookOutPath();
+        auto progress=[this,terminalBar](float f,const char* stage){
+            setStage(f,stage); if(terminalBar) printBar(f,stage);
+        };
+        std::string systemOut,spoofOut,detail;
+        if(!delegateOfficialPhysxCook(pkg,out,spoof,systemOut,spoofOut,detail)){
+            if(terminalBar) fprintf(stderr,"\n");
+            setStatus("ERROR: exact wall/furniture collision delegation failed: "+detail);
+            cooking.store(false);
+            return;
+        }
+        std::string msg="Cooked with "+detail+"  | system(rooted) APK: "+systemOut;
+        if(!spoofOut.empty()) msg+="  | no-root spoof APK: "+spoofOut;
+        bool deliveryOk=true;
+        if(installAfterCook && !deviceConnected()){
+            msg+="  || NO DEVICE connected (adb) -> skipped auto-install; APKs are ready";
+            deliveryOk=false;
+        } else if(installAfterCook) {
+            std::string loftSummary;
+            if(cookui::usesVistaWrapper(loftTarget)) {
+                deliveryOk=wrapAndInstallLoftTarget(systemOut,progress,loftSummary);
+                msg+="  || "+(loftSummary.empty()?statusSnapshot():loftSummary);
+            } else {
+            progress(0.9f,"detect root");
+            const bool rooted=deviceIsRooted();
+            if(rooted && !systemOut.empty()){
+                const bool installed=installToDevice(
+                    systemOut,pkg,progress,/*uninstallFirst=*/false,rooted);
+                    deliveryOk=installed;
+                    msg+=installed
+                        ?"  || ROOT -> installed UNSPOOFED ("+pkg+") + auto-selected"
+                        :"  || "+statusSnapshot();
+            } else if(!spoofOut.empty()){
+                std::string backup; const HavenBkp haven=backupOriginalHaven(backup);
+                if(haven==HB_FAILED){
+                    deliveryOk=false;
+                    msg+="  || ABORTED: could not back up original Haven 2025; it was left untouched";
+                } else {
+                    const bool installed=installToDevice(
+                        spoofOut,HAVEN_PKG(),progress,/*uninstallFirst=*/true,rooted);
+                    deliveryOk=installed;
+                    msg+=installed
+                        ?"  || no root -> backed up/replaced Haven 2025 with the SPOOF"
+                        :"  || "+statusSnapshot();
+                }
+            } else {
+                deliveryOk=false;
+                msg+="  || no compatible APK was produced for this headset";
+            }
+            }
+        }
+        if(!pendingCookSig.empty()){
+            if(FILE* f=fopen(cookSigPath().c_str(),"w")){
+                fputs(pendingCookSig.c_str(),f); fclose(f);
+            }
+        }
+        if(terminalBar) fprintf(stderr,"\n");
+        lastCookOk.store(deliveryOk);
+        setStatus(msg); setStage(1.f,"Done"); cooking.store(false);
+    }
+#endif
 
     // shared cook core (used by the worker AND the headless CLI). terminalBar = print a \r progress bar to stderr.
-    void runCook(std::vector<hslcook::ExportMesh> ems, std::string pkg, bool sign, bool spoof, bool terminalBar, std::vector<sitem::Item> sceneItems) {
+    void runCook(std::vector<hslcook::ExportMesh> ems, std::string pkg, bool sign, bool spoof, bool terminalBar, std::vector<sitem::Item> sceneItems, hslcook::CookQualityOptions quality) {
         using namespace hslcook;
+        lastCookOk.store(false);
         if (ems.empty()) { setStatus("ERROR: no exportable meshes"); cooking.store(false); return; }
         HsrScopedEnvironment restoreCompatibilityEnv({
-            "HSR_V206_HAVEN_COMPAT", "HSR_NOCULL", "HSR_CULL", "HSR_NOBOUNDSOVERRIDE"
+            "HSR_V206_HAVEN_COMPAT", "HSR_NOCULL", "HSR_CULL", "HSR_NOBOUNDSOVERRIDE",
+            "HSR_AUTO_FARCLIP"
         });
         // BAKE each navmesh/mesh-collider's GIZMO transform (T·R·S) into its navVerts — the cook reads navVerts raw, so
         // without this a navmesh you MOVED in the editor cooks at its ORIGINAL spot ("navmesh gizmo doesn't work").
@@ -6636,6 +8259,20 @@ struct Editor {
             if (!ident){ for (size_t v=0;v+2<it.navVerts.size();v+=3){ float p[3]={it.navVerts[v],it.navVerts[v+1],it.navVerts[v+2]},o[3]; xformPoint(M,p,o); it.navVerts[v]=o[0]; it.navVerts[v+1]=o[1]; it.navVerts[v+2]=o[2]; }
                 it.pos[0]=it.pos[1]=it.pos[2]=0; it.rot[0]=it.rot[1]=it.rot[2]=0; it.scale[0]=it.scale[1]=it.scale[2]=1; }   // baked in -> identity
         }
+        // Match the visual cook's malformed-micro-helper quarantine for exact
+        // collision items. A four-vertex animated particle plane with NaN
+        // coordinates must not reach PhysX, while any substantial malformed
+        // floor/wall collider remains a hard failure downstream.
+        sceneItems.erase(std::remove_if(sceneItems.begin(),sceneItems.end(),[](const sitem::Item& item){
+            if(item.type!=sitem::NAVMESH || item.navVerts.size()/3>16 || item.navIdx.size()/3>32)
+                return false;
+            const bool invalid=std::any_of(item.navVerts.begin(),item.navVerts.end(),
+                [](float value){return !std::isfinite(value);});
+            if(invalid)
+                fprintf(stderr,"[PHYSX] quarantined malformed micro-collider '%s'; structural colliders remain strict\n",
+                        item.name.c_str());
+            return invalid;
+        }),sceneItems.end());
         // Navmesh options are UI TOGGLES (navmesh panel), not env flags — push them to the cook here so hsl_cooker.h reads them.
         setenv_("HSR_NAVSMOOTH", navSmooth ? "1" : "");
         setenv_("HSR_NAVDEBUG",  navDebugClone ? "1" : "");
@@ -6650,10 +8287,19 @@ struct Editor {
         std::string spoofOut  = stem + "_NoRoot-Spoof.apk";
         auto progress = [this,terminalBar](float f, const char* s){ setStage(f,s); if (terminalBar) printBar(f,s); };
         bool ok=false; std::vector<uint8_t> sceneZip;
+        const std::string sessionText=serializeSession();
         // package spoof for the unsigned/own-package APK uses the env's COOK_PKG; we override via the field
         setenv_("HSR_COOK_PKG", pkg.c_str());
         setenv_("HSR_HZANIM", animSkinned ? "1" : "");   // emit skeletal HZANIM clips so skinned meshes ANIMATE on device (clouds/koi/droids)
-        const bool useV206HavenCompat = spoof && v206HavenCompat;
+        const bool detectedV206HavenCompat=connectedHeadsetNeedsV206Compatibility();
+        // Upstream v0.10.22 control proved that its normal NUXD-combined
+        // carrier works on VrShell 206 when Calming is active. The older
+        // Haven-static compatibility recook is therefore never selected
+        // automatically; it was the direct cause of our black Winterlodge.
+        const bool useV206HavenCompat = false;
+        fprintf(stderr,"[V206] no-root compatibility=%s (legacy-force-ignored=%d auto=%d detected=%d)\n",
+                useV206HavenCompat?"enabled":"normal",
+                0,autoV206Compat?1:0,detectedV206HavenCompat?1:0);
         // The rooted APK is always cooked through the established path. When the
         // optional fallback is enabled, only the no-root scene is cooked a second
         // time with canonical Haven IDs + tight bounds.
@@ -6661,7 +8307,11 @@ struct Editor {
             setenv_("HSR_V206_HAVEN_COMPAT", enabled ? "1" : "");
             setenv_("HSR_NOCULL", (!enabled && noCull) ? "1" : "");
             setenv_("HSR_CULL", (enabled || !noCull) ? "1" : "");
-            setenv_("HSR_NOBOUNDSOVERRIDE", (enabled || !antiCull) ? "1" : "");
+            // The v206 no-root scene is mirrored into Haven's home_static_arch template, but it still needs the
+            // same per-mesh MeshPartBoundsOverride components as the normal/root cook.  Disabling them only for
+            // this compatibility pass made large scenery parts disappear on-device even though every mesh
+            // were present in the APK.  Version-0 overrides are already emitted specifically for old+new shells.
+            setenv_("HSR_NOBOUNDSOVERRIDE", !antiCull ? "1" : "");
         };
         std::vector<hslcook::ExportMesh> compatEms;
         std::vector<sitem::Item> compatSceneItems;
@@ -6671,94 +8321,230 @@ struct Editor {
         }
         configureCompatibility(false);
         setenv_("HSR_NOAUTOFLOOR", cookAutoFloor ? "" : "1");   // Cook-tab toggle: OFF = no generated floor/walls at all
+        const bool hasExactSceneColliders = std::any_of(
+            sceneItems.begin(), sceneItems.end(),
+            [this](const sitem::Item& item){ return isMeshColliderItem(item); });
+#ifdef HSR_HAVE_PHYSX
+        fprintf(stderr,"[PHYSX] capability=official-SEBD exactSceneColliders=%d\n",
+                hasExactSceneColliders?1:0);
+#else
+        fprintf(stderr,"[PHYSX] capability=box-fallback-only exactSceneColliders=%d\n",
+                hasExactSceneColliders?1:0);
+        // Never silently turn requested furniture/wall trimeshes into the
+        // coarse box fallback. It can cook successfully while producing no
+        // useful resistance (Star Trek .90). Floor-only cooks may still use
+        // the proven box path; exact scene structure requires the official
+        // PhysX-enabled build.
+        if(solidCollision&&hasExactSceneColliders&&!std::getenv("HSR_FORCE_NAVBOX")){
+#ifdef _WIN32
+            // Safety net for callers that already constructed an export
+            // snapshot. Normal UI/CLI paths decide before buildExportMeshes().
+            runOfficialPhysxDelegatedCook(pkg,spoof,terminalBar);
+#else
+            setStatus("ERROR: exact wall/furniture collision requires a PhysX-enabled cooker (HSR_HAVE_PHYSX=ON)");
+#endif
+            return;
+        }
+#endif
         // real double-sided trimesh collider (haven2025 SEBD: 16-align manifest + 128-align RTree + count-shift); off -> ColliderBox grid.
         // SEBD holds on device (v206 confirmed). HSR_FORCE_NAVBOX = escape hatch to the always-compatible ColliderBox
         // tilted-box path (device builds it from halfExtents, no cooked RTree) if a future PhysX build ever rejects the RTree.
         setenv_("HSR_NAVTRIMESH", (solidCollision && !std::getenv("HSR_FORCE_NAVBOX")) ? "1" : "");
         setenv_("HSR_NAVSLOPE", "");                           // no forced slope: the bake's solidCollision path now keeps ALL faces natively incl. CEILINGS (the old "0" dropped the roof undersides -> jump-through)
-        setenv_("HSR_VOXSOLID", voxelSolid ? "1" : "");        // thick all-sides voxel ColliderBoxes: OPT-IN, DEFAULT OFF (reverted — it walled off room interiors, "can't walk inside rooms"). Default collision = thin per-triangle floor+wall boxes (walkable). HSR_VOXSOLID re-enables for the thin-wall clip case.
+        setenv_("HSR_VOXSOLID", (voxelSolid || std::getenv("HSR_FORCE_VOXSOLID")) ? "1" : ""); // CLI may force a tightly filtered voxel pass.
         // HSL render config -> cook's ScenePlatformComponent (the SAME values the live preview applies = WYSIWYG)
         if (cfgFog) { char fc[64]; snprintf(fc,sizeof fc,"%.4f,%.4f,%.4f",cfgFogColor[0],cfgFogColor[1],cfgFogColor[2]); setenv_("HSR_FOGCOLOR",fc);
             char fs[24]; snprintf(fs,sizeof fs,"%.3f",cfgFogStart); setenv_("HSR_FOGSTART",fs);
             char fd[24]; snprintf(fd,sizeof fd,"%.6f",cfgFogDensity); setenv_("HSR_FOGDENSITY",fd); }
-        else setenv_("HSR_FOGDENSITY","0");               // fog disabled -> ship no visible distance fog
+        else if(autoFarClipFix) {
+            // Let sceneEntityJson use its official-vista-style, non-black,
+            // extremely subtle defaults. A zero/black fog block was part of
+            // the device's head-locked black-dome failure mode. At the default
+            // 150000m far plane the haze starts at 90000m, so foreground and
+            // normal skyline geometry remain visually unchanged.
+            float automaticFog[3]={0.05f,0.06f,0.09f};
+            deriveAutomaticFogColor(automaticFog);
+            char color[64];
+            snprintf(color,sizeof color,"%.4f,%.4f,%.4f",
+                     automaticFog[0],automaticFog[1],automaticFog[2]);
+            setenv_("HSR_FOGCOLOR",color);
+            setenv_("HSR_FOGSTART","90000");
+            setenv_("HSR_FOGDENSITY","0.00001");
+        } else {
+            setenv_("HSR_FOGCOLOR","");
+            setenv_("HSR_FOGSTART","");
+            setenv_("HSR_FOGDENSITY","0");               // expert/manual: explicitly ship no visible distance fog
+        }
         { char fcl[24]; snprintf(fcl,sizeof fcl,"%.0f",cfgFar); setenv_("HSR_FARCLIP",fcl); }
+        setenv_("HSR_AUTO_FARCLIP",autoFarClipFix?"1":"");
+        setenv_("HSR_DEPTHCLAMP",autoFarClipFix?"1":"");
         { char sd[32]; snprintf(sd,sizeof sd,"%.0f",skyboxDist); setenv_("HSR_SKYBOX_DIST", skybox ? sd : ""); }  // far backdrop -> skybox pass (escapes PortalStereoCamera far=5000)
         { char br[32]; snprintf(br,sizeof br,"%.0f",backdropFitRadius); setenv_("HSR_BACKDROP_FIT_R",br); }
         std::vector<uint8_t> vspv, fspv;
         const size_t exportedMeshCount = ems.size();
-        auto apk = exportSceneAPK(std::move(ems), nuxd, vspv, fspv, true, &ok, nullptr, &sceneZip, (cookAudio ? bgOgg : std::vector<uint8_t>{}), progress, std::move(sceneItems), serializeSession());
-        if (!ok || apk.empty()) { setStatus("ERROR: cook failed (shell: "+nuxd+")"); cooking.store(false); return; }
+        auto unusedRootApk = exportSceneAPK(std::move(ems), nuxd, vspv, fspv, true, &ok, nullptr, &sceneZip, (cookAudio ? bgOgg : std::vector<uint8_t>{}), progress, std::move(sceneItems), sessionText, quality, false);
+        (void)unusedRootApk;
+        if (!ok || sceneZip.empty()) { setStatus("ERROR: cook failed (shell: "+nuxd+")"); cooking.store(false); return; }
+        std::vector<uint8_t> rootSceneZip=std::move(sceneZip);
+        std::vector<uint8_t> spoofSceneZip;
         if (useV206HavenCompat) {
             configureCompatibility(true);
             bool compatOk = false;
-            std::vector<uint8_t> compatSceneZip, compatVspv, compatFspv;
+            std::vector<uint8_t> compatVspv, compatFspv;
             auto unusedCompatApk = exportSceneAPK(std::move(compatEms), nuxd, compatVspv, compatFspv,
-                true, &compatOk, nullptr, &compatSceneZip,
+                true, &compatOk, nullptr, &spoofSceneZip,
                 (cookAudio ? bgOgg : std::vector<uint8_t>{}), progress,
-                std::move(compatSceneItems), serializeSession());
-            if (!compatOk || unusedCompatApk.empty() || compatSceneZip.empty()) {
+                std::move(compatSceneItems), sessionText, quality, false);
+            (void)unusedCompatApk;
+            if (!compatOk || spoofSceneZip.empty()) {
                 configureCompatibility(false);
                 setStatus("ERROR: VrShell 206 compatibility cook failed");
                 cooking.store(false);
                 return;
             }
-            sceneZip = std::move(compatSceneZip);
             configureCompatibility(false);
         }
-        if (!writeFile(out, apk)) { setStatus("ERROR: cannot write "+out); cooking.store(false); return; }
+        const std::vector<uint8_t>& noRootSceneZip=useV206HavenCompat?spoofSceneZip:rootSceneZip;
+        std::vector<uint8_t> apk, apk2;
+        bool rootPackageOk=false, spoofPackageOk=!spoof;
+        const char* fromPkgEnv=getenv("HSR_COOK_FROMPKG");
+        const std::string fromPkg=fromPkgEnv?fromPkgEnv:"com.meta.environment.prod.nuxd";
+        if (spoof) {
+            if (!useV206HavenCompat) {
+                progress(0.86f,"Packaging scene once for Root + No-root");
+                apk=spliceAPK(sourceEnvPath,rootSceneZip,fromPkg,pkg,&rootPackageOk,sessionText);
+                if (rootPackageOk && !apk.empty()) {
+                    apk2=cloneApkWithManifest(apk,"com.meta.shell.env.footprint.haven2025",
+                                              /*nuxdIdentity=*/!spoofFootprint,
+                                              /*footprintIdentity=*/spoofFootprint,
+                                              &spoofPackageOk);
+                }
+            } else {
+                // The proven standalone-Haven carrier is the embedded combined
+                // Environment runtime plus Haven's combined manifest identity.
+                // Keep the Root and No-root packages independent: using either
+                // Nuxd's manifest identity or Haven v206's footprint runtime for
+                // the No-root package makes VrShell hide the environment.
+                progress(0.86f,"Packaging Root + proven combined Haven carrier");
+                std::thread rootPackageThread([&]{ apk=spliceAPK(sourceEnvPath,rootSceneZip,fromPkg,pkg,&rootPackageOk,sessionText); });
+                const auto havenPlan=standalonehaven::plan(spoofFootprint);
+                apk2=spliceAPK(
+                    sourceEnvPath,noRootSceneZip,fromPkg,
+                    "com.meta.shell.env.footprint.haven2025",
+                    &spoofPackageOk,sessionText,
+                    havenPlan.nuxdManifestIdentity,
+                    havenPlan.footprintManifestIdentity);
+                if (spoofPackageOk && !spoofFootprint &&
+                    !hslcook::validateProvenCombinedHavenCarrier(apk2)) {
+                    apk2.clear();
+                    spoofPackageOk=false;
+                }
+                rootPackageThread.join();
+            }
+        } else {
+            apk=spliceAPK(sourceEnvPath,rootSceneZip,fromPkg,pkg,&rootPackageOk,sessionText);
+        }
+        if (!rootPackageOk || apk.empty()) { setStatus("ERROR: Root APK packaging failed"); cooking.store(false); return; }
+        if (spoof && (!spoofPackageOk || apk2.empty())) {
+            setStatus(useV206HavenCompat
+                ? "ERROR: combined Haven carrier packaging failed"
+                : "ERROR: No-root APK packaging failed");
+            cooking.store(false);
+            return;
+        }
+        const bool previewCook=std::getenv("HSR_COOK_PREVIEW") != nullptr;
+        if ((!sign || previewCook) && !writeFile(out, apk)) { setStatus("ERROR: cannot write "+out); cooking.store(false); return; }
         // ── ONE-CLICK COOK→PREVIEW (HSR_COOK_PREVIEW=1): spawn a fresh renderer on the just-cooked V205 APK, so the
         //    cooked result (skinned + car HZANIM animation, max far-clip, materials) is validated FIRST-HAND IN THE
         //    RENDERER's V205 path — no device, no manual reload. The new window IS the HSL-mode preview. ──
-        if (std::getenv("HSR_COOK_PREVIEW")) {
+        if (previewCook) {
             std::string exe = AppConfig::exePath();   // portable (Win32/macOS/Linux)
             if (!exe.empty() && AppConfig::launchDetached(exe, out)) setStatus("Cooked + launched HSL preview: " + out);
         }
-        std::string finalSystem, finalSpoof, msg = "Cooked "+std::to_string(exportedMeshCount)+" meshes ("+std::to_string(apk.size()/1024)+"KB)";
+        std::string finalSystem, finalSpoof, systemMsg, spoofMsg;
+        std::string msg = "Cooked "+std::to_string(exportedMeshCount)+" meshes ("+std::to_string(apk.size()/1024)+"KB)";
+        bool parallelOutputs=false;
+        if(sign&&spoof&&!apk2.empty()) {
+            std::error_code spaceError;
+            const auto capacity=std::filesystem::space(
+                std::filesystem::path(systemOut).parent_path(),spaceError);
+            constexpr uintmax_t kParallelSigningHeadroom=16u*1024u*1024u;
+            parallelOutputs=!spaceError &&
+                capacity.available>=static_cast<uintmax_t>(apk.size())+
+                                    static_cast<uintmax_t>(apk2.size())+
+                                    kParallelSigningHeadroom;
+        }
+        bool systemSigned=false; std::thread systemSignThread;
         // ── own-package APK (sign -> <env>_Rooted-System.apk; drop the unsigned intermediate on success) ──
-        if (sign) {
-            if (signApk(out, systemOut, progress)) { finalSystem=systemOut; std::remove(out.c_str()); msg += "  | system(rooted) APK: "+systemOut; }
-            else { finalSystem=out; msg += "  | sign FAILED (UNSIGNED "+out+"; run `--fetch-tools`)"; }
+        if(parallelOutputs){
+            progress(0.88f,"Signing Root + No-root APKs in parallel");
+            systemSignThread=std::thread([&]{ systemSigned=signApkData(apk,systemOut); });
+        } else if(sign){
+            systemSigned=signApkData(apk,systemOut,progress);
+            if(systemSigned){ finalSystem=systemOut; std::remove(out.c_str()); systemMsg="  | system(rooted) APK: "+systemOut; }
+            else if(writeFile(out,apk)){ finalSystem=out; systemMsg="  | sign FAILED (UNSIGNED "+out+")"; }
+            else { systemMsg="  | sign FAILED and unsigned Root APK could not be written"; }
         } else finalSystem=out;
-        // ── Spoof APK (-> <env>_NoRoot-Spoof.apk): uses NUXD's manifest (a plain `combined` NON-footprint
-        //    Environment -> NO vista) but under the HAVEN2025 package name (the one an unrooted user can replace;
-        //    nuxd is a non-removable system pkg). So install/backup stays on haven2025, but the shell loads it as a
-        //    standalone Environment, not a footprint. nuxdIdentity=true selects the nuxd manifest. ──
-        if (spoof && !sceneZip.empty()) {
-            bool ok2=false; auto apk2=spliceAPK(nuxd, sceneZip, "com.meta.environment.prod.nuxd", "com.meta.shell.env.footprint.haven2025", &ok2, {}, /*nuxdIdentity=*/!spoofFootprint, /*footprintIdentity=*/spoofFootprint);
-            if (ok2 && !apk2.empty()){
-                if (sign) {   // the spoof must ALSO be signed or it can't install (INSTALL_PARSE_FAILED_NO_CERTIFICATES)
-                    std::string tmp2 = spoofOut + ".unsigned"; writeFile(tmp2, apk2);
-                    if (signApk(tmp2, spoofOut, progress)) { finalSpoof=spoofOut; msg += "  | no-root spoof APK: "+spoofOut; }
-                    else { writeFile(spoofOut, apk2); finalSpoof=spoofOut; msg += "  | spoof UNSIGNED: "+spoofOut; }
-                    std::remove(tmp2.c_str());
-                } else { writeFile(spoofOut, apk2); finalSpoof=spoofOut; msg += "  | spoof: "+spoofOut; }
+        // No-root Standard Home artifact. It uses the same NUXD-combined
+        // carrier proven by upstream v0.10.22; Vista delivery consumes
+        // finalSystem and does not need this second package.
+        if (spoof && !apk2.empty()) {
+            if (sign) {   // the spoof must ALSO be signed or it can't install (INSTALL_PARSE_FAILED_NO_CERTIFICATES)
+                if (signApkData(apk2, spoofOut, progress)) { finalSpoof=spoofOut; spoofMsg="  | no-root spoof APK: "+spoofOut; }
+                else {
+                    spoofMsg="  | no-root signing FAILED; previous signed APK preserved and no install attempted";
+                }
+            } else {
+                writeFile(spoofOut, apk2); finalSpoof=spoofOut; spoofMsg="  | spoof: "+spoofOut;
             }
         }
+        if(systemSignThread.joinable()){
+            systemSignThread.join();
+            if(systemSigned){ finalSystem=systemOut; std::remove(out.c_str()); systemMsg="  | system(rooted) APK: "+systemOut; }
+            else if(writeFile(out,apk)){ finalSystem=out; systemMsg="  | sign FAILED (UNSIGNED "+out+")"; }
+            else { systemMsg="  | sign FAILED and unsigned Root APK could not be written"; }
+        }
+        msg+=systemMsg+spoofMsg;
         // ── auto-install: ROOT -> own package (+auto-select); else back up haven2025 and install the spoof ──
-        if (installAfterCook && !deviceConnected()) {
+        const bool requestedSigningFailed=sign&&(!systemSigned||(spoof&&finalSpoof.empty()));
+        bool deliveryOk=true;
+        if(requestedSigningFailed) {
+            progress(1.0f,"signing failed safely");
+            msg+="  || SIGNING FAILED safely: no unsigned APK was published or installed. Free disk space and Retry Cook.";
+        } else if (installAfterCook && !deviceConnected()) {
+            deliveryOk=false;
             progress(1.0f, "no device - APKs written");
             msg += "  || NO DEVICE connected (adb) -> skipped auto-install; the APK files are written. Connect the Quest (USB or `adb connect`) and re-cook, or install the APK manually.";
         } else if (installAfterCook) {
+            std::string loftSummary;
+            if(cookui::usesVistaWrapper(loftTarget)) {
+                deliveryOk=wrapAndInstallLoftTarget(finalSystem,progress,loftSummary);
+                msg+="  || "+(loftSummary.empty()?statusSnapshot():loftSummary);
+            } else {
             progress(0.9f, "detect root");
             bool rooted = deviceIsRooted();
             if (rooted && !finalSystem.empty()) {
                 bool inst = installToDevice(finalSystem, pkg, progress, /*uninstallFirst=*/false, rooted);
-                msg += inst ? "  || ROOT -> installed UNSPOOFED ("+pkg+") + auto-selected (shell restart: "+std::string(shellRestartName())+")" : "  || install FAILED (adb/device?)";
+                deliveryOk=inst;
+                msg += inst ? "  || ROOT -> installed UNSPOOFED ("+pkg+") + auto-selected (shell restart: "+std::string(shellRestartName())+")" : "  || "+statusSnapshot();
             } else if (!finalSpoof.empty()) {
                 // SAFE ORDER: back up the ORIGINAL Haven 2025 first; THEN (cert mismatch) uninstall it; THEN install the
                 // spoof. Only uninstall if the backup succeeded (or there was nothing installed to back up).
                 std::string bkp; HavenBkp hb = backupOriginalHaven(bkp);
                 if (hb == HB_FAILED) {
+                    deliveryOk=false;
                     msg += "  || ABORTED: could NOT back up the original Haven 2025, so it was left UNTOUCHED (your original is safe). Check the device/storage and retry, or use the Rooted-System APK.";
                 } else {
                     setStatus("Replacing Haven 2025: it's signed with Meta's certificate (not ours), so the ORIGINAL is uninstalled first (backup kept in "+havenBackupDir()+"). Restore anytime: --restore-haven.");
                     bool inst = installToDevice(finalSpoof, HAVEN_PKG(), progress, /*uninstallFirst=*/true, rooted);
+                    deliveryOk=inst;
                     msg += inst ? ("  || no root -> "+std::string(hb==HB_OK?("backed up Haven 2025 ("+havenBackupDir()+"), "):"")+"uninstalled the original + installed the SPOOF (shell restart: "+std::string(shellRestartName())+"). It loads where Haven 2025 does (unrooted can't switch envs); set Haven 2025 as your home if it isn't already. Restore: --restore-haven.")
-                                : "  || spoof install FAILED (adb/device? Haven 2025 may be a non-removable system app - try the Rooted-System APK). Restore the original with --restore-haven if needed.";
+                                : "  || "+statusSnapshot();
                 }
             } else {
+                deliveryOk=false;
                 msg += rooted ? "  || ROOT but no system APK" : "  || no root and no spoof APK (enable the spoof toggle)";
+            }
             }
             // Vista neutralize is NO LONGER automatic — it's a MANUAL "Neutralize vistas now" button only
             // (it destructively replaces the real Meta vistas, so it must be an explicit user choice).
@@ -6767,12 +8553,14 @@ struct Editor {
         // record the cook signature next to the APKs so "Install only" can detect an unchanged scene and skip
         // the re-cook next time. pendingCookSig was computed on the UI thread at cook start (the exact state
         // being cooked) — writing it here (worker) is a plain file write, no shared-state read.
-        if ((!finalSystem.empty() || !finalSpoof.empty()) && !pendingCookSig.empty()) {
+        if (!requestedSigningFailed && (!finalSystem.empty() || !finalSpoof.empty()) && !pendingCookSig.empty()) {
             if (FILE* f=fopen(cookSigPath().c_str(),"w")){ fputs(pendingCookSig.c_str(),f); fclose(f); }
         }
+        lastCookOk.store(!requestedSigningFailed && deliveryOk);
         setStatus(msg); setStage(1.f, "Done"); cooking.store(false);
     }
     std::string pendingCookSig;   // cook-input signature computed on the UI thread at cook start; runCook writes it on success
+    std::atomic<bool> lastCookOk{false}; // synchronous/headless callers must return a failing process status on rejected cooks
     static bool fileEx(const std::string& p){ FILE* f=fopen(p.c_str(),"rb"); if(f){ fclose(f); return true; } return false; }
     // adb resolution order: $HSR_ADB -> bundled beside the exe (adb.exe + AdbWinApi.dll + AdbWinUsbApi.dll, or a
     // platform-tools/ folder next to the renderer) -> the usual SDK path -> "adb" on PATH. Bundling those 3 files
@@ -7153,12 +8941,16 @@ struct Editor {
         std::vector<std::string> apks = havenBackupApks();
         if (apks.empty()) { setStatus("No Haven 2025 backup found in "+havenBackupDir()+" - nothing to restore (a backup is made automatically the first time you install a spoof)."); return; }
         std::string log; bool ok = installHavenBackup(ADB, sel, apks, log);
+        std::string calmingRestore;
+        const bool calmingOk=!ok||restoreDormantCalming(ADB,sel,calmingRestore);
         // restore has NO environment_selected IPC to piggyback on — the restart IS how the restored
         // original shows up — so honor only an explicit "Never" here.
         if (ok && shellRestart != 2) relaunchShell(ADB, sel);
         std::string first = log.substr(0, log.find_first_of("\r\n"));
-        setStatus(ok ? ("Restored the ORIGINAL Haven 2025 ("+std::to_string(apks.size())+" apk"+std::string(apks.size()>1?"s":"")+") + relaunched shell.")
+        setStatus(ok ? ("Restored the ORIGINAL Haven 2025 ("+std::to_string(apks.size())+" apk"+std::string(apks.size()>1?"s":"")+") + relaunched shell."+
+                        (!calmingRestore.empty()?(" "+calmingRestore+"."):""))
                      : ("Restore FAILED: "+(first.empty()?std::string("is the headset connected? (adb devices)"):first)+"  Backup kept in "+havenBackupDir()+"."));
+        if(!calmingOk)setStatus("Original Haven restored, but "+calmingRestore+".");
     }
     // Static CLI restore (no Editor instance / no serial) for `"Quest Home Editor" --restore-haven`.
     static int cliRestoreHaven() {
@@ -7196,16 +8988,523 @@ struct Editor {
     bool pkgInstalled(const std::string& ADB, const std::string& sel, const std::string& pkg) {
         return adbCapture(ADB, sel, "shell pm path "+pkg).find("package:") != std::string::npos;
     }
+    struct InstalledPackageVersion {
+        bool installed = false;
+        uint64_t code = 0;
+        std::string name;
+    };
+    InstalledPackageVersion installedPackageVersion(const std::string& ADB,
+                                                     const std::string& sel,
+                                                     const std::string& pkg) {
+        InstalledPackageVersion version;
+        const std::string d = adbCapture(ADB, sel, "shell dumpsys package "+pkg);
+        auto grab=[&](const char* key)->std::string {
+            size_t p=d.find(key); if(p==std::string::npos) return ""; p+=strlen(key);
+            std::string value;
+            while(p<d.size() && d[p]!=' ' && d[p]!='\r' && d[p]!='\n' && d[p]!='\t')
+                value.push_back(d[p++]);
+            return value;
+        };
+        const std::string code=grab("versionCode=");
+        version.name=grab("versionName=");
+        if(code.empty() && version.name.empty()) return version;
+        char* end=nullptr;
+        const unsigned long long parsed=strtoull(code.c_str(), &end, 10);
+        if(!code.empty() && end && !*end) version.code=parsed;
+        version.installed=true;
+        return version;
+    }
+    struct QuestHomeInventory {
+        InstalledPackageVersion haven, calming, focused, oceanarium, horror;
+    };
+    QuestHomeInventory questHomeInventory(const std::string& ADB, const std::string& sel) {
+        return {
+            installedPackageVersion(ADB, sel, HAVEN_PKG()),
+            installedPackageVersion(ADB, sel, "com.meta.shell.env.vista.calming"),
+            installedPackageVersion(ADB, sel, "com.meta.shell.env.vista.focused"),
+            installedPackageVersion(ADB, sel, "com.meta.shell.env.vista.oceanarium"),
+            installedPackageVersion(ADB, sel, "com.meta.shell.env.vista.horror")
+        };
+    }
+    std::string knownWrappedVistaConflict(const std::string& ADB,const std::string& sel) {
+        const QuestHomeInventory inventory=questHomeInventory(ADB,sel);
+        const std::pair<const char*,const InstalledPackageVersion*> slots[]={
+            {"com.meta.shell.env.vista.calming",&inventory.calming},
+            {"com.meta.shell.env.vista.focused",&inventory.focused},
+            {"com.meta.shell.env.vista.oceanarium",&inventory.oceanarium},
+            {"com.meta.shell.env.vista.horror",&inventory.horror}
+        };
+        namespace fs=std::filesystem;
+        const fs::path cooked=AppConfig::s_homeLibrary.empty()?fs::path("cooked"):
+                              fs::path(AppConfig::homeRel("cooked"));
+        std::error_code ec;
+        if(!fs::is_directory(cooked,ec)) return {};
+        for(const auto& file:fs::directory_iterator(cooked,ec)) {
+            if(ec||!file.is_regular_file(ec)||
+               file.path().filename().string().find(".apk.wrapper.txt")==std::string::npos)
+                continue;
+            if(file.file_size(ec)>64*1024) continue;
+            std::string report;
+            if(FILE* f=fopen(file.path().string().c_str(),"rb")) {
+                char b[1024];size_t n;
+                while((n=fread(b,1,sizeof b,f))>0)report.append(b,n);
+                fclose(f);
+            }
+            for(const auto& slot:slots) {
+                const auto& version=*slot.second;
+                if(!version.installed) continue;
+                const std::string identity=std::to_string(version.code)+" / "+version.name;
+                if(report.find(std::string("carrierPackage=")+slot.first)!=std::string::npos &&
+                   report.find("newVersion="+identity)!=std::string::npos)
+                    return slot.first;
+            }
+        }
+        return {};
+    }
+    static std::string normalHomeCalmingMarker() {
+        return AppConfig::homeRel("profiles/normal-home-calming-restore.txt");
+    }
+    std::string findKnownWrappedArtifact(const std::string& pkg,
+                                         const InstalledPackageVersion& version) {
+        namespace fs=std::filesystem;
+        std::vector<fs::path> roots={fs::path(AppConfig::homeRel("cooked"))};
+#ifdef _WIN32
+        if(const char* user=std::getenv("USERPROFILE"))
+            roots.emplace_back(fs::path(user)/"Downloads");
+#endif
+        const std::string identity=std::to_string(version.code)+" / "+version.name;
+        std::error_code ec;
+        for(const fs::path& root:roots) {
+            if(!fs::is_directory(root,ec)){ec.clear();continue;}
+            for(const auto& entry:fs::directory_iterator(root,ec)) {
+                if(ec)break;
+                const std::string name=entry.path().filename().string();
+                if(!entry.is_regular_file(ec) ||
+                   name.find(".apk.wrapper.txt")==std::string::npos ||
+                   entry.file_size(ec)>64*1024) continue;
+                std::ifstream report(entry.path(),std::ios::binary);
+                const std::string text((std::istreambuf_iterator<char>(report)),
+                                       std::istreambuf_iterator<char>());
+                if(text.find("carrierPackage="+pkg)==std::string::npos ||
+                   text.find("newVersion="+identity)==std::string::npos) continue;
+                std::string apk=entry.path().string();
+                apk.resize(apk.size()-strlen(".wrapper.txt"));
+                if(fileEx(apk)) return apk;
+            }
+            ec.clear();
+        }
+        return {};
+    }
+    bool installPackageArtifact(const std::string& ADB,const std::string& sel,
+                                const std::string& apk,const std::string& pkg) {
+        auto bs=[](std::string p){
+#ifdef _WIN32
+            for(char& c:p)if(c=='/')c='\\';
+#endif
+            return p;
+        };
+        hslcook::ApkManifestIdentity expected;
+        if(!hslcook::readApkManifestIdentity(hslcook::readFileBytes(apk),expected) ||
+           expected.packageName!=pkg) return false;
+        std::string result=adbCapture(ADB,sel,"install -r -d -g \""+bs(apk)+"\"");
+        if(result.find("Success")==std::string::npos &&
+           installsafety::mayRetryAfterUninstall(result)) {
+            runAdb(ADB,sel,"uninstall "+pkg);
+            result=adbCapture(ADB,sel,"install -d -g \""+bs(apk)+"\"");
+        }
+        if(result.find("Success")==std::string::npos) return false;
+        const auto installed=installedPackageVersion(ADB,sel,pkg);
+        return installed.installed &&
+               (!expected.versionCode||installed.code==expected.versionCode) &&
+               (expected.versionName.empty()||installed.name==expected.versionName);
+    }
+    bool restoreDormantCalming(const std::string& ADB,const std::string& sel,
+                               std::string& detail) {
+        const std::string marker=normalHomeCalmingMarker();
+        std::ifstream in(marker,std::ios::binary);
+        if(!in)return true;
+        std::string artifact((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+        while(!artifact.empty()&&(artifact.back()=='\r'||artifact.back()=='\n'))
+            artifact.pop_back();
+        if(artifact.empty()||!fileEx(artifact) ||
+           !installPackageArtifact(ADB,sel,artifact,
+                                    "com.meta.shell.env.vista.calming")) {
+            detail="saved custom Calming could not be restored from "+artifact;
+            return false;
+        }
+        std::remove(marker.c_str());
+        detail="custom Calming restored automatically";
+        return true;
+    }
+    bool stageOfficialCalmingForNormalHome(const std::string& ADB,
+                                           const std::string& sel,
+                                           std::string& detail) {
+        namespace fs=std::filesystem;
+        const std::string pkg="com.meta.shell.env.vista.calming";
+        const InstalledPackageVersion installed=installedPackageVersion(ADB,sel,pkg);
+        if(!installed.installed)return true;
+        const fs::path baseline=fs::path(AppConfig::homeRel("carriers"))/
+                                "Calming-official-baseline.apk";
+        if(!fileEx(baseline.string())||!reusableVistaCarrier(baseline.string())) {
+            detail="official Calming baseline is missing or invalid";
+            return false;
+        }
+        hslcook::ApkManifestIdentity official;
+        if(!hslcook::readApkManifestIdentity(
+                hslcook::readFileBytes(baseline.string()),official)) {
+            detail="official Calming baseline identity is unreadable";
+            return false;
+        }
+        if(installed.code==official.versionCode &&
+           (official.versionName.empty()||installed.name==official.versionName))
+            return true;
+        const std::string custom=findKnownWrappedArtifact(pkg,installed);
+        if(custom.empty()) {
+            detail="installed custom Calming has no matching preserved wrapper artifact";
+            return false;
+        }
+        std::error_code ec;
+        fs::create_directories(fs::path(normalHomeCalmingMarker()).parent_path(),ec);
+        const fs::path temporary=normalHomeCalmingMarker()+".tmp";
+        {std::ofstream out(temporary,std::ios::binary|std::ios::trunc);
+         if(!out){detail="could not create Calming restore transaction";return false;}
+         out<<custom<<"\n";}
+        fs::rename(temporary,normalHomeCalmingMarker(),ec);
+        if(ec){fs::remove(temporary,ec);detail="could not publish Calming restore transaction";return false;}
+        if(!installPackageArtifact(ADB,sel,baseline.string(),pkg)) {
+            const bool restored=installPackageArtifact(ADB,sel,custom,pkg);
+            if(restored)std::remove(normalHomeCalmingMarker().c_str());
+            detail=restored
+                ?"official Calming could not be staged; custom Calming was restored automatically"
+                :"official Calming staging failed and custom Calming could not be restored automatically from "+custom;
+            return false;
+        }
+        detail="custom Calming preserved and official Calming staged for standalone Haven";
+        return true;
+    }
+    bool connectedHeadsetNeedsV206Compatibility() {
+        if(!autoV206Compat) return false;
+        auto bs=[](std::string p){
+#ifdef _WIN32
+            for(char& c:p) if(c=='/') c='\\';
+#endif
+            return p;
+        };
+        const std::string ADB=bs(adbPath()), sel=adbSerial.empty()?"":(" -s "+adbSerial);
+        // Compatibility detection is read-only and must still work for
+        // HSR_NOINSTALL/offline validation cooks. deviceConnected() intentionally
+        // returns false in that mode to prohibit mutations, which previously also
+        // disabled v206 detection and produced a different, rejected Haven APK.
+        const std::string state=adbCapture(ADB,sel,"get-state");
+        if(state.find("device")==std::string::npos ||
+           state.find("error")!=std::string::npos ||
+           state.find("no devices")!=std::string::npos) return false;
+        constexpr uint64_t kFirstKnownV206HavenCode=974700779ull;
+        const InstalledPackageVersion haven=installedPackageVersion(ADB,sel,HAVEN_PKG());
+        if(haven.installed && haven.code>=kFirstKnownV206HavenCode) return true;
+        const InstalledPackageVersion shell=installedPackageVersion(ADB,sel,"com.oculus.vrshell");
+        const char* p=shell.name.c_str();
+        while(*p && !std::isdigit((unsigned char)*p)) ++p;
+        return *p && strtoul(p,nullptr,10)>=206ul;
+    }
+    static const char* loftTargetName(int target) {
+        static const char* names[5]={"Standard","Calming","Focused","Oceanarium","Horror"};
+        return names[std::clamp(target,0,4)];
+    }
+    static const char* loftTargetPackage(int target) {
+        static const char* packages[5]={"",
+            "com.meta.shell.env.vista.calming",
+            "com.meta.shell.env.vista.focused",
+            "com.meta.shell.env.vista.oceanarium",
+            "com.meta.shell.env.vista.horror"};
+        return packages[std::clamp(target,0,4)];
+    }
+    static bool reusableVistaCarrier(const std::string& path) {
+        FILE* f=fopen(path.c_str(),"rb"); if(!f)return false;
+        fseek(f,0,SEEK_END);const long n=ftell(f);fseek(f,0,SEEK_SET);
+        if(n<=0){fclose(f);return false;}
+        std::vector<uint8_t> apk((size_t)n);
+        const bool read=fread(apk.data(),1,apk.size(),f)==apk.size();fclose(f);
+        if(!read)return false;
+        std::vector<uint8_t> scene;
+        if(!hslcook::extractZipEntryBytes(apk,"assets/scene.zip",
+            hslcook::zipsafety::kSceneReadLimits.maxTotalUncompressedBytes,scene))return false;
+        std::vector<hslcook::CookFile> files;
+        if(!hslcook::readSceneArchiveFiles(scene,files))return false;
+        std::vector<uint8_t> patched;size_t spaces=0;
+        for(const auto& file:files){
+            const std::string& p=file.first;
+            if(p.rfind("content/meta/",0)!=0||p.size()<28||
+               p.compare(p.size()-25,25,"/space.hstf/template_9k0v")!=0)continue;
+            ++spaces;
+            if(!hslcook::makeVistaCarrierSpace(file.second,nullptr,patched))return false;
+        }
+        return spaces==1&&!patched.empty();
+    }
+    bool prepareInstalledVistaCarrier(const std::string& ADB,const std::string& sel,
+                                      int target,std::string& carrier,
+                                      InstalledPackageVersion& installed) {
+        namespace fs=std::filesystem;
+        const std::string pkg=loftTargetPackage(target);
+        installed=installedPackageVersion(ADB,sel,pkg);
+        if(!installed.installed) return false;
+        std::string paths=adbCapture(ADB,sel,"shell pm path "+pkg),devicePath;
+        size_t at=0;
+        while(at<paths.size()) {
+            size_t nl=paths.find('\n',at); std::string line=trimAdbValue(paths.substr(at,nl==std::string::npos?std::string::npos:nl-at));
+            at=nl==std::string::npos?paths.size():nl+1;
+            if(line.rfind("package:",0)!=0) continue;
+            std::string candidate=line.substr(8);
+            if(devicePath.empty() || candidate.find("base.apk")!=std::string::npos) devicePath=candidate;
+        }
+        if(devicePath.empty()) return false;
+        std::error_code ec; const fs::path dir=fs::path(AppConfig::homeRel("carriers"));
+        fs::create_directories(dir,ec); if(ec) return false;
+        const fs::path baseline=dir/(std::string(loftTargetName(target))+"-official-baseline.apk");
+        bool baselineReady=fileEx(baseline.string())&&reusableVistaCarrier(baseline.string());
+        // Recover a baseline created by an older release before pulling the
+        // currently installed slot. A previously wrapped Vista is intentionally
+        // pruned and is not a reusable official carrier.
+        if(!baselineReady) {
+            const std::string prefix=std::string(loftTargetName(target))+"-";
+            for(const auto& entry:fs::directory_iterator(dir,ec)){
+                if(ec)break;
+                const std::string name=entry.path().filename().string();
+                if(!entry.is_regular_file()||name.rfind(prefix,0)!=0||
+                   entry.path().extension()!=".apk"||!reusableVistaCarrier(entry.path().string()))continue;
+                fs::copy_file(entry.path(),baseline,fs::copy_options::overwrite_existing,ec);
+                if(!ec){baselineReady=true;break;}
+            }
+        }
+        std::string safeName=installed.name; for(char& c:safeName) if(!std::isalnum((unsigned char)c)&&c!='.'&&c!='-')c='_';
+        carrier=(dir/(std::string(loftTargetName(target))+"-"+std::to_string(installed.code)+"-"+safeName+".apk")).string();
+        auto bs=[](std::string p){
+#ifdef _WIN32
+            for(char& c:p) if(c=='/')c='\\';
+#endif
+            return p;
+        };
+        if(!fileEx(carrier)&&
+           (runAdb(ADB,sel,"pull \""+devicePath+"\" \""+bs(carrier)+"\"")!=0||!fileEx(carrier)))return false;
+        if(!reusableVistaCarrier(carrier)){
+            fprintf(stderr,"[VISTA] installed %s is already wrapped/pruned and cannot be reused as an official carrier; preserved backup: %s\n",
+                     loftTargetName(target),carrier.c_str());
+            if(baselineReady) { carrier=baseline.string(); return true; }
+            return false;
+        }
+        // The installed package is an official reusable carrier. Refresh the
+        // baseline from it so Meta updates are respected automatically.
+        fs::copy_file(carrier,baseline,fs::copy_options::overwrite_existing,ec);
+        if(ec||!reusableVistaCarrier(baseline.string()))return false;
+        carrier=baseline.string();
+        return true;
+    }
+    void restoreVistaSlot(int target) {
+        namespace fs=std::filesystem;
+        if(target<1||target>4) {
+            setStatus("Vista restore aborted: invalid slot.");
+            return;
+        }
+        if(!adbWorks(true)) {
+            setStatus("adb not found - open the Logcat tab (it auto-downloads adb), or Browse for it.");
+            return;
+        }
+        const std::string name=loftTargetName(target);
+        const std::string pkg=loftTargetPackage(target);
+        const fs::path baseline=fs::path(AppConfig::homeRel("carriers"))/
+                                (name+"-official-baseline.apk");
+        if(!fileEx(baseline.string())) {
+            setStatus("No preserved original "+name+" Vista baseline found. Cook to this slot once while its original Meta Vista is installed; the slot was left untouched.");
+            return;
+        }
+        hslcook::ApkManifestIdentity identity;
+        if(!reusableVistaCarrier(baseline.string())||
+           !hslcook::readApkManifestIdentity(hslcook::readFileBytes(baseline.string()),identity)||
+           identity.packageName!=pkg) {
+            setStatus("Original "+name+" Vista baseline failed validation; restore aborted and all backups were kept.");
+            return;
+        }
+        auto bs=[](std::string p){
+#ifdef _WIN32
+            for(char& c:p)if(c=='/')c='\\';
+#endif
+            return p;
+        };
+        const std::string ADB=bs(adbPath());
+        const std::string sel=adbSerial.empty()?"":(" -s "+adbSerial);
+        setStatus("Restoring original "+name+" Vista...");
+        if(!installPackageArtifact(ADB,sel,baseline.string(),pkg)) {
+            setStatus("Restore of original "+name+" Vista failed; the slot and preserved baseline were not deleted.");
+            return;
+        }
+        if(shellRestart!=2)relaunchShell(ADB,sel);
+        setStatus("Restored original "+name+" Vista and verified its package identity. Other Vista slots and all backups were left untouched.");
+    }
+    bool ensureOriginalHavenForVistaMode(const std::string& ADB,const std::string& sel,
+                                        std::string& detail) {
+        const auto backups=havenBackupApks();
+        if(backups.empty()) return true; // untouched Quest: Meta Haven remains authoritative
+        hslcook::ApkManifestIdentity original;
+        if(!hslcook::readApkManifestIdentity(hslcook::readFileBytes(backups.front()),original)) {
+            detail="the preserved Haven backup has no readable Android identity";
+            return false;
+        }
+        const InstalledPackageVersion installed=installedPackageVersion(ADB,sel,HAVEN_PKG());
+        if(installed.installed && installed.code==original.versionCode &&
+           (original.versionName.empty()||installed.name==original.versionName)) {
+            std::string calmingRestore;
+            if(!restoreDormantCalming(ADB,sel,calmingRestore)) {
+                detail=calmingRestore;
+                return false;
+            }
+            if(!calmingRestore.empty())detail=calmingRestore;
+            return true;
+        }
+        std::string log;
+        if(!installHavenBackup(ADB,sel,backups,log)) {
+            detail="original Haven 2025 could not be restored before Vista installation";
+            return false;
+        }
+        std::string calmingRestore;
+        if(!restoreDormantCalming(ADB,sel,calmingRestore)) {
+            detail="original Haven was restored, but "+calmingRestore;
+            return false;
+        }
+        detail="original Haven 2025 restored automatically for Vista mode";
+        if(!calmingRestore.empty())detail+="; "+calmingRestore;
+        return true;
+    }
+    bool wrapAndInstallLoftTargetFor(int target,const std::string& cookedSystemApk,
+                                     const std::function<void(float,const char*)>& progress,
+                                     std::string& summary) {
+        if(target<=0) return false;
+        if(!deviceConnected()) { summary="Loft target requires a connected Quest to read and back up the installed Vista carrier."; return false; }
+        auto bs=[](std::string p){
+#ifdef _WIN32
+            for(char& c:p) if(c=='/')c='\\';
+#endif
+            return p;
+        };
+        const std::string ADB=bs(adbPath()),sel=adbSerial.empty()?"":(" -s "+adbSerial);
+        std::string havenTransition;
+        if(!ensureOriginalHavenForVistaMode(ADB,sel,havenTransition)) {
+            summary="Vista install aborted safely: "+havenTransition+".";
+            return false;
+        }
+        std::string carrier; InstalledPackageVersion installed;
+        if(progress) progress(0.91f,"back up installed Vista carrier");
+        if(!prepareInstalledVistaCarrier(ADB,sel,target,carrier,installed)) {
+            summary=std::string("Could not pull/back up installed ")+loftTargetName(target)+" Vista; slot was left untouched.";
+            return false;
+        }
+        std::string output=cookedSystemApk;
+        if(size_t dot=output.rfind(".apk");dot!=std::string::npos) output.resize(dot);
+        output+="-"+std::string(loftTargetName(target))+"-Vista.apk";
+        const std::string exe=AppConfig::exePath();
+        std::string command;
+#ifdef _WIN32
+        command="\"\""+bs(exe)+"\" --v206-vista-wrapper-auto \""+bs(cookedSystemApk)+"\" \""+bs(carrier)+"\" \""+bs(output)+"\" "
+              +std::to_string(installed.code)+" \""+installed.name+"\"\"";
+#else
+        command="\""+exe+"\" --v206-vista-wrapper-auto \""+cookedSystemApk+"\" \""+carrier+"\" \""+output+"\" "
+              +std::to_string(installed.code)+" \""+installed.name+"\"";
+#endif
+        if(progress) progress(0.93f,"build v206 Vista wrapper");
+        if(system(command.c_str())!=0 || !fileEx(output)) {
+            summary=std::string("v206 ")+loftTargetName(target)+" wrapper failed; installed slot and carrier backup remain untouched.";
+            return false;
+        }
+        if(progress) progress(0.96f,"install wrapped Vista");
+        const bool ok=installToDevice(output,loftTargetPackage(target),progress,false,false);
+        const std::string installFailure=ok?std::string():statusSnapshot();
+        const bool restored=!ok &&
+            installToDevice(carrier,loftTargetPackage(target),progress,false,false);
+        summary=ok
+            ? std::string("installed wrapped Home in Loft ")+loftTargetName(target)+"; rollback carrier: "+carrier
+            : restored
+                ? installFailure+" Original "+loftTargetName(target)+" carrier restored automatically."
+                : installFailure+" Wrapped Vista rollback also failed; preserved carrier: "+carrier;
+        if(ok&&!havenTransition.empty()) summary+="; "+havenTransition;
+        return ok;
+    }
+    bool wrapAndInstallLoftTarget(const std::string& cookedSystemApk,
+                                  const std::function<void(float,const char*)>& progress,
+                                  std::string& summary) {
+        return wrapAndInstallLoftTargetFor(loftTarget,cookedSystemApk,progress,summary);
+    }
     // versionCode (+versionName) of an installed package, "" if not installed. Parses the FULL `dumpsys package`
     // in C++ (no on-device `| grep` — that pipe would run in Windows cmd, not the device shell).
     std::string pkgVersion(const std::string& ADB, const std::string& sel, const std::string& pkg) {
-        std::string d = adbCapture(ADB, sel, "shell dumpsys package "+pkg);
-        if (d.find("versionCode=")==std::string::npos && d.find("Unable to find")!=std::string::npos) return "";
-        auto grab=[&](const char* key)->std::string{ size_t p=d.find(key); if(p==std::string::npos) return ""; p+=strlen(key);
-            std::string v; while(p<d.size() && d[p]!=' '&&d[p]!='\r'&&d[p]!='\n'&&d[p]!='\t') v+=d[p++]; return v; };
-        std::string vc=grab("versionCode="), vn=grab("versionName=");
-        if (vc.empty() && vn.empty()) return "";
-        return vc.empty()? vn : (vc + (vn.empty()?"":(" / "+vn)));
+        const InstalledPackageVersion version=installedPackageVersion(ADB, sel, pkg);
+        if(!version.installed) return "";
+        const std::string code=version.code ? std::to_string(version.code) : "";
+        return code.empty()? version.name : (code + (version.name.empty()?"":(" / "+version.name)));
+    }
+    using QuestDisplayTarget=questdisplay::Target;
+    static std::string trimAdbValue(std::string value) {
+        while(!value.empty() && (value.back()=='\r'||value.back()=='\n'||value.back()==' '||value.back()=='\t')) value.pop_back();
+        size_t first=value.find_first_not_of(" \t\r\n");
+        return first==std::string::npos ? std::string() : value.substr(first);
+    }
+    static std::string lowerAscii(std::string value) {
+        for(char& c:value) c=(char)std::tolower((unsigned char)c);
+        return value;
+    }
+    QuestDisplayTarget detectQuestDisplayTarget(const std::string& ADB, const std::string& sel) {
+        auto prop=[&](const char* key){ return trimAdbValue(adbCapture(ADB,sel,std::string("shell getprop ")+key)); };
+        return questdisplay::classify({
+            prop("ro.product.manufacturer"),
+            prop("ro.product.model"),
+            prop("ro.product.device")
+        });
+    }
+    void refreshDisplayQualityInfo() {
+        std::string ADB=adbPath();
+#ifdef _WIN32
+        for(char& c:ADB) if(c=='/') c='\\';
+#endif
+        const std::string sel=adbSerial.empty()?"":(" -s "+adbSerial);
+        const QuestDisplayTarget target=detectQuestDisplayTarget(ADB,sel);
+        displayInfoDevice=target.name;
+        displayInfoTarget=target.recognized()
+            ? std::to_string(target.width)+"x"+std::to_string(target.height)
+            : std::string();
+        const std::string curW=trimAdbValue(adbCapture(ADB,sel,"shell getprop debug.oculus.textureWidth"));
+        const std::string curH=trimAdbValue(adbCapture(ADB,sel,"shell getprop debug.oculus.textureHeight"));
+        displayInfoCurrent=curW.empty()||curH.empty()?"system default":(curW+"x"+curH);
+        displayInfoScanned=true;
+    }
+    bool applyAutomaticDisplayQuality(const std::string& ADB, const std::string& sel,
+                                      const std::function<void(float,const char*)>& progress) {
+        if(!autoDisplayQuality && !manualDisplayQuality) return false;
+        QuestDisplayTarget target=detectQuestDisplayTarget(ADB,sel);
+        if(!manualDisplayQuality && !target.recognized()) {
+            setStatus("Display quality: device is not a recognized Quest; no display properties were changed.");
+            return false;
+        }
+        if(manualDisplayQuality)
+            target={questdisplay::Model::Unknown,"Manual expert target",manualDisplayWidth,manualDisplayHeight};
+        auto current=[&](const char* key){ return trimAdbValue(adbCapture(ADB,sel,std::string("shell getprop ")+key)); };
+        const std::string wantedW=std::to_string(target.width), wantedH=std::to_string(target.height);
+        if(current("debug.oculus.textureWidth")==wantedW && current("debug.oculus.textureHeight")==wantedH)
+            return false;
+        if(progress) progress(0.985f,"set automatic display quality");
+        runAdb(ADB,sel,"shell setprop debug.oculus.textureWidth "+wantedW);
+        runAdb(ADB,sel,"shell setprop debug.oculus.textureHeight "+wantedH);
+        const bool verified=current("debug.oculus.textureWidth")==wantedW
+                         && current("debug.oculus.textureHeight")==wantedH;
+        if(verified)
+            setStatus(std::string("Display quality: detected ")+target.name+" -> "+wantedW+"x"+wantedH+" per eye.");
+        else
+            setStatus(std::string("Display quality: ")+target.name+" detected, but Quest rejected the requested values.");
+        if(verified) {
+            displayInfoDevice=target.name;
+            displayInfoCurrent=wantedW+"x"+wantedH;
+            displayInfoTarget=displayInfoCurrent;
+            displayInfoScanned=true;
+        }
+        return verified;
     }
     bool installToDevice(const std::string& apkPath, const std::string& pkg, const std::function<void(float,const char*)>& progress, bool uninstallFirst=false, bool rooted=false) {
         auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
@@ -7214,6 +9513,60 @@ struct Editor {
 #endif
             return p; };
         std::string ADB=bs(adbPath()), AP=bs(apkPath), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
+        // A full no-root Haven is deliberately packaged as a standalone
+        // Environment (envIsFootprint=0). VrShell then resolves vista='' while
+        // it is active; installed custom Vista packages are dormant, not a
+        // conflict. Never replace them here. If this Haven later fails its load
+        // check, rollback restores Haven only and every custom Vista remains
+        // exactly as the user had it.
+        std::error_code sizeError;
+        const uint64_t apkBytes=std::filesystem::file_size(apkPath,sizeError);
+        if(sizeError || apkBytes==0) {
+            setStatus("Install ABORTED: the APK is missing or empty. Rebuild it before changing the Quest.");
+            return false;
+        }
+        const uint64_t freeBytes=installsafety::parseDfAvailableBytes(
+            adbCapture(ADB,sel,"shell df -k /data/local/tmp"));
+        if(!installsafety::hasEnoughSpace(freeBytes,apkBytes)) {
+            const uint64_t need=installsafety::requiredFreeBytes(apkBytes)/(1024ull*1024ull);
+            const uint64_t free=freeBytes/(1024ull*1024ull);
+            setStatus("Install ABORTED before replacement: Quest storage has "+
+                      std::to_string(free)+" MiB free; at least "+
+                      std::to_string(need)+" MiB is required. Free space and retry.");
+            return false;
+        }
+        const std::vector<uint8_t> installApk=hslcook::readFileBytes(apkPath);
+        hslcook::ApkManifestIdentity expectedIdentity;
+        const bool haveExpectedIdentity=hslcook::readApkManifestIdentity(
+            installApk,expectedIdentity);
+        if(haveExpectedIdentity && expectedIdentity.packageName!=pkg) {
+            setStatus("Install ABORTED: APK package "+expectedIdentity.packageName+
+                      " does not match destination "+pkg+". Nothing on the Quest was changed.");
+            return false;
+        }
+        const bool developmentOverride =
+            std::getenv("HSR_ALLOW_UNPROVEN_V206_HAVEN") != nullptr;
+        const bool replacingStandaloneHaven=uninstallFirst && pkg==HAVEN_PKG();
+        const bool provenCarrierValidated=replacingStandaloneHaven &&
+            hslcook::validateProvenCombinedHavenCarrier(installApk);
+        const auto standaloneDecision=installsafety::standaloneHavenDecision(
+            replacingStandaloneHaven,
+            connectedHeadsetNeedsV206Compatibility(),
+            provenCarrierValidated);
+        if(standaloneDecision ==
+           installsafety::StandaloneHavenDecision::BlockInvalidV206Carrier) {
+            setStatus("Install BLOCKED safely: the VrShell 206 standalone-Haven APK failed its "
+                      "runtime + combined-manifest carrier validation. Original Haven and every "
+                      "custom Vista were left unchanged.");
+            return false;
+        }
+        std::string calmingTransition;
+        if(uninstallFirst && pkg==HAVEN_PKG() &&
+           !restoreDormantCalming(ADB,sel,calmingTransition)) {
+            setStatus("Install ABORTED before changing Haven: "+calmingTransition+
+                      ". Custom Vistas were left untouched.");
+            return false;
+        }
         if (progress) progress(0.95f, "adb install");
         if (uninstallFirst) {
             // The spoof is signed with OUR cert, not Meta's -> an in-place update over ANY existing (differently-signed)
@@ -7232,11 +9585,56 @@ struct Editor {
         bool ok = ilog.find("Success") != std::string::npos;
         if (!ok && uninstallFirst) {   // report the ACTUAL adb reason so the user knows why THIS unit failed
             std::string first = ilog.substr(0, ilog.find_first_of("\r\n"));
-            setStatus("Install FAILED on this unit: " + (first.empty()?std::string("(no adb output — device/storage?)"):first));
+            std::string restoreLog;
+            const auto backups=havenBackupApks();
+            const bool restored=!backups.empty() &&
+                                installHavenBackup(ADB,sel,backups,restoreLog);
+            std::string calmingRestore;
+            const bool calmingRestored=restoreDormantCalming(ADB,sel,calmingRestore);
+            setStatus("Install FAILED on this unit: " +
+                      (first.empty()?std::string("(no adb output — device/storage?)"):first) +
+                      (restored?" Original Haven 2025 was restored automatically.":
+                       " The preserved Haven backup is available from Maintenance > Restore.")+
+                      (calmingRestored&& !calmingRestore.empty()
+                           ?" "+calmingRestore+".":""));
             return false;
         }
-        if (!ok && !uninstallFirst){ runAdb(ADB, sel, "uninstall "+pkg); ok = adbCapture(ADB, sel, "install -g \""+AP+"\"").find("Success")!=std::string::npos; }   // own-package sig/version clash fallback
-        if (!ok) return false;
+        if (!ok && !uninstallFirst &&
+            installsafety::mayRetryAfterUninstall(ilog)) {
+            runAdb(ADB, sel, "uninstall "+pkg);
+            const std::string retryLog=adbCapture(
+                ADB, sel, "install -g \""+AP+"\"");
+            ok=retryLog.find("Success")!=std::string::npos;
+            if(!ok) ilog=retryLog;
+        }
+        if (!ok) {
+            const std::string first=ilog.substr(0,ilog.find_first_of("\r\n"));
+            setStatus("Install FAILED without replacing Haven: "+
+                      (first.empty()?std::string("(no adb output — device/storage?)"):first)+
+                      ". The destination package remains recoverable.");
+            return false;
+        }
+        const InstalledPackageVersion installed=installedPackageVersion(ADB,sel,pkg);
+        const bool identityVerified=installed.installed &&
+            (!haveExpectedIdentity ||
+             ((expectedIdentity.versionCode==0 ||
+               installed.code==expectedIdentity.versionCode) &&
+              (expectedIdentity.versionName.empty() ||
+               installed.name==expectedIdentity.versionName)));
+        if(!identityVerified) {
+            std::string restoreLog;
+            const auto backups=uninstallFirst?havenBackupApks():std::vector<std::string>{};
+            const bool restored=!backups.empty() &&
+                                installHavenBackup(ADB,sel,backups,restoreLog);
+            std::string calmingRestore;
+            const bool calmingRestored=restoreDormantCalming(ADB,sel,calmingRestore);
+            setStatus("Install verification FAILED: Android did not report the expected package version."+
+                      std::string(restored?" Original Haven 2025 was restored automatically.":
+                                           " The installed state was left visible for Expert recovery.")+
+                      (calmingRestored&& !calmingRestore.empty()
+                           ?" "+calmingRestore+".":""));
+            return false;
+        }
         if (progress) progress(0.98f, "select env");
         // Set the home to this package. DEVICE-PROVEN reality: the shell reads environment_selected from the ROOT-ONLY
         // oculuspreferences prefs DB — `settings put secure environment_selected` writes a SEPARATE copy the shell
@@ -7245,13 +9643,39 @@ struct Editor {
         // the already-selected haven2025 (the shell loads that package = our content), so no pref write is needed —
         // the port shows wherever Haven 2025 does. (Rooted own-package installs DO select via su below.)
         runAdb(ADB, sel, "shell su -c \"oculuspreferences --setc environment_selected apk://"+pkg+"/assets/scene.zip\"");   // rooted only
+        const bool displayQualityChanged=applyAutomaticDisplayQuality(ADB,sel,progress);
         // Shell restart is an OPTION (Auto=only unrooted / Always / Never). UNROOTED needs it (nothing else reloads the
         // replaced haven2025); the reload is `am force-stop` (kill is denied to uid 2000) — see relaunchShell.
-        if (shellRestart==1 || (shellRestart==0 && !rooted)) {
+        if (shellRestart==1 || (shellRestart==0 && (!rooted || displayQualityChanged))) {
             if (progress) progress(0.99f, loadDiag ? "relaunch + diagnose load" : "relaunch shell");
             if (loadDiag) { runAdb(ADB, sel, "shell setprop debug.logLevel Verbose"); runAdb(ADB, sel, "logcat -c"); }   // raise verbosity + clear (no root)
             relaunchShell(ADB, sel);
-            if (loadDiag) setStatus(captureEnvDiagnostics(ADB, sel, pkg, apkPath+".loaddiag.txt"));   // NO-ROOT: read WHY it loaded/rejected
+            if (loadDiag) {
+                const std::string diagnosis=captureEnvDiagnostics(
+                    ADB,sel,pkg,apkPath+".loaddiag.txt");
+                if(uninstallFirst &&
+                   runtimehealth::mustRollbackStandaloneHaven(
+                       diagnosis,developmentOverride || provenCarrierValidated)) {
+                    std::string restoreLog;
+                    const auto backups=havenBackupApks();
+                    const bool restored=!backups.empty() &&
+                                        installHavenBackup(ADB,sel,backups,restoreLog);
+                    if(restored) {
+                        std::remove(cookSigPath().c_str());
+                        relaunchShell(ADB,sel);
+                    }
+                    std::string calmingRestore;
+                    const bool calmingRestored=restoreDormantCalming(ADB,sel,calmingRestore);
+                    setStatus("Installed Home did not produce positive VrShell render evidence: "+diagnosis+
+                               (restored
+                                   ?" Original Haven was restored automatically and the unverified cook cache was invalidated."
+                                   :" Automatic Haven rollback failed; use Maintenance > Restore.")+
+                              (calmingRestored&& !calmingRestore.empty()
+                                   ?" "+calmingRestore+".":""));
+                    return false;
+                }
+                setStatus(diagnosis);
+            }   // NO-ROOT: read WHY it loaded/rejected
         }
         return true;
     }
@@ -7274,28 +9698,32 @@ struct Editor {
         if (!pid.empty()) runAdb(ADB, sel, "shell su -c \"kill "+pid+"\"");   // rooted (best-effort, cleaner)
         runAdb(ADB, sel, "shell am force-stop com.oculus.vrshell");           // universal no-root reload
     }
-    // Wipe com.oculus.vrshell's app data (`pm clear`) and relaunch the home, for a home stuck on stale/corrupted
-    // state after env experiments. Tries the plain shell-uid clear first; if the build denies it, retries via su
-    // (rooted headsets). Installed env APKs are untouched — only vrshell's saved data/caches go.
+    // Upstream v0.10.21 recovery path: wipe VrShell's persisted state and caches, then relaunch it. Installed
+    // environment APKs remain untouched. The UI always gates this through drawClearVrShellConfirm().
     void clearVrShellData() {
-        auto bs=[](std::string p){   // cmd.exe needs backslashes; POSIX shells need the '/' path UNTOUCHED
+        auto bs=[](std::string p){
 #ifdef _WIN32
-            for(char&c:p) if(c=='/')c='\\';
+            for(char& c:p) if(c=='/') c='\\';
 #endif
-            return p; };
-        std::string ADB=bs(adbPath()), sel = adbSerial.empty()? "" : (" -s "+adbSerial);
-        if (!deviceConnected()) { setStatus("Clear VrShell data: NO device connected - plug in USB or use Wi-Fi Connect first."); return; }
-        std::string out = adbCapture(ADB, sel, "shell pm clear com.oculus.vrshell");
-        bool ok = out.find("Success")!=std::string::npos;
-        if (!ok) {   // shell uid denied (some builds) -> rooted fallback
-            out = adbCapture(ADB, sel, "shell su -c \"pm clear com.oculus.vrshell\"");
-            ok = out.find("Success")!=std::string::npos;
+            return p;
+        };
+        const std::string ADB=bs(adbPath()), sel=adbSerial.empty()?"":(" -s "+adbSerial);
+        if(!deviceConnected()) {
+            setStatus("Clear VrShell data: no device connected - connect a Quest first.");
+            return;
         }
-        if (ok) relaunchShell(ADB, sel);   // bring the home back up fresh right away
-        std::string first = out.substr(0, out.find_first_of("\r\n"));
-        setStatus(ok ? "VrShell app data CLEARED + home relaunched - it restarts with factory-fresh state."
-                     : "Clear VrShell data FAILED (device said: "+(first.empty()?std::string("no output"):first)+").");
+        std::string out=adbCapture(ADB,sel,"shell pm clear com.oculus.vrshell");
+        bool ok=out.find("Success")!=std::string::npos;
+        if(!ok) {
+            out=adbCapture(ADB,sel,"shell su -c \"pm clear com.oculus.vrshell\"");
+            ok=out.find("Success")!=std::string::npos;
+        }
+        if(ok) relaunchShell(ADB,sel);
+        const std::string first=out.substr(0,out.find_first_of("\r\n"));
+        setStatus(ok ? "VrShell app data cleared and Quest Home relaunched with fresh state."
+                     : "Clear VrShell data failed (device said: "+(first.empty()?std::string("no output"):first)+").");
     }
+
     // ── env-reject REASON classifier (shared by the live diag + the exported report) ────────────────────────────
     // Pull the ONE line that actually explains a nuxd fallback. Two hard-won rules from device logs:
     //   • SKIP benign lines: "unable to open package .../streamables.zip" is an OPTIONAL asset absent even from
@@ -7821,16 +10249,145 @@ struct Editor {
         setStatus("Blender import is Windows-only for now");
 #endif
     }
-    void startCook() {
+    void applyCookQualityEnvironment(const hslcook::CookQualityOptions& quality) {
+        char fps[32], cap[32], rot[32];
+        snprintf(fps,sizeof fps,"%.3f",quality.animationFps);
+        snprintf(rot,sizeof rot,"%d",quality.rotationKeyLimit);
+        setenv_("HSR_HZFPS",fps);
+        setenv_("HSR_ROTKEYS",rot);
+        if(quality.animationFrameCap>0){ snprintf(cap,sizeof cap,"%d",quality.animationFrameCap); setenv_("HSR_HZMAXFRAMES",cap); }
+        else setenv_("HSR_HZMAXFRAMES","");
+    }
+    void ensureAutomaticNavigationForCook() {
+        if(!autoNavigation || !r) return;
+        // Generated navigation is tool-owned and can be rebuilt safely while
+        // preserving every manually authored collider. Do this at cook time as
+        // well as through the UI prompt: a stale session must not silently
+        // retain a floor selected by an older ranking algorithm.
+        if(automaticNavigationGenerated &&
+           loadedNavigationGeneratorVersion>0 &&
+           loadedNavigationGeneratorVersion<kNavigationGeneratorVersion) {
+            fprintf(stderr,
+                    "[AUTONAV] upgrading generated navigation v%d -> v%d before cook; manual colliders are preserved\n",
+                    loadedNavigationGeneratorVersion,kNavigationGeneratorVersion);
+            rebuildGeneratedWalkSurface();
+        }
+        if(std::any_of(items.begin(),items.end(),[](const sitem::Item& item){
+            return item.type==sitem::NAVMESH;
+        })) return;
+        addNavmesh(1);
+        automaticNavigationGenerated=true;
+        loadedNavigationGeneratorVersion=kNavigationGeneratorVersion;
+        collisionReviewSuggested=false;
+        if(!expertMode) {
+            // addNavmesh() selects its new technical item and opens Object for
+            // manual editing. Automatic Standard cooks must remain on the
+            // guided Cook page and keep generated collision helpers invisible.
+            selItem=-1; selItems.clear(); tab=TAB_COOK; propScroll=0.f;
+            showType[sitem::NAVMESH]=false;
+            showType[sitem::BOXCOL]=false;
+        }
+        // Do not materialize a Spawn item from generated navmesh coordinates.
+        // The scene cooker already derives the correct source-space anchor.
+        // Converting the generated/local nav anchor into a root-child Spawn
+        // mixed coordinate frames in large legacy Homes (Winterlodge placed
+        // the player inside the mountain/sky scenery). Authored Spawn items
+        // remain exact; raw Homes use the same proven automatic anchor as the
+        // official AstroBoy cook.
+        fprintf(stderr,"[AUTONAV] raw Home had no navigation: generated Smart Navmesh + structural collider set; cooker retains the source-space automatic spawn\n");
+    }
+    void ensureAutomaticFarClipGroupsForCook() {
+        if(!autoFarClipFix || !r || !sceneMeshes) return;
+        float eye[3]={0.f,1.6f,0.f};
+        for(const auto& item:items) if(item.type==sitem::SPAWN&&item.allowStart&&item.isLocal) {
+            eye[0]=item.pos[0];eye[1]=item.pos[1]+1.6f;eye[2]=item.pos[2];break;
+        }
+        std::set<int> collisionSources;
+        for(const auto& item:items) if(item.type==sitem::NAVMESH)
+            collisionSources.insert(item.srcMeshes.begin(),item.srcMeshes.end());
+        const int group=nextBackdropFitGroup++;
+        size_t marked=0;
+        const size_t count=std::min(sceneMeshes->size(),r->gpuMeshes.size());
+        for(size_t mi=0;mi<count;++mi) {
+            if(backdropFitGroups.count((int)mi)||collisionSources.count((int)mi)||r->gpuMeshes[mi].dynamicVerts)continue;
+            const auto& pos=(*sceneMeshes)[mi].positions; if(pos.size()<9)continue;
+            double sx=0,sy=0,sz=0;float minD2=std::numeric_limits<float>::max(),maxD2=0.f;size_t points=0;
+            for(size_t v=0;v+2<pos.size();v+=3) {
+                float p[3],w[3];p[0]=pos[v];p[1]=pos[v+1];p[2]=pos[v+2];xformPoint(r->gpuMeshes[mi].model,p,w);
+                const float dx=w[0]-eye[0],dy=w[1]-eye[1],dz=w[2]-eye[2],d2=dx*dx+dy*dy+dz*dz;
+                minD2=std::min(minD2,d2);maxD2=std::max(maxD2,d2);sx+=w[0];sy+=w[1];sz+=w[2];++points;
+            }
+            // With the automatic 150km far plane, ordinary Meta backdrops at
+            // 5-15km are already safe and must retain their authored transform.
+            // Fitting those meshes to the old 3km workaround split compound
+            // skyline and displaced its signs. Normalize only pathological
+            // coordinates near the configured far plane.
+            const float transformThreshold=std::max(20000.f,cfgFar*0.80f);
+            if(!points)continue;
+            const float cx=(float)(sx/points)-eye[0],cy=(float)(sy/points)-eye[1],cz=(float)(sz/points)-eye[2];
+            std::string name=r->gpuMeshes[mi].name;for(char& c:name)c=(char)std::tolower((unsigned char)c);
+            const bool named=name.find("sky")!=std::string::npos||name.find("vista")!=std::string::npos||
+                             name.find("backdrop")!=std::string::npos||name.find("dome")!=std::string::npos||
+                             name.find("horizon")!=std::string::npos;
+            if(std::getenv("HSR_VERBOSE")&&maxD2>1000.f*1000.f)
+                fprintf(stderr,"[AUTO_FARCLIP] candidate %zu '%s' min=%.1fm max=%.1fm center=%.1fm named=%d\n",
+                        mi,r->gpuMeshes[mi].name.c_str(),std::sqrt(minD2),std::sqrt(maxD2),
+                        std::sqrt(cx*cx+cy*cy+cz*cz),named?1:0);
+            if(maxD2<=transformThreshold*transformThreshold)continue;
+            if(minD2<=1000.f*1000.f&&cx*cx+cy*cy+cz*cz<=1500.f*1500.f&&!named)continue;
+            backdropFitGroups[(int)mi]=group;++marked;
+            fprintf(stderr,"[AUTO_FARCLIP] normalize mesh %zu '%s' maxDistance=%.1fm threshold=%.1fm group=%d\n",
+                    mi,r->gpuMeshes[mi].name.c_str(),std::sqrt(maxD2),transformThreshold,group);
+        }
+        if(!marked)--nextBackdropFitGroup;
+        fprintf(stderr,"[AUTO_FARCLIP] editor analysis marked %zu static far mesh(es); persisted for every cooker backend\n",marked);
+    }
+    void startCook(bool forceRebuild=false) {
         if (cooking.load()) return;
+        if (blockUnsupportedNormalHomeInstall()) return;
+        ensureAutomaticNavigationForCook();
+        ensureAutomaticFarClipGroupsForCook();
+        // Normal COOK is incremental. This is the fastest repeat path and is
+        // independent of the texture cache: if scene, profile, source and all
+        // build settings match the signed outputs, there is nothing to rebuild.
+        if (!forceRebuild) {
+            saveProject();
+            bool haveSystem=false, haveSpoof=false;
+            if (cookState(haveSystem,haveSpoof)==0) {
+                if (installAfterCook) installOnly();
+                else setStatus("Cook is already current - reused the existing signed APKs (no recook needed).");
+                return;
+            }
+        }
         // PRE-COOK GUARD: no collision at all -> the port has no floor, the player falls forever. Warn (once) and let
         // the user place a Navmesh/Box collider or turn on Auto-floor. "Cook anyway" (modal) bypasses via startCookNow().
-        if (!envHasCollision()) { cookWarnOpen = true; return; }
-        startCookNow();
+        if (!envHasCollision()) { cookWarnForceRebuild=forceRebuild; cookWarnOpen = true; return; }
+        startCookNow(forceRebuild);
     }
-    void startCookNow() {
+    void startCookNow(bool forceRebuild=false) {
+        (void)forceRebuild; // state was resolved by startCook; retained for the warning-modal handoff
         if (cooking.load()) return;
+        const hslcook::CookQualityOptions quality=hslcook::cookQualityOptions(cookQuality);
+        applyCookQualityEnvironment(quality);
         saveProject();   // AUTO-SAVE the session on cook — the user's edits (transforms/renames/hides/spawn points/colliders/skybox marks + cook config) are persisted to <env>.hsledit BEFORE cooking, so a cook never silently loses unsaved edits (they're already baked into the APK via the live state; this just keeps the on-disk session in sync).
+#if defined(_WIN32) && !defined(HSR_HAVE_PHYSX)
+        // Exact structure collision is cooked by the official PhysX backend.
+        // Decide before constructing the expensive, immediately-discarded
+        // export snapshot (textures, animation clips, transformed geometry).
+        if(needsOfficialPhysxDelegate()){
+            if(cookThread.joinable()) cookThread.join();
+            pendingCookSig=cookSignatureHex();
+            cooking.store(true); cookProg.store(0.f);
+            // A Vista wrapper consumes the own-package Rooted/System APK only.
+            // Building and signing a Haven no-root spoof here is pure duplicate
+            // work and can trigger a second full v206 scene cook.
+            const bool produceNoRoot=spoofHaven && loftTarget==0;
+            cookThread=std::thread([this,pkg=cookPkg,spoof=produceNoRoot]{
+                runOfficialPhysxDelegatedCook(pkg,spoof,false);
+            });
+            return;
+        }
+#endif
         // BEFORE buildExportMeshes: the anim-extractor lambda gates the fog/river RIGID-HZANIM+UV path on
         // HSR_HZANIM — runCook's setenv came AFTER extraction, so the gate was ALWAYS false on the first cook
         // of a session (river waterCards fell to the seam-smearing getTime TRANSLATE = the torn river).
@@ -7841,25 +10398,66 @@ struct Editor {
         pendingCookSig = cookSignatureHex();   // snapshot the up-to-date signature (UI thread) — runCook writes it on success
         cooking.store(true); cookProg.store(0.f);
         std::vector<sitem::Item> its=items; bakeNavmeshes(its);
-        cookThread = std::thread([this, ems=std::move(ems), pkg=cookPkg, sign=autoSign, spoof=spoofHaven, its=std::move(its)]() mutable {
-            runCook(std::move(ems), pkg, sign, spoof, false, std::move(its));
+        const bool produceNoRoot=spoofHaven && loftTarget==0;
+        cookThread = std::thread([this, ems=std::move(ems), pkg=cookPkg, sign=autoSign, spoof=produceNoRoot, its=std::move(its), quality]() mutable {
+            runCook(std::move(ems), pkg, sign, spoof, false, std::move(its), quality);
         });
     }
     // headless / CLI entry (replaces HSR_EXPORT path): synchronous, with a terminal progress bar.
-    void exportAPKSync() {
+    bool exportAPKSync() {
+        // Automation/test equivalent of the Cook-target selector. Keeping this
+        // in the front-end also guarantees that Vista cooks skip the redundant
+        // Haven spoof before a delegated PhysX backend is launched.
+        if (const char* requestedTarget=std::getenv("HSR_LOFT_TARGET")) {
+            std::string target=requestedTarget;
+            std::transform(target.begin(),target.end(),target.begin(),
+                           [](unsigned char c){return (char)std::tolower(c);});
+            if(target=="0"||target=="standard"||target=="haven") loftTarget=0;
+            else if(target=="1"||target=="calming") loftTarget=1;
+            else if(target=="2"||target=="focused") loftTarget=2;
+            else if(target=="3"||target=="oceanarium") loftTarget=3;
+            else if(target=="4"||target=="horror") loftTarget=4;
+            else fprintf(stderr,"[COOK] unknown HSR_LOFT_TARGET '%s'; using %s\n",
+                         requestedTarget,loftTargetName(loftTarget));
+        }
+        if (const char* requested = std::getenv("HSR_COOK_PROFILE")) {
+            hslcook::CookQualityProfile parsed;
+            if (hslcook::tryParseCookQuality(requested, parsed)) cookQuality = parsed;
+            else fprintf(stderr, "[COOK] unknown HSR_COOK_PROFILE '%s'; using %.*s\n", requested,
+                         (int)hslcook::cookQualityId(cookQuality).size(), hslcook::cookQualityId(cookQuality).data());
+        }
         if (std::getenv("HSR_NOHZ")) animSkinned=false;   // diag: cook with skinned anim OFF (isolate the HZANIM crash)
         if (std::getenv("HSR_NOAUDIO")) cookAudio=false;  // headless/CLI: cook a silent home (no background audio loop)
         if (std::getenv("HSR_NOINSTALL")) installAfterCook=false;   // batch/CLI: cook the APK files only, don't touch the device
+        if (std::getenv("HSR_NOSPOOF")) spoofHaven=false;           // root/Vista-only automation: skip duplicate Haven output
         if (std::getenv("HSR_NOAUTOFLOOR")) cookAutoFloor=false;   // headless/CLI: honor the no-generated-collision flag (runCook re-derives the env var from this)
         if (std::getenv("HSR_NOBOUNDSOVERRIDE")) antiCull=false;    // headless/CLI: honor "Anti-cull bounds" OFF (runCook re-derives it from antiCull, else the member default clobbers the env var)
         if (std::getenv("HSR_NOCULL")) noCull=true;                 // explicit legacy escape hatch for old Homes
         if (std::getenv("HSR_CULL")) noCull=false;                  // legacy spelling: force tight VrShell-206 bounds
-        if (std::getenv("HSR_V206_HAVEN_COMPAT")) v206HavenCompat=true; // opt-in only; default remains unchanged
+        if (blockUnsupportedNormalHomeInstall()) {
+            lastCookOk.store(false);
+            return false;
+        }
+        ensureAutomaticNavigationForCook();
+        ensureAutomaticFarClipGroupsForCook();
+        const hslcook::CookQualityOptions quality=hslcook::cookQualityOptions(cookQuality);
+        applyCookQualityEnvironment(quality);
+#if defined(_WIN32) && !defined(HSR_HAVE_PHYSX)
+        if(needsOfficialPhysxDelegate()){
+            pendingCookSig=cookSignatureHex();
+            cooking.store(true); cookProg.store(0.f);
+            const bool produceNoRoot=spoofHaven && loftTarget==0;
+            runOfficialPhysxDelegatedCook(cookPkg,produceNoRoot,true);
+            return lastCookOk.load();
+        }
+#endif
         setenv_("HSR_HZANIM", animSkinned ? "1" : "");   // BEFORE buildExportMeshes (same as startCook): the extractor's RIGID+UV gates read it
         auto ems = buildExportMeshes();
         std::vector<sitem::Item> its=items; bakeNavmeshes(its);
         pendingCookSig = cookSignatureHex();   // record for "Install only" change-detection
-        cooking.store(true); runCook(std::move(ems), cookPkg, autoSign, spoofHaven, true, std::move(its));
+        const bool produceNoRoot=spoofHaven && loftTarget==0;
+        cooking.store(true); runCook(std::move(ems), cookPkg, autoSign, produceNoRoot, true, std::move(its), quality);
+        return lastCookOk.load();
     }
     // The meshes a navmesh draws from: its explicit selection, else the whole walkable scene (non-backdrop, visible).
     std::vector<int> navSourceMeshes(const sitem::Item& si){
@@ -7911,6 +10509,16 @@ struct Editor {
         // down-/side-facing faces — so a PATCH sheet (whose winding can point away from +Y) contributed NO
         // collision ("patch not counted"). Exact colliders respect the mesh's own geometry/plane verbatim.
         bool exactCollider = isMeshColliderItem(si);
+        const bool smartObstacles = si.name.rfind("Collider (smart obstacles)",0)==0;
+        float walkFloorY=1e30f;
+        if (smartObstacles) {
+            for (const auto& walk : items) {
+                if (walk.type!=sitem::NAVMESH || isMeshColliderItem(walk)) continue;
+                for (size_t v=1;v<walk.navVerts.size();v+=3)
+                    if (std::isfinite(walk.navVerts[v])) walkFloorY=std::min(walkFloorY,walk.navVerts[v]);
+            }
+            if (!std::isfinite(walkFloorY)) walkFloorY=0.f;
+        }
         struct TB { float ax,ay,az, bx,by,bz, cx,cy,cz; };   // a walkable triangle (full verts, for height interpolation)
         std::vector<TB> tb; float mn[3]={1e30f,1e30f,1e30f}, mx[3]={-1e30f,-1e30f,-1e30f};
         for (int m:ms){ if(m<0||m>=(int)r->gpuMeshes.size())continue; auto& gm=r->gpuMeshes[m];
@@ -7937,6 +10545,31 @@ struct Editor {
                 if (exactCollider)  slopeMin = -2.0f;  // exact solid obstacle: keep ALL faces (unit ny/nl >= -1 > -2 always) incl. patches
                 if(const char* e=std::getenv("HSR_NAVSLOPE")){ float s=(float)atof(e); if(s>=0.0f) slopeMin=s; }
                 float nl=std::sqrt(nx*nx+ny*ny+nz*nz); if(nl<1e-9f || ny/nl < slopeMin) continue;   // signed -> floor + walls, drop ceilings
+                const float cy=(wa[1]+wb[1]+wc[1])/3.f;
+                // A scene-shell mesh often contains the floor, walls and roof
+                // in one object. The floor already belongs to the walk pass;
+                // duplicating its low horizontal faces in the obstacle pass
+                // creates closed collision shells and traps the player.
+                if (smartObstacles && std::fabs(ny)/nl>0.72f && cy<=walkFloorY+0.22f)
+                    continue;
+                if (const char* e=std::getenv("HSR_NAV_MIN_Y")) {
+                    const float v=(float)atof(e); if(std::isfinite(v)&&cy<v) continue;
+                }
+                if (const char* e=std::getenv("HSR_NAV_MAX_Y")) {
+                    const float v=(float)atof(e); if(std::isfinite(v)&&cy>v) continue;
+                }
+                if (const char* e=std::getenv("HSR_NAV_RADIUS")) {
+                    const float radius=(float)atof(e);
+                    const char* ex=std::getenv("HSR_NAV_CENTER_X");
+                    const char* ez=std::getenv("HSR_NAV_CENTER_Z");
+                    if (std::isfinite(radius) && radius>0.f && ex && ez) {
+                        const float cx=(float)atof(ex), cz=(float)atof(ez);
+                        const float tx=(wa[0]+wb[0]+wc[0])/3.f-cx;
+                        const float tz=(wa[2]+wb[2]+wc[2])/3.f-cz;
+                        if (std::isfinite(cx) && std::isfinite(cz) &&
+                            tx*tx+tz*tz > radius*radius) continue;
+                    }
+                }
                 tb.push_back(TB{wa[0],wa[1],wa[2], wb[0],wb[1],wb[2], wc[0],wc[1],wc[2]});
                 for (const float* w : {wa,wb,wc}){ mn[0]=std::min(mn[0],w[0]); mx[0]=std::max(mx[0],w[0]); mn[2]=std::min(mn[2],w[2]); mx[2]=std::max(mx[2],w[2]); } }
         }
@@ -7949,6 +10582,59 @@ struct Editor {
                 if(s>0.3f){up++; uyl=std::min(uyl,cy); uyh=std::max(uyh,cy);} else if(s<-0.3f){dn++; dyl=std::min(dyl,cy); dyh=std::max(dyh,cy);} else vt++; }
             fprintf(stderr,"[NAVDBG] navmesh tris: UP(floor)=%d Y[%.2f..%.2f]  DOWN(ceiling)=%d Y[%.2f..%.2f]  VERTICAL(wall)=%d  (total %zu)\n", up,uyl,uyh, dn,dyl,dyh, vt, tb.size());
         }
+        // Legacy multi-level Homes can contain hundreds of thousands of render
+        // triangles. Convert their walkable faces to a compact PhysX height
+        // mesh: one thin surface quad per occupied XZ cell, with holes retained.
+        // Unlike ColliderBox grids this introduces no tall invisible blocks and
+        // allows stairs/ramps to descend below the main floor.
+        if (std::getenv("HSR_NAVGRIDMESH")) {
+            float cell=0.75f;
+            if(const char* e=std::getenv("HSR_NAVGRIDCELL")){
+                const float v=(float)atof(e); if(std::isfinite(v)&&v>=0.25f) cell=v;
+            }
+            const int nx=std::max(1,(int)std::ceil((mx[0]-mn[0])/cell));
+            const int nz=std::max(1,(int)std::ceil((mx[2]-mn[2])/cell));
+            if ((uint64_t)nx*(uint64_t)nz <= 250000u) {
+                std::vector<float> height((size_t)nx*(size_t)nz,-1e30f);
+                for(const TB& t:tb){
+                    const float minx=std::min(t.ax,std::min(t.bx,t.cx));
+                    const float maxx=std::max(t.ax,std::max(t.bx,t.cx));
+                    const float minz=std::min(t.az,std::min(t.bz,t.cz));
+                    const float maxz=std::max(t.az,std::max(t.bz,t.cz));
+                    int x0=std::max(0,(int)std::floor((minx-mn[0])/cell));
+                    int x1=std::min(nx-1,(int)std::floor((maxx-mn[0])/cell));
+                    int z0=std::max(0,(int)std::floor((minz-mn[2])/cell));
+                    int z1=std::min(nz-1,(int)std::floor((maxz-mn[2])/cell));
+                    const float den=(t.bz-t.cz)*(t.ax-t.cx)+(t.cx-t.bx)*(t.az-t.cz);
+                    if(std::fabs(den)<1e-8f) continue;
+                    for(int z=z0;z<=z1;z++) for(int x=x0;x<=x1;x++){
+                        const float px=mn[0]+(x+0.5f)*cell, pz=mn[2]+(z+0.5f)*cell;
+                        const float u=((t.bz-t.cz)*(px-t.cx)+(t.cx-t.bx)*(pz-t.cz))/den;
+                        const float v=((t.cz-t.az)*(px-t.cx)+(t.ax-t.cx)*(pz-t.cz))/den;
+                        const float w=1.f-u-v;
+                        if(u < -0.02f || v < -0.02f || w < -0.02f) continue;
+                        const float y=u*t.ay+v*t.by+w*t.cy;
+                        float& h=height[(size_t)z*(size_t)nx+(size_t)x];
+                        if(y>h) h=y;
+                    }
+                }
+                size_t cells=0;
+                for(int z=0;z<nz;z++) for(int x=0;x<nx;x++){
+                    const float y=height[(size_t)z*(size_t)nx+(size_t)x];
+                    if(y < -1e29f) continue;
+                    const float x0=mn[0]+x*cell, x1=x0+cell;
+                    const float z0=mn[2]+z*cell, z1=z0+cell;
+                    const uint32_t b=(uint32_t)(si.navVerts.size()/3);
+                    const float q[12]={x0,y,z0, x1,y,z0, x1,y,z1, x0,y,z1};
+                    for(float f:q) si.navVerts.push_back(f);
+                    si.navIdx.insert(si.navIdx.end(),{b,b+2,b+1,b,b+3,b+2});
+                    ++cells;
+                }
+                fprintf(stderr,"[NAV] PhysX height mesh: %zu cells, %zu tris, %.2fm grid\n",
+                        cells,si.navIdx.size()/3,cell);
+                return;
+            }
+        }
         // REUSE the actual walkable triangles (NO rebuilt grid) -> the cook makes one TILTED collision box per triangle,
         // so the collision follows the road's exact shape/height/tilt. (Very dense meshes: the cook falls back to a height
         // grid; the editor caps the stored count for preview sanity.)
@@ -7957,11 +10643,18 @@ struct Editor {
             uint32_t b=(uint32_t)(si.navVerts.size()/3);
             float v[9]={t.ax,t.ay,t.az, t.bx,t.by,t.bz, t.cx,t.cy,t.cz}; for(float f:v) si.navVerts.push_back(f);
             si.navIdx.push_back(b); si.navIdx.push_back(b+1); si.navIdx.push_back(b+2);
-            // MESH COLLIDER items = DOUBLE-SIDED: PhysX trimesh collision is single-sided per winding, so a
+            // MESH COLLIDER and automatic SMART-floor items = DOUBLE-SIDED:
+            // PhysX trimesh collision is single-sided per winding. Legacy Homes
+            // do not consistently wind their horizontal floor faces upward; a
+            // visually correct smart floor could therefore let gravity pass
+            // straight through it. The reversed twin makes either source
+            // winding solid. Manually authored non-smart walk navmeshes retain
+            // their exact one-sided semantics.
             // one-sided bake blocked from one side only ("only a side collidable, the roof is not") — append
-            // the reversed twin so both faces + the roof's underside block. (Walkable navmeshes stay single-
-            // sided: their reversed floor would block from below and doubles the SEBD for no gain.)
-            if (exactCollider){ si.navIdx.push_back(b); si.navIdx.push_back(b+2); si.navIdx.push_back(b+1); }
+            // the reversed twin so both faces + the roof's underside block.
+            if (exactCollider || si.navMode==1){
+                si.navIdx.push_back(b); si.navIdx.push_back(b+2); si.navIdx.push_back(b+1);
+            }
         }
     }
     // For each NAVMESH item, (re)bake its triangles so the cook has fresh world geometry.
@@ -7971,14 +10664,497 @@ struct Editor {
             bakeNavGeometry(si);
         }
     }
+    // Pick the most plausible walkable foundation for the one-click
+    // Add -> NavMesh -> Smart workflow. Feeding every scene mesh into the
+    // heightfield lets chair/table/roof tops win cells above the real floor.
+    // Rank meshes by actual near-horizontal projected triangle area, with only
+    // a modest semantic tie-breaker, so arbitrary community names still work.
+    std::vector<int> autoSmartFloorMeshes() {
+        struct Candidate {
+            int mesh=-1;
+            double area=0.0, score=0.0;
+            float floorY=0.f, startSurfaceY=0.f;
+            bool coversStart=false;
+            bool compactFoundation=false;
+            bool explicitGround=false;
+            float minX=0.f,maxX=0.f,minZ=0.f,maxZ=0.f;
+        };
+        std::vector<Candidate> candidates;
+        if (!r) return {};
+        // An authored/user start is strongest. With none, the neutral world
+        // origin is the deterministic reference used by official converted
+        // Homes and avoids selecting a disconnected side platform.
+        bool haveStart=true; float startX=0.f,startZ=0.f;
+        for(const auto& item:items) if(item.type==sitem::SPAWN&&item.allowStart&&item.isLocal){
+            haveStart=true;startX=item.pos[0];startZ=item.pos[2];break;
+        }
+        for (int m=0; m<(int)r->gpuMeshes.size(); ++m) {
+            auto& gm=r->gpuMeshes[(size_t)m];
+            if (r->isHidden(m) || r->isDeleted((size_t)m) || isBackdropFitMesh(m) ||
+                noColMeshes.count(m) || gm.useBlend || gm.additive) continue;
+            std::string name=gm.name;
+            for(char& ch:name) ch=(char)std::tolower((unsigned char)ch);
+            float boundsMin[3],boundsMax[3]; worldAabb(gm,boundsMin,boundsMax);
+            const float extentX=boundsMax[0]-boundsMin[0], extentZ=boundsMax[2]-boundsMin[2];
+            const bool explicitGroundName =
+                name.find("floor")!=std::string::npos || name.find("ground")!=std::string::npos ||
+                name.find("road")!=std::string::npos || name.find("terrain")!=std::string::npos ||
+                name.find("platform")!=std::string::npos || name.find("deck")!=std::string::npos ||
+                name.find("walkway")!=std::string::npos;
+            const bool effectName =
+                name.find("glow")!=std::string::npos || name.find("effect")!=std::string::npos ||
+                name.find("logo")!=std::string::npos || name.find("background")!=std::string::npos ||
+                name.find("backdrop")!=std::string::npos || name.find("vista")!=std::string::npos ||
+                name.find("sky")!=std::string::npos || name.find("dome")!=std::string::npos ||
+                name.find("ceiling")!=std::string::npos || name.find("roof")!=std::string::npos ||
+                name.find("fog")!=std::string::npos || name.find("smoke")!=std::string::npos ||
+                name.find("cloud")!=std::string::npos;
+            // Unnamed legacy backdrop/effect cards can dwarf the actual Home.
+            // Permit genuinely large outdoor floors only when their semantics
+            // identify them as ground; effects never become player collision.
+            if (effectName) continue;
+            const std::vector<float>* Pp=&gm.pickPos;
+            const std::vector<uint32_t>* Ip=&gm.pickIdx;
+            if ((Pp->size()<9 || Ip->size()<3) && sceneMeshes && m<(int)sceneMeshes->size()) {
+                Pp=&(*sceneMeshes)[(size_t)m].positions;
+                Ip=&(*sceneMeshes)[(size_t)m].indices;
+            }
+            const auto& P=*Pp; const auto& I=*Ip;
+            if (P.size()<9 || I.size()<3) continue;
+            double horizontalArea=0.0; float lowest=1e30f;
+            bool coversStart=false;float startSurfaceY=-1e30f;
+            for (size_t k=0;k+2<I.size();k+=3) {
+                const uint32_t ia=I[k],ib=I[k+1],ic=I[k+2];
+                if ((size_t)ia*3+2>=P.size() || (size_t)ib*3+2>=P.size() ||
+                    (size_t)ic*3+2>=P.size()) continue;
+                float a[3],b[3],c[3];
+                xformPoint(gm.model,&P[(size_t)ia*3],a);
+                xformPoint(gm.model,&P[(size_t)ib*3],b);
+                xformPoint(gm.model,&P[(size_t)ic*3],c);
+                const float e1x=b[0]-a[0],e1y=b[1]-a[1],e1z=b[2]-a[2];
+                const float e2x=c[0]-a[0],e2y=c[1]-a[1],e2z=c[2]-a[2];
+                const float nx=e1y*e2z-e1z*e2y;
+                const float ny=e1z*e2x-e1x*e2z;
+                const float nz=e1x*e2y-e1y*e2x;
+                const float nl=std::sqrt(nx*nx+ny*ny+nz*nz);
+                if (nl<1e-8f || std::fabs(ny)/nl<0.72f) continue;
+                horizontalArea += 0.5*std::fabs((double)e1x*e2z-(double)e1z*e2x);
+                lowest=std::min(lowest,std::min(a[1],std::min(b[1],c[1])));
+                if(haveStart){
+                    const float den=(b[2]-c[2])*(a[0]-c[0])+(c[0]-b[0])*(a[2]-c[2]);
+                    if(std::fabs(den)>=1e-8f){
+                        const float u=((b[2]-c[2])*(startX-c[0])+(c[0]-b[0])*(startZ-c[2]))/den;
+                        const float v=((c[2]-a[2])*(startX-c[0])+(a[0]-c[0])*(startZ-c[2]))/den;
+                        const float w=1.f-u-v;
+                        if(u>=-1e-4f&&v>=-1e-4f&&w>=-1e-4f){
+                            coversStart=true;
+                            startSurfaceY=std::max(startSurfaceY,u*a[1]+v*b[1]+w*c[1]);
+                        }
+                    }
+                }
+            }
+            if (horizontalArea<0.25 || !std::isfinite(lowest)) continue;
+            // Large unnamed cards are normally scenery, but a horizontal mesh
+            // geometrically carrying the authored/user start is direct evidence
+            // of a playable foundation and must not be rejected by its name.
+            if(!explicitGroundName&&std::max(extentX,extentZ)>50.f&&!coversStart)continue;
+            double semantic=1.0;
+            if (name.find("floor")!=std::string::npos || name.find("ground")!=std::string::npos ||
+                name.find("road")!=std::string::npos || name.find("terrain")!=std::string::npos ||
+                name.find("platform")!=std::string::npos || name.find("deck")!=std::string::npos ||
+                name.find("walkway")!=std::string::npos)
+                semantic=1.35;
+            if (name.find("ceiling")!=std::string::npos || name.find("roof")!=std::string::npos ||
+                name.find("sky")!=std::string::npos)
+                semantic=0.15;
+            if (name.find("chair")!=std::string::npos || name.find("table")!=std::string::npos ||
+                name.find("screen")!=std::string::npos)
+                semantic*=0.35;
+            const bool compactFoundation =
+                explicitGroundName || std::max(extentX,extentZ)<=100.f;
+            candidates.push_back({m,horizontalArea,horizontalArea*semantic,
+                                  lowest,startSurfaceY,coversStart,
+                                  compactFoundation,explicitGroundName,
+                                  boundsMin[0],boundsMax[0],boundsMin[2],boundsMax[2]});
+        }
+        if (candidates.empty()) return {};
+        std::sort(candidates.begin(),candidates.end(),[](const Candidate& a,const Candidate& b){
+            // Authored floor/ground/road/platform semantics are the strongest
+            // source hint. Legacy Homes often place neutral X/Z below an upper
+            // architectural shell while the actual main floor is elsewhere.
+            // When no such hint exists (for example Winterlodge), the existing
+            // geometry-first fallback remains unchanged.
+            if(a.explicitGround!=b.explicitGround)
+                return a.explicitGround;
+            return navigationfloor::better(
+                {a.coversStart,a.compactFoundation,a.score,a.mesh},
+                {b.coversStart,b.compactFoundation,b.score,b.mesh});
+        });
+        const Candidate& best=candidates.front();
+        fprintf(stderr,"[AUTONAV] selected floor mesh %d '%s': horizontalArea=%.2fm2 score=%.2f floorY=%.2f coversStart=%d startSurfaceY=%.2f\n",
+                best.mesh,r->gpuMeshes[(size_t)best.mesh].name.c_str(),best.area,best.score,best.floorY,
+                best.coversStart?1:0,best.startSurfaceY);
+        // A room's visible floor is commonly split into several material
+        // meshes (tatami/rug/main floor, indoor/outdoor sections). Selecting
+        // only the highest-scoring part made the surrounding strips solid but
+        // left the large central panel intangible. Grow a connected component
+        // from the proven best surface through explicitly floor-named,
+        // near-level neighbours. This remains bounded to the local Home and
+        // cannot pull in distant panorama cards.
+        std::vector<int> selected={best.mesh};
+        bool changed=true;
+        constexpr float kJoinMargin=2.0f;
+        constexpr float kJoinHeight=5.0f;
+        while(changed) {
+            changed=false;
+            for(const Candidate& candidate:candidates) {
+                if(!candidate.explicitGround ||
+                   std::find(selected.begin(),selected.end(),candidate.mesh)!=selected.end())
+                    continue;
+                bool joins=false;
+                for(int selectedMesh:selected) {
+                    const auto found=std::find_if(candidates.begin(),candidates.end(),
+                        [selectedMesh](const Candidate& value){return value.mesh==selectedMesh;});
+                    if(found==candidates.end())continue;
+                    const bool overlap=
+                        candidate.minX<=found->maxX+kJoinMargin &&
+                        candidate.maxX>=found->minX-kJoinMargin &&
+                        candidate.minZ<=found->maxZ+kJoinMargin &&
+                        candidate.maxZ>=found->minZ-kJoinMargin;
+                    if(overlap&&std::fabs(candidate.floorY-found->floorY)<=kJoinHeight) {
+                        joins=true;break;
+                    }
+                }
+                if(joins){selected.push_back(candidate.mesh);changed=true;}
+            }
+        }
+        if(selected.size()>1)
+            fprintf(stderr,"[AUTONAV] connected floor group: %zu meshes (primary + adjacent authored floor sections)\n",
+                    selected.size());
+        return selected;
+    }
+    std::vector<int> autoSmartObstacleMeshes(const std::vector<int>& floors) {
+        std::vector<int> out;
+        if (!r) return out;
+        for (int m=0;m<(int)r->gpuMeshes.size();++m) {
+            if (std::find(floors.begin(),floors.end(),m)!=floors.end() ||
+                r->isHidden(m) || r->isDeleted((size_t)m) || isBackdropFitMesh(m) ||
+                noColMeshes.count(m)) continue;
+            auto& gm=r->gpuMeshes[(size_t)m];
+            if(gm.useBlend||gm.additive)continue;
+            std::string name=gm.name;
+            for(char& ch:name) ch=(char)std::tolower((unsigned char)ch);
+            if (name.find("glow")!=std::string::npos || name.find("effect")!=std::string::npos ||
+                name.find("logo")!=std::string::npos || name.find("background")!=std::string::npos ||
+                name.find("backdrop")!=std::string::npos || name.find("vista")!=std::string::npos ||
+                name.find("screen")!=std::string::npos || name.find("sky")!=std::string::npos)
+                continue;
+            float mn[3],mx[3]; worldAabb(gm,mn,mx);
+            if (!std::isfinite(mn[0]) || !std::isfinite(mx[0])) continue;
+            const float ex=mx[0]-mn[0], ey=mx[1]-mn[1], ez=mx[2]-mn[2];
+            if (std::max(ex,std::max(ey,ez))>250.f || std::max(ex,ez)<0.12f || ey<0.08f) continue;
+            out.push_back(m);
+            fprintf(stderr,"[AUTONAV] structure mesh %d '%s' bounds=(%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f)\n",
+                    m,gm.name.c_str(),mn[0],mn[1],mn[2],mx[0],mx[1],mx[2]);
+        }
+        return out;
+    }
+    std::vector<sitem::Item> autoSmartObstacleBoxes(const std::vector<int>& floors,
+                                                     const sitem::Item& walk) {
+        std::vector<sitem::Item> out;
+        if (!r || floors.empty()) return out;
+        float floorMin[3]={1e30f,1e30f,1e30f},floorMax[3]={-1e30f,-1e30f,-1e30f};
+        for(int m:floors) {
+            if(m<0||m>=(int)r->gpuMeshes.size()) continue;
+            float mn[3],mx[3]; worldAabb(r->gpuMeshes[(size_t)m],mn,mx);
+            for(int k=0;k<3;++k){floorMin[k]=std::min(floorMin[k],mn[k]);floorMax[k]=std::max(floorMax[k],mx[k]);}
+        }
+        const float floorArea=std::max(1.f,(floorMax[0]-floorMin[0])*(floorMax[2]-floorMin[2]));
+        double ax=0,az=0;size_t an=0;float low=1e30f,high=-1e30f;
+        float walkMinX=1e30f,walkMaxX=-1e30f,walkMinZ=1e30f,walkMaxZ=-1e30f;
+        for(size_t v=0;v+2<walk.navVerts.size();v+=3){
+            ax+=walk.navVerts[v];az+=walk.navVerts[v+2];++an;
+            low=std::min(low,walk.navVerts[v+1]);high=std::max(high,walk.navVerts[v+1]);
+            walkMinX=std::min(walkMinX,walk.navVerts[v]);walkMaxX=std::max(walkMaxX,walk.navVerts[v]);
+            walkMinZ=std::min(walkMinZ,walk.navVerts[v+2]);walkMaxZ=std::max(walkMaxZ,walk.navVerts[v+2]);
+        }
+        float sx=0,sz=0;
+        if(an){
+            const float cx=(float)(ax/an),cz=(float)(az/an),band=low+(high-low)*0.4f;
+            float best=1e30f;
+            for(size_t v=0;v+2<walk.navVerts.size();v+=3){
+                if(walk.navVerts[v+1]>band)continue;
+                const float dx=walk.navVerts[v]-cx,dz=walk.navVerts[v+2]-cz,d=dx*dx+dz*dz;
+                if(d<best){best=d;sx=walk.navVerts[v];sz=walk.navVerts[v+2];}
+            }
+        }
+        for(int m=0;m<(int)r->gpuMeshes.size();++m){
+            if(std::find(floors.begin(),floors.end(),m)!=floors.end()||r->isHidden(m)||
+               r->isDeleted((size_t)m)||isBackdropFitMesh(m)||noColMeshes.count(m))continue;
+            auto& gm=r->gpuMeshes[(size_t)m];
+            if(gm.useBlend||gm.additive)continue;
+            std::string name=gm.name;for(char&ch:name)ch=(char)std::tolower((unsigned char)ch);
+            const bool obstacleName=
+                name.find("chair")!=std::string::npos||name.find("table")!=std::string::npos||
+                name.find("desk")!=std::string::npos||name.find("station")!=std::string::npos||
+                name.find("console")!=std::string::npos||name.find("sofa")!=std::string::npos||
+                name.find("couch")!=std::string::npos||name.find("column")!=std::string::npos||
+                name.find("pillar")!=std::string::npos||name.find("door")!=std::string::npos;
+            if(!obstacleName||name.find("screen")!=std::string::npos)continue;
+            float mn[3],mx[3];worldAabb(gm,mn,mx);
+            const float ex=mx[0]-mn[0],ey=mx[1]-mn[1],ez=mx[2]-mn[2];
+            const float area=ex*ez;
+            if(!std::isfinite(area)||ex<0.12f||ey<0.12f||ez<0.12f||
+               area>floorArea*0.35f||std::max(ex,ez)>12.f)continue;
+            // A coarse furniture proxy is accepted only when the established
+            // player capsule is clearly outside it. This prevents grouped
+            // chair/table meshes from spawning the user inside a solid box.
+            if(sx>=mn[0]-0.55f&&sx<=mx[0]+0.55f&&sz>=mn[2]-0.55f&&sz<=mx[2]+0.55f)continue;
+            sitem::Item box;box.type=sitem::BOXCOL;box.name="AutoCollider ("+gm.name+")";
+            box.pos[0]=(mn[0]+mx[0])*0.5f;box.pos[1]=(mn[1]+mx[1])*0.5f;box.pos[2]=(mn[2]+mx[2])*0.5f;
+            box.half[0]=std::max(0.08f,ex*0.5f);box.half[1]=std::max(0.08f,ey*0.5f);box.half[2]=std::max(0.08f,ez*0.5f);
+            out.push_back(std::move(box));
+        }
+        fprintf(stderr,"[AUTONAV] smart obstacle proxies: %zu boxes, floorArea=%.2fm2 spawnXZ=(%.2f,%.2f)\n",
+                out.size(),floorArea,sx,sz);
+        return out;
+    }
+    sitem::Item autoSmartSceneCollider(const std::vector<int>& floors,
+                                       const sitem::Item& walk) {
+        sitem::Item collider;
+        collider.type=sitem::NAVMESH;
+        collider.navMode=2;
+        collider.name="Collider (Auto scene structure)";
+        if(!r)return collider;
+        double ax=0,az=0;size_t an=0;float low=1e30f,high=-1e30f;
+        float walkMinX=1e30f,walkMaxX=-1e30f,walkMinZ=1e30f,walkMaxZ=-1e30f;
+        for(size_t v=0;v+2<walk.navVerts.size();v+=3){
+            ax+=walk.navVerts[v];az+=walk.navVerts[v+2];++an;
+            low=std::min(low,walk.navVerts[v+1]);high=std::max(high,walk.navVerts[v+1]);
+            walkMinX=std::min(walkMinX,walk.navVerts[v]);walkMaxX=std::max(walkMaxX,walk.navVerts[v]);
+            walkMinZ=std::min(walkMinZ,walk.navVerts[v+2]);walkMaxZ=std::max(walkMaxZ,walk.navVerts[v+2]);
+        }
+        float sx=0,sz=0;
+        if(an){
+            const float cx=(float)(ax/an),cz=(float)(az/an),band=low+(high-low)*0.4f;
+            float best=1e30f;
+            for(size_t v=0;v+2<walk.navVerts.size();v+=3){
+                if(walk.navVerts[v+1]>band)continue;
+                const float dx=walk.navVerts[v]-cx,dz=walk.navVerts[v+2]-cz,d=dx*dx+dz*dz;
+                if(d<best){best=d;sx=walk.navVerts[v];sz=walk.navVerts[v+2];}
+            }
+        }
+        size_t skippedSpawn=0,sourceTris=0;
+        for(int m=0;m<(int)r->gpuMeshes.size();++m){
+            if(std::find(floors.begin(),floors.end(),m)!=floors.end()||r->isHidden(m)||
+               r->isDeleted((size_t)m)||isBackdropFitMesh(m)||noColMeshes.count(m))continue;
+            auto& gm=r->gpuMeshes[(size_t)m];
+            if(gm.useBlend||gm.additive)continue;
+            std::string name=gm.name;for(char&ch:name)ch=(char)std::tolower((unsigned char)ch);
+            const bool visualOnly=
+                name.find("screen")!=std::string::npos||name.find("glow")!=std::string::npos||
+                name.find("effect")!=std::string::npos||name.find("logo")!=std::string::npos||
+                name.find("background")!=std::string::npos||name.find("backdrop")!=std::string::npos||
+                name.find("vista")!=std::string::npos||name.find("sky")!=std::string::npos||
+                name.find("fog")!=std::string::npos||name.find("smoke")!=std::string::npos||
+                name.find("cloud")!=std::string::npos;
+            if(visualOnly)continue;
+            const std::vector<float>* P=&gm.pickPos;
+            const std::vector<uint32_t>* I=&gm.pickIdx;
+            if((P->size()<9||I->size()<3)&&sceneMeshes&&m<(int)sceneMeshes->size()){
+                P=&(*sceneMeshes)[(size_t)m].positions;I=&(*sceneMeshes)[(size_t)m].indices;
+            }
+            for(size_t t=0;t+2<I->size();t+=3){
+                const uint32_t ia=(*I)[t],ib=(*I)[t+1],ic=(*I)[t+2];
+                if((size_t)ia*3+2>=P->size()||(size_t)ib*3+2>=P->size()||
+                   (size_t)ic*3+2>=P->size())continue;
+                float a[3],b[3],c[3];
+                xformPoint(gm.model,&(*P)[(size_t)ia*3],a);
+                xformPoint(gm.model,&(*P)[(size_t)ib*3],b);
+                xformPoint(gm.model,&(*P)[(size_t)ic*3],c);
+                // Generic near-structure rule: collision is derived from all
+                // opaque steep triangles around the actual walkable bounds,
+                // not English mesh names. This covers legacy material-only
+                // names while excluding kilometre-scale skylines.
+                const float tcx=(a[0]+b[0]+c[0])/3.f;
+                const float tcz=(a[2]+b[2]+c[2])/3.f;
+                constexpr float kStructureMargin=6.f;
+                if(tcx<walkMinX-kStructureMargin||tcx>walkMaxX+kStructureMargin||
+                   tcz<walkMinZ-kStructureMargin||tcz>walkMaxZ+kStructureMargin)continue;
+                const float ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2];
+                const float vx=c[0]-a[0],vy=c[1]-a[1],vz=c[2]-a[2];
+                const float nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;
+                const float nl=std::sqrt(nx*nx+ny*ny+nz*nz);
+                if(nl<1e-6f||std::fabs(ny)/nl>0.72f)continue; // never replace the walkable floor
+                ++sourceTris;
+                const float minx=std::min(a[0],std::min(b[0],c[0]));
+                const float maxx=std::max(a[0],std::max(b[0],c[0]));
+                const float minz=std::min(a[2],std::min(b[2],c[2]));
+                const float maxz=std::max(a[2],std::max(b[2],c[2]));
+                if(sx>=minx-0.75f&&sx<=maxx+0.75f&&sz>=minz-0.75f&&sz<=maxz+0.75f){
+                    ++skippedSpawn;continue;
+                }
+                const uint32_t base=(uint32_t)(collider.navVerts.size()/3);
+                for(const float* p:{a,b,c}){
+                    collider.navVerts.push_back(p[0]);collider.navVerts.push_back(p[1]);collider.navVerts.push_back(p[2]);
+                }
+                collider.navIdx.push_back(base);collider.navIdx.push_back(base+1);collider.navIdx.push_back(base+2);
+            }
+        }
+        fprintf(stderr,"[AUTONAV] scene structure collider: %zu/%zu steep tris, skippedNearSpawn=%zu spawnXZ=(%.2f,%.2f)\n",
+                collider.navIdx.size()/3,sourceTris,skippedSpawn,sx,sz);
+        return collider;
+    }
+    std::vector<int> autoSmartStructureMeshes(const std::vector<int>& floors,
+                                              const sitem::Item& walk) {
+        std::vector<int> out;
+        if(!r)return out;
+        double ax=0,az=0;size_t an=0;float low=1e30f,high=-1e30f;
+        float walkMinX=1e30f,walkMaxX=-1e30f,walkMinZ=1e30f,walkMaxZ=-1e30f;
+        for(size_t v=0;v+2<walk.navVerts.size();v+=3){
+            ax+=walk.navVerts[v];az+=walk.navVerts[v+2];++an;
+            low=std::min(low,walk.navVerts[v+1]);high=std::max(high,walk.navVerts[v+1]);
+            walkMinX=std::min(walkMinX,walk.navVerts[v]);walkMaxX=std::max(walkMaxX,walk.navVerts[v]);
+            walkMinZ=std::min(walkMinZ,walk.navVerts[v+2]);walkMaxZ=std::max(walkMaxZ,walk.navVerts[v+2]);
+        }
+        float sx=0,sz=0;
+        if(an){
+            const float cx=(float)(ax/an),cz=(float)(az/an),band=low+(high-low)*0.4f;
+            float best=1e30f;
+            for(size_t v=0;v+2<walk.navVerts.size();v+=3){
+                if(walk.navVerts[v+1]>band)continue;
+                const float dx=walk.navVerts[v]-cx,dz=walk.navVerts[v+2]-cz,d=dx*dx+dz*dz;
+                if(d<best){best=d;sx=walk.navVerts[v];sz=walk.navVerts[v+2];}
+            }
+        }
+        for(int m=0;m<(int)r->gpuMeshes.size();++m){
+            if(std::find(floors.begin(),floors.end(),m)!=floors.end()||r->isHidden(m)||
+               r->isDeleted((size_t)m)||isBackdropFitMesh(m)||noColMeshes.count(m))continue;
+            auto& gm=r->gpuMeshes[(size_t)m];
+            std::string name=gm.name;for(char&ch:name)ch=(char)std::tolower((unsigned char)ch);
+            const bool visualOnly=
+                name.find("screen")!=std::string::npos||name.find("glow")!=std::string::npos||
+                name.find("effect")!=std::string::npos||name.find("logo")!=std::string::npos||
+                name.find("background")!=std::string::npos||name.find("backdrop")!=std::string::npos||
+                name.find("vista")!=std::string::npos||name.find("sky")!=std::string::npos;
+            if(visualOnly)continue;
+            float mn[3],mx[3];worldAabb(gm,mn,mx);
+            if(!std::isfinite(mn[0])||!std::isfinite(mx[0]))continue;
+            const std::vector<float>* P=&gm.pickPos;
+            const std::vector<uint32_t>* I=&gm.pickIdx;
+            if((P->size()<9||I->size()<3)&&sceneMeshes&&m<(int)sceneMeshes->size()){
+                P=&(*sceneMeshes)[(size_t)m].positions;I=&(*sceneMeshes)[(size_t)m].indices;
+            }
+            bool hasNearSteepSurface=false;
+            constexpr float kStructureMargin=6.f;
+            for(size_t t=0;t+2<I->size()&&!hasNearSteepSurface;t+=3){
+                const uint32_t ia=(*I)[t],ib=(*I)[t+1],ic=(*I)[t+2];
+                if((size_t)ia*3+2>=P->size()||(size_t)ib*3+2>=P->size()||
+                   (size_t)ic*3+2>=P->size())continue;
+                float a[3],b[3],c[3];
+                xformPoint(gm.model,&(*P)[(size_t)ia*3],a);
+                xformPoint(gm.model,&(*P)[(size_t)ib*3],b);
+                xformPoint(gm.model,&(*P)[(size_t)ic*3],c);
+                const float tcx=(a[0]+b[0]+c[0])/3.f,tcz=(a[2]+b[2]+c[2])/3.f;
+                if(tcx<walkMinX-kStructureMargin||tcx>walkMaxX+kStructureMargin||
+                   tcz<walkMinZ-kStructureMargin||tcz>walkMaxZ+kStructureMargin)continue;
+                const float ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2];
+                const float vx=c[0]-a[0],vy=c[1]-a[1],vz=c[2]-a[2];
+                const float nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;
+                const float nl=std::sqrt(nx*nx+ny*ny+nz*nz);
+                hasNearSteepSurface=nl>=1e-6f&&std::fabs(ny)/nl<=0.72f;
+            }
+            if(!hasNearSteepSurface)continue;
+            // Never materialize a collider that already contains the selected
+            // player capsule. Nearby furniture is fine; enclosing shells are not.
+            out.push_back(m);
+            fprintf(stderr,"[AUTONAV] structure collider source %d '%s' bounds=(%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f)\n",
+                    m,gm.name.c_str(),mn[0],mn[1],mn[2],mx[0],mx[1],mx[2]);
+        }
+        fprintf(stderr,"[AUTONAV] selected %zu structure meshes, spawnXZ=(%.2f,%.2f)\n",
+                out.size(),sx,sz);
+        return out;
+    }
     // Add a navmesh of the chosen mode, bake its preview geometry, select it, ensure its markers are visible.
+    void rebuildGeneratedWalkSurface() {
+        if(!automaticNavigationGenerated||loadedNavigationGeneratorVersion<=0)return;
+        items.erase(std::remove_if(items.begin(),items.end(),[](const sitem::Item& item){
+            return (item.type==sitem::NAVMESH&&item.name=="Navmesh (smart)")||
+                   (item.type==sitem::BOXCOL&&item.name.rfind("AutoFloor ",0)==0);
+        }),items.end());
+        selItem=-1;selItems.clear();
+        addNavmesh(1);
+        automaticNavigationGenerated=true;
+        loadedNavigationGeneratorVersion=kNavigationGeneratorVersion;
+        collisionReviewSuggested=false;
+        if(!expertMode) {
+            // addNavmesh() finishes on the last generated exact structure
+            // collider (navMode=Selection). That is useful for experts, but it
+            // made a successful guided Cook appear to have switched away from
+            // Smart and exposed the technical Navmesh object inspector.
+            selItem=-1;
+            selItems.clear();
+            tab=TAB_COOK;
+            propScroll=0.f;
+            showType[sitem::NAVMESH]=false;
+            showType[sitem::BOXCOL]=false;
+        }
+        saveProject();
+        setStatus("Automatic collision updated. Manual colliders were preserved.");
+    }
+
     void addNavmesh(int mode){
+        // Direct calls are explicit user actions. The automatic cook path marks
+        // its generated result immediately after this function returns.
+        automaticNavigationGenerated=false;
+        loadedNavigationGeneratorVersion=0;
+        collisionReviewSuggested=false;
         sitem::Item it; it.type=sitem::NAVMESH; it.navMode=mode;
         if (mode==2){ it.srcMeshes=sel; it.name="Navmesh (sel "+std::to_string(sel.size())+")"; }
-        else if (mode==1) it.name="Navmesh (smart)";
+        else if (mode==1) { it.name="Navmesh (smart)"; it.srcMeshes=autoSmartFloorMeshes(); }
         else              it.name="Navmesh (flat)";
         bakeNavGeometry(it);
-        deselectAll(); items.push_back(std::move(it)); selItem=(int)items.size()-1; showType[sitem::NAVMESH]=true; tab=TAB_OBJECT; propScroll=0.f;
+        const std::vector<int> floorMeshes=it.srcMeshes;
+        deselectAll(); items.push_back(std::move(it));
+        if(mode==1){
+            const size_t smartWalkIndex=items.size()-1;
+            // The official delegated backend reconstructs SMART geometry from
+            // srcMeshes and older releases keep its PhysX mesh one-sided. PhysX
+            // also welds away reversed duplicate triangles, so "double the
+            // winding" cannot fix it. Add a bounded tilted grid of native
+            // ColliderBox primitives beneath the same SMART surface instead.
+            // Boxes are created by VrShell's own PhysX and are the proven,
+            // version-independent solid landing layer; gravity remains active
+            // and settles the user onto their top faces.
+            const auto landingBoxes=hslcook::navmeshToBoxes(
+                items[smartWalkIndex].navVerts,1.0f,0.50f,2000);
+            size_t boxIndex=0;
+            for(const auto& b:landingBoxes){
+                sitem::Item box;box.type=sitem::BOXCOL;
+                box.name="AutoFloor "+std::to_string(boxIndex++);
+                box.pos[0]=b[0];box.pos[1]=b[1];box.pos[2]=b[2];
+                box.half[0]=b[3];box.half[1]=b[4];box.half[2]=b[5];
+                items.push_back(std::move(box));
+            }
+            fprintf(stderr,"[AUTONAV] solid landing layer: %zu axis-aligned native ColliderBox height cells under Smart Navmesh\n",
+                    landingBoxes.size());
+            const auto structures=autoSmartStructureMeshes(floorMeshes,items[smartWalkIndex]);
+            for(int m:structures){
+                bool alreadyBound=false;
+                for(const auto& existing:items) {
+                    if(!isMeshColliderItem(existing))continue;
+                    if(std::find(existing.srcMeshes.begin(),existing.srcMeshes.end(),m)!=
+                       existing.srcMeshes.end()){alreadyBound=true;break;}
+                }
+                if(alreadyBound)continue;
+                sitem::Item collider;collider.type=sitem::NAVMESH;collider.navMode=2;
+                collider.srcMeshes={m};
+                collider.name="Collider ("+r->gpuMeshes[(size_t)m].name+")";
+                bakeNavGeometry(collider);
+                if(collider.navIdx.size()>=3)items.push_back(std::move(collider));
+            }
+        }
+        selItem=(int)items.size()-1; showType[sitem::NAVMESH]=true; tab=TAB_OBJECT; propScroll=0.f;
     }
     // "Make this object a mesh collider": a ColliderMesh built from ONE mesh's exact triangles (a solid obstacle you
     // can't walk through — same haven component as a navmesh, just sourced from a single object). Right-click -> Add.

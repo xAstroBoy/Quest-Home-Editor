@@ -34,7 +34,7 @@ public:
 
     // ── glTF skeletal animation (self-contained CPU skinning — our own code, not
     //    borrowed from libshell). animate(t) streams skinned positions per frame. ──
-    struct GNode { float t[3]={0,0,0}, r[4]={0,0,0,1}, s[3]={1,1,1}; int parent=-1; };
+    struct GNode { float t[3]={0,0,0}, r[4]={0,0,0,1}, s[3]={1,1,1}; int parent=-1; std::string name; };
     struct GSkin { std::vector<int> joints; std::vector<float> ibm; /*joints*16*/ };
     struct GSampler { std::vector<float> times; std::vector<float> vals; int comps=0; bool step=false; };
     struct GChannel { int node=-1, path=0, sampler=-1; };  // path: 0=T 1=R 2=S
@@ -452,7 +452,7 @@ public:
         };
         // ADDITIVE glow: a BLEND material driven by an EMISSION shader (emissiveFactor ~[1,1,1]) is a self-lit
         // GLOW (warp streaks, nebula haze, force-field, fire), NOT alpha-glass. Alpha-blended faint on dark
-        // backdrops -> nearly invisible on device (the Star Trek warp/fog "IS NOT VISIBLE"). Such meshes must
+        // backdrops -> nearly invisible on device. Such meshes must
         // ADD light (src+dst), not alpha-lerp. Real transparent glass exports emissiveFactor=[0,0,0] -> stays
         // alpha. (Blender's glTF exporter writes emissiveFactor=[1,1,1] for an Emission/unlit material.)
         auto matIsEmissiveGlow = [&](int matIdx) -> bool {
@@ -539,6 +539,7 @@ public:
         gnodes.assign(nodes.size(), GNode{});
         for (size_t i=0;i<nodes.size();++i) {
             const auto& nd = nodes[i];
+            if (nd.has("name"))        gnodes[i].name=nd["name"].asString();
             if (nd.has("translation")) for(int k=0;k<3;k++) gnodes[i].t[k]=(float)nd["translation"][k].asFloat();
             if (nd.has("rotation"))    for(int k=0;k<4;k++) gnodes[i].r[k]=(float)nd["rotation"][k].asFloat();
             if (nd.has("scale"))       for(int k=0;k<3;k++) gnodes[i].s[k]=(float)nd["scale"][k].asFloat();
@@ -1073,7 +1074,13 @@ public:
         for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) return true;
         return false;
     }
-    // True only if the node animation ACTUALLY changes the transform. Some V79 exports (Star Trek TNG bridge) bake a
+    const char* nodeNameOfMesh(int meshIdx) const {
+        for (auto& r : nodeAnimRecs)
+            if (r.meshIdx == meshIdx && r.nodeIdx >= 0 && (size_t)r.nodeIdx < gnodes.size())
+                return gnodes[r.nodeIdx].name.c_str();
+        return "";
+    }
+    // True only if the node animation ACTUALLY changes the transform. Some V79 exports bake a
     // 50-key CONSTANT T/R/S track onto EVERY object = "animated" but motionless; without this gate they all get a getTime
     // wisp PULSE shader -> the whole env "breathes"/moves on device. Returns false for constant (static) tracks.
     // Walks the ANCESTOR chain like every extractor's worldAt does: a mesh whose motion comes ONLY from an animated
@@ -1103,8 +1110,8 @@ public:
             const char* pn = ch.path == 0 ? "T" : ch.path == 1 ? "R" : "S";
             float mn[4] = {1e30f,1e30f,1e30f,1e30f}, mx[4] = {-1e30f,-1e30f,-1e30f,-1e30f};
             for (int k = 0; k < n; k++) for (int c = 0; c < s.comps; c++) { float v = s.vals[(size_t)k*s.comps+c]; if(v<mn[c])mn[c]=v; if(v>mx[c])mx[c]=v; }
-            fprintf(stderr, "[V79ANIM] mesh%d node%d path=%s keys=%d t0=%.3f tN=%.3f step=%d comps=%d min=(%.3f,%.3f,%.3f) max=(%.3f,%.3f,%.3f)\n",
-                    meshIdx, nodeIdx, pn, n, n?s.times[0]:0.f, n?s.times[n-1]:0.f, s.step?1:0, s.comps, mn[0],mn[1],mn[2], mx[0],mx[1],mx[2]);
+            fprintf(stderr, "[V79ANIM] mesh%d node%d '%s' path=%s keys=%d t0=%.3f tN=%.3f step=%d comps=%d min=(%.3f,%.3f,%.3f) max=(%.3f,%.3f,%.3f)\n",
+                    meshIdx, nodeIdx, gnodes[nodeIdx].name.c_str(), pn, n, n?s.times[0]:0.f, n?s.times[n-1]:0.f, s.step?1:0, s.comps, mn[0],mn[1],mn[2], mx[0],mx[1],mx[2]);
             if (ch.path == 2) for (int k = 0; k < n && k < 20; k++)
                 fprintf(stderr, "    [k%02d] t=%.3f s=(%.4f,%.4f,%.4f)\n", k, s.times[k],
                         s.vals[(size_t)k*s.comps], s.vals[(size_t)k*s.comps+1], s.vals[(size_t)k*s.comps+2]);
@@ -1132,7 +1139,7 @@ public:
     }
     // GENERAL node TRANSLATION port: sample the node's translation channel at N uniform frames over the loop, as OFFSETS
     // from the t=0 (baked) translation. The cooker generates a shadergen::TRANSLATE shader that replays them with piecewise-
-    // linear interpolation -> FAITHFULLY ports ANY translation animation (Star Trek sliding screens), not a pattern guess.
+    // linear interpolation -> faithfully ports any translation animation, not a pattern guess.
     // Returns false if the node has no translation channel or it doesn't actually move.
     bool extractNodeTranslation(int meshIdx, int N, std::vector<float>& frameOffs, float& loopSec) const {
         int nodeIdx = -1; for (auto& r : nodeAnimRecs) if (r.meshIdx == meshIdx) { nodeIdx = r.nodeIdx; break; }
@@ -1238,7 +1245,7 @@ public:
     //      frozen:  vert = W0·inv(W0)   · (W0·basePos) = W0·basePos          (correct world rest when un-driven)
     //    requireRotation (default): return !ok() unless the node BOTH translates AND rotates — pure translations
     //    keep the lighter getTime TRANSLATE replay, pure spins the getTime Rodrigues shader (both device-proven;
-    //    no regression on Star Trek screens / OW planets / erebor wisps). HSR_NOGLTFRIGID disables the whole path.
+    //    no regression on sliding screens, orbiting bodies, or wisps). HSR_NOGLTFRIGID disables the whole path.
     HzAnimExport extractNodeRigidHzAnim(int meshIdx, bool requireRotation = true) {
         HzAnimExport e;
         const NodeAnimRec* rec = nullptr;
@@ -1258,7 +1265,7 @@ public:
                         if (firstEnd < 0.f) firstEnd = tv.back(); else if (std::fabs(tv.back()-firstEnd) > 0.1f) multiPeriod = true;
                         bool nw = true; for (float p : chainPeriods) if (std::fabs(p-tv.back()) <= 0.05f) { nw = false; break; }
                         if (nw) chainPeriods.push_back(tv.back());
-                        if (tv.size() >= 2 && tv.back()-tv.front() > 1e-4f) {   // native key rate (Star Trek 60/s sawtooths — see extractHzAnim) + MIN-gap for non-uniform tracks
+                        if (tv.size() >= 2 && tv.back()-tv.front() > 1e-4f) {   // native key rate (including 60/s sawtooths; see extractHzAnim) + MIN-gap for non-uniform tracks
                             float r = (float)(tv.size()-1)/(tv.back()-tv.front()); if (r > srcKeyRate) srcKeyRate = r;
                             float mg = 1e9f; for (size_t kk = 1; kk < tv.size(); kk++){ float g = tv[kk]-tv[kk-1]; if (g > 1e-5f && g < mg) mg = g; }
                             if (mg < 1e8f) { float r2 = 1.f/mg; if (r2 > 120.f) r2 = 120.f; if (r2 > srcKeyRate) srcKeyRate = r2; } } }
@@ -1284,7 +1291,7 @@ public:
         // NATIVE key-rate sampling (min 30fps), floor 64 (short clips), NO cap — FULL PORT (the old 256 "device
         // clip size limit" was a misdiagnosis — official whale clips are 240 KB and the device loads them fine).
         // GRID-ALIGNED when dense: fps = the SOURCE key rate exactly (not NF/clipDur), so bake frame f lands ON
-        // source key f — the bake's frame-lerp IS the source's key-lerp (Star Trek streak teleports: an off-grid
+        // source key f — the bake's frame-lerp IS the source's key-lerp (for streak teleports, an off-grid
         // 61.2fps resample of the 60/s keys drifted through the teleport window = mid-lerp ghost frames).
         int natNF = (int)(clipDur * srcKeyRate + 0.5f);
         int NF; float bakeFps;
@@ -1919,7 +1926,7 @@ public:
         // NATIVE sampling density: bake the clip at the SOURCE'S OWN key rate (srcKeyRate, from the densest
         // contributing channel), not a hardcoded 30/s. Both directions matter: the caller sizes `frames` off
         // the GLOBAL timeline (166.8s x 30fps = 5004 — a 16.7s clip was oversampled 10x = 3MB ACL for 500
-        // real keys), AND the old fixed 30/s resample HALVED 60-key/s sources (Star Trek warp streaks: 50
+        // real keys), AND the old fixed 30/s resample halved 60-key/s sources (fast streak tracks: 50
         // keys/0.83s SAWTOOTH per bone — the 26-frame bake lerped ACROSS each teleport wrap = streaks
         // snapping mid-flight, ANIM-VERIFY err 50u of a 103u span). At the native rate the bake's lerp
         // between frames IS the source's own lerp between keys — exact by construction.

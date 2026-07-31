@@ -5,6 +5,7 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <array>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -49,44 +50,114 @@ inline void sha256(const uint8_t* p, size_t l, uint8_t out[32]){ Sha256 h; h.ini
 
 // ── big-integer (base 2^32, little-endian limbs) modexp for RSA-2048 ────────────────────────────────────────
 // Fixed 64 limbs for the modulus; products use 128 limbs. Enough for RSA-2048. One sign per APK → speed is fine.
-struct Big {                       // little-endian: v[0] is least significant
-    static const int W = 128;      // limbs (support up to 4096-bit intermediates)
-    uint32_t v[W];
-    Big(){ memset(v,0,sizeof v); }
-    static Big fromBE(const uint8_t* b, int nbytes){ Big r; for(int i=0;i<nbytes;i++){ r.v[(nbytes-1-i)/4] |= (uint32_t)b[i] << (8*((nbytes-1-i)%4)); } return r; }
-    void toBE(uint8_t* out, int nbytes) const { for(int i=0;i<nbytes;i++){ int j=nbytes-1-i; out[i]=(uint8_t)(v[j/4] >> (8*(j%4))); } }
-    int bits() const { for(int i=W-1;i>=0;--i) if(v[i]){ uint32_t x=v[i]; int b=0; while(x){x>>=1;++b;} return i*32+b; } return 0; }
-    bool ge(const Big& o) const { for(int i=W-1;i>=0;--i){ if(v[i]!=o.v[i]) return v[i]>o.v[i]; } return true; }
-    void sub(const Big& o){ uint64_t br=0; for(int i=0;i<W;i++){ uint64_t x=(uint64_t)v[i]-o.v[i]-br; v[i]=(uint32_t)x; br=(x>>63)&1; } }
-    void shl1(){ uint32_t c=0; for(int i=0;i<W;i++){ uint32_t nc=v[i]>>31; v[i]=(v[i]<<1)|c; c=nc; } }
-    bool bit(int i) const { return (v[i/32]>>(i%32))&1; }
-};
-// r = (a*b) mod m  (schoolbook multiply into 128 limbs, then binary reduce)
-inline Big mulmod(const Big& a, const Big& b, const Big& m){
-    uint64_t prod[Big::W]; memset(prod,0,sizeof prod);   // 64-bit accumulators, then normalize
-    // schoolbook (only lower 128 limbs matter for our sizes)
-    static uint32_t P[Big::W*2]; memset(P,0,sizeof P);
-    for(int i=0;i<Big::W;i++){ if(!a.v[i]) continue; uint64_t carry=0;
-        for(int j=0;j<Big::W;j++){ if(i+j>=Big::W*2) break; uint64_t cur=(uint64_t)P[i+j]+(uint64_t)a.v[i]*b.v[j]+carry; P[i+j]=(uint32_t)cur; carry=cur>>32; }
+using Rsa2048 = std::array<uint32_t,64>; // little-endian 32-bit limbs
+
+inline Rsa2048 rsaFromBE(const uint8_t* bytes, size_t count) {
+    Rsa2048 out{};
+    if (count > 256) { bytes += count - 256; count = 256; }
+    for (size_t i=0;i<count;++i) {
+        const size_t j=count-1-i;
+        out[j/4] |= (uint32_t)bytes[i] << (8*(j%4));
     }
-    (void)prod;
-    // reduce P (up to 256 limbs) mod m by binary long division on the high part; but our operands are < m (<2048b),
-    // so P < 2^4096 fits in 128 limbs. Copy low 128 limbs into a Big and reduce.
-    Big x; for(int i=0;i<Big::W;i++) x.v[i]=P[i];
-    // binary reduction: align m to x's top bit, subtract down.
-    int xb=x.bits(), mb=m.bits(); if(xb<mb) return x;
-    Big ms=m; int sh=xb-mb; for(int i=0;i<sh;i++) ms.shl1();
-    for(int i=0;i<=sh;i++){ if(x.ge(ms)) x.sub(ms);
-        // shift ms right by 1
-        uint32_t c=0; for(int k=Big::W-1;k>=0;--k){ uint32_t nc=ms.v[k]&1; ms.v[k]=(ms.v[k]>>1)|(c<<31); c=nc; } }
-    return x;
+    return out;
 }
-// result = base^exp mod m  (left-to-right binary)
-inline Big modexp(const Big& base, const Big& exp, const Big& m){
-    Big r; r.v[0]=1; int eb=exp.bits();
-    for(int i=eb-1;i>=0;--i){ r=mulmod(r,r,m); if(exp.bit(i)) r=mulmod(r,base,m); }
-    return r;
+
+inline void rsaToBE(const Rsa2048& value, uint8_t out[256]) {
+    for (size_t i=0;i<256;++i) {
+        const size_t j=255-i;
+        out[i]=(uint8_t)(value[j/4]>>(8*(j%4)));
+    }
 }
+
+inline bool rsaGe(const Rsa2048& a, const Rsa2048& b) {
+    for (int i=63;i>=0;--i) if (a[(size_t)i]!=b[(size_t)i]) return a[(size_t)i]>b[(size_t)i];
+    return true;
+}
+
+inline uint32_t rsaSub(Rsa2048& a, const Rsa2048& b) {
+    uint64_t borrow=0;
+    for (size_t i=0;i<64;++i) {
+        const uint64_t sub=(uint64_t)b[i]+borrow;
+        const uint64_t old=a[i];
+        a[i]=(uint32_t)(old-sub);
+        borrow=old<sub ? 1u : 0u;
+    }
+    return (uint32_t)borrow;
+}
+
+inline void rsaDoubleMod(Rsa2048& value, const Rsa2048& modulus) {
+    uint64_t carry=0;
+    for (size_t i=0;i<64;++i) {
+        const uint64_t doubled=(uint64_t)value[i]*2u+carry;
+        value[i]=(uint32_t)doubled;
+        carry=doubled>>32;
+    }
+    if (carry || rsaGe(value,modulus)) rsaSub(value,modulus);
+}
+
+struct RsaMontgomery2048 {
+    Rsa2048 modulus{};
+    Rsa2048 oneMont{}; // R mod n
+    Rsa2048 r2{};      // R^2 mod n
+    uint32_t n0Inverse=0; // -n[0]^-1 mod 2^32
+
+    explicit RsaMontgomery2048(const uint8_t modulusBE[256]) : modulus(rsaFromBE(modulusBE,256)) {
+        uint32_t inverse=1;
+        for (int i=0;i<5;++i) inverse*=2u-modulus[0]*inverse;
+        n0Inverse=0u-inverse;
+        Rsa2048 power{}; power[0]=1;
+        for (int i=0;i<2048;++i) rsaDoubleMod(power,modulus);
+        oneMont=power;
+        for (int i=0;i<2048;++i) rsaDoubleMod(power,modulus);
+        r2=power;
+    }
+
+    Rsa2048 multiply(const Rsa2048& a, const Rsa2048& b) const {
+        std::array<uint32_t,129> t{};
+        for (size_t i=0;i<64;++i) {
+            uint64_t carry=0;
+            for (size_t j=0;j<64;++j) {
+                const uint64_t sum=(uint64_t)t[i+j]+(uint64_t)a[i]*b[j]+carry;
+                t[i+j]=(uint32_t)sum;
+                carry=sum>>32;
+            }
+            size_t p=i+64;
+            while (carry) {
+                const uint64_t sum=(uint64_t)t[p]+carry;
+                t[p]=(uint32_t)sum; carry=sum>>32; ++p;
+            }
+        }
+        for (size_t i=0;i<64;++i) {
+            const uint32_t factor=(uint32_t)((uint64_t)t[i]*n0Inverse);
+            uint64_t carry=0;
+            for (size_t j=0;j<64;++j) {
+                const uint64_t sum=(uint64_t)t[i+j]+(uint64_t)factor*modulus[j]+carry;
+                t[i+j]=(uint32_t)sum;
+                carry=sum>>32;
+            }
+            size_t p=i+64;
+            while (carry) {
+                const uint64_t sum=(uint64_t)t[p]+carry;
+                t[p]=(uint32_t)sum; carry=sum>>32; ++p;
+            }
+        }
+        Rsa2048 out{};
+        for (size_t i=0;i<64;++i) out[i]=t[i+64];
+        if (t[128] || rsaGe(out,modulus)) rsaSub(out,modulus);
+        return out;
+    }
+
+    Rsa2048 exponentiate(const Rsa2048& base, const uint8_t exponentBE[256]) const {
+        Rsa2048 result=oneMont;
+        Rsa2048 value=multiply(base,r2);
+        for (size_t i=0;i<256;++i) for (int bit=7;bit>=0;--bit) {
+            result=multiply(result,result);
+            if ((exponentBE[i]>>bit)&1u) result=multiply(result,value);
+        }
+        Rsa2048 one{}; one[0]=1;
+        return multiply(result,one);
+    }
+};
 
 // RSA-2048 PKCS#1 v1.5 signature over SHA-256(msg). Returns 256 bytes big-endian.
 inline std::vector<uint8_t> rsaSignSha256(const uint8_t* msg, size_t len){
@@ -95,9 +166,10 @@ inline std::vector<uint8_t> rsaSignSha256(const uint8_t* msg, size_t len){
     static const uint8_t PREFIX[19]={0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20};
     uint8_t T[51]; memcpy(T,PREFIX,19); memcpy(T+19,hash,32);   // 19+32
     uint8_t EM[256]; EM[0]=0x00; EM[1]=0x01; int psLen=256-3-51; memset(EM+2,0xff,psLen); EM[2+psLen]=0x00; memcpy(EM+3+psLen,T,51);
-    Big m = Big::fromBE(EM,256), n = Big::fromBE(kDebugModulusBE,256), d = Big::fromBE(kDebugPrivExpBE,256);
-    Big sig = modexp(m,d,n);
-    std::vector<uint8_t> out(256); sig.toBE(out.data(),256); return out;
+    static const RsaMontgomery2048 rsa(kDebugModulusBE);
+    const Rsa2048 message=rsaFromBE(EM,256);
+    const Rsa2048 signature=rsa.exponentiate(message,kDebugPrivExpBE);
+    std::vector<uint8_t> out(256); rsaToBE(signature,out.data()); return out;
 }
 
 // ── little ZIP helpers (read the EOCD; used by both zipalign + v2) ──────────────────────────────────────────
@@ -252,6 +324,37 @@ inline bool signApkV2(const std::vector<uint8_t>& alignedApk, std::vector<uint8_
     uint32_t newCdOff=(uint32_t)(entriesEnd + block.size());
     out[newEocd+16]=(uint8_t)newCdOff; out[newEocd+17]=newCdOff>>8; out[newEocd+18]=newCdOff>>16; out[newEocd+19]=newCdOff>>24;
     return true;
+}
+
+// Cheap structural guard used before treating a generated APK as installable.
+// This is intentionally not a cryptographic verifier; Android performs that
+// verification. It proves that the v2 signing block we generate is present,
+// complete and attached immediately before the ZIP central directory.
+inline bool hasApkV2Signature(const std::vector<uint8_t>& apk) {
+    auto read64=[](const uint8_t* p) {
+        uint64_t value=0;
+        for(int i=0;i<8;++i)value|=(uint64_t)p[i]<<(8*i);
+        return value;
+    };
+    const int eocd=findEOCD(apk);
+    if(eocd<0) return false;
+    const uint32_t cdOff=rd32(&apk[(size_t)eocd+16]);
+    if(cdOff<32 || cdOff>apk.size()) return false;
+    static constexpr char kMagic[]="APK Sig Block 42";
+    if(memcmp(apk.data()+cdOff-16,kMagic,16)!=0) return false;
+    const uint64_t trailing=read64(apk.data()+cdOff-24);
+    if(trailing<24 || trailing>cdOff-8) return false;
+    const size_t blockStart=cdOff-(size_t)trailing-8;
+    if(blockStart+8>apk.size() || read64(apk.data()+blockStart)!=trailing) return false;
+    size_t p=blockStart+8;
+    const size_t pairsEnd=cdOff-24;
+    while(p+12<=pairsEnd) {
+        const uint64_t pairLen=read64(apk.data()+p); p+=8;
+        if(pairLen<4 || pairLen>pairsEnd-p) return false;
+        if(rd32(apk.data()+p)==0x7109871a) return true;
+        p+=(size_t)pairLen;
+    }
+    return false;
 }
 
 }} // namespace hslcook::sign

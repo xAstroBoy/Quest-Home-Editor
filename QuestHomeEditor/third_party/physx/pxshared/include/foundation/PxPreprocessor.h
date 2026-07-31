@@ -392,7 +392,11 @@ This declaration style is parsed correctly by Visual Assist.
 
 */
 #ifndef PX_ALIGN
-#if PX_MICROSOFT_FAMILY
+#if defined(__clang__)
+#define PX_ALIGN(alignment, decl) decl __attribute__((aligned(alignment)))
+#define PX_ALIGN_PREFIX(alignment)
+#define PX_ALIGN_SUFFIX(alignment) __attribute__((aligned(alignment)))
+#elif PX_MICROSOFT_FAMILY
 #define PX_ALIGN(alignment, decl) __declspec(align(alignment)) decl
 #define PX_ALIGN_PREFIX(alignment) __declspec(align(alignment))
 #define PX_ALIGN_SUFFIX(alignment)
@@ -472,7 +476,7 @@ PX_CUDA_CALLABLE PX_INLINE void PX_UNUSED(T const&)
 // This assert works on win32/win64, but may need further specialization on other platforms.
 // Some GCC compilers need the compiler flag -malign-double to be set.
 // Apparently the apple-clang-llvm compiler doesn't support malign-double.
-#if PX_PS4 || PX_APPLE_FAMILY || (PX_CLANG && !PX_ARM)
+#if PX_PS4 || PX_APPLE_FAMILY || (PX_CLANG && !PX_ARM && !PX_MICROSOFT_FAMILY)
 struct PxPackValidation
 {
 	char _;
