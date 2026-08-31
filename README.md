@@ -217,5 +217,14 @@ Want to be here? See **[How to Contribute](../../wiki/How-to-Contribute)**.
 
 ## License
 
-Research / educational use. All Meta content (environments, `libshell`, Haven 2025) belongs to Meta;
-this project ships none of it — it only converts files you already have.
+The original Quest Home Editor source code in this repository, except where
+otherwise noted, is licensed under the **MIT License**. See [LICENSE](LICENSE).
+
+This license applies only to code and other material for which this repository's
+contributors hold the necessary rights. It does **not** grant any rights to
+Meta-owned software, firmware, applications, environments, assets, trademarks,
+or other proprietary material. Quest Home Editor does not distribute Meta's
+`libshell`, Haven environments, or other Meta-owned content.
+
+Third-party libraries, vendored dependencies, fonts, and other third-party
+components remain subject to their respective licenses and copyright notices.
